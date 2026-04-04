@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Sign Up{% endblock %}
+{% block content %}
+  <h1 class="title">Create account</h1>
+  <p class="muted">Internal user signup.</p>
+  <form method="post" action="/signup">
+    <input type="hidden" name="captcha_token" value="{{ captcha_token }}" />
+    <label>Email</label>
+    <input name="email" type="email" required />
+    <label>Password</label>
+    <input name="password" type="password" required />
+    <div class="captchaBox">CAPTCHA: {{ captcha_question }}</div>
+    <label>CAPTCHA</label>
+    <input name="captcha_answer" type="number" inputmode="numeric" required />
+    <button type="submit">Create Account</button>
+  </form>
+  {% if error %}
+    <div class="errorBox">{{ error }}</div>
+  {% endif %}
+  <div class="links">
+    <p><a href="/login">Back to login</a></p>
+  </div>
+{% endblock %}

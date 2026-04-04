@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}Login CRM{% endblock %}
+{% block content %}
+  <h1 class="title">Ridecheck CRM</h1>
+  <p class="muted">Sign in with your account or the environment admin user.</p>
+  <form method="post" action="/login">
+    <input type="hidden" name="captcha_token" value="{{ captcha_token }}" />
+    <label>Email</label>
+    <input name="email" type="email" required />
+    <label>Password</label>
+    <div class="passwordWrap">
+      <input id="login-password" name="password" type="password" required />
+      <button class="eyeBtn" type="button" id="toggle-login-password" aria-label="Show password" title="Show password">
+        <svg id="icon-eye" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+          <path d="M1.5 12s3.5-6 10.5-6 10.5 6 10.5 6-3.5 6-10.5 6S1.5 12 1.5 12z" fill="none" stroke="currentColor" stroke-width="1.8"/>
+          <circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.8"/>
+        </svg>
+        <svg id="icon-eye-off" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" style="display:none;">
+          <path d="M2 2l20 20" fill="none" stroke="currentColor" stroke-width="1.8"/>
+          <path d="M1.5 12s3.5-6 10.5-6c2.2 0 4.1.6 5.7 1.5M22.5 12s-3.5 6-10.5 6c-2.2 0-4.2-.6-5.8-1.5" fill="none" stroke="currentColor" stroke-width="1.8"/>
+          <circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.8"/>
+        </svg>
+      </button>
+    </div>
+    <div class="captchaBox">CAPTCHA: {{ captcha_question }}</div>
+    <label>CAPTCHA</label>
+    <input name="captcha_answer" type="number" inputmode="numeric" required />
+    <button type="submit">Log In</button>
+  </form>
+  {% if error %}
+    <div class="err">{{ error }}</div>
+  {% endif %}
+  {% if message %}
+    <div class="captchaBox">{{ message }}</div>
+  {% endif %}
+  <div class="links">
+    <p><a href="/signup">Create account</a></p>
+    <p><a href="/forgot-password">Forgot password?</a></p>
+  </div>
+  <script>
+    (function () {
+      var btn = document.getElementById("toggle-login-password");
+      var input = document.getElementById("login-password");
+      var eye = document.getElementById("icon-eye");
+      var eyeOff = document.getElementById("icon-eye-off");
+      if (!btn || !input) return;
+      btn.addEventListener("click", function () {
+        var hidden = input.type === "password";
+        input.type = hidden ? "text" : "password";
+        if (eye && eyeOff) {
+          eye.style.display = hidden ? "none" : "";
+          eyeOff.style.display = hidden ? "" : "none";
+        }
+        btn.setAttribute("aria-label", hidden ? "Hide password" : "Show password");
+        btn.setAttribute("title", hidden ? "Hide password" : "Show password");
+      });
+    })();
+  </script>
+{% endblock %}

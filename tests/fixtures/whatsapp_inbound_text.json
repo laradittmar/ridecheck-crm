@@ -1,0 +1,35 @@
+{
+  "object": "whatsapp_business_account",
+  "entry": [
+    {
+      "id": "WHATSAPP_BUSINESS_ACCOUNT_ID",
+      "changes": [
+        {
+          "field": "messages",
+          "value": {
+            "messaging_product": "whatsapp",
+            "metadata": {
+              "display_phone_number": "15551234568",
+              "phone_number_id": "123"
+            },
+            "contacts": [
+              {
+                "profile": { "name": "" },
+                "wa_id": "5491112345693"
+              }
+            ],
+            "messages": [
+              {
+                "from": "5491112345693",
+                "id": "wamid.TEST_20260220_232500_161",
+                "timestamp": "1775232023",
+                "type": "text",
+                "text": { "body": "okay, perfecto. Pero que hacen?" }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
