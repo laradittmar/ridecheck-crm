@@ -15,16 +15,16 @@
             "contacts": [
               {
                 "profile": { "name": "" },
-                "wa_id": "5491112345693"
+                "wa_id": "5491112345698"
               }
             ],
             "messages": [
               {
-                "from": "5491112345693",
-                "id": "wamid.TEST_20260220_232500_161",
-                "timestamp": "1775232023",
+                "from": "5491112345698",
+                "id": "wamid.TEST_20260220_232500_193",
+                "timestamp": "1775348252",
                 "type": "text",
-                "text": { "body": "okay, perfecto. Pero que hacen?" }
+                "text": { "body": "revisan caja automatica tambien" }
               }
             ]
           }

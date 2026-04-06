@@ -260,6 +260,11 @@ class WhatsAppThread(Base):
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
+    thread_revisions: Mapped[list["ThreadRevision"]] = relationship(
+        "ThreadRevision",
+        back_populates="thread",
+        passive_deletes=True,
+    )
     messages: Mapped[list["WhatsAppMessage"]] = relationship(
         "WhatsAppMessage",
         back_populates="thread",
@@ -324,6 +329,58 @@ class WhatsAppThreadCandidate(Base):
     )
 
     thread: Mapped["WhatsAppThread"] = relationship("WhatsAppThread", back_populates="candidates")
+    thread_revisions: Mapped[list["ThreadRevision"]] = relationship(
+        "ThreadRevision",
+        back_populates="candidate",
+        passive_deletes=True,
+    )
+
+
+class ThreadRevision(Base):
+    __tablename__ = "thread_revisions"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('draft', 'collecting_data', 'booked', 'completed')",
+            name="ck_thread_revisions_status",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    thread_id: Mapped[int] = mapped_column(
+        ForeignKey("whatsapp_threads.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    candidate_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("whatsapp_thread_candidates.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="collecting_data", server_default="collecting_data")
+    buyer_name: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    buyer_phone: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    buyer_email: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    seller_type: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    seller_name: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    address: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    scheduled_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    scheduled_time: Mapped[Optional[time]] = mapped_column(Time, nullable=True)
+    tipo_vehiculo: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    marca: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    modelo: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    anio: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    publication_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    thread: Mapped["WhatsAppThread"] = relationship("WhatsAppThread", back_populates="thread_revisions")
+    candidate: Mapped[Optional["WhatsAppThreadCandidate"]] = relationship(
+        "WhatsAppThreadCandidate",
+        back_populates="thread_revisions",
+    )
 
 
 class WhatsAppMessage(Base):
@@ -376,6 +433,8 @@ Index("ix_whatsapp_threads_contact_id", WhatsAppThread.contact_id)
 Index("ix_whatsapp_threads_lead_id", WhatsAppThread.lead_id)
 Index("ix_whatsapp_thread_states_thread_id", WhatsAppThreadState.thread_id, unique=True)
 Index("ix_whatsapp_thread_candidates_thread_id", WhatsAppThreadCandidate.thread_id)
+Index("ix_thread_revisions_thread_id", ThreadRevision.thread_id)
+Index("ix_thread_revisions_candidate_id", ThreadRevision.candidate_id)
 Index("ix_whatsapp_messages_thread_id_timestamp", WhatsAppMessage.thread_id, WhatsAppMessage.timestamp)
 Index("ix_whatsapp_messages_wa_message_id", WhatsAppMessage.wa_message_id, unique=True)
 Index("ix_ai_events_thread_id", AiEvent.thread_id)

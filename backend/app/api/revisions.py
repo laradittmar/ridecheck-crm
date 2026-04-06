@@ -4,64 +4,17 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select
 
 from ..db import get_db
-from ..models import Lead, Revision, ViaticosZone
+from ..models import Lead, Revision
 from ..schemas.revisions import RevisionCreate, RevisionUpdate, RevisionOut
 from ..services.db_errors import commit_or_400
+from ..services.pricing import PricingService
+from ..repositories.pricing_repository import PricingRepository
 
 router = APIRouter(prefix="/leads/{lead_id}/revisions", tags=["revisions"])
 
-PRECIO_BASE_BY_TIPO = {
-    "AUTO": 120_000,
-    "SUV_4X4_DEPORTIVO": 130_000,
-    "CLASICO": 140_000,
-    "ESCANEO_MOTOR": 80_000,
-    "MOTO": 120_000,
-}
-
-
-def _calc_precio_base(tipo_vehiculo: str | None) -> int | None:
-    if not tipo_vehiculo:
-        return None
-    return PRECIO_BASE_BY_TIPO.get(tipo_vehiculo)
-
-
-def _lookup_viaticos(db: Session, zone_group: str | None, zone_detail: str | None) -> int | None:
-    if not zone_group:
-        return None
-
-    if zone_detail:
-        row = db.execute(
-            select(ViaticosZone)
-            .where(ViaticosZone.zone_group == zone_group)
-            .where(ViaticosZone.zone_detail == zone_detail)
-        ).scalars().first()
-        if row:
-            return row.viaticos
-
-    row = db.execute(
-        select(ViaticosZone)
-        .where(ViaticosZone.zone_group == zone_group)
-        .where(ViaticosZone.zone_detail.is_(None))
-    ).scalars().first()
-    if row:
-        return row.viaticos
-
-    return None
-
 
 def _recalc_quote_if_possible(db: Session, rev: Revision) -> None:
-    if rev.precio_base is None:
-        pb = _calc_precio_base(rev.tipo_vehiculo)
-        if pb is not None:
-            rev.precio_base = pb
-
-    if rev.viaticos is None:
-        vv = _lookup_viaticos(db, rev.zone_group, rev.zone_detail)
-        if vv is not None:
-            rev.viaticos = vv
-
-    if rev.precio_total is None and rev.precio_base is not None and rev.viaticos is not None:
-        rev.precio_total = rev.precio_base + rev.viaticos
+    PricingService(repository=PricingRepository()).recalculate_revision_if_possible(db=db, revision=rev)
 
 
 def _apply_revision_update(db: Session, revision: Revision, payload: RevisionUpdate) -> None:

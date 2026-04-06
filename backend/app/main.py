@@ -13,8 +13,11 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
 from .api.leads import router as leads_router
+from .api.pricing import router as pricing_router
 from .api.revision_items import router as revision_items_router
 from .api.revisions import router as revisions_router
+from .api.schedule import router as schedule_router
+from .api.thread_revisions import router as thread_revisions_router
 from .api.whatsapp import router as whatsapp_api_router, thread_router as whatsapp_thread_router
 from .auth import (
     SESSION_COOKIE,
@@ -399,8 +402,11 @@ def validate_whatsapp_settings() -> None:
 
 # routers
 app.include_router(leads_router)
+app.include_router(pricing_router)
 app.include_router(revision_items_router)
 app.include_router(revisions_router)
+app.include_router(thread_revisions_router)
+app.include_router(schedule_router)
 app.include_router(whatsapp_api_router)
 app.include_router(whatsapp_thread_router)
 app.include_router(ui_router)
