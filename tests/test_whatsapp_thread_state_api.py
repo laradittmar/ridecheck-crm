@@ -68,6 +68,7 @@ class WhatsAppThreadStateApiTests(unittest.TestCase):
                 "last_stage": None,
                 "needs_human": False,
                 "current_focus_candidate_id": None,
+                "current_revision_id": None,
                 "last_processed_inbound_wa_message_id": None,
                 "customer_name": None,
                 "home_zone_group": None,
@@ -88,9 +89,21 @@ class WhatsAppThreadStateApiTests(unittest.TestCase):
         self.assertIsNotNone(self.thread.state)
         self.assertEqual(self.thread.state.last_processed_inbound_wa_message_id, "wamid.HBgABC123")
 
+    def test_patch_state_updates_current_revision_id(self):
+        response = self.client.patch(
+            "/api/whatsapp/thread/12/state",
+            json={"current_revision_id": 55},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["current_revision_id"], 55)
+        self.assertIsNotNone(self.thread.state)
+        self.assertEqual(self.thread.state.current_revision_id, 55)
+
     def test_patch_state_omitting_new_field_preserves_existing_value(self):
         self.thread.state = WhatsAppThreadState(
             thread_id=12,
+            current_revision_id=44,
             last_processed_inbound_wa_message_id="wamid.HBgKEEP",
             customer_name="Lara",
         )
@@ -102,7 +115,9 @@ class WhatsAppThreadStateApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["customer_name"], "Lara Ridecheck")
+        self.assertEqual(response.json()["current_revision_id"], 44)
         self.assertEqual(response.json()["last_processed_inbound_wa_message_id"], "wamid.HBgKEEP")
+        self.assertEqual(self.thread.state.current_revision_id, 44)
         self.assertEqual(self.thread.state.last_processed_inbound_wa_message_id, "wamid.HBgKEEP")
 
     def test_patch_state_validates_last_processed_inbound_message_id_length(self):

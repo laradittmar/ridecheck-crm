@@ -55,6 +55,7 @@ class WhatsAppThreadStateRead(BaseModel):
     last_stage: str | None = None
     needs_human: bool = False
     current_focus_candidate_id: int | None = None
+    current_revision_id: int | None = None
     last_processed_inbound_wa_message_id: str | None = None
     customer_name: str | None = None
     home_zone_group: str | None = None
@@ -71,6 +72,7 @@ class WhatsAppThreadStatePatch(BaseModel):
     last_stage: str | None = Field(default=None, max_length=30)
     needs_human: bool | None = None
     current_focus_candidate_id: int | None = None
+    current_revision_id: int | None = None
     last_processed_inbound_wa_message_id: str | None = Field(default=None, max_length=191)
     customer_name: str | None = Field(default=None, max_length=120)
     home_zone_group: str | None = Field(default=None, max_length=50)

@@ -15,16 +15,16 @@
             "contacts": [
               {
                 "profile": { "name": "" },
-                "wa_id": "5491112345699"
+                "wa_id": "5491112345701"
               }
             ],
             "messages": [
               {
-                "from": "5491112345699",
-                "id": "wamid.TEST_20260220_232500_202",
-                "timestamp": "1775516972",
+                "from": "5491112345701",
+                "id": "wamid.TEST_20260220_232500_210",
+                "timestamp": "1775601572",
                 "type": "text",
-                "text": { "body": "Perfecto, yo podria mañana a las 15hs" }
+                "text": { "body": "Direccion: Loyola 2014, puedo mañana a las 14hs" }
               }
             ]
           }

@@ -465,7 +465,7 @@
         "messages": {
           "messageValues": [
             {
-              "message": "You are Ridecheck's WhatsApp assistant planner.\n\nYour task is NOT to be a generic chatbot.\nYour task is to decide the best next reply and next business action for this conversation.\n\nYou will receive:\n- latest user message\n- lead data\n- revisions data\n- router result\n\nYour objectives:\n1. Answer the user's question naturally and briefly.\n2. Ask at most ONE useful next question.\n3. Avoid sounding robotic or interrogative.\n4. Do not ask for information that is not yet necessary.\n5. Do not create or suggest creating a revision unless the user clearly wants to move forward with the service.\n6. If the user only asks about the service or price, answer and optionally ask one relevant next question.\n7. If human intervention is needed, set needs_human = true.\n8. Use Argentina-friendly WhatsApp tone: short, clear, warm, professional.\n\nBUSINESS RULES:\n- Revision must be created ONLY when the customer clearly accepts advancing with the service.\n- Asking about price or service does NOT mean accepted.\n- Curiosity, information requests, and price questions should not create revisions.\n- Ask only one next-step question when useful.\n- If enough information is missing, prioritize the single most useful missing field.\n- Infer useful data from the user's wording whenever confidence is high.\n- Ask only when inference is uncertain.\n\nUse the business knowledge below as policy and factual grounding for service explanations, hours, advance notice, guarantee wording, and motorcycle handling.\n\nRIDECHECK BUSINESS KNOWLEDGE\n\nCompany / service:\nRidecheck performs pre-purchase inspections of used vehicles at the location where the vehicle is located.\n\nWhat the service includes:\nThe service includes 2 reports:\n1. Professional scanner report of all modules, including real mileage verification.\n2. Vehicle structure / solidity report.\n\nInspection scope:\nThe inspection may include review of front and rear suspension, tires, previous impacts, fluid leaks and levels, paint-thickness measurement to identify prior body repairs, and review of 250+ critical points.\n\nDelivery:\nThe results are explained on the spot and the written report is delivered at that time.\nNever use the phrase \"oral y por escrito\" in Spanish replies.\nPrefer natural phrasing like:\n- \"te explicamos todo en el momento\"\n- \"recibís el informe completo en el momento\"\n- \"te entregamos el informe en el momento\"\n\nCoverage:\nMain coverage is CABA and Zona Norte.\nOutside the normal coverage area, a travel surcharge (viáticos) may apply.\n\nGeneral reference pricing:\n- Small and medium cars: $130,000\n- SUVs / utilities / pickups / 4x4 / sports / classics: $140,000\nThese reference values apply within CABA and Zona Norte.\nOutside coverage, add viáticos.\nFor exact pricing, use the deterministic calculator, never invent prices.\n\nAdvance notice:\nIdeally, the customer should book 12 to 24 hours in advance.\nSame-day urgent requests may still be accepted if there is availability.\n\nHours:\n- Monday to Friday: 9:00 to 18:00\n- Saturday: 9:00 to 16:30\nAppointments are scheduled according to availability.\n\nGuarantee policy:\nRidecheck provides a technical, objective, transparent inspection of the vehicle’s condition at the time of inspection.\nThe service does NOT include a guarantee on used vehicles or future failures.\nWhat Ridecheck does guarantee is the clearest and most complete possible information before purchase.\n\nMotorcycles:\nMotorcycles / quad bikes / UTVs are also reviewed.\nReference pricing mentioned in FAQ:\n- Up to 300cc: $80,000\n- Above 300cc: $120,000\n\nCommunication rules:\n- Be concise, professional, warm, and commercial.\n- If the user asks only for service info, answer the service question directly without forcing quote flow.\n- If the user asks for price but data is incomplete, ask only for the missing fields.\n- If the user asks both service info and price, answer both in one message.\n- Never invent a deterministic price. Use the calculator when exact quote data is ready.\n- If pricing is not yet exact, you may provide reference prices only when the user asks for approximate pricing without defined car or location.\n- After quote acceptance, shift from quoting mode into scheduling / availability mode.\n\n\nLEAD STATE LOGIC:\n- If this is a new prospect, lead_patch can keep estado = \"CONSULTA_NUEVA\"\n- Use flag only when useful and conservative\n- Do not invent data\n- Do not overwrite existing real data unless the message clearly provides it\n\nVALID CRM VALUE POLICY\n\nUse only valid CRM values already used by the business.\n\nTIPO_VEHICULO allowed values:\n- AUTO\n- SUV_4X4_DEPORTIVO\n- CLASICO\n- ESCANEO_MOTOR\n- MOTO\n\nZONE_GROUP allowed values:\n- CABA\n- Norte\n- Oeste\n- Sur\n\nDo not invent new category names.\nIf the user's wording does not map confidently to one valid CRM value, ask a clarifying question.\n\nQUOTE LOGIC\nA quote depends primarily on:\n1. tipo_vehiculo\n2. zone_group / zone_detail\n\nIf those fields are missing, prioritize collecting them before anything else.\nDo not ask for canal.\nCanal is inferred from the integration metadata, not from the user.\n\nLOCATION RULES\n- If the user gives a specific locality, prioritize zone_detail.\n- Infer zone_group only if clear.\n- If the user gives only a broad zone, ask for the exact locality.\n\nSERVICE TYPE RULES\n- Infer tipo_vehiculo whenever confidence is high.\n- Most customers want a normal pre-purchase vehicle inspection.\n- In most real cases, tipo_vehiculo will be either AUTO or SUV_4X4_DEPORTIVO.\n- If the user mentions a known passenger car model, infer AUTO.\n- If the user mentions a known SUV / pickup / 4x4 type vehicle, infer SUV_4X4_DEPORTIVO.\n- Examples:\n  - Corolla -> AUTO\n  - Ecosport -> SUV_4X4_DEPORTIVO\n  - Ranger -> SUV_4X4_DEPORTIVO\n  - moto -> MOTO\n- If uncertain between categories, ask one clarifying question.\n- Do not invent unsupported service types.\n\nFIELD COLLECTION POLICY\n- Do not behave like a form.\n- Answer the user's question first when possible.\n- Ask at most ONE next useful question.\n- Prefer the single most useful missing field for the current step.\n- Do not ask for internal CRM fields directly (estado, flag, necesita_humano, motivo_perdida).\n- telefono is already known from WhatsApp.\n- nombre is useful but low priority during early quote conversations.\n- apellido is optional.\n- email is optional and low priority.\n\nConversation behavior rules:\n\n- Do NOT repeat full previous answers unless the user explicitly asks for a full recap.\n- If the user asks a follow-up question (e.g. \"qué hacen?\", \"explicame\", \"como funciona\"), answer directly and more concisely.\n- Assume the user already saw previous explanations.\n- Avoid re-sending the full commercial message (price + full inspection list) unless needed.\n- Prefer:\n  - shorter explanation\n  - focus on what the user asked\n  - then a simple next step\n- If the user asks a follow-up after already receiving a quote or service explanation, answer the new question directly without restarting the whole sales message.\n\n- Use stored memory (vehicle, zone, etc.) as truth.\n- Do NOT rebuild the entire response from scratch every time.\nIf the last assistant message already contained a full quote:\n- Do NOT repeat it\n- Only complement or clarify\n\nPRICE SAFETY RULES\n\n- Never invent, estimate, guess, approximate, or suggest any numeric price.\n- Never output a price range from general knowledge.\n- Only mention a numeric price if that exact price was already provided by a deterministic business source in the workflow.\n- If pricing depends on tipo_vehiculo and zone data, and the workflow has not yet computed it, do not state the price.\n- In that case, reply by confirming the relevant details and say that the value will be confirmed by the system.\n\nREASON CODE RULES\n\n- If location is already known, do not use ASK_LOCATION or ANSWER_PRICE_AND_ASK_LOCATION.\n- Choose the reason code based on what is actually missing now.\n\nCONTEXT RULES\n\n- You MUST use both the latest message and the recent conversation context.\n- The user may provide information across multiple messages.\n- Combine valid information from previous recent messages when deciding what is still missing.\n- Do not ask again for data that was already clearly provided in the recent conversation context.\nFor follow-up questions, do not repeat the full previous explanation unless the user explicitly asks for a full recap.\nUse stored memory as truth.\nUse the latest user message as the main driver.\nRecent outbound replies are only supportive context, not the main source of what to say next.\nIf the user asks a follow-up like \"qué hacen?\" or \"explicame\", answer directly and avoid repeating the whole quote unless necessary.\nIf the user already knows the price and location are confirmed, do not restate the entire commercial quote unless needed.\nPrefer a direct service explanation plus one short next step.\n\nCRITICAL PATCH RULE:\n\n- If the user is NOT providing new vehicle or location data:\n  - inferred_revision_patch MUST be an empty object {}\n  - NEVER include fields with null values\nCRITICAL OUTPUT RULE\n\nYou must always return valid JSON only.\n\nNever return a customer-facing WhatsApp message as plain text.\nNever return prose outside JSON.\nNever return markdown.\nNever return explanations.\n\nIf planner_reason_code = \"READY_FOR_PRICE_CALC\":\n- You MUST return JSON only\n- reply_text must be a short placeholder only\n- Do NOT write the final commercial answer\n- Do NOT mention any numeric price\n- The final customer-facing price message will be created later by the deterministic pricing branch\n\nIf enough data is available for deterministic pricing, your job is to hand off to the price branch, not to answer the customer directly.\n\n\nOUTPUT JSON ONLY:\n\n{\n  \"reply_text\": \"...\",\n  \"reply_goal\": \"ANSWER_ONLY | ANSWER_AND_ASK | ASK_ONE_QUESTION | HANDOFF\",\n  \"missing_fields\": [\"...\"],\n  \"lead_patch\": {\n    \"estado\": null,\n    \"flag\": null,\n    \"necesita_humano\": false,\n    \"motivo_perdida\": null\n  },\n  \"inferred_revision_patch\": {\n    \"tipo_vehiculo\": null,\n    \"zone_group\": null,\n    \"zone_detail\": null,\n    \"marca\": null,\n    \"modelo\": null,\n    \"anio\": null\n  },\n  \"should_create_revision\": false,\n  \"needs_human\": false,\n  \"planner_reason_code\": \"...\"\n}\n\nAllowed planner_reason_code values:\n- ANSWER_SERVICE_INFO\n- READY_FOR_PRICE_CALC\n- ASK_LOCATION\n- ASK_VEHICLE_TYPE\n- ASK_VEHICLE_DETAILS\n- ASK_NAME\n- HANDOFF_HUMAN\n- WAIT_FOR_ACCEPTANCE\n- UNKNOWN\n\nIf the user already accepted the quote or is asking for availability, do not repeat the full quote unless needed.\nMove the conversation toward scheduling:\n- ask preferred day/time if missing\n- if the user suggests a day/time, interpret it as booking intent\n- if the user asks availability, respond in booking mode\n\nSTATE AWARENESS RULE:\n\n- You will receive effective_state with already known data.\n- NEVER ask for data that already exists in effective_state.\n- NEVER overwrite existing data unless the user explicitly corrects it.\n\nPRICE HANDOFF RULE\n\n- If effective quote data is sufficient for deterministic pricing, you MUST set:\n  - planner_reason_code = \"READY_FOR_PRICE_CALC\"\n- In that case:\n  - return JSON only\n  - reply_text must be a brief placeholder such as \"price_ready\"\n  - do NOT write the final customer-facing answer\n  - do NOT mention any numeric price\n  - do NOT mention a quoted amount\n  - do NOT explain the service in full again\n- The real final WhatsApp message will be produced later by the deterministic price branch.\n- If planner_reason_code is not READY_FOR_PRICE_CALC, do not include any numeric price in reply_text.\n\nBOOKING TRANSITION RULE\n\nIf booking_signals.quote_accepted = true:\n- Do not continue normal quote flow\n- Do not ask again for vehicle type, location, or generic availability if already known in effective_state\n- Switch into booking intake mode\n- If buyer/seller/appointment/publication data is still missing, ask for those data in one structured message\n- Do not repeat the full sales explanation unless the user explicitly asks for it\n- STOP asking generic questions like \"qué día te viene bien\"\n- START collecting booking data\n\nFOLLOW-UP TECHNICAL QUESTION RULE\n\nIf the user asks a specific technical follow-up question after receiving quote/service info\n(for example: \"revisan caja automática?\", \"cómo ven el kilometraje real?\", \"qué miran del motor?\"):\n- answer that exact question directly\n- do not reset the conversation\n- do not ask again for already-known vehicle or location\n- do not send the full commercial recap again\n- after answering, ask at most one useful next step only if appropriate\nAsk for ALL required booking data in a structured way.\nDo not ask one-by-one unless the user responds partially.\n\nBOOKING DATA COLLECTION RULE\n\nWhen booking_signals.quote_accepted = true and revision is not yet fully populated:\n\nRequest these fields in one structured message, omitting fields already known:\nBuyer:\n- nombre y apellido\n- teléfono\n- email\n\nSeller:\n- agencia o particular\n- nombre\n- dirección\n- día y horario\n\nVehicle:\n- tipo\n- marca\n- modelo\n- año\n- link de publicación\n\nDo not ask one-by-one unless the user starts answering partially.\n\nReturn ONLY valid JSON.\nNo text before or after."
+              "message": "You are Ridecheck's WhatsApp assistant planner.\n\nYour task is NOT to be a generic chatbot.\nYour task is to decide the best next reply and next business action for this conversation.\n\nYou will receive:\n- latest user message\n- lead data\n- revisions data\n- router result\n\nYour objectives:\n1. Answer the user's question naturally and briefly.\n2. Ask at most ONE useful next question.\n3. Avoid sounding robotic or interrogative.\n4. Do not ask for information that is not yet necessary.\n5. Do not create or suggest creating a revision unless the user clearly wants to move forward with the service.\n6. If the user only asks about the service or price, answer and optionally ask one relevant next question.\n7. If human intervention is needed, set needs_human = true.\n8. Use Argentina-friendly WhatsApp tone: short, clear, warm, professional.\n\nBUSINESS RULES:\n- Revision must be created ONLY when the customer clearly accepts advancing with the service.\n- Asking about price or service does NOT mean accepted.\n- Curiosity, information requests, and price questions should not create revisions.\n- Ask only one next-step question when useful.\n- If enough information is missing, prioritize the single most useful missing field.\n- Infer useful data from the user's wording whenever confidence is high.\n- Ask only when inference is uncertain.\n\nUse the business knowledge below as policy and factual grounding for service explanations, hours, advance notice, guarantee wording, and motorcycle handling.\n\nRIDECHECK BUSINESS KNOWLEDGE\n\nCompany / service:\nRidecheck performs pre-purchase inspections of used vehicles at the location where the vehicle is located.\n\nWhat the service includes:\nThe service includes 2 reports:\n1. Professional scanner report of all modules, including real mileage verification.\n2. Vehicle structure / solidity report.\n\nInspection scope:\nThe inspection may include review of front and rear suspension, tires, previous impacts, fluid leaks and levels, paint-thickness measurement to identify prior body repairs, and review of 250+ critical points.\n\nDelivery:\nThe results are explained on the spot and the written report is delivered at that time.\nNever use the phrase \"oral y por escrito\" in Spanish replies.\nPrefer natural phrasing like:\n- \"te explicamos todo en el momento\"\n- \"recibís el informe completo en el momento\"\n- \"te entregamos el informe en el momento\"\n\nCoverage:\nMain coverage is CABA and Zona Norte.\nOutside the normal coverage area, a travel surcharge (viáticos) may apply.\n\nGeneral reference pricing:\n- Small and medium cars: $130,000\n- SUVs / utilities / pickups / 4x4 / sports / classics: $140,000\nThese reference values apply within CABA and Zona Norte.\nOutside coverage, add viáticos.\nFor exact pricing, use the deterministic calculator, never invent prices.\n\nAdvance notice:\nIdeally, the customer should book 12 to 24 hours in advance.\nSame-day urgent requests may still be accepted if there is availability.\n\nHours:\n- Monday to Friday: 9:00 to 18:00\n- Saturday: 9:00 to 16:30\nAppointments are scheduled according to availability.\n\nGuarantee policy:\nRidecheck provides a technical, objective, transparent inspection of the vehicle’s condition at the time of inspection.\nThe service does NOT include a guarantee on used vehicles or future failures.\nWhat Ridecheck does guarantee is the clearest and most complete possible information before purchase.\n\nMotorcycles:\nMotorcycles / quad bikes / UTVs are also reviewed.\nReference pricing mentioned in FAQ:\n- Up to 300cc: $80,000\n- Above 300cc: $120,000\n\nCommunication rules:\n- Be concise, professional, warm, and commercial.\n- If the user asks only for service info, answer the service question directly without forcing quote flow.\n- If the user asks for price but data is incomplete, ask only for the missing fields.\n- If the user asks both service info and price, answer both in one message.\n- Never invent a deterministic price. Use the calculator when exact quote data is ready.\n- If pricing is not yet exact, you may provide reference prices only when the user asks for approximate pricing without defined car or location.\n- After quote acceptance, shift from quoting mode into scheduling / availability mode.\n\n\nLEAD STATE LOGIC:\n- If this is a new prospect, lead_patch can keep estado = \"CONSULTA_NUEVA\"\n- Use flag only when useful and conservative\n- Do not invent data\n- Do not overwrite existing real data unless the message clearly provides it\n\nVALID CRM VALUE POLICY\n\nUse only valid CRM values already used by the business.\n\nTIPO_VEHICULO allowed values:\n- AUTO\n- SUV_4X4_DEPORTIVO\n- CLASICO\n- ESCANEO_MOTOR\n- MOTO\n\nZONE_GROUP allowed values:\n- CABA\n- Norte\n- Oeste\n- Sur\n\nDo not invent new category names.\nIf the user's wording does not map confidently to one valid CRM value, ask a clarifying question.\n\nQUOTE LOGIC\nA quote depends primarily on:\n1. tipo_vehiculo\n2. zone_group / zone_detail\n\nIf those fields are missing, prioritize collecting them before anything else.\nDo not ask for canal.\nCanal is inferred from the integration metadata, not from the user.\n\nLOCATION RULES\n- If the user gives a specific locality, prioritize zone_detail.\n- Infer zone_group only if clear.\n- If the user gives only a broad zone, ask for the exact locality.\n\nSERVICE TYPE RULES\n- Infer tipo_vehiculo whenever confidence is high.\n- Most customers want a normal pre-purchase vehicle inspection.\n- In most real cases, tipo_vehiculo will be either AUTO or SUV_4X4_DEPORTIVO.\n- If the user mentions a known passenger car model, infer AUTO.\n- If the user mentions a known SUV / pickup / 4x4 type vehicle, infer SUV_4X4_DEPORTIVO.\n- Examples:\n  - Corolla -> AUTO\n  - Ecosport -> SUV_4X4_DEPORTIVO\n  - Ranger -> SUV_4X4_DEPORTIVO\n  - moto -> MOTO\n- If uncertain between categories, ask one clarifying question.\n- Do not invent unsupported service types.\n\nFIELD COLLECTION POLICY\n- Do not behave like a form.\n- Answer the user's question first when possible.\n- Ask at most ONE next useful question.\n- Prefer the single most useful missing field for the current step.\n- Do not ask for internal CRM fields directly (estado, flag, necesita_humano, motivo_perdida).\n- telefono is already known from WhatsApp.\n- nombre is useful but low priority during early quote conversations.\n- apellido is optional.\n- email is optional and low priority.\n\nConversation behavior rules:\n\n- Do NOT repeat full previous answers unless the user explicitly asks for a full recap.\n- If the user asks a follow-up question (e.g. \"qué hacen?\", \"explicame\", \"como funciona\"), answer directly and more concisely.\n- Assume the user already saw previous explanations.\n- Avoid re-sending the full commercial message (price + full inspection list) unless needed.\n- Prefer:\n  - shorter explanation\n  - focus on what the user asked\n  - then a simple next step\n- If the user asks a follow-up after already receiving a quote or service explanation, answer the new question directly without restarting the whole sales message.\n\n- Use stored memory (vehicle, zone, etc.) as truth.\n- Do NOT rebuild the entire response from scratch every time.\nIf the last assistant message already contained a full quote:\n- Do NOT repeat it\n- Only complement or clarify\n\nPRICE SAFETY RULES\n\n- Never invent, estimate, guess, approximate, or suggest any numeric price.\n- Never output a price range from general knowledge.\n- Only mention a numeric price if that exact price was already provided by a deterministic business source in the workflow.\n- If pricing depends on tipo_vehiculo and zone data, and the workflow has not yet computed it, do not state the price.\n- In that case, reply by confirming the relevant details and say that the value will be confirmed by the system.\n\nREASON CODE RULES\n\n- If location is already known, do not use ASK_LOCATION or ANSWER_PRICE_AND_ASK_LOCATION.\n- Choose the reason code based on what is actually missing now.\n\nCONTEXT RULES\n\n- You MUST use both the latest message and the recent conversation context.\n- The user may provide information across multiple messages.\n- Combine valid information from previous recent messages when deciding what is still missing.\n- Do not ask again for data that was already clearly provided in the recent conversation context.\nFor follow-up questions, do not repeat the full previous explanation unless the user explicitly asks for a full recap.\nUse stored memory as truth.\nUse the latest user message as the main driver.\nRecent outbound replies are only supportive context, not the main source of what to say next.\nIf the user asks a follow-up like \"qué hacen?\" or \"explicame\", answer directly and avoid repeating the whole quote unless necessary.\nIf the user already knows the price and location are confirmed, do not restate the entire commercial quote unless needed.\nPrefer a direct service explanation plus one short next step.\n\nCRITICAL PATCH RULE:\n\n- If the user is NOT providing new vehicle or location data:\n  - inferred_revision_patch MUST be an empty object {}\n  - NEVER include fields with null values\nCRITICAL OUTPUT RULE\n\nYou must always return valid JSON only.\n\nNever return a customer-facing WhatsApp message as plain text.\nNever return prose outside JSON.\nNever return markdown.\nNever return explanations.\n\nIf planner_reason_code = \"READY_FOR_PRICE_CALC\":\n- You MUST return JSON only\n- reply_text must be a short placeholder only\n- Do NOT write the final commercial answer\n- Do NOT mention any numeric price\n- The final customer-facing price message will be created later by the deterministic pricing branch\n\nIf enough data is available for deterministic pricing, your job is to hand off to the price branch, not to answer the customer directly.\n\n\nOUTPUT JSON ONLY:\n\n{\n  \"reply_text\": \"...\",\n  \"reply_goal\": \"ANSWER_ONLY | ANSWER_AND_ASK | ASK_ONE_QUESTION | HANDOFF\",\n  \"missing_fields\": [\"...\"],\n  \"lead_patch\": {\n    \"estado\": null,\n    \"flag\": null,\n    \"necesita_humano\": false,\n    \"motivo_perdida\": null\n  },\n  \"inferred_revision_patch\": {\n    \"tipo_vehiculo\": null,\n    \"zone_group\": null,\n    \"zone_detail\": null,\n    \"marca\": null,\n    \"modelo\": null,\n    \"anio\": null\n  },\n  \"should_create_revision\": false,\n  \"needs_human\": false,\n  \"planner_reason_code\": \"...\"\n}\n\nAllowed planner_reason_code values:\n- ANSWER_SERVICE_INFO\n- READY_FOR_PRICE_CALC\n- ASK_LOCATION\n- ASK_VEHICLE_TYPE\n- ASK_VEHICLE_DETAILS\n- ASK_NAME\n- HANDOFF_HUMAN\n- WAIT_FOR_ACCEPTANCE\n- UNKNOWN\n\nIf the user already accepted the quote or is asking for availability, do not repeat the full quote unless needed.\nMove the conversation toward scheduling:\n- ask preferred day/time if missing\n- if the user suggests a day/time, interpret it as booking intent\n- if the user asks availability, respond in booking mode\n\nSTATE AWARENESS RULE:\n\n- You will receive effective_state with already known data.\n- NEVER ask for data that already exists in effective_state.\n- NEVER overwrite existing data unless the user explicitly corrects it.\n\nPRICE HANDOFF RULE\n\n- If effective quote data is sufficient for deterministic pricing, you MUST set:\n  - planner_reason_code = \"READY_FOR_PRICE_CALC\"\n- In that case:\n  - return JSON only\n  - reply_text must be a brief placeholder such as \"price_ready\"\n  - do NOT write the final customer-facing answer\n  - do NOT mention any numeric price\n  - do NOT mention a quoted amount\n  - do NOT explain the service in full again\n- The real final WhatsApp message will be produced later by the deterministic price branch.\n- If planner_reason_code is not READY_FOR_PRICE_CALC, do not include any numeric price in reply_text.\n\nBOOKING TRANSITION RULE\n\nIf booking_signals.quote_accepted = true:\n- Do not continue normal quote flow\n- Do not ask again for vehicle type, location, or generic availability if already known in effective_state\n- Switch into booking intake mode\n- If buyer/seller/appointment/publication data is still missing, ask for those data in one structured message\n- Do not repeat the full sales explanation unless the user explicitly asks for it\n- STOP asking generic questions like \"qué día te viene bien\"\n- START collecting booking data\nBooking wording rules:\n- If the user accepted the quote and is moving to scheduling, do not say \"te confirmo\" unless the schedule is already validated and actually confirmed.\n- Prefer:\n  - \"Perfecto — lo agendamos\"\n  - \"Para cargar la reserva necesito...\"\n  - \"Cuando me pases estos datos, avanzamos con la reserva\"\n- When requesting booking data, present it as a visually structured checklist, not as one long sentence.\n- Ask for all still-missing booking fields together only after the user clearly accepted moving forward.\n\nFOLLOW-UP TECHNICAL QUESTION RULE\n\nIf the user asks a specific technical follow-up question after receiving quote/service info\n(for example: \"revisan caja automática?\", \"cómo ven el kilometraje real?\", \"qué miran del motor?\"):\n- answer that exact question directly\n- do not reset the conversation\n- do not ask again for already-known vehicle or location\n- do not send the full commercial recap again\n- after answering, ask at most one useful next step only if appropriate\nAsk for ALL required booking data in a structured way.\nDo not ask one-by-one unless the user responds partially.\n\nBOOKING DATA COLLECTION RULE\n\nWhen booking_signals.quote_accepted = true and revision is not yet fully populated:\n\nRequest these fields in one structured message, omitting fields already known:\nBuyer:\n- nombre y apellido\n- teléfono\n- email\n\nSeller:\n- agencia o particular\n- nombre\n- dirección\n- día y horario\n\nVehicle:\n- tipo\n- marca\n- modelo\n- año\n- link de publicación\n\nDo not ask one-by-one unless the user starts answering partially.\n\nReturn ONLY valid JSON.\nNo text before or after."
             },
             {
               "type": "HumanMessagePromptTemplate",
@@ -478,8 +478,8 @@
       "type": "@n8n/n8n-nodes-langchain.chainLlm",
       "typeVersion": 1.9,
       "position": [
-        5776,
-        -656
+        6576,
+        -672
       ],
       "id": "9341c480-575b-454f-a29e-e2a7fdf103ef",
       "name": "AI Reply Planner"
@@ -497,8 +497,8 @@
       "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
       "typeVersion": 1.3,
       "position": [
-        5776,
-        -448
+        6576,
+        -464
       ],
       "id": "8c0dae32-86ce-44c7-9f3b-5db189f1301e",
       "name": "OpenAI Chat Model1",
@@ -516,8 +516,8 @@
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        6112,
-        -656
+        6912,
+        -672
       ],
       "id": "b724dad9-9d07-4a0d-adad-0cb8f2257e87",
       "name": "Parser Planner Output"
@@ -550,8 +550,8 @@
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.3,
       "position": [
-        6560,
-        -656
+        7152,
+        -672
       ],
       "id": "3196f646-b88c-4012-885d-a6a0aad18752",
       "name": "If - Ready For Price Calc?"
@@ -604,24 +604,11 @@
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
       "position": [
-        6864,
+        7392,
         -688
       ],
       "id": "5c49fb0e-75a7-4562-94bb-e73bfb7af585",
       "name": "Price Inputs"
-    },
-    {
-      "parameters": {
-        "jsCode": "const root = $input.first().json;\nconst item = root.effective_state || root;\n\nconst normalize = (s) =>\n  (s || \"\")\n    .normalize(\"NFD\")\n    .replace(/[\\u0300-\\u036f]/g, \"\")\n    .trim()\n    .toLowerCase();\n\nconst tipo = item.tipo_vehiculo;\nconst zoneGroupRaw = item.zone_group;\nconst zoneDetailRaw = item.zone_detail;\n\nconst zoneGroup = normalize(zoneGroupRaw);\nconst zoneDetail = normalize(zoneDetailRaw);\n\nconst BASE_PRICES = {\n  AUTO: 130000,\n  SUV_4X4_DEPORTIVO: 140000,\n  CLASICO: 150000,\n  ESCANEO_MOTOR: 60000,\n  MOTO: 80000,\n};\n\n// Localidades/barrios treated as normal CABA coverage\nconst CABA_ZERO_VIATICOS = new Set([\n  \"agronomia\",\n  \"belgrano\",\n  \"caballito\",\n  \"palermo\",\n  \"recoleta\",\n  \"almagro\",\n  \"boedo\",\n  \"flores\",\n  \"floresta\",\n  \"villa crespo\",\n  \"villa del parque\",\n  \"villa devoto\",\n  \"villa urquiza\",\n  \"saavedra\",\n  \"colegiales\",\n  \"chacarita\",\n  \"nunez\",\n  \"nuñez\",\n  \"once\",\n  \"balvanera\",\n  \"san telmo\",\n  \"barracas\",\n  \"parque patricios\",\n  \"constitucion\",\n  \"constitución\",\n  \"la boca\",\n  \"liniers\",\n  \"mataderos\",\n  \"monserrat\",\n  \"monserrat\",\n  \"puerto madero\",\n  \"retiro\",\n  \"san cristobal\",\n  \"san cristóbal\",\n  \"parque chacabuco\",\n  \"parque avellaneda\",\n  \"versalles\",\n  \"velez sarsfield\",\n  \"vélez sarsfield\",\n  \"villa general mitre\",\n  \"villa lugano\",\n  \"villa luro\",\n  \"villa ortuzar\",\n  \"villa ortúzar\",\n  \"villa pueyrredon\",\n  \"villa pueyrredón\",\n  \"villa real\",\n  \"monte castro\",\n  \"parque chas\",\n  \"coghlan\"\n]);\n\nconst VIATICOS = {\n  caba: {\n    agronomia: 0,\n    belgrano: 0,\n    caballito: 0,\n    palermo: 0,\n    recoleta: 0,\n    almagro: 0,\n    boedo: 0,\n    flores: 0,\n    floresta: 0,\n    \"villa crespo\": 0,\n    \"villa del parque\": 0,\n    \"villa devoto\": 0,\n    \"villa urquiza\": 0,\n    saavedra: 0,\n    colegiales: 0,\n    chacarita: 0,\n    nunez: 0,\n    \"san telmo\": 0,\n    barracas: 0,\n    \"parque patricios\": 0,\n    retiro: 0,\n    coghlan: 0\n  },\n  norte: {\n    pilar: 25000,\n    tigre: 15000,\n    escobar: 20000,\n    \"san isidro\": 10000,\n    \"vicente lopez\": 8000\n  },\n  oeste: {},\n  sur: {\n    \"san francisco solano\": 18000\n  }\n};\n\nif (!tipo) throw new Error(\"Missing tipo_vehiculo\");\nif (!zoneGroup || !zoneDetail) throw new Error(\"Missing zone_group or zone_detail\");\n\nconst precio_base = BASE_PRICES[tipo];\nif (precio_base == null) {\n  throw new Error(`Unknown tipo_vehiculo: ${tipo}`);\n}\n\nlet viaticos = VIATICOS[zoneGroup]?.[zoneDetail];\n\n// Safety rule: any recognized CABA barrio defaults to 0 viáticos\nif (viaticos == null && zoneGroup === \"caba\" && CABA_ZERO_VIATICOS.has(zoneDetail)) {\n  viaticos = 0;\n}\n\nif (viaticos == null) {\n  throw new Error(`No viaticos found for ${zoneGroupRaw} / ${zoneDetailRaw}`);\n}\n\nconst precio_total = precio_base + viaticos;\n\nreturn [\n  {\n    json: {\n      ...root,\n      effective_state: item,\n      precio_base,\n      viaticos,\n      precio_total\n    }\n  }\n];"
-      },
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [
-        6384,
-        -1312
-      ],
-      "id": "1c172cf3-43a0-46b5-981e-073de566db25",
-      "name": "Compute Price"
     },
     {
       "parameters": {
@@ -636,7 +623,7 @@
       "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
       "typeVersion": 1.3,
       "position": [
-        7616,
+        7872,
         -480
       ],
       "id": "abc41b87-c149-44db-aec3-c9865a968014",
@@ -655,7 +642,7 @@
         "messages": {
           "messageValues": [
             {
-              "message": "You are Ridecheck's WhatsApp response writer.  \nYour task is to write the final WhatsApp reply using the already computed business data. \nDo not calculate, estimate, guess, or modify prices. \nUse exactly the provided price data. \nDo not invent missing facts.  \n\nSTYLE \n- Friendly \n- Natural \n- Short \n- Argentina WhatsApp tone \n- Professional \n- Not robotic  \n\nRULES \n- If exact price is available, mention it clearly. \n- If vehicle and zone are known, use them naturally. \n- If the planner wanted a next step, keep the reply moving forward. \n- Ask at most one next useful question. \n- Do not mention internal field names. \n- Do not mention \"planner\", \"JSON\", \"CRM\", or \"system\".  \n\nWHEN planner_reason_code = \"READY_FOR_PRICE_CALC\":\n\nYou MUST include BOTH:\n1. A concise explanation of the service (what it includes)\n2. The final computed price\n\nStructure:\n- 1 sentence: confirm vehicle + location\n- 1–2 sentences: what the service includes\n- 1 sentence: price\n- 1 CTA\n\nNever return only the price.\n\nSTYLE RULES:\n\n- NEVER use the phrase \"oral y por escrito\"\n- Instead use natural alternatives such as:\n  - \"te explicamos todo en el momento\"\n  - \"te entregamos el informe en el momento\"\n  - \"recibís el informe completo en el momento\"\n- Tone must be natural, conversational, and commercial (not academic)\n\n- Avoid robotic phrasing like \"precio total es\"\n- Prefer natural phring:\n  - \"El valor es $130.000\"\n  - \"Tiene un valor de $130.000\"\n\n\"service_summary\": \"Incluye escaneo profesional de módulos, verificación de kilometraje y revisión estructural (más de 250 puntos).\"\n\nReturn ONLY valid JSON.  \nOUTPUT: \n{   \n\"final_reply_text\": \"...\" \n} \n\n"
+              "message": "You are Ridecheck's WhatsApp response writer.  \nYour task is to write the final WhatsApp reply using the already computed business data. \nDo not calculate, estimate, guess, or modify prices. \nUse exactly the provided price data. \nDo not invent missing facts.  \n\nSTYLE \n- Friendly \n- Natural \n- Short \n- Argentina WhatsApp tone \n- Professional \n- Not robotic  \n\nRULES \n- If exact price is available, mention it clearly. \n- If vehicle and zone are known, use them naturally. \n- If the planner wanted a next step, keep the reply moving forward. \n- Ask at most one next useful question. \n- Do not mention internal field names. \n- Do not mention \"planner\", \"JSON\", \"CRM\", or \"system\".  \n\nWHEN planner_reason_code = \"READY_FOR_PRICE_CALC\":\n\nYou MUST include BOTH:\n1. A concise explanation of the service (what it includes)\n2. The final computed price\n\nStructure:\n- 1 sentence: confirm vehicle + location\n- 1–2 sentences: what the service includes\n- 1 sentence: price\n- 1 CTA\n\nNever return only the price.\n\nSTYLE RULES:\n\n- NEVER use the phrase \"oral y por escrito\"\n- Instead use natural alternatives such as:\n  - \"te explicamos todo en el momento\"\n  - \"te entregamos el informe en el momento\"\n  - \"recibís el informe completo en el momento\"\n- Tone must be natural, conversational, and commercial (not academic)\n\n- Avoid robotic phrasing like \"precio total es\"\n- Prefer natural phring:\n  - \"El valor es $130.000\"\n  - \"Tiene un valor de $130.000\"\n\n\"service_summary\": \"Incluye escaneo profesional de módulos, verificación de kilometraje y revisión estructural (más de 250 puntos).\"\n\n\nReturn ONLY valid JSON.  \nOUTPUT: \n{   \n\"final_reply_text\": \"...\" \n} \n\n"
             },
             {
               "type": "HumanMessagePromptTemplate",
@@ -668,7 +655,7 @@
       "type": "@n8n/n8n-nodes-langchain.chainLlm",
       "typeVersion": 1.9,
       "position": [
-        7616,
+        7872,
         -688
       ],
       "id": "fa966094-2c43-41c0-912d-7d1fe503fe4e",
@@ -681,7 +668,7 @@
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        7936,
+        8192,
         -688
       ],
       "id": "d1de2480-ace3-4f2c-bc32-188fcee72846",
@@ -704,7 +691,7 @@
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
       "position": [
-        6992,
+        7520,
         -304
       ],
       "id": "f5943875-b263-4bf8-99b1-00bc4d2d781a",
@@ -733,7 +720,7 @@
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
       "position": [
-        8384,
+        8640,
         -704
       ],
       "id": "a33eee21-b758-4163-91ea-0a35c337d7b3",
@@ -757,8 +744,8 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.4,
       "position": [
-        1936,
-        -1184
+        1968,
+        -1360
       ],
       "id": "dd8e7b7c-0192-4001-b987-1d17995c9f3b",
       "name": "Mark Leads Needs Human"
@@ -786,8 +773,8 @@
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
       "position": [
-        4304,
-        -1184
+        4336,
+        -1360
       ],
       "id": "8d9a16b0-dcc7-455a-b372-49e0102558e4",
       "name": "Human Handoff Result"
@@ -820,7 +807,7 @@
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.3,
       "position": [
-        8128,
+        8384,
         -688
       ],
       "id": "f4c121a9-85fd-4bb4-84e1-8548cddc5d1d",
@@ -883,7 +870,7 @@
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.3,
       "position": [
-        7920,
+        8176,
         -304
       ],
       "id": "296fa68c-69dd-4d8a-b033-eb3eaa0fc32f",
@@ -912,7 +899,7 @@
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
       "position": [
-        8192,
+        8448,
         -304
       ],
       "id": "0af5c406-24eb-404d-b7e5-1a9b0c409f17",
@@ -940,7 +927,7 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.4,
       "position": [
-        8416,
+        8672,
         -304
       ],
       "id": "ae7dea87-5891-4114-a919-372819f5f0c4",
@@ -974,8 +961,8 @@
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.3,
       "position": [
-        5136,
-        -1184
+        5168,
+        -1360
       ],
       "id": "051f5533-58fa-472a-9e24-4af8b41590bb",
       "name": "IF - Has Reply Text?2"
@@ -1003,8 +990,8 @@
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
       "position": [
-        5408,
-        -1184
+        5440,
+        -1360
       ],
       "id": "6df8a6b3-130a-4338-9d7f-8b16a6c47dcd",
       "name": "Debug Final Reply2"
@@ -1031,7 +1018,7 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.4,
       "position": [
-        8592,
+        8848,
         -704
       ],
       "id": "49532faf-c3dc-469b-af85-b3c7e6c00a69",
@@ -1072,7 +1059,7 @@
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
       "position": [
-        8816,
+        9072,
         -704
       ],
       "id": "fac86c1d-7edf-4260-8239-8f9647078903",
@@ -1100,8 +1087,8 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.4,
       "position": [
-        5616,
-        -1184
+        5648,
+        -1360
       ],
       "id": "a482f669-abfb-470b-849a-e9593cca2caf",
       "name": "Send Whatsapp Reply2"
@@ -1260,8 +1247,8 @@
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
       "position": [
-        5808,
-        -1184
+        5840,
+        -1360
       ],
       "id": "e197f9fb-4230-4db9-90d9-e17b75ea004c",
       "name": "Send Result 2"
@@ -1301,7 +1288,7 @@
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
       "position": [
-        8608,
+        8864,
         -304
       ],
       "id": "6c769724-92c7-48fd-aa99-bc7f4fd0eeb6",
@@ -1379,8 +1366,8 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.4,
       "position": [
-        3792,
-        -656
+        3024,
+        -624
       ],
       "id": "413a8f27-2df6-4192-aca2-6f31e0d1f2ad",
       "name": "Patch Thread State"
@@ -1414,8 +1401,8 @@
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.3,
       "position": [
-        4000,
-        -864
+        3232,
+        -960
       ],
       "id": "d846dfaf-f677-42b9-8542-a4bda4d994c8",
       "name": "IF - Create Candidate?"
@@ -1432,8 +1419,8 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.4,
       "position": [
-        4400,
-        -880
+        3632,
+        -976
       ],
       "id": "1d398e5c-30d1-42b8-a4da-d339afae0174",
       "name": "Create Candidate"
@@ -1450,8 +1437,8 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.4,
       "position": [
-        4128,
-        -384
+        3344,
+        -320
       ],
       "id": "33ecd654-ee00-4e3d-af31-0364a9f60c89",
       "name": "Patch Candidate node"
@@ -1468,8 +1455,8 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.4,
       "position": [
-        5056,
-        -896
+        4288,
+        -992
       ],
       "id": "e39c8bb2-4f94-4627-aae9-7c73107fd33e",
       "name": "Patch Thread State Focus After Create"
@@ -1482,8 +1469,8 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.4,
       "position": [
-        4912,
-        -656
+        3568,
+        -624
       ],
       "id": "6ac09a92-65b0-49e2-877d-3b44e7906212",
       "name": "Refresh Thread State",
@@ -1497,8 +1484,8 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.4,
       "position": [
-        5120,
-        -656
+        5888,
+        -608
       ],
       "id": "df208d6b-8b05-42ed-8d8e-29f5d1e334d1",
       "name": "Refresh Thread Candidates",
@@ -1511,8 +1498,8 @@
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        5328,
-        -656
+        6096,
+        -608
       ],
       "id": "d8073c1a-e17e-45c9-8a7a-dd490898eaf0",
       "name": "Normalize Thread Candidates"
@@ -1524,46 +1511,11 @@
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        5536,
-        -656
+        6304,
+        -608
       ],
       "id": "b616829c-93cd-42bb-886a-a83e04e8a355",
       "name": "Build Effective Quote Input"
-    },
-    {
-      "parameters": {
-        "conditions": {
-          "options": {
-            "caseSensitive": true,
-            "leftValue": "",
-            "typeValidation": "loose",
-            "version": 3
-          },
-          "conditions": [
-            {
-              "id": "b9f04ab2-c33f-46a5-b8c2-29856fcebc12",
-              "leftValue": "={{$json[\"ready_for_price\"]}}",
-              "rightValue": "true",
-              "operator": {
-                "type": "string",
-                "operation": "equals",
-                "name": "filter.operator.equals"
-              }
-            }
-          ],
-          "combinator": "and"
-        },
-        "looseTypeValidation": true,
-        "options": {}
-      },
-      "type": "n8n-nodes-base.if",
-      "typeVersion": 2.3,
-      "position": [
-        6144,
-        -1296
-      ],
-      "id": "ad33f237-57ed-4d46-baba-53aa2b3320f0",
-      "name": "IF - Ready for PRICE"
     },
     {
       "parameters": {
@@ -1594,8 +1546,8 @@
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.3,
       "position": [
-        4688,
-        -880
+        3920,
+        -976
       ],
       "id": "a4342b45-ea1e-45e9-b7e2-b8b68e838676",
       "name": "IF - candidate focus after create"
@@ -1628,8 +1580,8 @@
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.3,
       "position": [
-        3808,
-        -368
+        3024,
+        -304
       ],
       "id": "b6774d02-1cd5-4cea-b919-98629862b4cb",
       "name": "IF - Patch Candidate"
@@ -1654,8 +1606,8 @@
       "type": "n8n-nodes-base.wait",
       "typeVersion": 1.1,
       "position": [
-        4608,
-        -656
+        3296,
+        -624
       ],
       "id": "7fea885d-46db-4ee0-86c0-d4fbae1c1a80",
       "name": "Wait (1sec)",
@@ -1721,7 +1673,7 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.4,
       "position": [
-        9024,
+        9280,
         -704
       ],
       "id": "f7c7d74b-c888-4e8e-a35d-727a0ece8830",
@@ -1739,84 +1691,11 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.4,
       "position": [
-        8816,
+        9072,
         -304
       ],
       "id": "ea02a09c-5ad5-43ed-95f0-ce6a824757ee",
       "name": "Patch Thread State - Mark Processed1"
-    },
-    {
-      "parameters": {
-        "jsCode": "const cleanPatch = (patch) => {\n  if (!patch || typeof patch !== \"object\" || Array.isArray(patch)) return {};\n\n  return Object.fromEntries(\n    Object.entries(patch).filter(([_, v]) => v !== null && v !== undefined)\n  );\n};\n\nconst input = $input.first().json;\n\nreturn [\n  {\n    json: {\n      ...input,\n      inferred_revision_patch: cleanPatch(input.inferred_revision_patch),\n      lead_patch: cleanPatch(input.lead_patch),\n      candidate_patch: cleanPatch(input.candidate_patch),\n    }\n  }\n];"
-      },
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [
-        6288,
-        208
-      ],
-      "id": "d0c1d785-8302-4b97-a946-71e98209bfa6",
-      "name": "Sanitize Planner Patches"
-    },
-    {
-      "parameters": {
-        "jsCode": "const input = $input.first().json;\n\nlet should_create_revision = false;\n\nif (\n  input.booking_signals?.quote_accepted &&\n  input.create_candidate === false\n) {\n  should_create_revision = true;\n}\n\nreturn [{\n  json: {\n    ...input,\n    should_create_revision\n  }\n}];"
-      },
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [
-        2944,
-        240
-      ],
-      "id": "3905834d-9bac-4530-a706-bf345aabf2ac",
-      "name": "Handle Revision Creation"
-    },
-    {
-      "parameters": {
-        "conditions": {
-          "options": {
-            "caseSensitive": true,
-            "leftValue": "",
-            "typeValidation": "strict",
-            "version": 3
-          },
-          "conditions": [
-            {
-              "id": "c2ce4e03-3a33-44ea-b365-3d29bb6b6406",
-              "leftValue": "={{$node[\"Parser Updater Output\"].json.booking_signals?.quote_accepted}}",
-              "rightValue": "true",
-              "operator": {
-                "type": "boolean",
-                "operation": "true",
-                "singleValue": true
-              }
-            }
-          ],
-          "combinator": "and"
-        },
-        "options": {}
-      },
-      "type": "n8n-nodes-base.if",
-      "typeVersion": 2.3,
-      "position": [
-        3232,
-        224
-      ],
-      "id": "97f77b53-99f5-48e9-84dc-5719c38d22ea",
-      "name": "IF - Should create Revision?"
-    },
-    {
-      "parameters": {
-        "jsCode": "const input = $input.first().json;\n\nconst patch = input.inferred_revision_patch || {};\n\nreturn [{\n  json: {\n    ...input,\n    revision_patch: {\n      ...patch\n    }\n  }\n}];"
-      },
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [
-        3568,
-        240
-      ],
-      "id": "7934888d-8800-4732-beec-e6f347e86796",
-      "name": "Merge Booking Data"
     },
     {
       "parameters": {
@@ -1830,7 +1709,7 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.4,
       "position": [
-        7248,
+        7648,
         -688
       ],
       "id": "f2c9f321-60f8-48bd-b87b-7efb4cf3e445",
@@ -1843,8 +1722,8 @@
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        2672,
-        -960
+        2752,
+        -1152
       ],
       "id": "6297de5d-b97d-42eb-8a32-dad7dbc41caa",
       "name": "Sanitize Lead Patch"
@@ -1861,8 +1740,8 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.4,
       "position": [
-        3152,
-        -976
+        3232,
+        -1168
       ],
       "id": "542775e8-b1cd-4563-842d-97f1ce39fb99",
       "name": "Sync Lead State"
@@ -1895,11 +1774,226 @@
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.3,
       "position": [
-        2880,
-        -960
+        2960,
+        -1152
       ],
       "id": "dd63eec2-fce9-4b1f-a32e-32c5c11b777f",
       "name": "IF - Has Lead Patch"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "440990b4-4d57-44cc-a6c5-c7c8ecb8d23d",
+              "leftValue": "={{ $json[\"current_revision_id\"] != null }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        3824,
+        -624
+      ],
+      "id": "0f725a9f-8ed6-4e23-ae03-408568ae7de2",
+      "name": "IF - Has Current Revision?"
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=http://backend:8000/api/whatsapp/thread/{{$node[\"Refresh Thread State\"].json[\"thread_id\"]}}/state",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"current_revision_id\": {{$node[\"Create Revision2\"].json[\"revision_id\"]}}\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        4608,
+        -752
+      ],
+      "id": "97fa929f-2a73-4570-97dc-e6e28cfe1c76",
+      "name": "Patch Thread State - Current Revision"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "53b7dcbc-408b-44ed-965b-4091dac45b00",
+              "name": "effective_revision_id",
+              "value": "={{$node[\"Refresh Thread State\"].json[\"current_revision_id\"]}}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        4544,
+        -608
+      ],
+      "id": "6a302391-6d8c-469b-aeda-bbe4bcaf5eec",
+      "name": "Effective Revision Id (existing)"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "b28dd17e-2b28-4306-9786-4790841b0a4d",
+              "name": "effective_revision_id",
+              "value": "={{$node[\"Create Revision2\"].json[\"revision_id\"]}}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        4816,
+        -752
+      ],
+      "id": "708ec353-7710-4984-bbc2-f2152c999d4c",
+      "name": "Effective Revision Id (created)"
+    },
+    {
+      "parameters": {
+        "jsCode": "const revisionPatch = $node[\"Parser Updater Output\"].json.revision_patch || {};\nconst effectiveRevisionId = $json.effective_revision_id ?? null;\n\nconst cleanPatch = Object.fromEntries(\n  Object.entries(revisionPatch).filter(([, v]) => v !== null && v !== undefined && v !== \"\")\n);\n\nreturn [\n  {\n    json: {\n      effective_revision_id: effectiveRevisionId,\n      revision_patch: cleanPatch\n    }\n  }\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5008,
+        -608
+      ],
+      "id": "eded0a79-0cb6-4d08-8172-ab6f84d83265",
+      "name": "Sanitize Revision Patch"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "9042efca-dfca-4715-8cd8-a18d4a4df7cd",
+              "leftValue": "={{ Object.keys($json[\"revision_patch\"] || {}).length > 0 }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        5296,
+        -608
+      ],
+      "id": "b941076a-fe3c-4016-9115-e55669312888",
+      "name": "IF - Has Revision Patch"
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=http://backend:8000/api/revisions/{{$json[\"effective_revision_id\"]}}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json[\"revision_patch\"] }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        5600,
+        -736
+      ],
+      "id": "cf8dfd62-2083-4968-bc6a-35ad8bdd01e7",
+      "name": "Patch Revision"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://backend:8000/api/revisions",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"thread_id\": {{$node[\"Refresh Thread State\"].json[\"thread_id\"]}},\n  \"candidate_id\": {{$node[\"Refresh Thread State\"].json[\"current_focus_candidate_id\"]}}\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        4384,
+        -752
+      ],
+      "id": "d204eeed-b1a4-40ae-a37a-6aa973daf356",
+      "name": "Create Revision2"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "89b44dec-d7ca-44ea-a630-98c677317ebd",
+              "leftValue": "={{ $node[\"Refresh Thread State\"].json[\"current_focus_candidate_id\"] != null }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        4112,
+        -736
+      ],
+      "id": "5bd9c00b-9179-48ba-90a3-74e72d3841a3",
+      "name": "IF - Has Focus Candidate?"
     }
   ],
   "pinData": {},
@@ -2201,11 +2295,6 @@
             "index": 0
           }
         ]
-      ]
-    },
-    "Compute Price": {
-      "main": [
-        []
       ]
     },
     "OpenAI Chat Model2": {
@@ -2551,7 +2640,7 @@
       "main": [
         [
           {
-            "node": "Refresh Thread Candidates",
+            "node": "IF - Has Current Revision?",
             "type": "main",
             "index": 0
           }
@@ -2589,12 +2678,6 @@
             "index": 0
           }
         ]
-      ]
-    },
-    "IF - Ready for PRICE": {
-      "main": [
-        [],
-        []
       ]
     },
     "IF - candidate focus after create": {
@@ -2688,16 +2771,6 @@
         ]
       ]
     },
-    "Sanitize Planner Patches": {
-      "main": [
-        []
-      ]
-    },
-    "Handle Revision Creation": {
-      "main": [
-        []
-      ]
-    },
     "Request Backend Price": {
       "main": [
         [
@@ -2707,11 +2780,6 @@
             "index": 0
           }
         ]
-      ]
-    },
-    "IF - Should create Revision?": {
-      "main": [
-        []
       ]
     },
     "Sanitize Lead Patch": {
@@ -2740,6 +2808,126 @@
           }
         ]
       ]
+    },
+    "IF - Has Current Revision?": {
+      "main": [
+        [
+          {
+            "node": "Effective Revision Id (existing)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "IF - Has Focus Candidate?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Effective Revision Id (existing)": {
+      "main": [
+        [
+          {
+            "node": "Sanitize Revision Patch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Patch Thread State - Current Revision": {
+      "main": [
+        [
+          {
+            "node": "Effective Revision Id (created)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitize Revision Patch": {
+      "main": [
+        [
+          {
+            "node": "IF - Has Revision Patch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Has Revision Patch": {
+      "main": [
+        [
+          {
+            "node": "Patch Revision",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Refresh Thread Candidates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Patch Revision": {
+      "main": [
+        [
+          {
+            "node": "Refresh Thread Candidates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Revision2": {
+      "main": [
+        [
+          {
+            "node": "Patch Thread State - Current Revision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Effective Revision Id (created)": {
+      "main": [
+        [
+          {
+            "node": "Sanitize Revision Patch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Has Focus Candidate?": {
+      "main": [
+        [
+          {
+            "node": "Create Revision2",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Effective Revision Id (existing)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     }
   },
   "active": true,
@@ -2750,7 +2938,7 @@
     "executionOrder": "v0",
     "binaryMode": "separate"
   },
-  "versionId": "92d3fa9f-7e6e-4e7a-9e10-693d2e132201",
+  "versionId": "54eac50a-ec77-47b5-a01a-e6ddf084a9db",
   "meta": {
     "templateCredsSetupCompleted": true,
     "instanceId": "901b1363662cf3bc56c95f2a53ad959853de7dd61ff56bcc45761e36d4550634"

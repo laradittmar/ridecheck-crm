@@ -286,6 +286,7 @@ class WhatsAppThreadState(Base):
     last_stage: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
     needs_human: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     current_focus_candidate_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    current_revision_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     last_processed_inbound_wa_message_id: Mapped[Optional[str]] = mapped_column(String(191), nullable=True)
     customer_name: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
     home_zone_group: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
