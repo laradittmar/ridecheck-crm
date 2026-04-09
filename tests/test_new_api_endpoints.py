@@ -65,6 +65,14 @@ class FakeScheduleService:
             "rules_applied": ["Duracion fija de revision: 45 minutos"],
         }
 
+    def list_slots(self, payload):
+        return {
+            "preferred_day": "2026-04-08",
+            "business_hours": "09:00-18:00",
+            "slots": ["2026-04-08T10:00", "2026-04-08T11:30"],
+            "rules_applied": ["Duracion fija de revision: 45 minutos"],
+        }
+
 
 class FakeThreadRevision:
     def __init__(self):
@@ -130,6 +138,21 @@ class NewApiEndpointTests(unittest.TestCase):
         self.assertEqual(response.json()["valid"], True)
         self.assertEqual(response.json()["approval_tag"], "Esperando aprobación")
         self.assertEqual(response.json()["requested_slot"]["start"], "2026-04-08T10:00")
+
+    def test_schedule_slots_endpoint(self):
+        app = FastAPI()
+        app.include_router(schedule_router)
+        app.dependency_overrides[get_schedule_service] = lambda: FakeScheduleService()
+
+        with TestClient(app) as client:
+            response = client.get(
+                "/api/schedule/slots",
+                params={"preferred_day": "2026-04-08", "address": "Av. Santa Fe 1234"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["business_hours"], "09:00-18:00")
+        self.assertEqual(response.json()["slots"][0], "2026-04-08T10:00")
 
     def test_thread_revision_endpoints(self):
         app = FastAPI()

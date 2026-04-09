@@ -15,14 +15,14 @@
             "contacts": [
               {
                 "profile": { "name": "" },
-                "wa_id": "5491112345704"
+                "wa_id": "5491112345707"
               }
             ],
             "messages": [
               {
-                "from": "5491112345704",
-                "id": "wamid.TEST_20260220_232500_219",
-                "timestamp": "1775750631",
+                "from": "5491112345707",
+                "id": "wamid.TEST_20260220_232500_223",
+                "timestamp": "1775771571",
                 "type": "text",
                 "text": { "body": "Hola, quiero revisar un auto. Juan Garcia, es agencia, Toyota Yaris 2024, Loyola 2014 - agronomia, mañana 14hs" }
               }

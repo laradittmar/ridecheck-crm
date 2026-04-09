@@ -190,6 +190,27 @@ class BackendServiceTests(unittest.TestCase):
         self.assertIn("CRM", result.reasons[0])
         self.assertGreater(len(result.suggested_slots), 0)
 
+    def test_schedule_service_excludes_current_revision_from_conflicts(self):
+        existing = Revision(
+            id=5,
+            lead_id=1,
+            turno_fecha=date(2026, 4, 8),
+            turno_hora=time(10, 0),
+        )
+        service = ScheduleService(db=FakeScheduleDb(revisions=[existing]))
+
+        result = service.check(
+            ScheduleCheckIn(
+                address="Av. Santa Fe 1234",
+                preferred_day="2026-04-08",
+                preferred_time="10:00",
+                exclude_revision_id=5,
+            )
+        )
+
+        self.assertTrue(result.valid)
+        self.assertEqual(result.conflicts, [])
+
     def test_schedule_service_applies_priority_zone_rule(self):
         service = ScheduleService(db=FakeScheduleDb())
 
@@ -203,6 +224,20 @@ class BackendServiceTests(unittest.TestCase):
 
         self.assertFalse(result.valid)
         self.assertTrue(any("prioritaria" in reason for reason in result.reasons))
+
+    def test_schedule_service_lists_slots_for_day(self):
+        service = ScheduleService(db=FakeScheduleDb())
+
+        result = service.list_slots(
+            ScheduleCheckIn(
+                address="Av. Santa Fe 1234",
+                preferred_day="2026-04-08",
+                preferred_time="09:00",
+            )
+        )
+
+        self.assertEqual(result.business_hours, "09:00-18:00")
+        self.assertGreater(len(result.slots), 0)
 
 
 if __name__ == "__main__":

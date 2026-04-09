@@ -13,6 +13,7 @@ class ScheduleCheckIn(BaseModel):
     zone_detail: str | None = Field(default=None, max_length=80)
     distance_km: float | None = Field(default=None, ge=0)
     is_holiday: bool = False
+    exclude_revision_id: int | None = None
 
 
 class ScheduleSlotOut(BaseModel):
@@ -40,4 +41,11 @@ class ScheduleCheckOut(BaseModel):
     total_slot_minutes: int = 60
     conflicts: list[ScheduleConflictOut] = []
     reasons: list[str] = []
+    rules_applied: list[str] = []
+
+
+class ScheduleSlotsOut(BaseModel):
+    preferred_day: date
+    business_hours: str
+    slots: list[str]
     rules_applied: list[str] = []

@@ -9,7 +9,13 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..models import Revision, ThreadRevision
-from ..schemas.schedule import ScheduleCheckIn, ScheduleCheckOut, ScheduleConflictOut, ScheduleSlotOut
+from ..schemas.schedule import (
+    ScheduleCheckIn,
+    ScheduleCheckOut,
+    ScheduleConflictOut,
+    ScheduleSlotOut,
+    ScheduleSlotsOut,
+)
 
 SERVICE_MINUTES = 45
 BUFFER_MINUTES = 15
@@ -86,7 +92,10 @@ class ScheduleService:
             reasons.append("La zona solicitada es prioritaria y debe asignarse entre las 09:00 y las 12:00")
             rules_applied.append("Zona prioritaria: validacion reforzada para 09:00 a 12:00")
 
-        occupied_slots = self._load_occupied_slots(payload.preferred_day)
+        occupied_slots = self._load_occupied_slots(
+            preferred_day=payload.preferred_day,
+            exclude_revision_id=payload.exclude_revision_id,
+        )
         overlaps = [
             slot for slot in occupied_slots
             if requested_start < slot.end and requested_end > slot.start
@@ -134,7 +143,49 @@ class ScheduleService:
             rules_applied=rules_applied,
         )
 
-    def _load_occupied_slots(self, preferred_day: date) -> list[OccupiedSlot]:
+    def list_slots(self, payload: ScheduleCheckIn) -> ScheduleSlotsOut:
+        hours = self._business_hours(
+            preferred_day=payload.preferred_day,
+            normalized_context=self._normalized_context(payload),
+            is_holiday=payload.is_holiday,
+        )
+        travel_minutes = self._travel_minutes(payload.distance_km)
+        total_slot_minutes = SERVICE_MINUTES + BUFFER_MINUTES + travel_minutes
+        occupied_slots = self._load_occupied_slots(
+            preferred_day=payload.preferred_day,
+            exclude_revision_id=payload.exclude_revision_id,
+        )
+        rules_applied = [
+            "Duracion fija de revision: 45 minutos",
+            "Buffer operativo: 15 minutos",
+            f"Traslado estimado: {travel_minutes} minutos",
+            f"Tiempo total reservado: {total_slot_minutes} minutos",
+            f"Horario operativo del dia: {self._format_hours(hours.start, hours.end)}",
+        ]
+        if payload.is_holiday:
+            rules_applied.append("Feriado: se usa horario reducido 09:00 a 15:00")
+        if hours.extended_for_zone:
+            rules_applied.append("Extension especial aplicada para San Isidro/Vicente Lopez")
+        if hours.alternating_note:
+            rules_applied.append(hours.alternating_note)
+        if self._is_priority_zone(payload):
+            rules_applied.append("Zona prioritaria: se ofrecen solo horarios compatibles con la franja 09:00 a 12:00")
+
+        return ScheduleSlotsOut(
+            preferred_day=payload.preferred_day,
+            business_hours=self._format_hours(hours.start, hours.end),
+            slots=self._suggest_slots(
+                preferred_day=payload.preferred_day,
+                occupied_slots=occupied_slots,
+                hours=hours,
+                total_slot_minutes=total_slot_minutes,
+                payload=payload,
+                max_results=24,
+            ),
+            rules_applied=rules_applied,
+        )
+
+    def _load_occupied_slots(self, preferred_day: date, exclude_revision_id: int | None = None) -> list[OccupiedSlot]:
         slots: list[OccupiedSlot] = []
 
         revisions = self.db.execute(
@@ -143,6 +194,8 @@ class ScheduleService:
             .where(Revision.turno_hora.is_not(None))
         ).scalars().all()
         for revision in revisions:
+            if exclude_revision_id is not None and int(revision.id) == int(exclude_revision_id):
+                continue
             start_dt = datetime.combine(revision.turno_fecha, revision.turno_hora)
             slots.append(
                 OccupiedSlot(
@@ -181,11 +234,12 @@ class ScheduleService:
         hours: "_BusinessHours",
         total_slot_minutes: int,
         payload: ScheduleCheckIn,
+        max_results: int = 5,
     ) -> list[str]:
         suggestions: list[str] = []
         candidate = datetime.combine(preferred_day, hours.start)
         hard_end = datetime.combine(preferred_day, hours.end)
-        while candidate + timedelta(minutes=total_slot_minutes) <= hard_end and len(suggestions) < 5:
+        while candidate + timedelta(minutes=total_slot_minutes) <= hard_end and len(suggestions) < max_results:
             if self._is_candidate_usable(candidate, total_slot_minutes, occupied_slots, payload):
                 suggestions.append(candidate.isoformat(timespec="minutes"))
             candidate += timedelta(minutes=30)
@@ -249,20 +303,13 @@ class ScheduleService:
         if weekday == 3:
             return _BusinessHours(start=time(9, 0), end=time(14, 0))
         if weekday == 4:
-            if self._is_alternating_week(preferred_day):
-                start_time = time(9, 30)
-                end_time = time(14, 0)
-                note = "Viernes alternado: se aplica la jornada corta de 09:30 a 14:00"
-            else:
-                start_time = time(9, 0)
-                end_time = time(18, 0)
-                note = "Viernes alternado: se aplica la jornada larga de 09:00 a 18:00"
-            if self._has_special_extension(normalized_context) and end_time < time(15, 0):
-                end_time = time(15, 0)
+            start_time = time(9, 0)
+            end_time = time(18, 0)
+            note = "Viernes: jornada normal de 09:00 a 18:00"
             return _BusinessHours(
                 start=start_time,
                 end=end_time,
-                extended_for_zone=self._has_special_extension(normalized_context),
+                extended_for_zone=False,
                 alternating_note=note,
             )
         if weekday == 5:

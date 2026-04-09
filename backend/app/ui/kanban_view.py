@@ -974,6 +974,23 @@ def _latest_revision(revs: list[Revision]) -> Revision | None:
     )[0]
 
 
+def _revision_approval_tag(rev: Revision) -> str | None:
+    explicit = _clean_str_like(getattr(rev, "approval_tag", None))
+    if explicit:
+        return explicit
+    estado = (_val(getattr(rev, "estado_revision", None)) or "").upper()
+    if estado == "PENDIENTE" and getattr(rev, "turno_fecha", None):
+        return "Esperando aprobación"
+    return None
+
+
+def _clean_str_like(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 # ---------- constants ----------
 
 KANBAN_ORDER = [
@@ -1651,6 +1668,9 @@ def render_page(
               }
             }
             if (form && form.matches('form[action="/ui/revision_latest_update"]')) {
+              if (e.defaultPrevented) {
+                return;
+              }
               closeAllOpenPopovers();
             }
           });
@@ -3072,11 +3092,17 @@ def render_calendar_page(
       .calAppt.past { background:#f3f4f6; border-color:#d1d5db; color:#6b7280; }
       .calAppt.future-ok { background:#ecfdf3; border-color:#86efac; }
       .calAppt.future-pending { background:#fee2e2; border-color:#fca5a5; }
+      .calApptApproval { display:flex; align-items:stretch; gap:0; margin:4px 0 4px -4px; }
+      .calStatusRibbon { flex:0 0 48px; width:48px; border-radius:10px 0 0 10px; background:linear-gradient(180deg, #fff9ef 0%, #f7edd3 100%); color:#cb8b08; display:flex; align-items:center; justify-content:center; padding:6px 0; box-shadow: inset -1px 0 0 rgba(255,255,255,.82), 10px 0 14px rgba(123, 92, 29, .12); border-right:1px solid rgba(207, 148, 27, .28); }
+      .calStatusRibbonText { display:flex; flex-direction:column; align-items:center; justify-content:center; gap:3px; min-width:74px; transform:rotate(-90deg); transform-origin:center; white-space:nowrap; }
+      .calStatusRibbonWord { display:block; font-size:8px; font-weight:900; letter-spacing:.16em; text-transform:uppercase; line-height:1.05; text-align:center; }
+      .calApptBody { min-width:0; flex:1 1 auto; }
+      .calApptApproval .calApptBody { padding-left:8px; }
       .calMeta { font-size:12px; color: var(--muted); }
       .calRow { display:flex; justify-content:space-between; gap:8px; align-items:center; min-width:0; }
       .calMetaVehicle { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
       .calTopBar { display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; margin-bottom:12px; }
-      .calTopCenter { font-weight:700; }
+      .calTopCenter { font-weight:700; color:#fff; }
       .calTopLinks { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
       @media (max-width: 900px) { .calGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
       @media (max-width: 520px) { .calGrid { grid-template-columns: 1fr; } }
@@ -3192,13 +3218,27 @@ def render_calendar_page(
                     appt_cls = "past"
                 else:
                     appt_cls = "future-ok" if estado_val == "CONFIRMADO" else "future-pending"
+                approval_tag = _revision_approval_tag(r)
+                approval_prefix = ""
+                approval_suffix = ""
+                if approval_tag and not is_past:
+                    approval_prefix = (
+                        '<div class="calApptApproval">'
+                        '<div class="calStatusRibbon">'
+                        '<span class="calStatusRibbonText"><span class="calStatusRibbonWord">ESPERANDO</span><span class="calStatusRibbonWord">APROBACI&Oacute;N</span></span>'
+                        "</div>"
+                        '<div class="calApptBody">'
+                    )
+                    approval_suffix = "</div></div>"
                 html.append(f"""
                     <a class="calAppt {appt_cls}" href="{href}" data-search="{search_text}">
+                      {approval_prefix}
                       <div class="calRow"><b>{_txt(n)}</b><span class="pill">{time_txt}</span></div>
                       <div class="calMeta calMetaVehicle">Vehículo: {_txt(veh)}</div>
                       <div class="calMeta">Dirección: {addr}</div>
                       <div class="calMeta">Profesional: {_txt(prof_label)}</div>
                       <div class="calMeta">Estado operativo: {_txt(estado_op)}</div>
+                      {approval_suffix}
                     </a>
                   """)
         html.append("</div>")
@@ -3965,7 +4005,7 @@ def render_revisions_block(
     """)
 
     if not revs:
-        chunks.append('<div class="muted" style="margin-top:10px;">No hay revisiones a-n.</div>')
+        chunks.append('<div class="muted" style="margin-top:10px;">No hay revisiones.</div>')
     else:
         for r in revs_display:
             rev_num = rev_num_by_id.get(r.id, 0)
@@ -4164,7 +4204,7 @@ def render_edit_latest_revision_form(
             <button class="iconBtn" type="button" aria-label="Cerrar" onclick="closeEditLatest({lead_id})">{ICON_CLOSE}</button>
           </div>
 
-          <form method="post" action="/ui/revision_latest_update" class="revEditPanel">
+          <form method="post" action="/ui/revision_latest_update" class="revEditPanel" data-revision-id="{last_rev.id}" data-current-turno-time="{th_val}">
             <input type="hidden" name="lead_id" value="{lead_id}"/>
             <div class="revModalBody">
               <style>
@@ -4173,6 +4213,9 @@ def render_edit_latest_revision_form(
                 #editrev-{lead_id} .revSectionBody {{ margin-top:8px; }}
                 #editrev-{lead_id} .revReadonly {{ background:#f3f4f6; color:#4b5563; }}
                 #editrev-{lead_id} .revHint {{ margin-top:6px; }}
+                #editrev-{lead_id} .revScheduleSuggestions {{ display:flex; flex-wrap:wrap; gap:6px; margin-top:6px; }}
+                #editrev-{lead_id} .revScheduleChip {{ border:1px solid #fcd34d; background:#fffbeb; color:#92400e; border-radius:999px; padding:4px 10px; font-size:12px; font-weight:700; cursor:pointer; }}
+                #editrev-{lead_id} .revScheduleChip:hover {{ background:#fef3c7; }}
               </style>
 
               <fieldset class="box revSection">
@@ -4358,13 +4401,19 @@ def render_edit_latest_revision_form(
                   <div class="grid">
                     <div>
                       <div class="label">Turno fecha</div>
-                      <input type="date" name="turno_fecha" value="{tf_val}"/>
+                      <input type="date" name="turno_fecha" value="{tf_val}" data-turno-fecha="1"/>
                     </div>
                     <div>
                       <div class="label">Turno hora</div>
-                      <input type="time" name="turno_hora" value="{th_val}"/>
+                      <select name="turno_hora" data-turno-hora="1">
+                        <option value="">-</option>
+                        {f'<option value="{th_val}" selected>{th_val}</option>' if th_val else ''}
+                      </select>
                     </div>
                   </div>
+                  <div class="muted small revHint" data-schedule-help="1">Seleccioná una fecha para cargar horarios válidos.</div>
+                  <div class="muted small revHint" data-schedule-error="1" style="display:none; color:#b91c1c;"></div>
+                  <div class="revHint" data-schedule-suggestions="1" style="display:none;"></div>
 
                   <div class="grid" style="margin-top:8px;">
                     <div>
@@ -4422,11 +4471,19 @@ def render_edit_latest_revision_form(
         (function () {{
           var root = document.getElementById("editrev-{lead_id}");
           if (!root) return;
+          var form = root.querySelector('form[action="/ui/revision_latest_update"]');
           var sel = root.querySelector('select[data-tipo-vendedor="1"]');
           var wrap = root.querySelector('[data-agencia-wrap="1"]');
           var agenciaSelect = root.querySelector('select[data-agencia-select="1"]');
           var recalcSel = root.querySelector('select[data-recalcular-presupuesto="1"]');
           var totalInput = root.querySelector('input[data-precio-total="1"]');
+          var turnoDateInput = root.querySelector('[data-turno-fecha="1"]');
+          var turnoTimeSelect = root.querySelector('[data-turno-hora="1"]');
+          var scheduleHelp = root.querySelector('[data-schedule-help="1"]');
+          var scheduleError = root.querySelector('[data-schedule-error="1"]');
+          var scheduleSuggestions = root.querySelector('[data-schedule-suggestions="1"]');
+          var submitBtn = form ? form.querySelector('button[type="submit"]') : null;
+          var scheduleRequestId = 0;
           function syncAgencia() {{
             if (!sel || !wrap) return;
             var show = (sel.value || "") === "AGENCIA";
@@ -4439,10 +4496,214 @@ def render_edit_latest_revision_form(
             totalInput.readOnly = autoMode;
             totalInput.classList.toggle("revReadonly", autoMode);
           }}
+          function trimValue(el) {{
+            return ((el && el.value) || "").trim();
+          }}
+          function scheduleAddress() {{
+            var direccionInput = form ? form.querySelector('input[name="direccion_texto"]') : null;
+            var zoneGroupInput = form ? form.querySelector('select[name="zone_group"]') : null;
+            var zoneDetailInput = form ? form.querySelector('select[name="zone_detail"]') : null;
+            return trimValue(direccionInput) || trimValue(zoneDetailInput) || trimValue(zoneGroupInput) || "Sin dirección";
+          }}
+          function buildSchedulePayload(includeTime) {{
+            var zoneGroupInput = form ? form.querySelector('select[name="zone_group"]') : null;
+            var zoneDetailInput = form ? form.querySelector('select[name="zone_detail"]') : null;
+            return {{
+              address: scheduleAddress(),
+              preferred_day: trimValue(turnoDateInput),
+              preferred_time: includeTime ? trimValue(turnoTimeSelect) : "09:00",
+              zone_group: trimValue(zoneGroupInput) || null,
+              zone_detail: trimValue(zoneDetailInput) || null,
+              exclude_revision_id: form ? Number(form.getAttribute("data-revision-id") || "0") || null : null,
+            }};
+          }}
+          function clearScheduleFeedback() {{
+            if (scheduleError) {{
+              scheduleError.textContent = "";
+              scheduleError.style.display = "none";
+            }}
+            if (scheduleSuggestions) {{
+              scheduleSuggestions.innerHTML = "";
+              scheduleSuggestions.style.display = "none";
+            }}
+          }}
+          function slotToTime(slot) {{
+            var text = String(slot || "");
+            var parts = text.split("T");
+            if (parts.length < 2) return "";
+            return parts[1].slice(0, 5);
+          }}
+          function applySuggestedSlot(slot) {{
+            if (!turnoDateInput || !turnoTimeSelect) return;
+            var text = String(slot || "");
+            var parts = text.split("T");
+            if (parts.length < 2) return;
+            turnoDateInput.value = parts[0];
+            loadScheduleSlots(parts[1].slice(0, 5));
+          }}
+          function renderSuggestions(slots) {{
+            if (!scheduleSuggestions) return;
+            scheduleSuggestions.innerHTML = "";
+            if (!slots || !slots.length) {{
+              scheduleSuggestions.style.display = "none";
+              return;
+            }}
+            var label = document.createElement("div");
+            label.className = "muted small";
+            label.textContent = "Alternativas sugeridas:";
+            scheduleSuggestions.appendChild(label);
+            var row = document.createElement("div");
+            row.className = "revScheduleSuggestions";
+            slots.forEach(function (slot) {{
+              var btn = document.createElement("button");
+              btn.type = "button";
+              btn.className = "revScheduleChip";
+              btn.textContent = String(slot).replace("T", " ");
+              btn.addEventListener("click", function () {{
+                clearScheduleFeedback();
+                applySuggestedSlot(slot);
+              }});
+              row.appendChild(btn);
+            }});
+            scheduleSuggestions.appendChild(row);
+            scheduleSuggestions.style.display = "";
+          }}
+          function showScheduleError(message, slots) {{
+            if (scheduleError) {{
+              scheduleError.textContent = message;
+              scheduleError.style.display = "";
+            }}
+            renderSuggestions(slots || []);
+          }}
+          function populateTimeOptions(slots, preferredTime, invalidMessage) {{
+            if (!turnoTimeSelect) return;
+            var desired = (preferredTime || trimValue(turnoTimeSelect) || "").slice(0, 5);
+            turnoTimeSelect.innerHTML = '<option value="">-</option>';
+            var seen = {{}};
+            (slots || []).forEach(function (slot) {{
+              var timeValue = slotToTime(slot);
+              if (!timeValue || seen[timeValue]) return;
+              seen[timeValue] = true;
+              var option = document.createElement("option");
+              option.value = timeValue;
+              option.textContent = timeValue;
+              if (timeValue === desired) option.selected = true;
+              turnoTimeSelect.appendChild(option);
+            }});
+            if (desired && !seen[desired]) {{
+              var fallback = document.createElement("option");
+              fallback.value = desired;
+              fallback.textContent = invalidMessage || (desired + " (ya no disponible)");
+              fallback.selected = true;
+              turnoTimeSelect.appendChild(fallback);
+            }}
+          }}
+          function updateScheduleHelp(text) {{
+            if (scheduleHelp) scheduleHelp.textContent = text;
+          }}
+          function loadScheduleSlots(preferredTime) {{
+            clearScheduleFeedback();
+            if (!form || !turnoDateInput || !turnoTimeSelect) return Promise.resolve();
+            var day = trimValue(turnoDateInput);
+            if (!day) {{
+              populateTimeOptions([], "", "");
+              updateScheduleHelp("Seleccioná una fecha para cargar horarios válidos.");
+              return Promise.resolve();
+            }}
+            var params = new URLSearchParams();
+            var payload = buildSchedulePayload(false);
+            params.set("preferred_day", day);
+            params.set("address", payload.address);
+            if (payload.zone_group) params.set("zone_group", payload.zone_group);
+            if (payload.zone_detail) params.set("zone_detail", payload.zone_detail);
+            if (payload.exclude_revision_id) params.set("exclude_revision_id", String(payload.exclude_revision_id));
+            var requestId = ++scheduleRequestId;
+            updateScheduleHelp("Cargando horarios válidos...");
+            return fetch("/api/schedule/slots?" + params.toString(), {{
+              headers: {{ "Accept": "application/json" }}
+            }}).then(function (res) {{
+              if (!res.ok) throw new Error("schedule_slots_failed");
+              return res.json();
+            }}).then(function (data) {{
+              if (requestId !== scheduleRequestId) return;
+              var desired = (preferredTime || trimValue(turnoTimeSelect) || "").slice(0, 5);
+              var validTimes = (data.slots || []).map(slotToTime).filter(Boolean);
+              populateTimeOptions(data.slots || [], desired, desired ? (desired + " (inválido)") : "");
+              updateScheduleHelp("Horarios disponibles: " + (data.business_hours || "-"));
+              if (desired && validTimes.indexOf(desired) === -1) {{
+                showScheduleError("El horario seleccionado ya no es válido para esta agenda.", data.slots || []);
+              }}
+            }}).catch(function () {{
+              if (requestId !== scheduleRequestId) return;
+              updateScheduleHelp("No se pudieron cargar horarios válidos. Podés volver a intentar.");
+            }});
+          }}
+          function validateSchedule() {{
+            if (!turnoDateInput || !turnoTimeSelect) return Promise.resolve(true);
+            var day = trimValue(turnoDateInput);
+            var timeValue = trimValue(turnoTimeSelect);
+            if (!day || !timeValue) return Promise.resolve(true);
+            clearScheduleFeedback();
+            var payload = buildSchedulePayload(true);
+            return fetch("/api/schedule/check", {{
+              method: "POST",
+              headers: {{
+                "Content-Type": "application/json",
+                "Accept": "application/json"
+              }},
+              body: JSON.stringify(payload)
+            }}).then(function (res) {{
+              if (!res.ok) throw new Error("schedule_check_failed");
+              return res.json();
+            }}).then(function (data) {{
+              if (!data.valid) {{
+                var firstReason = (data.reasons && data.reasons[0]) || "El turno seleccionado no es válido.";
+                showScheduleError(firstReason, data.suggested_slots || []);
+                return false;
+              }}
+              updateScheduleHelp((data.approval_tag || "Turno valido") + " - " + (data.business_hours || "-"));
+              return true;
+            }}).catch(function () {{
+              showScheduleError("No se pudo validar el turno. Probá de nuevo.", []);
+              return false;
+            }});
+          }}
           if (sel) sel.addEventListener("change", syncAgencia);
           if (recalcSel) recalcSel.addEventListener("change", syncPrecioTotalReadonly);
+          if (turnoDateInput) turnoDateInput.addEventListener("change", function () {{
+            loadScheduleSlots("");
+          }});
+          ['input[name="direccion_texto"]', 'select[name="zone_group"]', 'select[name="zone_detail"]'].forEach(function (selector) {{
+            var field = form ? form.querySelector(selector) : null;
+            if (!field) return;
+            field.addEventListener("change", function () {{
+              if (trimValue(turnoDateInput)) {{
+                window.setTimeout(function () {{
+                  loadScheduleSlots(trimValue(turnoTimeSelect));
+                }}, 0);
+              }}
+            }});
+          }});
+          if (form) {{
+            form.addEventListener("submit", function (e) {{
+              if (form.getAttribute("data-schedule-validated") === "1") return;
+              var hasDate = trimValue(turnoDateInput);
+              var hasTime = trimValue(turnoTimeSelect);
+              if (!hasDate || !hasTime) return;
+              e.preventDefault();
+              if (submitBtn) submitBtn.disabled = true;
+              validateSchedule().then(function (valid) {{
+                if (!valid) return;
+                form.setAttribute("data-schedule-validated", "1");
+                form.submit();
+              }}).finally(function () {{
+                if (submitBtn) submitBtn.disabled = false;
+              }});
+            }});
+          }}
           syncAgencia();
           syncPrecioTotalReadonly();
+          loadScheduleSlots(form ? form.getAttribute("data-current-turno-time") || "" : "");
         }})();
       </script>
     """
