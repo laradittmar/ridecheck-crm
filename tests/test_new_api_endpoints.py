@@ -47,7 +47,23 @@ class FakePricingService:
 
 class FakeScheduleService:
     def check(self, payload):
-        return {"valid": True, "suggested_slots": []}
+        return {
+            "valid": True,
+            "suggested_slots": ["2026-04-08T10:00"],
+            "approval_tag": "Esperando aprobación",
+            "requested_slot": {
+                "start": "2026-04-08T10:00",
+                "end": "2026-04-08T11:00",
+            },
+            "business_hours": "09:00-18:00",
+            "service_minutes": 45,
+            "buffer_minutes": 15,
+            "travel_minutes": 0,
+            "total_slot_minutes": 60,
+            "conflicts": [],
+            "reasons": [],
+            "rules_applied": ["Duracion fija de revision: 45 minutos"],
+        }
 
 
 class FakeThreadRevision:
@@ -111,7 +127,9 @@ class NewApiEndpointTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"valid": True, "suggested_slots": []})
+        self.assertEqual(response.json()["valid"], True)
+        self.assertEqual(response.json()["approval_tag"], "Esperando aprobación")
+        self.assertEqual(response.json()["requested_slot"]["start"], "2026-04-08T10:00")
 
     def test_thread_revision_endpoints(self):
         app = FastAPI()

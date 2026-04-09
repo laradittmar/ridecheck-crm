@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import unittest
 from dataclasses import dataclass
+from datetime import date, time
 from pathlib import Path
 
 
@@ -11,7 +12,7 @@ BACKEND_DIR = ROOT_DIR / "backend"
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from app.models import ThreadRevision
+from app.models import Revision, ThreadRevision
 from app.schemas.schedule import ScheduleCheckIn
 from app.schemas.thread_revisions import ThreadRevisionCreateIn, ThreadRevisionPatch
 from app.services.pricing import PricingService
@@ -79,6 +80,36 @@ class FakeThreadRevisionRepository:
         return revision
 
 
+class FakeScalarResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def all(self):
+        return list(self._rows)
+
+
+class FakeExecuteResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def scalars(self):
+        return FakeScalarResult(self._rows)
+
+
+class FakeScheduleDb:
+    def __init__(self, revisions=None, thread_revisions=None):
+        self.revisions = revisions or []
+        self.thread_revisions = thread_revisions or []
+
+    def execute(self, stmt):
+        entity = stmt.column_descriptions[0].get("entity")
+        if entity is Revision:
+            return FakeExecuteResult(self.revisions)
+        if entity is ThreadRevision:
+            return FakeExecuteResult(self.thread_revisions)
+        return FakeExecuteResult([])
+
+
 class BackendServiceTests(unittest.TestCase):
     def test_pricing_service_normalizes_zone_detail_and_maps_group(self):
         service = PricingService(repository=FakePricingRepository())
@@ -121,8 +152,8 @@ class BackendServiceTests(unittest.TestCase):
         self.assertEqual(revision.buyer_name, "Lara")
         self.assertEqual(revision.seller_name, "Agencia Norte")
 
-    def test_schedule_service_placeholder(self):
-        service = ScheduleService()
+    def test_schedule_service_accepts_open_slot_and_adds_approval_tag(self):
+        service = ScheduleService(db=FakeScheduleDb())
 
         result = service.check(
             ScheduleCheckIn(
@@ -133,7 +164,45 @@ class BackendServiceTests(unittest.TestCase):
         )
 
         self.assertTrue(result.valid)
-        self.assertEqual(result.suggested_slots, [])
+        self.assertEqual(result.approval_tag, "Esperando aprobación")
+        self.assertEqual(result.total_slot_minutes, 60)
+        self.assertEqual(result.conflicts, [])
+
+    def test_schedule_service_detects_conflict_with_existing_revision(self):
+        existing = Revision(
+            id=5,
+            lead_id=1,
+            turno_fecha=date(2026, 4, 8),
+            turno_hora=time(10, 0),
+        )
+        service = ScheduleService(db=FakeScheduleDb(revisions=[existing]))
+
+        result = service.check(
+            ScheduleCheckIn(
+                address="Av. Santa Fe 1234",
+                preferred_day="2026-04-08",
+                preferred_time="10:30",
+            )
+        )
+
+        self.assertFalse(result.valid)
+        self.assertEqual(result.conflicts[0].source, "revision")
+        self.assertIn("CRM", result.reasons[0])
+        self.assertGreater(len(result.suggested_slots), 0)
+
+    def test_schedule_service_applies_priority_zone_rule(self):
+        service = ScheduleService(db=FakeScheduleDb())
+
+        result = service.check(
+            ScheduleCheckIn(
+                address="La Plata centro",
+                preferred_day="2026-04-08",
+                preferred_time="13:00",
+            )
+        )
+
+        self.assertFalse(result.valid)
+        self.assertTrue(any("prioritaria" in reason for reason in result.reasons))
 
 
 if __name__ == "__main__":

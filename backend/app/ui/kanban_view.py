@@ -113,7 +113,23 @@ def _base_css(extra_css: str = "") -> str:
       body {{ font-family: Arial, sans-serif; margin: 0; background: var(--bg); font-size:var(--font-base); }}
       a {{ color:#2563eb; text-decoration: underline; }}
 
-      .layout {{ display:flex; min-height:100vh; }}
+      .layout {{
+        display:flex;
+        min-height:100vh;
+        position:relative;
+        isolation:isolate;
+      }}
+      .layout::before {{
+        content:"";
+        position:fixed;
+        inset:0;
+        background-image: linear-gradient(180deg, rgba(255,255,255,.1), rgba(243,244,246,.15)), url('/static/bg.png');
+        background-size: cover;
+        background-position: center;
+        background-repeat: no-repeat;
+        pointer-events:none;
+        z-index:-1;
+      }}
       .sidebar{{
         width: 232px; background:#111827; color:#fff; padding:12px; position:sticky; top:0; height:100vh;
         transition: width .15s ease;
@@ -161,9 +177,9 @@ def _base_css(extra_css: str = "") -> str:
       .sidebar.collapsed .sidebarFooter {{ display:none; }}
       .main{{
         flex:1; padding:clamp(18px, 1vw, 28px);
-        background-image: linear-gradient(180deg, rgba(255,255,255,.1), rgba(243,244,246,.15)), url('/static/bg.png');
-        background-size: cover;
-        background-position: center;
+        background:transparent;
+        position:relative;
+        z-index:1;
       }}
       .kanbanTopBar {{
         position: sticky;
