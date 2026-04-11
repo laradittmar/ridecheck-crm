@@ -200,11 +200,15 @@
   background: #e6f4ea;
 }
 
+.wa-app {
+  --wa-avatar-green: #14b8a6;
+}
+
 .wa-app .wa-avatar {
   width: 32px;
   height: 32px;
   border-radius: 50%;
-  background: #14b8a6;
+  background: var(--wa-avatar-green);
   color: #fff;
   font-size: 11px;
   font-weight: 700;
@@ -218,6 +222,65 @@
   width: 36px;
   height: 36px;
   flex-basis: 36px;
+}
+
+.wa-app .avatar-wrapper {
+  position: relative;
+  width: 36px;
+  height: 36px;
+  flex: 0 0 36px;
+}
+
+.wa-app .avatar-main {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 36px;
+  height: 36px;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--wa-avatar-green);
+  color: #fff;
+  font-weight: 700;
+  font-size: 11px;
+  line-height: 1;
+  border: 1px solid rgba(17,24,39,.10);
+  z-index: 2;
+}
+
+.wa-app .avatar-flag {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 48px;
+  height: 48px;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  z-index: 1;
+  border: 1px solid rgba(17,24,39,.14);
+}
+
+.wa-app .avatar-flag.flag-presupuestando {
+  background: #fef3c7;
+}
+
+.wa-app .avatar-flag.flag-enviado {
+  background: #e0f2fe;
+}
+
+.wa-app .avatar-flag.flag-aceptado {
+  background: #dcfce7;
+}
+
+.wa-app .avatar-flag.flag-recompra {
+  background: #e0e7ff;
+}
+
+.wa-app .avatar-flag.flag-perdido {
+  background: #fecaca;
 }
 
 .wa-app .wa-chat-main {

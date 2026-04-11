@@ -33,6 +33,21 @@ QUICK_REPLIES = [
     "Perfecto, agendamos revisión.",
 ]
 
+ESTADO_INITIALS = {
+    "CONSULTA_NUEVA": "CN",
+    "COORDINAR_DISPONIBILIDAD": "CD",
+    "AGENDADO": "A",
+    "REVISION_COMPLETA": "RC",
+}
+
+FLAG_FROM_ESTADO = {
+    "CALIFICANDO": "PRESUPUESTANDO",
+    "PRESUPUESTO_ENVIADO": "PRESUPUESTO_ENVIADO",
+    "ACEPTADO": "ACEPTADO",
+    "RECOMPRA": "RECOMPRA",
+    "PERDIDO": "PERDIDO",
+}
+
 
 class WhatsAppSendPayload(BaseModel):
     text: str
@@ -112,6 +127,55 @@ def _avatar_initials(display_name: str | None) -> str:
     return (parts[0][:1] + parts[1][:1]).upper()
 
 
+def _lead_operational_estado(estado: str | None) -> str:
+    normalized = str(estado or "").strip().upper()
+    if normalized in ESTADO_INITIALS:
+        return normalized
+    return "CONSULTA_NUEVA"
+
+
+def _lead_flag_value(flag: str | None, estado: str | None) -> str | None:
+    normalized_flag = str(flag or "").strip().upper()
+    if normalized_flag:
+        return normalized_flag
+    normalized_estado = str(estado or "").strip().upper()
+    return FLAG_FROM_ESTADO.get(normalized_estado)
+
+
+def _flag_css_class(flag: str | None) -> str:
+    normalized = str(flag or "").strip().upper()
+    mapping = {
+        "PRESUPUESTANDO": "flag-presupuestando",
+        "PRESUPUESTO_ENVIADO": "flag-enviado",
+        "ACEPTADO": "flag-aceptado",
+        "RECOMPRA": "flag-recompra",
+        "PERDIDO": "flag-perdido",
+    }
+    return mapping.get(normalized, "")
+
+
+def _render_list_avatar(
+    display_name: str | None,
+    lead_id: int | None,
+    lead_estado: str | None,
+    lead_flag: str | None,
+) -> str:
+    if lead_id is None:
+        return f'<span class="wa-avatar" aria-hidden="true">{html_lib.escape(_avatar_initials(display_name))}</span>'
+
+    estado_key = _lead_operational_estado(lead_estado)
+    estado_initials = ESTADO_INITIALS.get(estado_key, "CN")
+    flag_value = _lead_flag_value(lead_flag, lead_estado)
+    flag_class = _flag_css_class(flag_value)
+    flag_html = f'<span class="avatar-flag {flag_class}"></span>' if flag_class else ""
+    return (
+        '<span class="avatar-wrapper" aria-hidden="true">'
+        f'<span class="avatar-main">{html_lib.escape(estado_initials)}</span>'
+        f"{flag_html}"
+        "</span>"
+    )
+
+
 def _status_indicator(status: str | None) -> str:
     normalized = str(status or "").strip().lower()
     if normalized == "sent":
@@ -156,6 +220,8 @@ def _render_list_item(
     wa_id: str,
     display_name: str | None,
     lead_id: int | None,
+    lead_estado: str | None,
+    lead_flag: str | None,
     unread_count: int,
     last_message_at,
     preview: str,
@@ -168,12 +234,13 @@ def _render_list_item(
     unread = int(unread_count or 0)
     badge = f'<span class="wa-chat-unread">{unread}</span>' if unread > 0 else ""
     lead_attr = "" if lead_id is None else str(int(lead_id))
+    avatar_html = _render_list_avatar(display_name, lead_id, lead_estado, lead_flag)
     return (
         f'<div class="wa-chat-row{active_cls}" data-wa-item="1" data-thread-id="{thread_id}" data-lead-id="{html_lib.escape(lead_attr, quote=True)}" '
         f'data-wa-id="{html_lib.escape(wa_id, quote=True)}" data-display-name="{html_lib.escape(name, quote=True)}" data-wa-unread="{unread}" '
         f'data-wa-text="{html_lib.escape((name + " " + wa_id + " " + item_preview).lower(), quote=True)}">'
         f'  <a class="wa-chat-item{active_cls}" href="/whatsapp/thread/{thread_id}">'
-        f'    <span class="wa-avatar" aria-hidden="true">{html_lib.escape(_avatar_initials(display_name))}</span>'
+        f"    {avatar_html}"
         f'    <span class="wa-chat-main">'
         f'      <span class="wa-chat-top">'
         f'        <span class="wa-chat-name">{html_lib.escape(name)}</span>'
@@ -1211,12 +1278,15 @@ def whatsapp_inbox(request: Request, db: Session = Depends(get_db)) -> HTMLRespo
             select(
                 WhatsAppThread.id.label("thread_id"),
                 WhatsAppThread.lead_id.label("lead_id"),
+                Lead.estado.label("lead_estado"),
+                Lead.flag.label("lead_flag"),
                 WhatsAppContact.wa_id.label("wa_id"),
                 WhatsAppContact.display_name.label("display_name"),
                 WhatsAppThread.unread_count.label("unread_count"),
                 WhatsAppThread.last_message_at.label("last_message_at"),
             )
             .join(WhatsAppContact, WhatsAppThread.contact_id == WhatsAppContact.id)
+            .outerjoin(Lead, WhatsAppThread.lead_id == Lead.id)
             .order_by(WhatsAppThread.last_message_at.desc().nullslast(), WhatsAppThread.id.desc())
         ).all()
         thread_ids = [int(r.thread_id) for r in rows]
@@ -1245,6 +1315,8 @@ def whatsapp_inbox(request: Request, db: Session = Depends(get_db)) -> HTMLRespo
                     wa_id=r.wa_id or "-",
                     display_name=r.display_name,
                     lead_id=r.lead_id,
+                    lead_estado=r.lead_estado,
+                    lead_flag=r.lead_flag,
                     unread_count=int(r.unread_count or 0),
                     last_message_at=r.last_message_at,
                     preview=preview,
@@ -1294,12 +1366,15 @@ def whatsapp_thread(thread_id: str, request: Request, db: Session = Depends(get_
             select(
                 WhatsAppThread.id.label("thread_id"),
                 WhatsAppThread.lead_id.label("lead_id"),
+                Lead.estado.label("lead_estado"),
+                Lead.flag.label("lead_flag"),
                 WhatsAppContact.wa_id.label("wa_id"),
                 WhatsAppContact.display_name.label("display_name"),
                 WhatsAppThread.unread_count.label("unread_count"),
                 WhatsAppThread.last_message_at.label("last_message_at"),
             )
             .join(WhatsAppContact, WhatsAppThread.contact_id == WhatsAppContact.id)
+            .outerjoin(Lead, WhatsAppThread.lead_id == Lead.id)
             .order_by(WhatsAppThread.last_message_at.desc().nullslast(), WhatsAppThread.id.desc())
         ).all()
         list_thread_ids = [int(r.thread_id) for r in list_rows]
@@ -1327,6 +1402,8 @@ def whatsapp_thread(thread_id: str, request: Request, db: Session = Depends(get_
                 wa_id=r.wa_id or "-",
                 display_name=r.display_name,
                 lead_id=r.lead_id,
+                lead_estado=r.lead_estado,
+                lead_flag=r.lead_flag,
                 unread_count=int(r.unread_count or 0),
                 last_message_at=r.last_message_at,
                 preview=item_preview,

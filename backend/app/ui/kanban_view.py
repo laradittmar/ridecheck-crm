@@ -3050,7 +3050,7 @@ def render_calendar_page(
     next_monday = week_start + timedelta(days=7)
 
     def day_label(d: date) -> str:
-        labels = ["Lun", "Mar", "Mi-", "Jue", "Vie", "S-b", "Dom"]
+        labels = ["Lun", "Mar", "Mie", "Jue", "Vie", "Sab", "Dom"]
         return f"{labels[d.weekday()]} {d.strftime('%d/%m')}"
 
     profesionales = profesionales or []
@@ -3091,13 +3091,79 @@ def render_calendar_page(
       .calAppt:hover { box-shadow: var(--shadow2); }
       .calAppt.past { background:#f3f4f6; border-color:#d1d5db; color:#6b7280; }
       .calAppt.future-ok { background:#ecfdf3; border-color:#86efac; }
-      .calAppt.future-pending { background:#fee2e2; border-color:#fca5a5; }
-      .calApptApproval { display:flex; align-items:stretch; gap:0; margin:4px 0 4px -4px; }
-      .calStatusRibbon { flex:0 0 48px; width:48px; border-radius:10px 0 0 10px; background:linear-gradient(180deg, #fff9ef 0%, #f7edd3 100%); color:#cb8b08; display:flex; align-items:center; justify-content:center; padding:6px 0; box-shadow: inset -1px 0 0 rgba(255,255,255,.82), 10px 0 14px rgba(123, 92, 29, .12); border-right:1px solid rgba(207, 148, 27, .28); }
-      .calStatusRibbonText { display:flex; flex-direction:column; align-items:center; justify-content:center; gap:3px; min-width:74px; transform:rotate(-90deg); transform-origin:center; white-space:nowrap; }
-      .calStatusRibbonWord { display:block; font-size:8px; font-weight:900; letter-spacing:.16em; text-transform:uppercase; line-height:1.05; text-align:center; }
-      .calApptBody { min-width:0; flex:1 1 auto; }
-      .calApptApproval .calApptBody { padding-left:8px; }
+      
+      .calAppt {
+        display: block;
+        text-decoration: none;
+        color: inherit;
+        background: #fff;
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 4px;
+        margin-bottom: 8px;
+        box-shadow: var(--shadow);
+        }
+
+      .calAppt.future-pending {
+        background: #fee2e2;
+        border-color: #fca5a5;
+        }
+
+      .calApptApproval {
+        display: flex;
+       align-items: stretch;
+        gap: 0;
+        margin: 0;
+        min-height: 92px;
+        }
+
+    .calStatusRibbon {
+      position: relative;
+      flex: 0 0 26px;
+      width: 26px;
+      margin: 1px 0 1px 1px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 8px 0 0 8px;
+      background: linear-gradient(180deg, #fffdf4 0%, #f8efcf 100%);
+      color: #c58a00;
+      border-right: 1px solid rgba(207, 148, 27, .18);
+      box-shadow: none;
+      overflow: hidden;
+        }
+
+    .calStatusRibbonInner {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%) rotate(-90deg);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 2px;
+      white-space: nowrap;
+        }
+
+    .calStatusRibbonWord {
+      display: block;
+      font-size: 7px;
+      line-height: 1;
+      font-weight: 800;
+      letter-spacing: .05em;
+      text-transform: uppercase;
+      text-align: center;
+      color: #b88200;
+      text-shadow: 0 1px 1px rgba(0,0,0,0.2);
+        }
+
+    .calApptApproval .calApptBody {
+      flex: 1 1 auto;
+      min-width: 0;
+      padding: 2px 8px 2px 6px;
+        }
+      .calApptApproval .calApptBody { padding-left: 8px; }
       .calMeta { font-size:12px; color: var(--muted); }
       .calRow { display:flex; justify-content:space-between; gap:8px; align-items:center; min-width:0; }
       .calMetaVehicle { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
@@ -3225,7 +3291,10 @@ def render_calendar_page(
                     approval_prefix = (
                         '<div class="calApptApproval">'
                         '<div class="calStatusRibbon">'
-                        '<span class="calStatusRibbonText"><span class="calStatusRibbonWord">ESPERANDO</span><span class="calStatusRibbonWord">APROBACI&Oacute;N</span></span>'
+                        '<div class="calStatusRibbonInner">'
+                        '<span class="calStatusRibbonWord">ESPERANDO</span>'
+                        '<span class="calStatusRibbonWord">APROBACI&Oacute;N</span>'
+                        "</div>"
                         "</div>"
                         '<div class="calApptBody">'
                     )

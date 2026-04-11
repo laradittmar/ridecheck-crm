@@ -26,7 +26,8 @@ def upsert_thread_state(
         db.add(state)
 
     for field, value in payload.model_dump(exclude_unset=True).items():
-        setattr(state, field, value)
+        if value is not None:
+            setattr(state, field, value)
 
     try:
         db.commit()
