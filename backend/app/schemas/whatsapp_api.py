@@ -21,6 +21,10 @@ class WhatsAppThreadLinkIn(BaseModel):
     lead_id: int
 
 
+class WhatsAppThreadDisplayNamePatch(BaseModel):
+    display_name: str
+
+
 class WhatsAppMessageOut(BaseModel):
     id: int
     thread_id: int

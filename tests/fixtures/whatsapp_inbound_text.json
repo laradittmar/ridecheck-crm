@@ -15,16 +15,16 @@
             "contacts": [
               {
                 "profile": { "name": "" },
-                "wa_id": "5491112345735"
+                "wa_id": "5491112345736"
               }
             ],
             "messages": [
               {
-                "from": "5491112345735",
-                "id": "wamid.TEST_20260220_232500_286",
-                "timestamp": "1775944990",
+                "from": "5491112345736",
+                "id": "wamid.TEST_20260220_232500_289",
+                "timestamp": "1775948770",
                 "type": "text",
-                "text": { "body": "Jueves 9:30hs" }
+                "text": { "body": "Okay, 13hs" }
               }
             ]
           }

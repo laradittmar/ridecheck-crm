@@ -19,6 +19,7 @@ from ..schemas.whatsapp_api import (
     WhatsAppThreadCandidateCreate,
     WhatsAppThreadCandidatePatch,
     WhatsAppThreadCandidateRead,
+    WhatsAppThreadDisplayNamePatch,
     WhatsAppSendTextIn,
     WhatsAppSendTextOut,
     WhatsAppThreadStatePatch,
@@ -77,6 +78,33 @@ def get_thread_state(thread_id: int, db: Session = Depends(get_db)):
 def patch_thread_state(thread_id: int, payload: WhatsAppThreadStatePatch, db: Session = Depends(get_db)):
     thread = _require_thread(db, thread_id)
     return upsert_thread_state(db=db, thread=thread, payload=payload)
+
+
+@router.patch("/thread/{thread_id}/display-name", response_model=WhatsAppThreadOut)
+def patch_thread_display_name(
+    thread_id: int,
+    payload: WhatsAppThreadDisplayNamePatch,
+    db: Session = Depends(get_db),
+):
+    new_name = (payload.display_name or "").strip()
+    if not new_name:
+        raise HTTPException(status_code=400, detail="display_name is required")
+
+    thread_data = db.execute(
+        select(WhatsAppThread, WhatsAppContact)
+        .join(WhatsAppContact, WhatsAppThread.contact_id == WhatsAppContact.id)
+        .where(WhatsAppThread.id == thread_id)
+    ).first()
+    if thread_data is None:
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+    contact = thread_data[1]
+    contact.display_name = new_name
+    commit_or_400(db, detail="No se pudo actualizar el nombre del chat")
+    refreshed = load_thread_payload(db, thread_id)
+    if refreshed is None:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    return refreshed
 
 
 @router.get("/thread/{thread_id}/candidates", response_model=list[WhatsAppThreadCandidateRead])
