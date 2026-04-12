@@ -146,6 +146,10 @@ def _base_css(extra_css: str = "") -> str:
       .nav a{{
         display:flex; align-items:center; gap:10px; padding:10px 10px; border-radius:10px; color:#e5e7eb; text-decoration:none; margin-bottom:8px;
       }}
+      .nav {{
+        padding-bottom:12px;
+        border-bottom:1px solid rgba(255,255,255,.16);
+      }}
       .navIcon{{ display:inline-flex; color:#fff; }}
       .waNavIcon{{ display:flex; align-items:center; justify-content:center; line-height:0; }}
       .navIcon svg{{ width:18px; height:18px; display:block; }}
@@ -158,6 +162,7 @@ def _base_css(extra_css: str = "") -> str:
       .sidebarFooter {{
         margin-top:auto;
         padding-top:12px;
+        padding-bottom:18px;
         border-top:1px solid rgba(255,255,255,.16);
       }}
       .sidebarAiBlock {{

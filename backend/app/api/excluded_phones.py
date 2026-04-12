@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import re
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -36,7 +37,8 @@ class ExcludedPhoneCheckResult(BaseModel):
 
 
 def _normalize_phone(phone: str) -> str:
-    normalized = str(phone or "").strip()
+    raw = str(phone or "").strip()
+    normalized = re.sub(r"\D+", "", raw)
     if not normalized:
         raise HTTPException(status_code=400, detail="Phone is required")
     if len(normalized) > 40:
