@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select
 
 from ..models import Agencia, Lead, Revision, ViaticosZone, Profesional, Vendedor
-from .components import render_sidebar_nav, render_whatsapp_icon_svg
+from .components import render_sidebar_ai_block, render_sidebar_ai_script, render_sidebar_nav, render_whatsapp_icon_svg
 
 logger = logging.getLogger(__name__)
 
@@ -67,11 +67,13 @@ def _sidebar_user_block(user_email: str) -> str:
     safe_email = html_lib.escape((user_email or "").strip() or "admin")
     return f"""
       <div class="sidebarFooter">
+        {render_sidebar_ai_block()}
         <div class="sidebarUser">{safe_email}</div>
         <form method="post" action="/logout">
           <button class="logoutBtn" type="submit">Log Out</button>
         </form>
       </div>
+      {render_sidebar_ai_script()}
     """
 
 
@@ -133,6 +135,8 @@ def _base_css(extra_css: str = "") -> str:
       .sidebar{{
         width: 232px; background:#111827; color:#fff; padding:12px; position:sticky; top:0; height:100vh;
         transition: width .15s ease;
+        display:flex;
+        flex-direction:column;
       }}
       .sidebar.collapsed{{ width:68px; }}
       .brandRow{{ display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:12px; }}
@@ -156,6 +160,98 @@ def _base_css(extra_css: str = "") -> str:
         padding-top:12px;
         border-top:1px solid rgba(255,255,255,.16);
       }}
+      .sidebarAiBlock {{
+        display:flex;
+        flex-direction:column;
+        gap:8px;
+        margin-bottom:14px;
+      }}
+      .sidebarAiTitle {{
+        font-size:12px;
+        font-weight:700;
+        letter-spacing:.2px;
+        color:#f9fafb;
+      }}
+      .sidebarAiSubtitle {{
+        font-size:11px;
+        line-height:1.35;
+        color:rgba(255,255,255,.8);
+      }}
+      .sidebarAiToggle {{
+        position:relative;
+        width:54px;
+        height:30px;
+        border:none;
+        border-radius:999px;
+        background:#ef4444;
+        color:#fff;
+        cursor:pointer;
+        transition: background .18s ease, opacity .18s ease, box-shadow .18s ease;
+        box-shadow: inset 0 0 0 1px rgba(255,255,255,.12);
+      }}
+      .sidebarAiToggle:hover:not(:disabled) {{
+        box-shadow: inset 0 0 0 1px rgba(255,255,255,.18), 0 4px 10px rgba(0,0,0,.18);
+      }}
+      .sidebarAiToggle:focus-visible {{
+        outline:2px solid rgba(255,255,255,.85);
+        outline-offset:2px;
+      }}
+      .sidebarAiToggle:disabled {{
+        cursor:wait;
+      }}
+      .sidebarAiToggle.is-on {{
+        background:#22c55e;
+      }}
+      .sidebarAiToggle.is-off {{
+        background:#ef4444;
+      }}
+      .sidebarAiToggle.is-loading {{
+        opacity:.7;
+      }}
+      .sidebarAiGlyph {{
+        position:absolute;
+        top:50%;
+        transform:translateY(-50%);
+        font-size:12px;
+        font-weight:700;
+        line-height:1;
+        opacity:.7;
+        pointer-events:none;
+      }}
+      .sidebarAiGlyphOff {{
+        right:10px;
+      }}
+      .sidebarAiGlyphOn {{
+        left:10px;
+      }}
+      .sidebarAiToggle.is-on .sidebarAiGlyphOff {{
+        opacity:0;
+      }}
+      .sidebarAiToggle.is-off .sidebarAiGlyphOn {{
+        opacity:0;
+      }}
+      .sidebarAiKnob {{
+        position:absolute;
+        top:3px;
+        left:3px;
+        width:24px;
+        height:24px;
+        border-radius:50%;
+        background:#fff;
+        box-shadow:0 2px 8px rgba(15,23,42,.28);
+        transition: transform .18s ease;
+      }}
+      .sidebarAiToggle.is-on .sidebarAiKnob {{
+        transform:translateX(24px);
+      }}
+      .sidebarAiStatus {{
+        min-height:14px;
+        font-size:10px;
+        color:rgba(255,255,255,.72);
+      }}
+      .sidebarAiStatus.is-error {{
+        color:#fca5a5;
+      }}
       .sidebarUser {{
         font-size:12px;
         color:#d1d5db;
@@ -174,6 +270,9 @@ def _base_css(extra_css: str = "") -> str:
         cursor:pointer;
       }}
       .logoutBtn:hover {{ background: rgba(255,255,255,.1); }}
+      .sidebar.collapsed .sidebarAiBlock {{
+        display:none;
+      }}
       .sidebar.collapsed .sidebarFooter {{ display:none; }}
       .main{{
         flex:1; padding:clamp(18px, 1vw, 28px);

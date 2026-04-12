@@ -10,11 +10,30 @@
     * { box-sizing:border-box; }
     body { margin:0; font-family:Arial,sans-serif; background:var(--bg); color:var(--text); }
     .layout { display:grid; grid-template-columns:260px 1fr; min-height:100vh; }
-    .sidebar { background:var(--sidebar); color:var(--sidebarText); padding:14px 12px; }
+    .sidebar { background:var(--sidebar); color:var(--sidebarText); padding:14px 12px; display:flex; flex-direction:column; }
     .brand { font-weight:700; letter-spacing:.4px; margin:2px 8px 14px; }
     .nav a { display:flex; gap:8px; align-items:center; color:var(--sidebarText); text-decoration:none; padding:10px 12px; border-radius:10px; margin:2px 0; font-size:14px; }
     .nav a:hover, .nav a.active { background:rgba(255,255,255,.12); }
-    .sidebarFooter { margin-top:18px; padding:10px 12px; border-top:1px solid rgba(255,255,255,.15); font-size:12px; color:#cbd5e1; word-break:break-word; }
+    .sidebarFooter { margin-top:auto; padding:10px 12px; border-top:1px solid rgba(255,255,255,.15); font-size:12px; color:#cbd5e1; word-break:break-word; }
+    .sidebarAiBlock { display:flex; flex-direction:column; gap:8px; margin-bottom:14px; }
+    .sidebarAiTitle { font-size:12px; font-weight:700; letter-spacing:.2px; color:#f9fafb; }
+    .sidebarAiSubtitle { font-size:11px; line-height:1.35; color:rgba(255,255,255,.8); }
+    .sidebarAiToggle { position:relative; width:54px; height:30px; border:none; border-radius:999px; background:#ef4444; color:#fff; cursor:pointer; transition:background .18s ease, opacity .18s ease, box-shadow .18s ease; box-shadow:inset 0 0 0 1px rgba(255,255,255,.12); }
+    .sidebarAiToggle:hover:not(:disabled) { box-shadow:inset 0 0 0 1px rgba(255,255,255,.18), 0 4px 10px rgba(0,0,0,.18); }
+    .sidebarAiToggle:focus-visible { outline:2px solid rgba(255,255,255,.85); outline-offset:2px; }
+    .sidebarAiToggle:disabled { cursor:wait; }
+    .sidebarAiToggle.is-on { background:#22c55e; }
+    .sidebarAiToggle.is-off { background:#ef4444; }
+    .sidebarAiToggle.is-loading { opacity:.7; }
+    .sidebarAiGlyph { position:absolute; top:50%; transform:translateY(-50%); font-size:12px; font-weight:700; line-height:1; opacity:.7; pointer-events:none; }
+    .sidebarAiGlyphOff { right:10px; }
+    .sidebarAiGlyphOn { left:10px; }
+    .sidebarAiToggle.is-on .sidebarAiGlyphOff { opacity:0; }
+    .sidebarAiToggle.is-off .sidebarAiGlyphOn { opacity:0; }
+    .sidebarAiKnob { position:absolute; top:3px; left:3px; width:24px; height:24px; border-radius:50%; background:#fff; box-shadow:0 2px 8px rgba(15,23,42,.28); transition:transform .18s ease; }
+    .sidebarAiToggle.is-on .sidebarAiKnob { transform:translateX(24px); }
+    .sidebarAiStatus { min-height:14px; font-size:10px; color:rgba(255,255,255,.72); }
+    .sidebarAiStatus.is-error { color:#fca5a5; }
     .main { padding:18px; }
     .card { background:var(--panel); border:1px solid var(--border); border-radius:12px; overflow:auto; }
     .title { margin:0 0 12px; font-size:20px; }
@@ -38,7 +57,27 @@
         <a href="/whatsapp/inbox"><span>WhatsApp Inbox</span></a>
         <a href="/integrations/whatsapp/debug" class="active"><span>WhatsApp</span> <span class="muted">Debug</span></a>
       </nav>
-      <div class="sidebarFooter">{{ user_email or "" }}</div>
+      <div class="sidebarFooter">
+        <div class="sidebarAiBlock" data-ai-control="1">
+          <div class="sidebarAiTitle">IA</div>
+          <div class="sidebarAiSubtitle">Respuesta + Cotizador + Turnero</div>
+          <button
+            type="button"
+            class="sidebarAiToggle is-loading"
+            data-ai-toggle="1"
+            role="switch"
+            aria-checked="false"
+            aria-label="Activar o desactivar IA"
+            disabled
+          >
+            <span class="sidebarAiGlyph sidebarAiGlyphOff" aria-hidden="true">&#10005;</span>
+            <span class="sidebarAiGlyph sidebarAiGlyphOn" aria-hidden="true">&#10003;</span>
+            <span class="sidebarAiKnob" aria-hidden="true"></span>
+          </button>
+          <div class="sidebarAiStatus" data-ai-status="1" aria-live="polite"></div>
+        </div>
+        <div>{{ user_email or "" }}</div>
+      </div>
     </aside>
     <main class="main">
       <h1 class="title">WhatsApp Debug</h1>
@@ -108,5 +147,100 @@
       </div>
     </main>
   </div>
+  <script>
+    (function () {
+      function setAiToggleState(toggle, enabled, loading) {
+        toggle.classList.toggle("is-on", !!enabled);
+        toggle.classList.toggle("is-off", !enabled);
+        toggle.classList.toggle("is-loading", !!loading);
+        toggle.setAttribute("aria-checked", enabled ? "true" : "false");
+        toggle.disabled = !!loading;
+      }
+
+      function initSidebarAi() {
+        var toggle = document.querySelector("[data-ai-toggle='1']");
+        if (!toggle) return;
+
+        var block = toggle.closest("[data-ai-control='1']");
+        var status = block ? block.querySelector("[data-ai-status='1']") : null;
+        var currentValue = null;
+        var inFlight = false;
+
+        function setStatus(message, isError) {
+          if (!status) return;
+          status.textContent = message || "";
+          status.classList.toggle("is-error", !!isError);
+        }
+
+        function applyValue(nextValue, loading) {
+          currentValue = !!nextValue;
+          setAiToggleState(toggle, currentValue, loading);
+        }
+
+        function loadState() {
+          setStatus("", false);
+          setAiToggleState(toggle, false, true);
+          fetch("/api/settings/ai-enabled", {
+            method: "GET",
+            headers: { "Accept": "application/json" },
+            credentials: "same-origin"
+          })
+            .then(function (resp) {
+              if (!resp.ok) throw new Error("load_failed");
+              return resp.json();
+            })
+            .then(function (data) {
+              applyValue(!!(data && data.ai_enabled), false);
+            })
+            .catch(function () {
+              applyValue(false, false);
+              setStatus("No se pudo cargar", true);
+            });
+        }
+
+        toggle.addEventListener("click", function () {
+          if (inFlight || currentValue === null) return;
+
+          var previousValue = currentValue;
+          var nextValue = !previousValue;
+          inFlight = true;
+          applyValue(nextValue, true);
+          setStatus("", false);
+
+          fetch("/api/settings/ai-enabled", {
+            method: "PATCH",
+            headers: {
+              "Accept": "application/json",
+              "Content-Type": "application/json"
+            },
+            credentials: "same-origin",
+            body: JSON.stringify({ ai_enabled: nextValue })
+          })
+            .then(function (resp) {
+              if (!resp.ok) throw new Error("patch_failed");
+              return resp.json();
+            })
+            .then(function (data) {
+              applyValue(!!(data && data.ai_enabled), false);
+            })
+            .catch(function () {
+              applyValue(previousValue, false);
+              setStatus("No se pudo actualizar", true);
+            })
+            .finally(function () {
+              inFlight = false;
+            });
+        });
+
+        loadState();
+      }
+
+      if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", initSidebarAi, { once: true });
+      } else {
+        initSidebarAi();
+      }
+    })();
+  </script>
 </body>
 </html>
