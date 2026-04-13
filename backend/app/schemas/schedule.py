@@ -49,3 +49,9 @@ class ScheduleSlotsOut(BaseModel):
     business_hours: str
     slots: list[str]
     rules_applied: list[str] = []
+
+
+class ScheduleAppointmentOut(BaseModel):
+    time: str
+    address: str
+    source: str

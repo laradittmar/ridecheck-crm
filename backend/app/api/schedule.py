@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from ..db import get_db
-from ..schemas.schedule import ScheduleCheckIn, ScheduleCheckOut, ScheduleSlotsOut
+from ..schemas.schedule import ScheduleAppointmentOut, ScheduleCheckIn, ScheduleCheckOut, ScheduleSlotsOut
 from ..services.schedule import ScheduleService
 
 router = APIRouter(prefix="/api/schedule", tags=["schedule"])
@@ -46,3 +46,11 @@ def list_schedule_slots(
         exclude_revision_id=exclude_revision_id,
     )
     return service.list_slots(payload)
+
+
+@router.get("/appointments-that-day", response_model=list[ScheduleAppointmentOut])
+def list_appointments_that_day(
+    date: date,
+    service: ScheduleService = Depends(get_schedule_service),
+):
+    return service.list_appointments_that_day(date)

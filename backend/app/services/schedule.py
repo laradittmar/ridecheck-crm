@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from ..models import Revision, ThreadRevision
 from ..schemas.schedule import (
+    ScheduleAppointmentOut,
     ScheduleCheckIn,
     ScheduleCheckOut,
     ScheduleConflictOut,
@@ -185,6 +186,41 @@ class ScheduleService:
             rules_applied=rules_applied,
         )
 
+    def list_appointments_that_day(self, scheduled_day: date) -> list[ScheduleAppointmentOut]:
+        appointments: list[ScheduleAppointmentOut] = []
+
+        revisions = self.db.execute(
+            select(Revision)
+            .where(Revision.turno_fecha == scheduled_day)
+            .where(Revision.turno_hora.is_not(None))
+            .where(Revision.estado_revision != "CANCELADO")
+        ).scalars().all()
+        for revision in revisions:
+            appointments.append(
+                ScheduleAppointmentOut(
+                    time=revision.turno_hora.strftime("%H:%M"),
+                    address=self._revision_address(revision),
+                    source="revision",
+                )
+            )
+
+        thread_revisions = self.db.execute(
+            select(ThreadRevision)
+            .where(ThreadRevision.scheduled_date == scheduled_day)
+            .where(ThreadRevision.scheduled_time.is_not(None))
+            .where(ThreadRevision.status.in_(("booked", "completed")))
+        ).scalars().all()
+        for revision in thread_revisions:
+            appointments.append(
+                ScheduleAppointmentOut(
+                    time=revision.scheduled_time.strftime("%H:%M"),
+                    address=(revision.address or "").strip() or "-",
+                    source="thread_revision",
+                )
+            )
+
+        return sorted(appointments, key=lambda item: (item.time, item.source, item.address))
+
     def _load_occupied_slots(self, preferred_day: date, exclude_revision_id: int | None = None) -> list[OccupiedSlot]:
         slots: list[OccupiedSlot] = []
 
@@ -256,6 +292,16 @@ class ScheduleService:
         if self._is_priority_zone(payload) and candidate.time() >= PRIORITY_CUTOFF:
             return False
         return not any(candidate < slot.end and candidate_end > slot.start for slot in occupied_slots)
+
+    @staticmethod
+    def _revision_address(revision: Revision) -> str:
+        parts = [
+            str(revision.direccion_texto or "").strip(),
+            str(revision.zone_detail or "").strip(),
+            str(revision.zone_group or "").strip(),
+        ]
+        clean_parts = [part for part in parts if part]
+        return ", ".join(clean_parts) if clean_parts else "-"
 
     @staticmethod
     def _travel_minutes(distance_km: float | None) -> int:
