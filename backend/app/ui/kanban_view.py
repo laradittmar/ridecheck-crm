@@ -648,6 +648,7 @@ def _base_css(extra_css: str = "") -> str:
       .revHeadLine2 .pill-prof {{ max-width:100%; }}
       .revHeadLine3 {{ display:flex; align-items:center; gap:8px; min-width:0; max-width:100%; flex-wrap:wrap; overflow:hidden; }}
       .revEstadoPill {{ background:#eef2ff; border-color:#c7d2fe; color:#1e3a8a; }}
+      .revApprovalRow {{ display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }}
 
       .label {{ font-size: var(--font-sm); color:#374151; margin-bottom: 4px; }}
       .small {{ font-size: var(--font-sm); }}
@@ -1957,6 +1958,20 @@ def render_page(
               method: "POST",
               headers: { "Content-Type": "application/x-www-form-urlencoded" },
               body: body.toString(),
+            });
+          }
+
+          function updateAppointmentApproval(revisionId, status) {
+            if (!revisionId || !status) return;
+            return fetch("/api/revisions/" + revisionId + "/appointment-approval", {
+              method: "PATCH",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ status: status }),
+            }).then(function (resp) {
+              if (!resp.ok) throw new Error("No se pudo actualizar la aprobacion del turno");
+              window.location.reload();
+            }).catch(function (err) {
+              window.alert(err && err.message ? err.message : "No se pudo actualizar la aprobacion del turno");
             });
           }
 
@@ -4201,6 +4216,17 @@ def render_revisions_block(
                 agencia_txt = _txt(getattr(r.agencia, "nombre_agencia", None))
             elif getattr(r, "agencia_id", None):
                 agencia_txt = str(getattr(r, "agencia_id"))
+            approval_status = _val(getattr(r, "appointment_approval_status", None)).upper()
+            approval_html = ""
+            if approval_status == "PENDING":
+                approval_html = f"""
+                  <div class="revApprovalRow">
+                    <button class="btn btn-sm btn-primary" type="button" onclick="updateAppointmentApproval({r.id}, 'APPROVED')">✓ Confirmar turno</button>
+                    <button class="btn btn-sm btn-danger" type="button" onclick="updateAppointmentApproval({r.id}, 'REJECTED')">✗ Rechazar turno</button>
+                  </div>
+                """
+            elif approval_status == "APPROVED":
+                approval_html = '<div class="revApprovalRow"><span class="pill pill-prof">✓ Turno confirmado</span></div>'
 
             chunks.append(f"""
               <div class="rev" id="rev-{l.id}-{r.id}">
@@ -4242,6 +4268,7 @@ def render_revisions_block(
                   <div class="muted small">Inicio: {turno_txt}</div>
                   <div class="muted small">Cliente presente: {("SI" if r.cliente_presente else ("NO" if r.cliente_presente is False else "-"))}</div>
                   <div class="muted small">Notas: {_txt(r.turno_notas)}</div>
+                  {approval_html}
                 </div>
 
                 <div class="box">

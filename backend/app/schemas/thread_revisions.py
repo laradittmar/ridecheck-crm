@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 
 ThreadRevisionStatus = Literal["draft", "collecting_data", "booked", "completed"]
+AppointmentApprovalStatus = Literal["PENDING", "APPROVED", "REJECTED"]
 
 
 class ThreadRevisionCreateIn(BaseModel):
@@ -33,6 +34,8 @@ class ThreadRevisionPatch(BaseModel):
     modelo: str | None = Field(default=None, max_length=50)
     anio: int | None = None
     publication_url: str | None = None
+    appointment_approval_status: AppointmentApprovalStatus | None = None
+    appointment_approval_sent_at: datetime | None = None
 
 
 class ThreadRevisionOut(BaseModel):
@@ -53,6 +56,10 @@ class ThreadRevisionOut(BaseModel):
     modelo: str | None = None
     anio: int | None = None
     publication_url: str | None = None
+    appointment_approval_status: str | None = None
+    appointment_approval_token: str | None = None
+    appointment_approval_sent_at: datetime | None = None
+    appointment_approved_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
 

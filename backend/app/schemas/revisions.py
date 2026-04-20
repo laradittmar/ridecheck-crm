@@ -1,5 +1,6 @@
 # app/schemas/revisions.py
 from datetime import datetime, date, time
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -83,6 +84,10 @@ class RevisionUpdate(RevisionCreate):
     recalcular_presupuesto: bool = True
 
 
+class RevisionAppointmentApprovalUpdate(BaseModel):
+    status: Literal["APPROVED", "REJECTED"]
+
+
 class RevisionOut(BaseModel):
     id: int
     lead_id: int
@@ -123,6 +128,10 @@ class RevisionOut(BaseModel):
     estado_revision: str
     resultado: str | None = None
     motivo_rechazo: str | None = None
+    appointment_approval_status: str | None = None
+    appointment_approval_token: str | None = None
+    appointment_approval_sent_at: datetime | None = None
+    appointment_approved_at: datetime | None = None
 
     class Config:
         from_attributes = True

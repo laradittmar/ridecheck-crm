@@ -15,7 +15,8 @@ from sqlalchemy.orm import Session
 from .api.leads import router as leads_router
 from .api.excluded_phones import router as excluded_phones_router
 from .api.pricing import router as pricing_router
-from .api.revision_items import router as revision_items_router
+from .api.routes.public_approval import router as public_approval_router
+from .api.revision_items import api_router as revision_items_api_router, router as revision_items_router
 from .api.revisions import router as revisions_router
 from .api.schedule import router as schedule_router
 from .api.settings import router as settings_router
@@ -406,7 +407,9 @@ def validate_whatsapp_settings() -> None:
 app.include_router(leads_router)
 app.include_router(excluded_phones_router)
 app.include_router(pricing_router)
+app.include_router(public_approval_router)
 app.include_router(revision_items_router)
+app.include_router(revision_items_api_router)
 app.include_router(revisions_router)
 app.include_router(thread_revisions_router)
 app.include_router(schedule_router)

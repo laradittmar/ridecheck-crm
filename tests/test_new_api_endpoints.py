@@ -16,6 +16,8 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from app.api.pricing import get_pricing_service, router as pricing_router
+from app.api.routes.public_approval import router as public_approval_router
+from app.api.revision_items import api_router as revision_items_api_router
 from app.api.schedule import get_schedule_service, router as schedule_router
 from app.api.thread_revisions import get_thread_revision_service, router as thread_revisions_router
 from app.db import get_db
@@ -93,6 +95,10 @@ class FakeThreadRevision:
         self.modelo = None
         self.anio = None
         self.publication_url = None
+        self.appointment_approval_status = None
+        self.appointment_approval_token = "approval-token"
+        self.appointment_approval_sent_at = None
+        self.appointment_approved_at = None
         self.created_at = datetime.now(timezone.utc)
         self.updated_at = datetime.now(timezone.utc)
 
@@ -105,6 +111,86 @@ class FakeThreadRevisionService:
 
     def patch_revision(self, revision_id: int, payload):
         return FakeThreadRevision()
+
+
+class FakePublicDb:
+    def __init__(self, revision=None):
+        self.revision = revision
+        self.committed = False
+
+    def get(self, model, revision_id: int):
+        if self.revision and revision_id == self.revision.id:
+            return self.revision
+        return None
+
+    def add(self, revision):
+        self.revision = revision
+
+    def commit(self):
+        self.committed = True
+
+
+class FakeLegacyRevision:
+    def __init__(self):
+        self.id = 55
+        self.lead_id = 9
+        self.created_at = datetime.now(timezone.utc)
+        self.tipo_vehiculo = None
+        self.marca = None
+        self.modelo = None
+        self.anio = None
+        self.link_compra = None
+        self.presupuesto_compra = None
+        self.vendedor_tipo = None
+        self.tipo_vendedor = None
+        self.agencia_id = None
+        self.compro = None
+        self.resultado_link = None
+        self.comision = None
+        self.cobrado = None
+        self.fecha_cobro = None
+        self.zone_group = None
+        self.zone_detail = None
+        self.direccion_texto = None
+        self.link_maps = None
+        self.direccion_estado = None
+        self.precio_base = None
+        self.viaticos = None
+        self.precio_total = None
+        self.pago = None
+        self.medio_pago = None
+        self.turno_fecha = None
+        self.turno_hora = None
+        self.cliente_presente = None
+        self.turno_notas = None
+        self.estado_revision = "PENDIENTE"
+        self.resultado = None
+        self.motivo_rechazo = None
+        self.appointment_approval_status = "PENDING"
+        self.appointment_approval_token = "legacy-token"
+        self.appointment_approval_sent_at = None
+        self.appointment_approved_at = None
+
+
+class FakeLegacyRevisionDb:
+    def __init__(self, revision=None):
+        self.revision = revision
+        self.committed = False
+        self.refreshed = False
+
+    def get(self, model, revision_id: int):
+        if self.revision and revision_id == self.revision.id:
+            return self.revision
+        return None
+
+    def commit(self):
+        self.committed = True
+
+    def rollback(self):
+        return None
+
+    def refresh(self, revision):
+        self.refreshed = True
 
 
 class NewApiEndpointTests(unittest.TestCase):
@@ -167,6 +253,63 @@ class NewApiEndpointTests(unittest.TestCase):
         self.assertEqual(create_response.json(), {"revision_id": 77})
         self.assertEqual(patch_response.status_code, 200)
         self.assertEqual(patch_response.json()["status"], "booked")
+
+    def test_public_approve_endpoint_updates_revision(self):
+        app = FastAPI()
+        app.include_router(public_approval_router)
+        revision = FakeThreadRevision()
+        db = FakePublicDb(revision=revision)
+        app.dependency_overrides[get_db] = lambda: db
+
+        with TestClient(app) as client:
+            response = client.post("/public/revisions/77/approve", params={"token": "approval-token"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Turno confirmado", response.text)
+        self.assertEqual(revision.appointment_approval_status, "APPROVED")
+        self.assertIsNotNone(revision.appointment_approved_at)
+        self.assertTrue(db.committed)
+
+    def test_public_reject_endpoint_validates_token(self):
+        app = FastAPI()
+        app.include_router(public_approval_router)
+        revision = FakeThreadRevision()
+        db = FakePublicDb(revision=revision)
+        app.dependency_overrides[get_db] = lambda: db
+
+        with TestClient(app) as client:
+            response = client.post("/public/revisions/77/reject", params={"token": "wrong-token"})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(revision.appointment_approval_status, None)
+        self.assertFalse(db.committed)
+
+    def test_revision_appointment_approval_endpoint_approves_without_touching_token(self):
+        app = FastAPI()
+        app.include_router(revision_items_api_router)
+        revision = FakeLegacyRevision()
+        db = FakeLegacyRevisionDb(revision=revision)
+        app.dependency_overrides[get_db] = lambda: db
+
+        with TestClient(app) as client:
+            response = client.patch("/api/revisions/55/appointment-approval", json={"status": "APPROVED"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["appointment_approval_status"], "APPROVED")
+        self.assertEqual(response.json()["appointment_approval_token"], "legacy-token")
+        self.assertIsNotNone(response.json()["appointment_approved_at"])
+        self.assertTrue(db.committed)
+
+    def test_revision_appointment_approval_endpoint_returns_404_for_missing_revision(self):
+        app = FastAPI()
+        app.include_router(revision_items_api_router)
+        db = FakeLegacyRevisionDb(revision=None)
+        app.dependency_overrides[get_db] = lambda: db
+
+        with TestClient(app) as client:
+            response = client.patch("/api/revisions/999/appointment-approval", json={"status": "REJECTED"})
+
+        self.assertEqual(response.status_code, 404)
 
 
 if __name__ == "__main__":

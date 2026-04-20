@@ -42,7 +42,7 @@ def upgrade() -> None:
     cols = {c["name"] for c in insp.get_columns(TABLE_NAME)}
     if "estado" in cols and COL_NAME in cols:
         for old_estado, flag_val in FLAG_FROM_ESTADO.items():
-            op.execute(
+            bind.execute(
                 sa.text(
                     f"""
                     UPDATE {TABLE_NAME}

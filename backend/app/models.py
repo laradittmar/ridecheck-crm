@@ -395,6 +395,10 @@ class ThreadRevision(Base):
     modelo: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     anio: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     publication_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    appointment_approval_status: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    appointment_approval_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, unique=True)
+    appointment_approval_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    appointment_approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

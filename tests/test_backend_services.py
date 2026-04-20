@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import sys
 import unittest
 from dataclasses import dataclass
@@ -151,6 +152,42 @@ class BackendServiceTests(unittest.TestCase):
         self.assertEqual(revision.status, "booked")
         self.assertEqual(revision.buyer_name, "Lara")
         self.assertEqual(revision.seller_name, "Agencia Norte")
+
+    def test_thread_revision_service_generates_token_when_pending_approval_is_set(self):
+        repository = FakeThreadRevisionRepository()
+        service = ThreadRevisionService(repository=repository)
+        sent_at = datetime(2026, 4, 20, 15, 30, tzinfo=timezone.utc)
+
+        revision = service.patch_revision(
+            revision_id=7,
+            payload=ThreadRevisionPatch(
+                appointment_approval_status="PENDING",
+                appointment_approval_sent_at=sent_at,
+            ),
+        )
+
+        self.assertEqual(revision.appointment_approval_status, "PENDING")
+        self.assertEqual(revision.appointment_approval_sent_at, sent_at)
+        self.assertIsNotNone(revision.appointment_approval_token)
+        self.assertGreaterEqual(len(revision.appointment_approval_token), 43)
+
+    def test_thread_revision_service_keeps_existing_token_when_approval_resolved(self):
+        repository = FakeThreadRevisionRepository()
+        repository.revision.appointment_approval_token = "existing-token"
+        repository.revision.appointment_approval_sent_at = datetime(2026, 4, 20, 12, 0, tzinfo=timezone.utc)
+        service = ThreadRevisionService(repository=repository)
+
+        revision = service.patch_revision(
+            revision_id=7,
+            payload=ThreadRevisionPatch(appointment_approval_status="APPROVED"),
+        )
+
+        self.assertEqual(revision.appointment_approval_status, "APPROVED")
+        self.assertEqual(revision.appointment_approval_token, "existing-token")
+        self.assertEqual(
+            revision.appointment_approval_sent_at,
+            datetime(2026, 4, 20, 12, 0, tzinfo=timezone.utc),
+        )
 
     def test_schedule_service_accepts_open_slot_and_adds_approval_tag(self):
         service = ScheduleService(db=FakeScheduleDb())

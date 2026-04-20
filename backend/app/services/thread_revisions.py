@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import secrets
 from datetime import datetime, timezone
 
 from fastapi import HTTPException
@@ -37,11 +38,19 @@ class ThreadRevisionService:
         if revision is None:
             raise HTTPException(status_code=404, detail="Revision not found")
 
+        patch_data = payload.model_dump(exclude_unset=True)
         changed = False
-        for field, value in payload.model_dump(exclude_unset=True).items():
+        for field, value in patch_data.items():
             if value is None:
                 continue
             setattr(revision, field, value)
+            changed = True
+
+        if (
+            patch_data.get("appointment_approval_status") == "PENDING"
+            and not revision.appointment_approval_token
+        ):
+            revision.appointment_approval_token = secrets.token_urlsafe(32)
             changed = True
 
         if changed:
