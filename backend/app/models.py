@@ -164,6 +164,10 @@ class Revision(Base):
     estado_revision: Mapped[str] = mapped_column(String(20), default="PENDIENTE")
     resultado: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     motivo_rechazo: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    appointment_approval_status: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    appointment_approval_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, unique=True)
+    appointment_approval_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    appointment_approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     lead: Mapped["Lead"] = relationship("Lead", back_populates="revisions")
     profesional: Mapped[Optional["Profesional"]] = relationship(

@@ -494,6 +494,9 @@ def _base_css(extra_css: str = "") -> str:
       .pill-veh {{ background:#eef2ff; border-color:#c7d2fe; }}
       .pill-count {{ background:#ecfeff; border-color:#a5f3fc; }}
       .pill-prof {{ background:#ecfdf3; border-color:#86efac; color:#166534; }}
+      .pill-approval-pending {{ background:#fffbeb; border-color:#fcd34d; color:#92400e; }}
+      .pill-approval-approved {{ background:#ecfdf3; border-color:#86efac; color:#166534; }}
+      .pill-approval-rejected {{ background:#fef2f2; border-color:#fca5a5; color:#991b1b; }}
       .leadIdBadge {{
         display:inline-flex;
         align-items:center;
@@ -649,6 +652,7 @@ def _base_css(extra_css: str = "") -> str:
       .revHeadLine3 {{ display:flex; align-items:center; gap:8px; min-width:0; max-width:100%; flex-wrap:wrap; overflow:hidden; }}
       .revEstadoPill {{ background:#eef2ff; border-color:#c7d2fe; color:#1e3a8a; }}
       .revApprovalRow {{ display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }}
+      .revApprovalRow {{ align-items:center; }}
 
       .label {{ font-size: var(--font-sm); color:#374151; margin-bottom: 4px; }}
       .small {{ font-size: var(--font-sm); }}
@@ -1094,6 +1098,87 @@ def _clean_str_like(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _revision_approval_status(rev: Revision) -> str | None:
+    explicit = (_val(getattr(rev, "appointment_approval_status", None)) or "").upper()
+    if explicit in {"PENDING", "APPROVED", "REJECTED"}:
+        return explicit
+    estado = (_val(getattr(rev, "estado_revision", None)) or "").upper()
+    if estado == "PENDIENTE" and getattr(rev, "turno_fecha", None):
+        return "PENDING"
+    return None
+
+
+def _revision_approval_tag(rev: Revision) -> str | None:
+    status = _revision_approval_status(rev)
+    if status == "PENDING":
+        return "Esperando aprobaciÃ³n"
+    if status == "APPROVED":
+        return "Turno confirmado"
+    if status == "REJECTED":
+        return "Turno rechazado"
+    explicit = _clean_str_like(getattr(rev, "approval_tag", None))
+    if explicit:
+        return explicit
+    return None
+
+
+def _render_revision_approval_ui(rev: Revision, include_actions: bool = False) -> str:
+    status = _revision_approval_status(rev)
+    if not status:
+        return ""
+    if status == "PENDING":
+        label_html = '<span class="pill pill-approval-pending">AprobaciÃ³n turno: pendiente</span>'
+        if include_actions:
+            return (
+                '<div class="revApprovalRow">'
+                f"{label_html}"
+                f'<button class="btn btn-sm btn-primary" type="button" onclick="updateAppointmentApproval({rev.id}, \'APPROVED\')">\u2713 Confirmar turno</button>'
+                f'<button class="btn btn-sm btn-danger" type="button" onclick="updateAppointmentApproval({rev.id}, \'REJECTED\')">\u2717 Rechazar turno</button>'
+                "</div>"
+            )
+        approval_tag = _revision_approval_tag(last_rev)
+        if approval_tag:
+            rev_lines.append(f"Aprobacion turno: {approval_tag}")
+        return f'<div class="revApprovalRow">{label_html}</div>'
+    if status == "APPROVED":
+        return '<div class="revApprovalRow"><span class="pill pill-approval-approved">\u2713 Turno confirmado</span></div>'
+    return '<div class="revApprovalRow"><span class="pill pill-approval-rejected">\u2717 Turno rechazado</span></div>'
+
+
+def _revision_approval_tag(rev: Revision) -> str | None:
+    status = _revision_approval_status(rev)
+    if status == "PENDING":
+        return "Esperando aprobacion"
+    if status == "APPROVED":
+        return "Turno confirmado"
+    if status == "REJECTED":
+        return "Turno rechazado"
+    explicit = _clean_str_like(getattr(rev, "approval_tag", None))
+    if explicit:
+        return explicit
+    return None
+
+
+def _render_revision_approval_ui(rev: Revision, include_actions: bool = False) -> str:
+    status = _revision_approval_status(rev)
+    if not status:
+        return ""
+    if status == "PENDING":
+        label_html = '<span class="pill pill-approval-pending">Aprobacion turno: pendiente</span>'
+        if include_actions:
+            return (
+                '<div class="revApprovalRow">'
+                f"{label_html}"
+                f'<button class="btn btn-sm btn-primary" type="button" onclick="updateAppointmentApproval({rev.id}, \'APPROVED\')">\u2713 Confirmar turno</button>'
+                f'<button class="btn btn-sm btn-danger" type="button" onclick="updateAppointmentApproval({rev.id}, \'REJECTED\')">\u2717 Rechazar turno</button>'
+                "</div>"
+            )
+        return f'<div class="revApprovalRow">{label_html}</div>'
+    if status == "APPROVED":
+        return '<div class="revApprovalRow"><span class="pill pill-approval-approved">\u2713 Turno confirmado</span></div>'
+    return '<div class="revApprovalRow"><span class="pill pill-approval-rejected">\u2717 Turno rechazado</span></div>'
 
 
 # ---------- constants ----------
@@ -1974,6 +2059,7 @@ def render_page(
               window.alert(err && err.message ? err.message : "No se pudo actualizar la aprobacion del turno");
             });
           }
+          window.updateAppointmentApproval = updateAppointmentApproval;
 
           function updateColumnCounts() {
             document.querySelectorAll(".kanbanCol").forEach(function (col) {
@@ -3403,10 +3489,12 @@ def render_calendar_page(
                     appt_cls = "past"
                 else:
                     appt_cls = "future-ok" if estado_val == "CONFIRMADO" else "future-pending"
+                approval_status = _revision_approval_status(r)
                 approval_tag = _revision_approval_tag(r)
+                approval_ui = _render_revision_approval_ui(r)
                 approval_prefix = ""
                 approval_suffix = ""
-                if approval_tag and not is_past:
+                if approval_status == "PENDING" and not is_past:
                     approval_prefix = (
                         '<div class="calApptApproval">'
                         '<div class="calStatusRibbon">'
@@ -3426,6 +3514,7 @@ def render_calendar_page(
                       <div class="calMeta">Dirección: {addr}</div>
                       <div class="calMeta">Profesional: {_txt(prof_label)}</div>
                       <div class="calMeta">Estado operativo: {_txt(estado_op)}</div>
+                      {approval_ui}
                       {approval_suffix}
                     </a>
                   """)
@@ -4005,6 +4094,10 @@ def render_lead_card(
                 f"Presupuesto: Base {_fmt_money(last_rev.precio_base)} + Viáticos {_fmt_money(last_rev.viaticos)} = {_fmt_money(last_rev.precio_total)}"
             )
 
+        approval_tag = _revision_approval_tag(last_rev)
+        if approval_tag:
+            rev_lines.append(f"Aprobacion turno: {approval_tag}")
+
     # revisions block
     revisions_block = render_revisions_block(l, revs, last_rev, zones_map, profesionales or [], agencias or [])
 
@@ -4089,6 +4182,7 @@ def render_lead_card(
             <div class="cardHeaderBottom">
               <span class="pill pill-veh">{vehicle_badge}</span>
               <span class="pill pill-prof">Profesional: {_txt(last_prof_label)}</span>
+              {(_render_revision_approval_ui(last_rev) if last_rev else "")}
             </div>
           </div>
 
@@ -4113,6 +4207,7 @@ def render_lead_card(
               )}
               {''.join(f"<div>{x}</div>" for x in rev_lines)}
               <div>Estado operativo: {_txt(last_rev.estado_revision) if last_rev else "-"}</div>
+              {(_render_revision_approval_ui(last_rev) if last_rev else "")}
             </div>
           </div>
         </div>
@@ -4228,6 +4323,7 @@ def render_revisions_block(
             elif approval_status == "APPROVED":
                 approval_html = '<div class="revApprovalRow"><span class="pill pill-prof">✓ Turno confirmado</span></div>'
 
+            approval_html = _render_revision_approval_ui(r, include_actions=True)
             chunks.append(f"""
               <div class="rev" id="rev-{l.id}-{r.id}">
                 <div class="revHead">
@@ -4629,6 +4725,7 @@ def render_edit_latest_revision_form(
                       <textarea name="turno_notas">{_val(last_rev.turno_notas)}</textarea>
                     </div>
                   </div>
+                  {_render_revision_approval_ui(last_rev, include_actions=True)}
                 </div>
               </fieldset>
 
