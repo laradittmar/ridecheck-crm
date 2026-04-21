@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import json
+import mimetypes
 from datetime import datetime, timezone
+from urllib import error, request as urlrequest
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.exc import DataError, IntegrityError
 from sqlalchemy.orm import Session
@@ -28,6 +34,7 @@ from ..schemas.whatsapp_api import (
     WhatsAppThreadMessagesOut,
     WhatsAppThreadOut,
 )
+from ..settings import get_settings
 from ..services.db_errors import commit_or_400
 from ..services.whatsapp_thread_state import build_thread_state_read, upsert_thread_state
 from ..services.whatsapp_threads import load_recent_thread_messages, load_thread_payload
@@ -37,11 +44,201 @@ router = APIRouter(prefix="/api/whatsapp", tags=["whatsapp"])
 thread_router = APIRouter(tags=["whatsapp"])
 
 
+class WhatsAppMediaInfoOut(BaseModel):
+    media_id: str
+    url: str
+    mime_type: str | None = None
+    file_size: int | None = None
+
+
+class WhatsAppMediaTranscriptionOut(BaseModel):
+    text: str
+
+
+def _require_whatsapp_token() -> str:
+    token = (get_settings().whatsapp_token or "").strip()
+    if not token:
+        raise HTTPException(status_code=503, detail="WHATSAPP_TOKEN missing")
+    return token
+
+
+def _require_openai_api_key() -> str:
+    token = (get_settings().openai_api_key or "").strip()
+    if not token:
+        raise HTTPException(status_code=503, detail="OPENAI_API_KEY missing")
+    return token
+
+
+def _load_whatsapp_media_info(media_id: str) -> WhatsAppMediaInfoOut:
+    media_id = str(media_id or "").strip()
+    if not media_id:
+        raise HTTPException(status_code=400, detail="media_id is required")
+
+    token = _require_whatsapp_token()
+    req = urlrequest.Request(
+        f"https://graph.facebook.com/v19.0/{media_id}",
+        method="GET",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=15) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+    except error.HTTPError as exc:
+        err_body = exc.read().decode("utf-8", errors="replace")
+        raise HTTPException(status_code=502, detail=f"WhatsApp media lookup failed: HTTP {exc.code}: {err_body}") from exc
+    except error.URLError as exc:
+        raise HTTPException(status_code=502, detail=f"WhatsApp media lookup failed: {exc.reason}") from exc
+
+    try:
+        payload = json.loads(body) if body.strip() else {}
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=502, detail="WhatsApp media lookup returned invalid JSON") from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail="WhatsApp media lookup returned an invalid payload")
+
+    url = str(payload.get("url") or "").strip()
+    if not url:
+        raise HTTPException(status_code=502, detail="WhatsApp media lookup did not return a download URL")
+
+    file_size_raw = payload.get("file_size")
+    try:
+        file_size = int(file_size_raw) if file_size_raw not in (None, "") else None
+    except (TypeError, ValueError):
+        file_size = None
+
+    return WhatsAppMediaInfoOut(
+        media_id=media_id,
+        url=url,
+        mime_type=str(payload.get("mime_type") or "").strip() or None,
+        file_size=file_size,
+    )
+
+
+def _open_whatsapp_media_stream(info: WhatsAppMediaInfoOut):
+    token = _require_whatsapp_token()
+    req = urlrequest.Request(
+        info.url,
+        method="GET",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    try:
+        return urlrequest.urlopen(req, timeout=30)
+    except error.HTTPError as exc:
+        err_body = exc.read().decode("utf-8", errors="replace")
+        raise HTTPException(status_code=502, detail=f"WhatsApp media download failed: HTTP {exc.code}: {err_body}") from exc
+    except error.URLError as exc:
+        raise HTTPException(status_code=502, detail=f"WhatsApp media download failed: {exc.reason}") from exc
+
+
+def _download_whatsapp_media_bytes(media_id: str) -> tuple[WhatsAppMediaInfoOut, bytes]:
+    info = _load_whatsapp_media_info(media_id)
+    upstream = _open_whatsapp_media_stream(info)
+    try:
+        data = upstream.read()
+    finally:
+        upstream.close()
+    return info, data
+
+
+def _guess_media_filename(media_id: str, mime_type: str | None) -> str:
+    extension = mimetypes.guess_extension(mime_type or "") or ".bin"
+    if extension == ".oga":
+        extension = ".ogg"
+    return f"{media_id}{extension}"
+
+
+def _transcribe_audio_bytes(media_id: str, audio_bytes: bytes, mime_type: str | None) -> str:
+    api_key = _require_openai_api_key()
+    boundary = f"----CodexBoundary{uuid4().hex}"
+    filename = _guess_media_filename(media_id, mime_type)
+    parts = [
+        f"--{boundary}\r\n".encode("utf-8"),
+        f'Content-Disposition: form-data; name="model"\r\n\r\nwhisper-1\r\n'.encode("utf-8"),
+        f"--{boundary}\r\n".encode("utf-8"),
+        f'Content-Disposition: form-data; name="language"\r\n\r\nes\r\n'.encode("utf-8"),
+        f"--{boundary}\r\n".encode("utf-8"),
+        (
+            f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+            f"Content-Type: {mime_type or 'application/octet-stream'}\r\n\r\n"
+        ).encode("utf-8"),
+        audio_bytes,
+        b"\r\n",
+        f"--{boundary}--\r\n".encode("utf-8"),
+    ]
+    body = b"".join(parts)
+    req = urlrequest.Request(
+        "https://api.openai.com/v1/audio/transcriptions",
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Content-Length": str(len(body)),
+        },
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=60) as resp:
+            response_body = resp.read().decode("utf-8", errors="replace")
+    except error.HTTPError as exc:
+        err_body = exc.read().decode("utf-8", errors="replace")
+        raise HTTPException(status_code=502, detail=f"OpenAI transcription failed: HTTP {exc.code}: {err_body}") from exc
+    except error.URLError as exc:
+        raise HTTPException(status_code=502, detail=f"OpenAI transcription failed: {exc.reason}") from exc
+
+    try:
+        payload = json.loads(response_body) if response_body.strip() else {}
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=502, detail="OpenAI transcription returned invalid JSON") from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail="OpenAI transcription returned an invalid payload")
+
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=502, detail="OpenAI transcription did not return text")
+    return text
+
+
 def _require_thread(db: Session, thread_id: int) -> WhatsAppThread:
     thread = db.get(WhatsAppThread, thread_id)
     if thread is None:
         raise HTTPException(status_code=404, detail="Thread not found")
     return thread
+
+
+@router.get("/media/{media_id}/info", response_model=WhatsAppMediaInfoOut)
+def get_media_info(media_id: str):
+    return _load_whatsapp_media_info(media_id)
+
+
+@router.get("/media/{media_id}")
+def download_media(media_id: str):
+    info = _load_whatsapp_media_info(media_id)
+    upstream = _open_whatsapp_media_stream(info)
+
+    def _iter_stream():
+        try:
+            while True:
+                chunk = upstream.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            upstream.close()
+
+    headers: dict[str, str] = {}
+    if info.file_size is not None:
+        headers["Content-Length"] = str(info.file_size)
+
+    return StreamingResponse(_iter_stream(), media_type=info.mime_type or "application/octet-stream", headers=headers)
+
+
+@router.post("/media/{media_id}/transcribe", response_model=WhatsAppMediaTranscriptionOut)
+def transcribe_media(media_id: str):
+    info, audio_bytes = _download_whatsapp_media_bytes(media_id)
+    text = _transcribe_audio_bytes(media_id=info.media_id, audio_bytes=audio_bytes, mime_type=info.mime_type)
+    return WhatsAppMediaTranscriptionOut(text=text)
 
 
 @router.get("/threads", response_model=list[WhatsAppThreadOut])

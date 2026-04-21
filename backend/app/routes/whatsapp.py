@@ -159,12 +159,16 @@ async def inbound_webhook(request: Request, db: Session = Depends(get_db)):
                     display_name = None
 
                 for message in _as_list(value.get("messages")):
-                    if not isinstance(message, dict) or message.get("type") != "text":
+                    if not isinstance(message, dict):
+                        continue
+
+                    message_type = str(message.get("type") or "").strip().lower()
+                    if message_type not in {"text", "audio", "image"}:
                         continue
 
                     wa_message_id = str(message.get("id") or "").strip()
                     if wa_message_id == "":
-                        logger.warning("whatsapp inbound text message missing id")
+                        logger.warning("whatsapp inbound message missing id type=%s", message_type or "-")
                         continue
 
                     existing_message_id = db.execute(
@@ -176,19 +180,80 @@ async def inbound_webhook(request: Request, db: Session = Depends(get_db)):
 
                     wa_id = wa_id_from_contact or str(message.get("from") or "").strip()
                     if wa_id == "":
-                        logger.warning("whatsapp inbound text message missing wa_id wa_message_id=%s", wa_message_id)
+                        logger.warning(
+                            "whatsapp inbound message missing wa_id wa_message_id=%s type=%s",
+                            wa_message_id,
+                            message_type or "-",
+                        )
                         continue
 
                     message_ts = _parse_wa_timestamp(message.get("timestamp"))
                     if message_ts is None:
                         logger.warning(
-                            "whatsapp inbound text message invalid timestamp wa_message_id=%s", wa_message_id
+                            "whatsapp inbound message invalid timestamp wa_message_id=%s type=%s",
+                            wa_message_id,
+                            message_type or "-",
                         )
                         continue
 
-                    text_block = message.get("text")
-                    text_body = text_block.get("body") if isinstance(text_block, dict) else None
-                    text = str(text_body) if text_body is not None else None
+                    text: str | None = None
+                    media_id: str | None = None
+                    stored_message_type = "text"
+                    raw_payload_to_store: dict[str, object] = payload
+                    n8n_payload: dict[str, object] = {
+                        "thread_id": None,
+                        "wa_message_id": wa_message_id,
+                        "wa_id": wa_id,
+                        "text": None,
+                    }
+
+                    if message_type == "text":
+                        text_block = message.get("text")
+                        text_body = text_block.get("body") if isinstance(text_block, dict) else None
+                        text = str(text_body) if text_body is not None else None
+                        n8n_payload["event"] = "inbound_message"
+                        n8n_payload["text"] = text
+                    elif message_type == "audio":
+                        audio_block = message.get("audio")
+                        media_id_raw = audio_block.get("id") if isinstance(audio_block, dict) else None
+                        media_id = str(media_id_raw).strip() if media_id_raw is not None else None
+                        if not media_id:
+                            logger.warning(
+                                "whatsapp inbound audio message missing media_id wa_message_id=%s",
+                                wa_message_id,
+                            )
+                            continue
+                        stored_message_type = "audio"
+                        raw_payload_to_store = message
+                        n8n_payload.update(
+                            {
+                                "text": None,
+                                "message_type": "audio",
+                                "media_id": media_id,
+                            }
+                        )
+                    elif message_type == "image":
+                        image_block = message.get("image")
+                        media_id_raw = image_block.get("id") if isinstance(image_block, dict) else None
+                        media_id = str(media_id_raw).strip() if media_id_raw is not None else None
+                        if not media_id:
+                            logger.warning(
+                                "whatsapp inbound image message missing media_id wa_message_id=%s",
+                                wa_message_id,
+                            )
+                            continue
+                        caption_raw = image_block.get("caption", "") if isinstance(image_block, dict) else ""
+                        caption = str(caption_raw)
+                        text = caption or None
+                        stored_message_type = "image"
+                        raw_payload_to_store = message
+                        n8n_payload.update(
+                            {
+                                "text": caption,
+                                "message_type": "image",
+                                "media_id": media_id,
+                            }
+                        )
 
                     try:
                         contact = db.execute(
@@ -218,8 +283,10 @@ async def inbound_webhook(request: Request, db: Session = Depends(get_db)):
                                 direction="in",
                                 status="received",
                                 timestamp=message_ts,
+                                message_type=stored_message_type,
+                                media_id=media_id,
                                 text=text,
-                                raw_payload=payload,
+                                raw_payload=raw_payload_to_store,
                             )
                         )
                         thread.last_message_at = message_ts
@@ -265,15 +332,10 @@ async def inbound_webhook(request: Request, db: Session = Depends(get_db)):
 
                         if ai_event_created and ai_event is not None and settings.n8n_webhook_url:
                             try:
+                                n8n_payload["thread_id"] = thread.id
                                 _post_n8n_event(
                                     settings.n8n_webhook_url,
-                                    {
-                                        "event": "inbound_message",
-                                        "thread_id": thread.id,
-                                        "wa_message_id": wa_message_id,
-                                        "wa_id": wa_id,
-                                        "text": text,
-                                    },
+                                    n8n_payload,
                                 )
                                 ai_event.status = "triggered"
                                 ai_event.last_error = None

@@ -436,6 +436,8 @@ class WhatsAppMessage(Base):
     wa_message_id: Mapped[Optional[str]] = mapped_column(String(191), nullable=True, unique=True)
     direction: Mapped[str] = mapped_column(String(10), nullable=False)
     timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    message_type: Mapped[Optional[str]] = mapped_column(String(20), nullable=True, default="text", server_default="text")
+    media_id: Mapped[Optional[str]] = mapped_column(String(191), nullable=True)
     text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="received", server_default="received")
     raw_payload: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)

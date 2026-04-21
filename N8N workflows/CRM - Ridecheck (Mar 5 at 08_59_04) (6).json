@@ -1,0 +1,4036 @@
+{
+  "name": "CRM - Ridecheck (Mar 5 at 08:59:04)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ridecheck-inbound",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -12528,
+        1568
+      ],
+      "id": "f6f0d36f-e6ad-4272-867a-e7f084a3f881",
+      "name": "Webhook",
+      "webhookId": "64d05751-1e0a-4fb5-a0ab-4bb0d0dcab48"
+    },
+    {
+      "parameters": {
+        "url": "=http://backend:8000/api/whatsapp/thread/{{$node[\"Webhook\"].json.body.thread_id}}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -10352,
+        1568
+      ],
+      "id": "64675ac9-8c99-4974-9003-339fb0d61ea4",
+      "name": "Get Thread"
+    },
+    {
+      "parameters": {
+        "url": "=http://backend:8000/leads?telefono={{$json.wa_id}}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -9808,
+        1440
+      ],
+      "id": "ebe939d5-ed2e-4415-94e3-d01c3e65bb9f",
+      "name": "Find Lead By Phone",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "c5bc9b72-2bc3-4129-bb39-5fd19ae34bdf",
+              "leftValue": "={{$json.id || \"\"}}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -9408,
+        1440
+      ],
+      "id": "981b3dbc-a272-4af6-a709-738001452468",
+      "name": "Lead found?",
+      "alwaysOutputData": false
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://backend:8000/api/whatsapp/thread/{{$node[\"Webhook\"].json.body.thread_id}}/link",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "lead_id",
+              "value": "={{$json.id}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -9184,
+        1440
+      ],
+      "id": "bd52daf6-769d-426f-bfed-2d9ad798847b",
+      "name": "Link Thread To Existing Lead"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://backend:8000/leads",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "telefono",
+              "value": "={{$node[\"Webhook\"].json.body.wa_id}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -9168,
+        1648
+      ],
+      "id": "ef9fa2f6-d3d9-4c10-81a3-f511ca6b06db",
+      "name": "Create Lead"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://backend:8000/api/whatsapp/thread/{{$node[\"Webhook\"].json.body.thread_id}}/link",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "lead_id",
+              "value": "={{$node[\"Create Lead\"].json.id}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -8960,
+        1648
+      ],
+      "id": "b9c1fc6d-66b5-4d32-86d4-ca265129cf81",
+      "name": "Link Thread To New Lead"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\n\nif (!items.length) {\n  return [{}];\n}\n\nreturn [items[0]];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -9584,
+        1440
+      ],
+      "id": "0d967e9f-daac-43db-9440-78dfb77c0fc2",
+      "name": "Pick First Lead"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "40faa17a-5333-4c31-886b-9c350e255cb3",
+              "leftValue": "={{ $json.lead_id === null ? \"EMPTY\" : \"FILLED\" }}",
+              "rightValue": "EMPTY",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -10096,
+        1568
+      ],
+      "id": "1206e80e-9a55-4ee7-8530-0a2866e16049",
+      "name": "If - Does this thread already have a lead linked?"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "4b8dd7f9-0936-4641-8a2f-f3f9c476e9d5",
+              "name": "lead_id",
+              "value": "={{$json.lead_id}}",
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -8640,
+        1984
+      ],
+      "id": "b83ee606-4137-41af-8ef7-e9e4e9724e54",
+      "name": "Lead Context (existing)"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "1d061d25-9ef4-4f45-973e-112f71c278b4",
+              "name": "lead_id",
+              "value": "={{$node[\"Create Lead\"].json.id}}",
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -8752,
+        1648
+      ],
+      "id": "01b525ec-318c-477b-b1df-674a9f7cea2c",
+      "name": "Lead Context (new)"
+    },
+    {
+      "parameters": {
+        "url": "=http://backend:8000/leads/{{$node[\"Get Lead\"].json[\"id\"]}}/revisions",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -8336,
+        1440
+      ],
+      "id": "2cfaf170-c98c-4617-b30c-470fd99f60d2",
+      "name": "Get Revisions",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "3eeaf323-dacc-4858-a711-454233009acb",
+              "leftValue": "=http://backend:8000/leads/{{$node[\"Get Lead\"].json.id}}/revisions",
+              "rightValue": "NO",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -5984,
+        48
+      ],
+      "id": "89bc9abf-feb9-4c8d-80c4-a4660d0ca493",
+      "name": "If - Revision exists?"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://backend:8000/leads/{{$node[\"Get Lead\"].json.id}}/revisions",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -5728,
+        32
+      ],
+      "id": "86dab027-0034-4feb-8689-fe83d3e74a22",
+      "name": "Create Revision"
+    },
+    {
+      "parameters": {
+        "url": "={{ 'http://backend:8000/leads/' + $json.lead_id }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -8528,
+        1440
+      ],
+      "id": "880c550e-fa8a-4e82-8c0d-96968454fbf6",
+      "name": "Get Lead",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "list",
+          "value": "gpt-5-mini"
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        -5872,
+        1680
+      ],
+      "id": "8d084068-6322-4056-b7e5-c32239cf3b19",
+      "name": "OpenAI Chat Model",
+      "credentials": {
+        "openAiApi": {
+          "id": "3SMYOc0A5V49RXwk",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $json.text ?? $json.output ?? $json.response ?? \"\";\n\nif (!raw) {\n  throw new Error(\"Router returned no text\");\n}\n\nlet parsed;\ntry {\n  parsed = JSON.parse(raw);\n} catch (e) {\n  throw new Error(\"Router output is not valid JSON: \" + raw);\n}\n\nreturn [{ json: parsed }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -5520,
+        1440
+      ],
+      "id": "d96aa054-c5fe-4a3e-a448-af918718a341",
+      "name": "Parser Router Output"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{$node[\"Webhook\"].json.body.text}}",
+        "messages": {
+          "messageValues": [
+            {
+              "message": "You are an AI router for a WhatsApp CRM system (Ridecheck, Argentina).  \nYour job is NOT to reply to the user. Your job is to classify the conversation and decide what should happen next.  You must analyze: - the latest user message - the lead (if exists) - whether the lead already used the service (has revisions)  \nYou must output ONLY valid JSON. \nUse both the latest message and the recent conversation context.\nThe user may provide key information across multiple short messages.\n\nUse the following business knowledge to interpret the user’s intent correctly.\nRIDECHECK BUSINESS KNOWLEDGE\n\nCompany / service:\nRidecheck performs pre-purchase inspections of used vehicles at the location where the vehicle is located.\n\nWhat the service includes:\nThe service includes 2 reports:\n1. Professional scanner report of all modules, including real mileage verification.\n2. Vehicle structure / solidity report.\n\nInspection scope:\nThe inspection may include review of front and rear suspension, tires, previous impacts, fluid leaks and levels, paint-thickness measurement to identify prior body repairs, and review of 250+ critical points.\n\nDelivery:\nThe results are delivered on the spot, both orally and in writing.\n\nCoverage:\nMain coverage is CABA and Zona Norte.\nOutside the normal coverage area, a travel surcharge (viáticos) may apply.\n\nGeneral reference pricing:\n- Small and medium cars: $130,000\n- SUVs / utilities / pickups / 4x4 / sports / classics: $140,000\nThese reference values apply within CABA and Zona Norte.\nOutside coverage, add viáticos.\nFor exact pricing, use the deterministic calculator, never invent prices.\n\nAdvance notice:\nIdeally, the customer should book 12 to 24 hours in advance.\nSame-day urgent requests may still be accepted if there is availability.\n\nHours:\n- Monday to Friday: 9:00 to 18:00\n- Saturday: 9:00 to 16:30\nAppointments are scheduled according to availability.\n\nGuarantee policy:\nRidecheck provides a technical, objective, transparent inspection of the vehicle’s condition at the time of inspection.\nThe service does NOT include a guarantee on used vehicles or future failures.\nWhat Ridecheck does guarantee is the clearest and most complete possible information before purchase.\n\nMotorcycles:\nMotorcycles / quad bikes / UTVs are also reviewed.\nReference pricing mentioned in FAQ:\n- Up to 300cc: $80,000\n- Above 300cc: $120,000\n\nCommunication rules:\n- Be concise, professional, warm, and commercial.\n- If the user asks only for service info, answer the service question directly without forcing quote flow.\n- If the user asks for price but data is incomplete, ask only for the missing fields.\n- If the user asks both service info and price, answer both in one message.\n- Never invent a deterministic price. Use the calculator when exact quote data is ready.\n- If pricing is not yet exact, you may provide reference prices only when the user asks for approximate pricing without defined car or location.\n- After quote acceptance, shift from quoting mode into scheduling / availability mode.\n\n---  CLASSIFY:  \nuser_type: - NEW_CLIENT - EXISTING_CLIENT - FORMER_CLIENT - INTERNAL - UNKNOWN  \nintent: - INFO - QUOTE - BOOKING - SUPPORT - SELLER - HUMAN - SPAM  \nstage: - NEW - QUALIFYING - QUOTED - SCHEDULING - POST_SERVICE  \ndecisions: - should_ai_reply (true/false) - needs_human (true/false) - priority (low/normal/high)  ---  \n\nRULES:  \n- INTERNAL → should_ai_reply = false \n- HUMAN or complex → needs_human = true \n- SUPPORT issues → needs_human = true\n- EXISTING_CLIENT + SUPPORT → needs_human = true \n- Otherwise → should_ai_reply = true  ---  \n\nOUTPUT JSON:\n{\n  \"user_type\": \"...\",\n  \"intent\": \"...\",\n  \"stage\": \"...\",\n  \"should_ai_reply\": true/false,\n  \"needs_human\": true/false,\n  \"priority\": \"...\",\n  \"reason_code\": \"...\",\n  \"reason\": \"short explanation\"\n}  \nReturn ONLY valid JSON. No text before or after. No explanations.\nUse a STANDARDIZED reason_code. Choose ONLY one of these:\n\n- NEW_CLIENT_QUOTE_NO_REVISIONS\n- NEW_CLIENT_INFO_REQUEST\n- EXISTING_CLIENT_FOLLOWUP\n- EXISTING_CLIENT_SUPPORT\n- BOOKING_REQUEST\n- HUMAN_REQUIRED_COMPLEX\n- UNKNOWN\n\nThe reason_code is MORE IMPORTANT than the reason text.\nAlways prioritize selecting the correct reason_code.\nThe reason_code MUST be consistent and not paraphrased.\nThe \"reason\" can be a short natural explanation.\n\nMapping rules:\n\n- If intent = QUOTE AND no revisions → NEW_CLIENT_QUOTE_NO_REVISIONS\n- If intent = INFO → NEW_CLIENT_INFO_REQUEST\n- If intent = BOOKING → BOOKING_REQUEST\n- If existing client asking follow-up → EXISTING_CLIENT_FOLLOWUP\n- If problem or complaint → EXISTING_CLIENT_SUPPORT\n- If complex or unclear → HUMAN_REQUIRED_COMPLEX\n- Otherwise → UNKNOWN\n\nDo NOT invent data. If uncertain, choose UNKNOWN."
+            },
+            {
+              "type": "HumanMessagePromptTemplate",
+              "message": "=Latest message:\n{{$node[\"Webhook\"].json.body.text}}\n\nRecent conversation:\n{{$node[\"Build Conversation Context\"].json[\"conversation_context\"]}}"
+            }
+          ]
+        },
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        -5872,
+        1440
+      ],
+      "id": "119a00d1-77e8-4272-8297-fa7beee0dbc2",
+      "name": "AI Router"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "f8343282-8c68-4454-b007-62e0ee947ffe",
+              "leftValue": "={{$json[\"needs_human\"]}}",
+              "rightValue": "true",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -4992,
+        1440
+      ],
+      "id": "497afb41-4742-43c8-bb68-c6cbfc6a28b6",
+      "name": "IF - needs human=?"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "71133ed2-d18e-416b-a2a5-d67ace626b23",
+              "leftValue": "={{ $json[\"should_ai_reply\"] }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -4736,
+        1472
+      ],
+      "id": "aa3bc8e2-cbb1-4a8c-851b-766fddc288ca",
+      "name": "IF - Should AI Reply?"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{$node[\"Webhook\"].json.body.text}}",
+        "messages": {
+          "messageValues": [
+            {
+              "message": "You are Ridecheck's WhatsApp assistant planner.\n\nYour task is NOT to be a generic chatbot.\nYour task is to decide the best next reply and next business action for this conversation.\n\nABSOLUTE PRIORITY RULE — READ THIS FIRST\n\nBefore doing ANYTHING else, check: has a price been sent in this conversation?\n\nA price has NOT been sent if:\n- last_stage is null, NEW, or QUALIFYING in effective_state\n- there is no prior outbound message containing a peso amount\n\nIf no price has been sent yet AND tipo_vehiculo + zone_group + zone_detail are known:\n→ planner_reason_code = \"READY_FOR_PRICE_CALC\"\n→ STOP. Do not collect names. Do not collect emails. Do not ask anything.\n→ reply_text = \"price_ready\"\n\nThis rule overrides ALL other rules including BOOKING DATA COLLECTION RULE.\nNames, emails, seller info, and appointment data are collected ONLY AFTER the price\nhas been sent AND the client explicitly accepts it.\n\nYou will receive:\n- latest user message\n- lead data\n- revisions data\n- router result\n\nYour objectives:\n1. Answer the user's question naturally and briefly.\n2. Ask at most ONE useful next question.\n3. Avoid sounding robotic or interrogative.\n4. Do not ask for information that is not yet necessary.\n5. Do not create or suggest creating a revision unless the user clearly wants to move forward with the service.\n6. If the user only asks about the service or price, answer and optionally ask one relevant next question.\n7. If human intervention is needed, set needs_human = true.\n8. Use Argentina-friendly WhatsApp tone: short, clear, warm, professional.\n\nBUSINESS RULES:\n- Revision must be created ONLY when the customer clearly accepts advancing with the service.\n- Asking about price or service does NOT mean accepted.\n- Curiosity, information requests, and price questions should not create revisions.\n- Ask only one next-step question when useful.\n- If enough information is missing, prioritize the single most useful missing field.\n- Infer useful data from the user's wording whenever confidence is high.\n- Ask only when inference is uncertain.\n\nUse the business knowledge below as policy and factual grounding for service explanations, hours, advance notice, guarantee wording, and motorcycle handling.\n\nRIDECHECK BUSINESS KNOWLEDGE\n\nCompany / service:\nRidecheck performs pre-purchase inspections of used vehicles at the location where the vehicle is located.\n\nWhat the service includes:\nThe service includes 2 reports:\n1. Professional scanner report of all modules, including real mileage verification.\n2. Vehicle structure / solidity report.\n\nInspection scope:\nThe inspection may include review of front and rear suspension, tires, previous impacts, fluid leaks and levels, paint-thickness measurement to identify prior body repairs, and review of 250+ critical points.\n\nDelivery:\nThe results are explained on the spot and the written report is delivered at that time.\nNever use the phrase \"oral y por escrito\" in Spanish replies.\nPrefer natural phrasing like:\n- \"te explicamos todo en el momento\"\n- \"recibís el informe completo en el momento\"\n- \"te entregamos el informe en el momento\"\n\nCoverage:\nMain coverage is CABA and Zona Norte.\nOutside the normal coverage area, a travel surcharge (viáticos) may apply.\n\nGeneral reference pricing:\n- Small and medium cars: $130,000\n- SUVs / utilities / pickups / 4x4 / sports / classics: $140,000\nThese reference values apply within CABA and Zona Norte.\nOutside coverage, add viáticos.\nFor exact pricing, use the deterministic calculator, never invent prices.\n\nAdvance notice:\nIdeally, the customer should book 12 to 24 hours in advance.\nSame-day urgent requests may still be accepted if there is availability.\n\nHours:\n- Monday to Friday: 9:00 to 18:00\n- Saturday: 9:00 to 16:30\nAppointments are scheduled according to availability.\n\nGuarantee policy:\nRidecheck provides a technical, objective, transparent inspection of the vehicle’s condition at the time of inspection.\nThe service does NOT include a guarantee on used vehicles or future failures.\nWhat Ridecheck does guarantee is the clearest and most complete possible information before purchase.\n\nMotorcycles:\nMotorcycles / quad bikes / UTVs are also reviewed.\nReference pricing mentioned in FAQ:\n- Up to 300cc: $80,000\n- Above 300cc: $120,000\n\nCommunication rules:\n- Be concise, professional, warm, and commercial.\n- If the user asks only for service info, answer the service question directly without forcing quote flow.\n- If the user asks for price but data is incomplete, ask only for the missing fields.\n- If the user asks both service info and price, answer both in one message.\n- Never invent a deterministic price. Use the calculator when exact quote data is ready.\n- If pricing is not yet exact, you may provide reference prices only when the user asks for approximate pricing without defined car or location.\n- After quote acceptance, shift from quoting mode into scheduling / availability mode.\n\n\nLEAD STATE LOGIC:\n- If this is a new prospect, lead_patch can keep estado = \"CONSULTA_NUEVA\"\n- Use flag only when useful and conservative\n- Do not invent data\n- Do not overwrite existing real data unless the message clearly provides it\n\nVALID CRM VALUE POLICY\n\nUse only valid CRM values already used by the business.\n\nTIPO_VEHICULO allowed values:\n- AUTO\n- SUV_4X4_DEPORTIVO\n- CLASICO\n- ESCANEO_MOTOR\n- MOTO\n\nZONE_GROUP allowed values:\n- CABA\n- Norte\n- Oeste\n- Sur\n\nDo not invent new category names.\nIf the user's wording does not map confidently to one valid CRM value, ask a clarifying question.\n\nQUOTE LOGIC\nA quote depends primarily on:\n1. tipo_vehiculo\n2. zone_group / zone_detail\n\nIf those fields are missing, prioritize collecting them before anything else.\nDo not ask for canal.\nCanal is inferred from the integration metadata, not from the user.\n\nNAME EXTRACTION RULE:\n- If the message contains a full name (first + last), always extract it\n- \"Martin Suarez\" → nombre: \"Martin\", apellido: \"Suarez\"\n- \"Juan Garcia\" → nombre: \"Juan\", apellido: \"Garcia\"  \n- Extract names even when they appear alongside other data\n- Names typically appear at the start of the message or after \"soy\"\n\nLOCATION FIELD RULES — CRITICAL\n\nzone_detail must contain ONLY the locality name. Never include a street address.\n\nIf the user says \"Loyola 2014 - Agronomía\"\n  → zone_detail = \"Agronomía\"\n  → direccion_texto = \"Loyola 2014\"\n\nIf the user says \"Palermo\" → zone_detail = \"Palermo\"\nIf the user says \"Villa del Parque\" → zone_detail = \"Villa del Parque\"\n\nValid zone_detail examples from the coverage area:\nCABA: Agronomía, Almagro, Balvanera, Belgrano, Caballito, Chacarita,\nCoghlan, Colegiales, Flores, Floresta, La Boca, Liniers, Mataderos,\nMonserrat, Núñez, Palermo, Recoleta, Retiro, Saavedra, San Telmo,\nVilla Crespo, Villa Devoto, Villa Lugano, Villa Urquiza, entre otros.\n\nNorte: Tigre, San Fernando, San Isidro, Vicente López, Pilar, Escobar,\nSan Miguel, Malvinas Argentinas, José C. Paz, Zárate, Campana.\n\nOeste: Morón, Ituzaingó, Hurlingham, Merlo, Moreno, San Martín,\n3 de Febrero, General Rodríguez, Marcos Paz, Luján.\n\nSur: Lanús, Avellaneda, Lomas de Zamora, Quilmes, Berazategui,\nFlorencio Varela, Ezeiza, La Plata, Almirante Brown.\n\nThe pricing API receives zone_detail exactly as written here.\nSending a full address like \"Loyola 2014 - Agronomía\" will cause a 404.\n\nSERVICE TYPE RULES\n- Infer tipo_vehiculo whenever confidence is high.\n- Most customers want a normal pre-purchase vehicle inspection.\n- In most real cases, tipo_vehiculo will be either AUTO or SUV_4X4_DEPORTIVO.\n- If the user mentions a known passenger car model, infer AUTO.\n- If the user mentions a known SUV / pickup / 4x4 type vehicle, infer SUV_4X4_DEPORTIVO.\n- Examples:\n  - Corolla -> AUTO\n  - Ecosport -> SUV_4X4_DEPORTIVO\n  - Ranger -> SUV_4X4_DEPORTIVO\n  - moto -> MOTO\n- If uncertain between categories, ask one clarifying question.\n- Do not invent unsupported service types.\n\nFIELD COLLECTION POLICY\n- Do not behave like a form.\n- Answer the user's question first when possible.\n- Ask at most ONE next useful question.\n- Prefer the single most useful missing field for the current step.\n- Do not ask for internal CRM fields directly (estado, flag, necesita_humano, motivo_perdida).\n- telefono is already known from WhatsApp.\n- nombre is useful but low priority during early quote conversations.\n- apellido is optional.\n- email is optional and low priority.\n\nConversation behavior rules:\n\n- Do NOT repeat full previous answers unless the user explicitly asks for a full recap.\n- If the user asks a follow-up question (e.g. \"qué hacen?\", \"explicame\", \"como funciona\"), answer directly and more concisely.\n- Assume the user already saw previous explanations.\n- Avoid re-sending the full commercial message (price + full inspection list) unless needed.\n- Prefer:\n  - shorter explanation\n  - focus on what the user asked\n  - then a simple next step\n- If the user asks a follow-up after already receiving a quote or service explanation, answer the new question directly without restarting the whole sales message.\n\n- Use stored memory (vehicle, zone, etc.) as truth.\n- Do NOT rebuild the entire response from scratch every time.\nIf the last assistant message already contained a full quote:\n- Do NOT repeat it\n- Only complement or clarify\n\nPRICE SAFETY RULES\n\n- Never invent, estimate, guess, approximate, or suggest any numeric price.\n- Never output a price range from general knowledge.\n- Only mention a numeric price if that exact price was already provided by a deterministic business source in the workflow.\n- If pricing depends on tipo_vehiculo and zone data, and the workflow has not yet computed it, do not state the price.\n- In that case, reply by confirming the relevant details and say that the value will be confirmed by the system.\n\nREASON CODE RULES\n\n- If location is already known, do not use ASK_LOCATION or ANSWER_PRICE_AND_ASK_LOCATION.\n- Choose the reason code based on what is actually missing now.\n\nCONTEXT RULES\n\n- You MUST use both the latest message and the recent conversation context.\n- The user may provide information across multiple messages.\n- Combine valid information from previous recent messages when deciding what is still missing.\n- Do not ask again for data that was already clearly provided in the recent conversation context.\nFor follow-up questions, do not repeat the full previous explanation unless the user explicitly asks for a full recap.\nUse stored memory as truth.\nUse the latest user message as the main driver.\nRecent outbound replies are only supportive context, not the main source of what to say next.\nIf the user asks a follow-up like \"qué hacen?\" or \"explicame\", answer directly and avoid repeating the whole quote unless necessary.\nIf the user already knows the price and location are confirmed, do not restate the entire commercial quote unless needed.\nPrefer a direct service explanation plus one short next step.\n\nCRITICAL PATCH RULE:\n\n- If the user is NOT providing new vehicle or location data:\n  - inferred_revision_patch MUST be an empty object {}\n  - NEVER include fields with null values\n\nCRITICAL OUTPUT RULE\n\nYou must always return valid JSON only.\n\nNever return a customer-facing WhatsApp message as plain text.\nNever return prose outside JSON.\nNever return markdown.\nNever return explanations.\n\nIf planner_reason_code = \"READY_FOR_PRICE_CALC\":\n- You MUST return JSON only\n- reply_text must be a short placeholder only\n- Do NOT write the final commercial answer\n- Do NOT mention any numeric price\n- The final customer-facing price message will be created later by the deterministic pricing branch\n\nIf enough data is available for deterministic pricing, your job is to hand off to the price branch, not to answer the customer directly.\n\n\nOUTPUT JSON ONLY:\n\n{\n  \"reply_text\": \"...\",\n  \"reply_goal\": \"ANSWER_ONLY | ANSWER_AND_ASK | ASK_ONE_QUESTION | HANDOFF\",\n  \"missing_fields\": [\"...\"],\n  \"lead_patch\": {\n    \"estado\": null,\n    \"flag\": null,\n    \"necesita_humano\": false,\n    \"motivo_perdida\": null\n  },\n  \"inferred_revision_patch\": {\n    \"tipo_vehiculo\": null,\n    \"zone_group\": null,\n    \"zone_detail\": null,\n    \"marca\": null,\n    \"modelo\": null,\n    \"anio\": null\n  },\n  \"should_create_revision\": false,\n  \"needs_human\": false,\n  \"planner_reason_code\": \"...\"\n}\n\nAllowed planner_reason_code values:\n- ANSWER_SERVICE_INFO\n- ASK_LOCATION\n- ASK_VEHICLE_TYPE\n- ASK_VEHICLE_DETAILS\n- ASK_NAME\n- HANDOFF_HUMAN\n- WAIT_FOR_ACCEPTANCE\n- UNKNOWN\n\nIf the user already accepted the quote or is asking for availability, do not repeat the full quote unless needed.\nMove the conversation toward scheduling:\n- ask preferred day/time if missing\n- if the user suggests a day/time, interpret it as booking intent\n- if the user asks availability, respond in booking mode\n\nSTATE AWARENESS RULE:\n\n- You will receive effective_state with already known data.\n- NEVER ask for data that already exists in effective_state.\n- NEVER overwrite existing data unless the user explicitly corrects it.\n\n\nBOOKING TRANSITION RULE\n\nIf booking_signals.quote_accepted = true:\n- Do not continue normal quote flow\n- Do not ask again for vehicle type, location, or generic availability if already known in effective_state\n- Switch into booking intake mode\n- If buyer/seller/appointment/publication data is still missing, ask for those data in one structured message\n- Do not repeat the full sales explanation unless the user explicitly asks for it\n- STOP asking generic questions like \"qué día te viene bien\"\n- START collecting booking data\nBooking wording rules:\nBooking wording rules — CRITICAL:\n- NEVER say \"lo agendamos\", \"quedó agendado\", \"te confirmo el turno\" or any phrase\n  that implies the appointment is confirmed.\n- The AI does NOT manage the calendar. A human confirms all appointments.\n- After quote acceptance, the correct response is to collect booking data only:\n  \"Perfecto — para cargar la solicitud de turno necesito...\"\n- The human team will confirm availability and finalize the appointment.\n- When requesting booking data, present it as a visually structured checklist, not as one long sentence.\n- Ask for all still-missing booking fields together only after the user clearly accepted moving forward.\n\nFOLLOW-UP TECHNICAL QUESTION RULE\n\nIf the user asks a specific technical follow-up question after receiving quote/service info\n(for example: \"revisan caja automática?\", \"cómo ven el kilometraje real?\", \"qué miran del motor?\"):\n- answer that exact question directly\n- do not reset the conversation\n- do not ask again for already-known vehicle or location\n- do not send the full commercial recap again\n- after answering, ask at most one useful next step only if appropriate\nAsk for ALL required booking data in a structured way.\nDo not ask one-by-one unless the user responds partially.\n\nBOOKING DATA COLLECTION RULE\n\nWhen booking_signals.quote_accepted = true and revision is not yet fully populated:\n\nRequest these fields in one structured message, omitting fields already known:\nBuyer:\n- nombre y apellido\n- teléfono\n- email\n\nSeller:\n- agencia o particular\n- nombre\n- dirección\n- día y horario\n\nVehicle:\n- tipo\n- marca\n- modelo\n- año\n- link de publicación\n\nDo not ask one-by-one unless the user starts answering partially.\n\nSCHEDULE CONFLICT RULE\n\nIf you receive schedule_valid = false in your input:\n- Do NOT confirm any appointment\n- Offer the suggested_slots as alternatives naturally\n- Example: \"El horario de mañana 14hs no está disponible. \n  Te puedo ofrecer estos horarios: [slots]. ¿Alguno te viene bien?\"\n- If suggested_slots is empty, say availability will be confirmed \n  by the team shortly.\n\nReturn ONLY valid JSON.\nNo text before or after."
+            },
+            {
+              "type": "HumanMessagePromptTemplate",
+              "message": "=Latest customer message:\n{{$node[\"Webhook\"].json.body.text}}\n\nEffective state (vehicle + zone already resolved):\n{{ JSON.stringify($node[\"Build Effective Quote Input\"].json) }}\n\nRecent conversation:\n{{$node[\"Build Conversation Context\"].json[\"conversation_context\"]}}\n\nThread state:\n{{ JSON.stringify($node[\"Refresh Thread State\"].json) }}\n\nLead:\n{{ JSON.stringify($node[\"Get Lead\"].json) }}\n\nRevisions:\n{{ JSON.stringify($node[\"Get Revisions\"].json) }}"
+            }
+          ]
+        },
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        2080,
+        1440
+      ],
+      "id": "80bd8d4c-716c-4512-9174-3af851886896",
+      "name": "AI Reply Planner"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "list",
+          "value": "gpt-5-mini"
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        2080,
+        1648
+      ],
+      "id": "363f11e2-1123-43a1-8bdd-16e58487f635",
+      "name": "OpenAI Chat Model1",
+      "credentials": {
+        "openAiApi": {
+          "id": "3SMYOc0A5V49RXwk",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $json.text ?? $json.output ?? $json.response ?? \"\";\n\nif (!raw) {\n  throw new Error(\"Planner returned no text\");\n}\n\nlet parsed;\n\ntry {\n  parsed = JSON.parse(raw);\n} catch (e) {\n  // Fallback: if planner returned plain text, wrap it so the flow does not crash\n  return [\n    {\n      json: {\n        reply_text: raw.trim(),\n        reply_goal: \"ANSWER_ONLY\",\n        missing_fields: [],\n        lead_patch: {\n          estado: null,\n          flag: null,\n          necesita_humano: false,\n          motivo_perdida: null\n        },\n        inferred_revision_patch: {\n          tipo_vehiculo: null,\n          zone_group: null,\n          zone_detail: null,\n          marca: null,\n          modelo: null,\n          anio: null\n        },\n        should_create_revision: false,\n        needs_human: false,\n        planner_reason_code: \"UNKNOWN\"\n      }\n    }\n  ];\n}\n\nreturn [{ json: parsed }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2416,
+        1440
+      ],
+      "id": "a40f230c-c993-4a5a-a9db-afb5742bef54",
+      "name": "Parser Planner Output"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "66d64363-ba70-46dd-b545-e77c145dea32",
+              "leftValue": "={{$node[\"Carry Price Flag\"].json[\"ready_for_price\"]}}",
+              "rightValue": "true",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        2656,
+        1440
+      ],
+      "id": "e35bee1c-58c7-4c81-b271-fefc17998d99",
+      "name": "If - Ready For Price Calc?"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "dd29e836-be82-4eec-b123-ce15d7aeb455",
+              "name": "tipo_vehiculo",
+              "value": "={{$node[\"Build Effective Quote Input\"].json[\"effective_state\"][\"tipo_vehiculo\"]}}",
+              "type": "string"
+            },
+            {
+              "id": "3bfc745a-4de2-45dc-ad74-6a4527d968c1",
+              "name": "zone_group",
+              "value": "={{$node[\"Build Effective Quote Input\"].json[\"effective_state\"][\"zone_group\"]}}",
+              "type": "string"
+            },
+            {
+              "id": "53dce501-b72d-47aa-bec3-7f7d8552b638",
+              "name": "zone_detail",
+              "value": "={{$node[\"Build Effective Quote Input\"].json[\"effective_state\"][\"zone_detail\"]}}",
+              "type": "string"
+            },
+            {
+              "id": "cd68977f-1430-46d9-9c32-2a1318d26ca5",
+              "name": "marca",
+              "value": "={{$node[\"Build Effective Quote Input\"].json[\"effective_state\"][\"marca\"]}}",
+              "type": "string"
+            },
+            {
+              "id": "688ba712-8910-4bd7-b7bf-c6e9514123be",
+              "name": "modelo",
+              "value": "={{$node[\"Build Effective Quote Input\"].json[\"effective_state\"][\"modelo\"]}}",
+              "type": "string"
+            },
+            {
+              "id": "5b4a67da-344f-4abc-886d-dc76ebe5478d",
+              "name": "anio",
+              "value": "={{$node[\"Build Effective Quote Input\"].json[\"effective_state\"][\"anio\"]}}",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        2896,
+        1424
+      ],
+      "id": "601dfac4-6ec1-4fd9-b506-250d34036d74",
+      "name": "Price Inputs"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "list",
+          "value": "gpt-5-mini"
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        3376,
+        1632
+      ],
+      "id": "e353053b-fd3f-4565-86aa-86e35b42ee4b",
+      "name": "OpenAI Chat Model2",
+      "credentials": {
+        "openAiApi": {
+          "id": "3SMYOc0A5V49RXwk",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{$node[\"Webhook\"].json.body.text}}",
+        "messages": {
+          "messageValues": [
+            {
+              "message": "You are Ridecheck's WhatsApp response writer.  \nYour task is to write the final WhatsApp reply using the already computed business data. \nDo not calculate, estimate, guess, or modify prices. \nUse exactly the provided price data. \nDo not invent missing facts.  \n\nSTYLE \n- Friendly \n- Natural \n- Short \n- Argentina WhatsApp tone \n- Professional \n- Not robotic  \n\nRULES \n- If exact price is available, mention it clearly. \n- If vehicle and zone are known, use them naturally. \n- If the planner wanted a next step, keep the reply moving forward. \n- Ask at most one next useful question. \n- Do not mention internal field names. \n- Do not mention \"planner\", \"JSON\", \"CRM\", or \"system\".  \n\nWHEN planner_reason_code = \"READY_FOR_PRICE_CALC\":\n\nYou MUST include BOTH:\n1. A concise explanation of the service (what it includes)\n2. The final computed price\n\nWhen sending a quote, always follow this exact structure:\nWhen writing a quote reply, always use this exact structure:\n\nGreeting: \"Hola [nombre] — soy Julián de Ridecheck.\"\nIf nombre is unknown, skip the name but keep the intro.\n\nThen confirm: vehicle + zone + address + date/time if provided by user.\n\nThen describe service:\n\"Incluye escaneo profesional de módulos, verificación de kilometraje \ny revisión estructural (más de 250 puntos); recibís el informe completo \nen el momento.\"\n\nThen state price: \"El valor es $[precio_total].\"\n\nThen end ALWAYS with:\n\"¿Avanzamos para ver si tenemos disponibilidad?\"\n\nNEVER use:\n- \"Confirmo el turno\"\n- \"Lo agendamos\" \n- \"Quedó reservado\"\n- \"Te confirmo\"\n- Any language implying the slot is booked\n\nThe AI never confirms appointments. A human always does.\n\nExample output:\n\"Hola [nombre] — soy Julián de Ridecheck. Para el [vehículo] en [zona] ([dirección]) \nel [día] a las [hora]: incluye escaneo profesional de módulos, verificación de \nkilometraje y revisión estructural (más de 250 puntos); recibís el informe completo \nen el momento. El valor es $[precio]. ¿Avanzamos para ver si tenemos disponibilidad?\"\n\nNever return only the price.\n\nSTYLE RULES:\n\n- NEVER use the phrase \"oral y por escrito\"\n- Instead use natural alternatives such as:\n  - \"te explicamos todo en el momento\"\n  - \"te entregamos el informe en el momento\"\n  - \"recibís el informe completo en el momento\"\n- Tone must be natural, conversational, and commercial (not academic)\n\n- Avoid robotic phrasing like \"precio total es\"\n- Prefer natural phring:\n  - \"El valor es $130.000\"\n  - \"Tiene un valor de $130.000\"\n\n\"service_summary\": \"Incluye escaneo profesional de módulos, verificación de kilometraje y revisión estructural (más de 250 puntos).\"\n\n\nReturn ONLY valid JSON.  \nOUTPUT: \n{   \n\"final_reply_text\": \"...\" \n} \n\n"
+            },
+            {
+              "type": "HumanMessagePromptTemplate",
+              "message": "=Latest customer message: \n{{$node[\"Webhook\"].json.body.text}}  \n\nPlanner output: \n{{ JSON.stringify($node[\"Parser Planner Output\"].json) }}  \n\nComputed pricing: \n{{ JSON.stringify($json) }}"
+            }
+          ]
+        },
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        3376,
+        1424
+      ],
+      "id": "8679c230-1d28-4091-b233-93e1516fe759",
+      "name": "Final Answer Maker"
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $json.text ?? $json.output ?? $json.response ?? \"\";\n\nif (!raw) {\n  throw new Error(\"Final Answer Maker returned no text\");\n}\n\nlet parsed;\ntry {\n  parsed = JSON.parse(raw);\n} catch (e) {\n  throw new Error(\"Final Answer output is not valid JSON: \" + raw);\n}\n\nreturn [{ json: parsed }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3696,
+        1424
+      ],
+      "id": "6c1db229-f822-4ad4-9397-75b9302e8783",
+      "name": "Parse Final Answer"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "507bf9f2-9cc1-4a0f-bd2e-d6fe68141c15",
+              "name": "final_reply_text",
+              "value": "={{$json[\"reply_text\"]}}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        3040,
+        1712
+      ],
+      "id": "68d89039-5cd1-411b-a818-3aafaf611f24",
+      "name": "Final Answer from Planner"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "fdba293f-d0f8-47ff-9c1a-47088d49c84d",
+              "name": "final_reply_text",
+              "value": "={{$json[\"final_reply_text\"]}}",
+              "type": "string"
+            },
+            {
+              "id": "90df52c0-f577-46fc-b829-a03829e05dad",
+              "name": "thread_id",
+              "value": "={{$node[\"Get Thread\"].json[\"thread_id\"]}}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        4144,
+        1408
+      ],
+      "id": "cdb45d20-ca1b-4004-aa50-957a364b6bb7",
+      "name": "Debug Final Reply"
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=http://backend:8000/leads/{{$node[\"Get Lead\"].json[\"id\"]}}",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "necesita_humano",
+              "value": "true"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -4624,
+        784
+      ],
+      "id": "32b19a0c-666d-4c8e-b45e-7aee51841413",
+      "name": "Mark Leads Needs Human"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "f51684c3-70b0-4707-b350-270f96750545",
+              "name": "handoff",
+              "value": "true",
+              "type": "string"
+            },
+            {
+              "id": "f84af003-4012-43d6-968d-8aaa350d7058",
+              "name": "final_reply_text",
+              "value": "\"\"",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -2256,
+        784
+      ],
+      "id": "99346d1c-2eb8-415a-9cb5-6433dcbae647",
+      "name": "Human Handoff Result"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "ed075e90-7ff0-4713-8ef4-8f6b9076b306",
+              "leftValue": "={{$json[\"final_reply_text\"]}}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        3888,
+        1424
+      ],
+      "id": "6b6184af-bc28-4dc1-8625-dd45dc0483bf",
+      "name": "IF - Has Reply Text?"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "5bc16e2a-5bab-4e2c-b88e-df09d73f7bcf",
+              "name": "handoff",
+              "value": "true",
+              "type": "string"
+            },
+            {
+              "id": "7af7532c-8647-4cc4-b348-98750dee758d",
+              "name": "final_reply_text",
+              "value": "\"\"",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -4688,
+        1872
+      ],
+      "id": "d79bc299-5857-4710-9a26-f3160784f0f1",
+      "name": "NO AI Reply Result"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "ed075e90-7ff0-4713-8ef4-8f6b9076b306",
+              "leftValue": "={{$json[\"final_reply_text\"]}}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        3680,
+        1808
+      ],
+      "id": "3c177267-b4c7-48e6-aae6-c0db69937fe6",
+      "name": "IF - Has Reply Text?1"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "fdba293f-d0f8-47ff-9c1a-47088d49c84d",
+              "name": "final_reply_text",
+              "value": "={{$json[\"final_reply_text\"]}}",
+              "type": "string"
+            },
+            {
+              "id": "90df52c0-f577-46fc-b829-a03829e05dad",
+              "name": "thread_id",
+              "value": "={{$node[\"Get Thread\"].json[\"thread_id\"]}}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        4080,
+        1792
+      ],
+      "id": "1aac1de0-a5ed-4900-a270-483535be8235",
+      "name": "Debug Final Reply1"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://backend:8000/api/whatsapp/thread/{{$node[\"Get Thread\"].json[\"thread_id\"]}}/send-text",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "text",
+              "value": "={{$json[\"final_reply_text\"]}}"
+            },
+            {
+              "name": "reply_to message_id",
+              "value": "={{null}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        4656,
+        2176
+      ],
+      "id": "60bf5e04-5ed7-48a9-acd8-81fcfe187ed0",
+      "name": "Send Whatsapp Reply1"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "ed075e90-7ff0-4713-8ef4-8f6b9076b306",
+              "leftValue": "={{$json[\"final_reply_text\"]}}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -1424,
+        784
+      ],
+      "id": "ae55b8f6-9a9e-4f5e-b74a-42f706d36687",
+      "name": "IF - Has Reply Text?2"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "fdba293f-d0f8-47ff-9c1a-47088d49c84d",
+              "name": "final_reply_text",
+              "value": "={{$json[\"final_reply_text\"]}}",
+              "type": "string"
+            },
+            {
+              "id": "90df52c0-f577-46fc-b829-a03829e05dad",
+              "name": "thread_id",
+              "value": "={{$node[\"Get Thread\"].json[\"thread_id\"]}}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -1152,
+        784
+      ],
+      "id": "842199ad-6a57-40bf-a43c-ba1ef65af68b",
+      "name": "Debug Final Reply2"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://backend:8000/api/whatsapp/thread/{{$node[\"Get Thread\"].json[\"thread_id\"]}}/send-text",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "text",
+              "value": "={{$json[\"final_reply_text\"]}}"
+            },
+            {
+              "name": "reply_to message_id",
+              "value": "={{null}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        4352,
+        1408
+      ],
+      "id": "e84c0bc9-684c-4cd4-ac0e-19b6dd6982a7",
+      "name": "Send Whatsapp Reply"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "f1ce3c19-65c6-496d-8460-2b22d40bfca1",
+              "name": "sent_text",
+              "value": "={{$json[\"text\"]}}",
+              "type": "string"
+            },
+            {
+              "id": "552bcf5a-0163-4a54-a4cf-95938d7fd0e8",
+              "name": "sent_to_thread",
+              "value": "={{$json[\"thread_id\"]}}",
+              "type": "string"
+            },
+            {
+              "id": "38abdee4-afdc-4513-a791-694cb6e389f3",
+              "name": "sent_wa_message_id",
+              "value": "={{$json[\"wa_message_id\"]}}",
+              "type": "string"
+            },
+            {
+              "id": "f290e949-002f-43f8-8e6c-06cce6ef8de8",
+              "name": "send_ok",
+              "value": "={{$json[\"ok\"]}}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        4576,
+        1408
+      ],
+      "id": "1454f063-cec4-4a44-b8a0-7a3d65ebc4ee",
+      "name": "Send Result"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://backend:8000/api/whatsapp/thread/{{$node[\"Get Thread\"].json[\"thread_id\"]}}/send-text",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "text",
+              "value": "={{$json[\"final_reply_text\"]}}"
+            },
+            {
+              "name": "reply_to message_id",
+              "value": "={{null}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -944,
+        784
+      ],
+      "id": "ed7e6c27-dbdb-4012-86b5-11f231594695",
+      "name": "Send Whatsapp Reply2"
+    },
+    {
+      "parameters": {
+        "url": "=http://backend:8000/api/whatsapp/thread/{{$node[\"Get Thread\"].json[\"thread_id\"]}}/state",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -7040,
+        1440
+      ],
+      "id": "547e2707-3a45-4fdb-83b6-9c5c17d93a07",
+      "name": "Get Thread State"
+    },
+    {
+      "parameters": {
+        "url": "=http://backend:8000/api/whatsapp/thread/{{$node[\"Get Thread\"].json[\"thread_id\"]}}/candidates",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -6544,
+        1440
+      ],
+      "id": "d008d1a6-eecd-4f1f-91ae-df2e8ae691e3",
+      "name": "Get Thread Candidates",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "url": "=http://backend:8000/api/whatsapp/thread/{{$node[\"Get Thread\"].json[\"thread_id\"]}}/messages?limit=10",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -8144,
+        1440
+      ],
+      "id": "5dcc9d0d-8755-4529-86b3-f61473528683",
+      "name": "Get Thread Messages 1",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "url": "=http://backend:8000/api/whatsapp/thread/{{$node[\"Get Thread\"].json[\"thread_id\"]}}/messages?limit=10",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -7760,
+        1440
+      ],
+      "id": "201e97ce-9e64-40a3-8785-bc2e62d6a185",
+      "name": "Get Thread Messages 2",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "64c875c2-4f2b-4165-8a47-38e7c01a9135",
+              "leftValue": "={{$json[\"latest_after_wait\"]}}",
+              "rightValue": "={{$json[\"current_execution_message\"]}}",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -7312,
+        1440
+      ],
+      "id": "d53f6ac0-2712-4d09-a064-665464f2190c",
+      "name": "IF - Latest Execution?"
+    },
+    {
+      "parameters": {
+        "jsCode": "const latestCheck = $input.first().json;\n\n// Pull messages from Get Thread Messages 2\nconst rawNode = $node[\"Get Thread Messages 2\"].json;\n\n// Support either shape:\n// A) { thread_id: 10, messages: [...] }\n// B) [ { thread_id: 10, messages: [...] } ]\nlet messages = [];\n\nif (Array.isArray(rawNode)) {\n  messages = rawNode[0]?.messages ?? [];\n} else {\n  messages = rawNode.messages ?? [];\n}\n\nconst currentWaMessageId = latestCheck.current_execution_message || null;\n\n// Sort by timestamp ascending just in case\nmessages = [...messages].sort((a, b) => {\n  return new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime();\n});\n\n// Find current inbound message\nconst currentMsg = messages.find(m => m.wa_message_id === currentWaMessageId);\n\n// Fallback: latest inbound message\nconst latestInbound = [...messages].reverse().find(m => m.direction === \"in\");\n\n// Use current matched message if found, otherwise fallback\nconst anchorMsg = currentMsg || latestInbound || null;\n\nconst anchorTimestamp = anchorMsg?.timestamp\n  ? new Date(anchorMsg.timestamp).getTime()\n  : Date.now();\n\n// Keep recent messages within 20 minutes before anchor\nconst WINDOW_MS = 20 * 60 * 1000;\n\nconst recentWindow = messages.filter(m => {\n  if (!m.timestamp) return false;\n  const ts = new Date(m.timestamp).getTime();\n  return ts <= anchorTimestamp && (anchorTimestamp - ts) <= WINDOW_MS;\n});\n\n// Recent inbound user messages only\nconst recentInbound = recentWindow\n  .filter(m => m.direction === \"in\" && typeof m.text === \"string\" && m.text.trim() !== \"\")\n  .slice(-6);\n\n// Recent outbound bot messages only\nconst recentOutbound = recentWindow\n  .filter(m => m.direction === \"out\" && typeof m.text === \"string\" && m.text.trim() !== \"\")\n  .slice(-3);\n\n// Latest user message\nconst latestUserMessage = anchorMsg?.direction === \"in\"\n  ? (anchorMsg.text || \"\").trim()\n  : (latestInbound?.text || \"\").trim();\n\n// Last outbound reply\nconst lastOutboundReply = recentOutbound.length\n  ? recentOutbound[recentOutbound.length - 1].text.trim()\n  : null;\n\n// Array of recent user messages\nconst recentUserMessages = recentInbound.map(m => m.text.trim());\n\n// Compact conversation context\nconst conversationContext = [\n  recentInbound.length\n    ? `Recent user messages: ${recentInbound.map(m => `\"${m.text.trim()}\"`).join(\" | \")}`\n    : null,\n  lastOutboundReply\n    ? `Last outbound reply: \"${lastOutboundReply}\"`\n    : null\n].filter(Boolean).join(\"\\n\");\n\nreturn [\n  {\n    json: {\n      latest_after_wait: latestCheck.latest_after_wait ?? null,\n      current_execution_message: latestCheck.current_execution_message ?? null,\n      current_wa_message_id: currentWaMessageId,\n      latest_user_message: latestUserMessage || null,\n      recent_user_messages: recentUserMessages,\n      last_outbound_reply: lastOutboundReply,\n      conversation_context: conversationContext,\n      conversation_message_count: recentInbound.length\n    }\n  }\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -6112,
+        1440
+      ],
+      "id": "d047a043-f3a1-4f33-b89e-e3c412fa5be8",
+      "name": "Build Conversation Context"
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $input.all();\n\nif (!raw || raw.length === 0) {\n  return [\n    {\n      json: {\n        candidates: []\n      }\n    }\n  ];\n}\n\n// If the HTTP node already emitted candidate items one by one\nreturn [\n  {\n    json: {\n      candidates: raw.map(item => item.json)\n    }\n  }\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -6336,
+        1440
+      ],
+      "id": "255c23ce-3a47-42a6-8312-f16e9cda500c",
+      "name": "Code in JavaScript"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "f1ce3c19-65c6-496d-8460-2b22d40bfca1",
+              "name": "sent_text",
+              "value": "={{$json[\"text\"]}}",
+              "type": "string"
+            },
+            {
+              "id": "552bcf5a-0163-4a54-a4cf-95938d7fd0e8",
+              "name": "sent_to_thread",
+              "value": "={{$json[\"thread_id\"]}}",
+              "type": "string"
+            },
+            {
+              "id": "38abdee4-afdc-4513-a791-694cb6e389f3",
+              "name": "sent_wa_message_id",
+              "value": "={{$json[\"wa_message_id\"]}}",
+              "type": "string"
+            },
+            {
+              "id": "f290e949-002f-43f8-8e6c-06cce6ef8de8",
+              "name": "send_ok",
+              "value": "={{$json[\"ok\"]}}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -752,
+        784
+      ],
+      "id": "70fc29f6-8cf0-4a7a-b200-0a7eea2c127e",
+      "name": "Send Result 2"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "f1ce3c19-65c6-496d-8460-2b22d40bfca1",
+              "name": "sent_text",
+              "value": "={{$json[\"text\"]}}",
+              "type": "string"
+            },
+            {
+              "id": "552bcf5a-0163-4a54-a4cf-95938d7fd0e8",
+              "name": "sent_to_thread",
+              "value": "={{$json[\"thread_id\"]}}",
+              "type": "string"
+            },
+            {
+              "id": "38abdee4-afdc-4513-a791-694cb6e389f3",
+              "name": "sent_wa_message_id",
+              "value": "={{$json[\"wa_message_id\"]}}",
+              "type": "string"
+            },
+            {
+              "id": "f290e949-002f-43f8-8e6c-06cce6ef8de8",
+              "name": "send_ok",
+              "value": "={{$json[\"ok\"]}}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        4960,
+        2176
+      ],
+      "id": "91b1d4af-5238-4ce9-a995-0d806e658114",
+      "name": "Send Result 1"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Latest user message:\n{{$node[\"Webhook\"].json[\"body\"][\"text\"]}}\n\nRecent conversation:\n{{$node[\"Build Conversation Context\"].json[\"conversation_context\"]}}\n\nThread state:\n{{JSON.stringify($node[\"Get Thread State\"].json)}}\n\nThread candidates:\n{{JSON.stringify($node[\"Get Thread Candidates\"].json)}}\n\nRouter result:\n{{JSON.stringify($node[\"Parser Router Output\"].json)}}\n\nLead:\n{{JSON.stringify($node[\"Get Lead\"].json)}}\n\nRevisions:\n{{JSON.stringify($node[\"Get Revisions\"].json)}}",
+        "messages": {
+          "messageValues": [
+            {
+              "message": "CRM fields are STRICT ENUMS. Invalid values will break the system.\nYou are the Ridecheck thread memory updater.\n\nYour job is NOT to answer the customer.\nYour job is to update conversation memory safely.\n\nYou will receive:\n- latest user message\n- recent user messages\n- conversation context\n- thread state\n- thread candidates\n- router result\n- lead\n- revisions\n\nRIDECHECK MEMORY MODEL\n\nThread state = conversation-level memory.\nCandidates = vehicle-level memory. There may be multiple candidates in one thread.\n\nAllowed candidate statuses:\n- mentioned\n- current_focus\n- discarded\n- quoted\n- booked\n\nMain rules:\n- Do not create a formal Revision here.\n- Do not invent facts.\n- If uncertain, patch less, not more.\n- If the user asks only for service info, update state but do not force candidate creation.\n- If the message clearly adds or corrects data for the current vehicle, patch the current focus candidate.\n- If the user clearly introduces a different vehicle, create a new candidate.\n- If one candidate is clearly the one currently being discussed, set it as current focus.\n- If the user is clearly reacting positively to a quote and asking for availability or proposing a day/time, treat that as booking/scheduling intent.\n\nIMPORTANT ID RULE:\n- current_focus_candidate_id must be an integer database id or null.\n- Never output placeholder strings like \"candidate_1\", \"candidate_2\", or labels.\n- If a new candidate is being created in this same step and no real database id exists yet, set current_focus_candidate_id = null and use:\n  - create_candidate = true\n  - candidate_focus_after_create = true\n- The real focus id will be patched later after the candidate is created.\n\nBooking / acceptance signals:\nTreat phrases like these as booking or quote-acceptance signals when they appear after a quote or with clear coordination intent:\n- perfecto\n- dale\n- buenísimo\n- me sirve\n- quiero coordinar\n- qué disponibilidad tenés\n- mañana podés\n- hoy a las 15\n- pasame horarios\n- cuándo podés\n\nBOOKING SIGNAL RULE — CRITICAL\n\nquote_accepted can ONLY be true if BOTH of these are true:\n1. last_stage in thread state is already \"QUOTED\" or \"SCHEDULING\"\n2. The user's message is a clear acceptance like \"si\", \"dale\", \"perfecto\", \n   \"quiero avanzar\"\n\nIf last_stage is null, NEW, or QUALIFYING:\n→ quote_accepted = false ALWAYS\n→ No matter what data the user sends\n→ A quote has not been sent yet, so it cannot be accepted\n\nSTATE & CRM CONTROL RULES\n\nYou are responsible for updating structured conversation state and CRM mirror fields.\n\nYou must follow these rules strictly.\n\n----------------------------------------\n1. THREAD STATE LOGIC (AI INTERNAL)\n----------------------------------------\n\nUse ONLY these values:\n\nlast_intent:\n- INFO\n- QUOTE\n- AVAILABILITY_BOOKING\n- SUPPORT\n\nlast_stage:\n- NEW\n- QUALIFYING\n- QUOTED\n- SCHEDULING\n- POST_SERVICE\n\nRules:\n\n- If intent = INFO → stage = NEW or QUALIFYING depending on context\n- If intent = QUOTE and data is incomplete → stage = QUALIFYING\n- If a quote has already been generated → stage = QUOTED\n- If the user is coordinating timing → \n  last_intent = AVAILABILITY_BOOKING\n  last_stage = SCHEDULING\n\nNever invent new values.\n\n----------------------------------------\n2. CRM LEAD ESTADO (STRICT ENUM)\n----------------------------------------\n\nEstado allowed values for crm_mirror.estado\nCONSULTA_NUEVA\nCOORDINAR_DISPONIBILIDAD\nAGENDADO\nREVISION_COMPLETA\nATENCION_HUMANA\n\nRules:\n\n- Default state during qualification and quoting:\n  → \"Consulta nueva\"\n\n- Move to:\n  → \"Coordinar disponibilidad\"\n  ONLY IF the user clearly accepted the quote AND is moving forward with scheduling\n\n- \"Agendado\" and \"Revisión completa\":\n  → DO NOT set these (reserved for human/backoffice)\n\nNever output any other value.\nNever output uppercase variants.\nNever output internal codes.\n\n----------------------------------------\n3. CRM FLAG (STRICT ENUM)\n----------------------------------------\n\nAllowed values ONLY:\nFlag allowed values for crm_mirror.flag\n\nPRESUPUESTANDO\nPRESUPUESTO_ENVIADO\nACEPTADO\nRECOMPRA\nPERDIDO\n\nRules:\n\n- During qualification:\n  → \"Presupuestando\"\n\n- When a deterministic quote has been produced:\n  → \"Presupuesto enviado\"\n\n- When the user clearly accepts:\n  → \"Aceptado\"\n\n- \"Re-compra\" and \"Perdido\":\n  → DO NOT set unless explicitly clear\n\nNever invent values.\n\n----------------------------------------\n4. BOOKING SIGNAL DETECTION\n----------------------------------------\n\nIf the user expresses clear intention to move forward, such as:\n\n- \"dale\"\n- \"agendemos\"\n- \"reserva\"\n- \"ok hagamoslo\"\n- \"coordinemos\"\n- \"qué disponibilidad tienen\"\n\nThen:\n\nbooking_signals.quote_accepted = true\n\nThis enables:\n\n- estado → \"Coordinar disponibilidad\"\n- flag → \"Aceptado\"\n- last_intent → AVAILABILITY_BOOKING\n- last_stage → SCHEDULING\n\nBOOKING DATE RESOLUTION:\n- Today is {{$now.toFormat('yyyy-MM-dd')}} (always inject current date)\n- When user says a day name like \"Martes\", calculate the actual next upcoming date for that day\n- Always output turno_fecha and preferred_day_text as ISO date: \"YYYY-MM-DD\"\n- Never output day names as strings (\"Martes\") — always resolve to actual date\n- If the user pastes an ISO datetime like \"2026-04-11T09:00\", extract date and time separately\n\n----------------------------------------\n5. CRM MIRROR PRINCIPLES\n----------------------------------------\n\n- CRM fields must reflect REAL business progress, not assumptions\n- Do NOT update aggressively\n- Do NOT overwrite correct previous values without strong evidence\n- If unsure → DO NOT update\n\n----------------------------------------\n6. MAPPING SUMMARY (IMPORTANT)\n----------------------------------------\n\nQUALIFYING / INFO / QUOTE (incomplete):\n→ estado = \"Consulta nueva\"\n→ flag = \"Presupuestando\"\n\nQUOTE READY / PRICE SENT:\n→ estado = \"Consulta nueva\"\n→ flag = \"Presupuesto enviado\"\n\nQUOTE ACCEPTED / MOVING TO BOOKING:\n→ estado = \"Coordinar disponibilidad\"\n→ flag = \"Aceptado\"\n\n----------------------------------------\n7. STRICT OUTPUT RULE\n----------------------------------------\n\n- Use EXACT string values as defined\n- Do NOT translate\n- Do NOT uppercase\n- Do NOT abbreviate\n- Do NOT invent alternatives\n\nIMPORTANT:\nA lead may end up hiring multiple times for different cars.\nDo NOT assume one lead = one revision.\nA revision should only be created later, after explicit acceptance for a specific candidate/service case.\n\nReturn ONLY valid JSON with this exact shape:\n\n{\n  \"state_patch\": {\n    \"last_intent\": null,\n    \"last_stage\": null,\n    \"needs_human\": null,\n    \"current_focus_candidate_id\": null,\n    \"customer_name\": null\n  },\n  \"create_candidate\": false,\n  \"candidate_create\": null,\n  \"candidate_patch_target_id\": null,\n  \"candidate_patch\": null,\n  \"candidate_focus_after_create\": false,\n  \"crm_mirror\": {\n    \"estado\": null,\n    \"flag\": null,\n    \"necesita_humano\": null\n  },\n  \"booking_signals\": {\n    \"quote_accepted\": false,\n    \"asked_availability\": false,\n    \"preferred_day_text\": null,\n    \"preferred_time_text\": null\n  }\n}\n\nRules for output:\n\nSTRICT INTENT RULES FOR MEMORY UPDATES\n\n1. Do NOT classify as BOOKING or AVAILABILITY_BOOKING unless at least one of these is true:\n- the user explicitly asks for availability, scheduling, day, date, hour, or turn\n- the user proposes a day or time\n- the user is clearly accepting a previously sent quote and moving forward\n\n2. Messages like these are NOT booking by themselves:\n- \"quiero revisar un auto\"\n- \"quiero cotizar\"\n- \"me interesa revisar un auto\"\n- \"quiero saber el valor\"\n- \"quiero info\"\nThese should usually remain in QUOTE or INFO depending on context.\n\n3. If the user mentions wanting to inspect/review/check a vehicle and provides location or vehicle info, this usually indicates QUOTE / QUALIFYING, not booking.\n\n4. Candidate creation rule:\nCreate a candidate when the message contains at least one meaningful vehicle-level fact for a new case, such as:\n- vehicle model or brand/model\n- tipo_vehiculo\n- locality / zone_detail\n- a clear statement about the car being discussed\nEven if some fields are still missing, create a candidate when there is enough evidence that a vehicle case is being discussed.\n\n5. For \"quiero revisar un auto en pilar\" you should usually:\n- set last_intent = QUOTE\n- set last_stage = QUALIFYING\n- create_candidate = true\n- create a candidate with tipo_vehiculo = AUTO, zone_detail = Pilar, and inferred zone_group if clear\n\n6. Use AVAILABILITY_BOOKING only after quote context or explicit scheduling language.\n\n\n- Use null when unknown.\n- candidate_create must be null unless create_candidate = true.\n- candidate_patch must be null unless candidate_patch_target_id is set.\n- crm_mirror is advisory for future lead patching.\n- booking_signals should capture scheduling intent if present.\n- Never output explanations outside JSON.\n\n7. CANDIDATE FIELD NAMES:\nUse only these exact field names in candidate_create and candidate_patch:\n- label\n- marca\n- modelo\n- version_text\n- anio\n- tipo_vehiculo\n- zone_group\n- zone_detail\n- direccion_texto\n- source_text\n- status\n\nDo NOT use alternate names like:\n- make\n- model\n- year\n- raw_text\n\n--- BOOKING DATA EXTRACTION ---\n\nWhen the conversation reaches booking or scheduling stage, you must extract structured CRM data.\n\nReturn ALSO these objects:\n\n\"lead_patch\": {\n  \"nombre\": null,\n  \"apellido\": null,\n  \"telefono\": null,\n  \"email\": null,\n  \"estado\": null,\n  \"flag\": null,\n  \"necesita_humano\": false,\n  \"motivo_perdida\": null\n},\n\n\"lead_revision_patch\": {\n  \"tipo_vehiculo\": null,\n  \"marca\": null,\n  \"modelo\": null,\n  \"anio\": null,\n  \"link_compra\": null,\n  \"vendedor_tipo\": null,\n  \"tipo_vendedor\": null,\n  \"direccion_texto\": null,\n  \"zone_group\": null,\n  \"zone_detail\": null,\n  \"turno_fecha\": null,\n  \"turno_hora\": null\n}\n\n\n--- EXTRACTION RULES ---\n\n1. Names:\n- If user gives full name → split into nombre / apellido\n- Example: \"Juan Garcia\" → nombre=\"Juan\", apellido=\"Garcia\"\n\n2. Vehicle:\n- Extract marca, modelo, anio when present\n- Example: \"Toyota Yaris 2024\"\n\n3. Seller:\n- agencia → \"AGENCIA\"\n- particular → \"PARTICULAR\"\n\n4. Location:\n- Extract direccion_texto if present\n- Extract zone_detail if clear\n- Infer zone_group ONLY if very clear\n\n5.CUSTOMER NAME IN STATE:\n- If nombre and apellido are extracted, also set:\n  state_patch.customer_name = \"nombre apellido\" (combined full name)\n- If name not in this message, set state_patch.customer_name = null\n  (backend ignores null and keeps existing value)\n\nLOCATION FIELD RULES — CRITICAL\n\nzone_detail must contain ONLY the locality name. Never include a street address.\n\nIf the user says \"Loyola 2014 - Agronomía\"\n  → zone_detail = \"Agronomía\"\n  → direccion_texto = \"Loyola 2014\"\n\nIf the user says \"Palermo\" → zone_detail = \"Palermo\"\nIf the user says \"Villa del Parque\" → zone_detail = \"Villa del Parque\"\n\nValid zone_detail examples from the coverage area:\nCABA: Agronomía, Almagro, Balvanera, Belgrano, Caballito, Chacarita,\nCoghlan, Colegiales, Flores, Floresta, La Boca, Liniers, Mataderos,\nMonserrat, Núñez, Palermo, Recoleta, Retiro, Saavedra, San Telmo,\nVilla Crespo, Villa Devoto, Villa Lugano, Villa Urquiza, entre otros.\n\nNorte: Tigre, San Fernando, San Isidro, Vicente López, Pilar, Escobar,\nSan Miguel, Malvinas Argentinas, José C. Paz, Zárate, Campana.\n\nOeste: Morón, Ituzaingó, Hurlingham, Merlo, Moreno, San Martín,\n3 de Febrero, General Rodríguez, Marcos Paz, Luján.\n\nSur: Lanús, Avellaneda, Lomas de Zamora, Quilmes, Berazategui,\nFlorencio Varela, Ezeiza, La Plata, Almirante Brown.\n\nThe pricing API receives zone_detail exactly as written here.\nSending a full address like \"Loyola 2014 - Agronomía\" will cause a 404.\n\n5. Scheduling:\n- Extract turno_fecha if user gives a day\n- Extract turno_hora if user gives time\n\n6. CRM State:\nIf quote is accepted:\n- estado = \"COORDINAR_DISPONIBILIDAD\"\n- flag = \"ACEPTADO\"\n\n7. NEVER:\n- invent data\n- overwrite existing data with null\n\nFLAG PROGRESSION RULE — CRITICAL\n\nPRESUPUESTO_ENVIADO is only set AFTER the pricing branch has run \nand a price has been sent to the client.\n\nACEPTADO is only set when the user explicitly accepts AFTER receiving a price.\n\nFor a first message containing booking data but no prior quote:\n→ flag = \"PRESUPUESTANDO\"\n→ quote_accepted = false\n→ do NOT set ACEPTADO until a price has actually been delivered\n\nReturn ONLY valid JSON."
+            }
+          ]
+        },
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        -4480,
+        1456
+      ],
+      "id": "a00ccd50-f885-4f92-bb50-b1f3cbc44a7d",
+      "name": "Candidate /State Updater"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "list",
+          "value": "gpt-5-mini"
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        -4480,
+        1664
+      ],
+      "id": "f05ebc69-fead-4639-aa56-b06d88cd2005",
+      "name": "OpenAI Chat Model3",
+      "credentials": {
+        "openAiApi": {
+          "id": "3SMYOc0A5V49RXwk",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $json.text ?? $json.output ?? $json.response ?? \"\";\n\nif (!raw) {\n  throw new Error(\"Updater returned no text\");\n}\n\nlet parsed;\ntry {\n  parsed = JSON.parse(raw);\n} catch (e) {\n  throw new Error(\"Updater output is not valid JSON: \" + raw);\n}\n\nreturn [{ json: parsed }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -4160,
+        1456
+      ],
+      "id": "6e95d1bf-8754-46be-bbb1-72278f05256f",
+      "name": "Parser Updater Output"
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=http://backend:8000/api/whatsapp/thread/{{$node[\"Get Thread\"].json[\"thread_id\"]}}/state",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $node[\"Parser Updater Output\"].json[\"state_patch\"] }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -3568,
+        1520
+      ],
+      "id": "316a626c-a456-4fa4-9f03-d600ec691345",
+      "name": "Patch Thread State"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "f8eda547-be2c-4ea8-b1ce-6b40175a5657",
+              "leftValue": "={{$node[\"Parser Updater Output\"].json[\"create_candidate\"]}}",
+              "rightValue": "true",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -3360,
+        1184
+      ],
+      "id": "4de98666-60e1-47fd-9e97-e87fe01947e1",
+      "name": "IF - Create Candidate?"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://backend:8000/api/whatsapp/thread/{{$node[\"Get Thread\"].json[\"thread_id\"]}}/candidates",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $node[\"Parser Updater Output\"].json[\"candidate_create\"] }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -2960,
+        1168
+      ],
+      "id": "df531e6c-4161-495d-8104-28649041f25d",
+      "name": "Create Candidate"
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=http://backend:8000/api/whatsapp/thread/{{$node[\"Get Thread\"].json[\"thread_id\"]}}/candidates/{{$node[\"Parser Updater Output\"].json[\"candidate_patch_target_id\"]}}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $node[\"Parser Updater Output\"].json[\"candidate_patch\"] }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -3248,
+        1824
+      ],
+      "id": "6b57722b-2de7-4fb9-85f0-6f5c6d8dee75",
+      "name": "Patch Candidate node"
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=http://backend:8000/api/whatsapp/thread/{{$node[\"Get Thread\"].json[\"thread_id\"]}}/state",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{\n  {\n    current_focus_candidate_id: $node[\"Create Candidate\"].json[\"id\"]\n  }\n}}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -2304,
+        1152
+      ],
+      "id": "cc1c0dd3-c368-4b2e-a33a-17f20ddd4b37",
+      "name": "Patch Thread State Focus After Create"
+    },
+    {
+      "parameters": {
+        "url": "=http://backend:8000/api/whatsapp/thread/{{$node[\"Get Thread\"].json[\"thread_id\"]}}/state",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -3024,
+        1520
+      ],
+      "id": "560ce628-8f21-4905-915f-dee87d4e8e18",
+      "name": "Refresh Thread State",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "url": "=http://backend:8000/api/whatsapp/thread/{{$node[\"Get Thread\"].json[\"thread_id\"]}}/candidates",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        1200,
+        1360
+      ],
+      "id": "9cc2d0da-c2f1-4df5-bcb4-9da42bf6f220",
+      "name": "Refresh Thread Candidates",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $input.all();\n\nif (!raw || raw.length === 0) {\n  return [\n    {\n      json: {\n        candidates: []\n      }\n    }\n  ];\n}\n\nreturn [\n  {\n    json: {\n      candidates: raw.map(item => item.json)\n    }\n  }\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1408,
+        1360
+      ],
+      "id": "90fb8069-0da6-4bb1-aeb5-0615d99d0939",
+      "name": "Normalize Thread Candidates"
+    },
+    {
+      "parameters": {
+        "jsCode": "const state = $node[\"Refresh Thread State\"].json;\nconst candidatesNode = $node[\"Normalize Thread Candidates\"].json;\n\nconst candidates = candidatesNode.candidates || [];\nconst focusId = state.current_focus_candidate_id;\n\nlet focusCandidate = null;\n\nif (focusId != null) {\n  focusCandidate = candidates.find(c => c.id === focusId) || null;\n}\n\n// fallback: if no focus id, try candidate with current_focus\nif (!focusCandidate) {\n  focusCandidate = candidates.find(c => c.status === \"current_focus\") || null;\n}\n\nif (!focusCandidate) {\n  return [\n    {\n      json: {\n        effective_state: null,\n        ready_for_price: false,\n        missing_fields: [\"candidate\"]\n      }\n    }\n  ];\n}\n\nconst normalize = (value) =>\n  (value || \"\")\n    .toString()\n    .normalize(\"NFD\")\n    .replace(/[\\u0300-\\u036f]/g, \"\")\n    .trim()\n    .toLowerCase();\n\n// infer zone_group from zone_detail when possible\nconst inferZoneGroupFromDetail = (zoneDetail) => {\n  const z = normalize(zoneDetail);\n\n  if (!z) return null;\n\n  // CABA\n  const cabaDetails = [\n    \"agronomia\",\n    \"almagro\",\n    \"balvanera\",\n    \"belgrano\",\n    \"caballito\",\n    \"chacarita\",\n    \"coghlan\",\n    \"colegiales\",\n    \"flores\",\n    \"floresta\",\n    \"la boca\",\n    \"liniers\",\n    \"mataderos\",\n    \"monserrat\",\n    \"monte castro\",\n    \"nunez\",\n    \"palermo\",\n    \"parque avellaneda\",\n    \"parque chacabuco\",\n    \"parque chas\",\n    \"parque patricios\",\n    \"paternal\",\n    \"pompeya\",\n    \"puerto madero\",\n    \"recoleta\",\n    \"retiro\",\n    \"saavedra\",\n    \"san cristobal\",\n    \"san nicolas\",\n    \"san telmo\",\n    \"velez sarsfield\",\n    \"versalles\",\n    \"villa crespo\",\n    \"villa del parque\",\n    \"villa devoto\",\n    \"villa general mitre\",\n    \"villa lugano\",\n    \"villa luro\",\n    \"villa ortuzar\",\n    \"villa pueyrredon\",\n    \"villa real\",\n    \"villa santa rita\",\n    \"villa soldati\",\n    \"villa urquiza\"\n  ];\n\n  if (cabaDetails.includes(z)) return \"CABA\";\n\n  // Norte\n  const norteDetails = [\n    \"acassuso\",\n    \"beccar\",\n    \"boulogne\",\n    \"don torcuato\",\n    \"el talar\",\n    \"escobar\",\n    \"garin\",\n    \"general pacheco\",\n    \"ingeniero maschwitz\",\n    \"martinez\",\n    \"munro\",\n    \"olivos\",\n    \"pacheco\",\n    \"pilar\",\n    \"san fernando\",\n    \"san isidro\",\n    \"tigre\",\n    \"torcuato\",\n    \"victoria\",\n    \"vicente lopez\"\n  ];\n\n  if (norteDetails.includes(z)) return \"Norte\";\n\n  // Oeste\n  const oesteDetails = [\n    \"castelar\",\n    \"haedo\",\n    \"ituzaingo\",\n    \"moreno\",\n    \"moron\",\n    \"padua\",\n    \"paso del rey\",\n    \"ramos mejia\",\n    \"san antonio de padua\"\n  ];\n\n  if (oesteDetails.includes(z)) return \"Oeste\";\n\n  // Sur\n  const surDetails = [\n    \"adrogue\",\n    \"avellaneda\",\n    \"banfield\",\n    \"berazategui\",\n    \"burzaco\",\n    \"calzada\",\n    \"ezeiza\",\n    \"glew\",\n    \"lanus\",\n    \"lomas de zamora\",\n    \"longchamps\",\n    \"monte grande\",\n    \"quilmes\",\n    \"san francisco solano\",\n    \"temperley\"\n  ];\n\n  if (surDetails.includes(z)) return \"Sur\";\n\n  return null;\n};\n\nlet effectiveZoneGroup = focusCandidate.zone_group ?? null;\nconst effectiveZoneDetail = focusCandidate.zone_detail ?? null;\n\n// if zone_group is missing but zone_detail is known, try to infer it\nif (!effectiveZoneGroup && effectiveZoneDetail) {\n  effectiveZoneGroup = inferZoneGroupFromDetail(effectiveZoneDetail);\n}\n\nconst missing = [];\nif (!focusCandidate.tipo_vehiculo) missing.push(\"tipo_vehiculo\");\n\n// only ask for location if zone_detail itself is missing.\n// if zone_detail exists, do not mark location as missing just because zone_group is null.\nif (!effectiveZoneDetail) {\n  missing.push(\"zone_detail\");\n}\n\nreturn [\n  {\n    json: {\n      effective_state: {\n        tipo_vehiculo: focusCandidate.tipo_vehiculo ?? null,\n        zone_group: effectiveZoneGroup,\n        zone_detail: effectiveZoneDetail,\n        marca: focusCandidate.marca ?? null,\n        modelo: focusCandidate.modelo ?? null,\n        anio: focusCandidate.anio ?? null,\n        candidate_id: focusCandidate.id\n      },\n      ready_for_price: missing.length === 0 && !!effectiveZoneGroup,\n      missing_fields: missing\n    }\n  }\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1616,
+        1360
+      ],
+      "id": "2abe6b73-22e7-4ac5-b755-3b18b3c2c41e",
+      "name": "Build Effective Quote Input"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "1aae5c16-2fe5-41dc-8097-8eaae5ae5ba4",
+              "leftValue": "={{$json[\"candidate_focus_after_create\"]}}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -2672,
+        1168
+      ],
+      "id": "d89e777b-1938-4c73-a58d-a852c5be4aeb",
+      "name": "IF - candidate focus after create"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "fecfec09-b700-4cff-8083-eff84797fc6d",
+              "leftValue": "={{$json[\"candidate_patch_target_id\"]}}",
+              "rightValue": "true",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -3568,
+        1840
+      ],
+      "id": "d4502702-463e-4e1d-baf5-2337e2b0d91d",
+      "name": "IF - Patch Candidate"
+    },
+    {
+      "parameters": {
+        "jsCode": "const current_execution_message = $node[\"Webhook\"].json[\"body\"][\"wa_message_id\"];\n\n// Read Get Thread Messages 2 output\nconst raw = $node[\"Get Thread Messages 2\"].json;\n\nlet messages = [];\n\nif (Array.isArray(raw)) {\n  if (raw.length > 0 && raw[0].messages) {\n    messages = raw[0].messages;\n  } else {\n    messages = raw;\n  }\n} else if (raw.messages) {\n  messages = raw.messages;\n}\n\n// Keep only inbound user messages\nconst inboundMessages = messages.filter(\n  m => m.direction === \"in\" && m.wa_message_id\n);\n\n// Sort oldest → newest\ninboundMessages.sort((a, b) => {\n  return new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime();\n});\n\nconst latestInbound = inboundMessages.length\n  ? inboundMessages[inboundMessages.length - 1].wa_message_id\n  : null;\n\nreturn [\n  {\n    json: {\n      latest_after_wait: latestInbound,\n      current_execution_message\n    }\n  }\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -7568,
+        1440
+      ],
+      "id": "93657a05-1922-44c0-947c-a3625801c009",
+      "name": "Debug Latest Check"
+    },
+    {
+      "parameters": {
+        "amount": 1
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        -3296,
+        1520
+      ],
+      "id": "6ef966eb-806b-4e9b-be01-545edbc54983",
+      "name": "Wait (1sec)",
+      "webhookId": "4b40a031-b9c3-414b-a69b-1001cfe55960"
+    },
+    {
+      "parameters": {
+        "amount": 10
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        -7936,
+        1440
+      ],
+      "id": "1afc8a1e-aafe-4025-9d38-d555304c4ede",
+      "name": "Wait (20 sec)",
+      "webhookId": "3e4b896a-bb27-4807-91b9-5efe6ceb986c"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "2bfcd06b-e18c-4f8a-80a9-ff96856a5594",
+              "leftValue": "={{$node[\"Get Thread State\"].json[\"last_processed_inbound_wa_message_id\"]}}",
+              "rightValue": "={{$node[\"Webhook\"].json[\"body\"][\"wa_message_id\"]}}",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -6832,
+        1440
+      ],
+      "id": "88dc26f5-6d60-4c42-b84f-763a2cc7bdd9",
+      "name": "IF - Already Processed Message"
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=http://backend:8000/api/whatsapp/thread/{{$node[\"Get Thread\"].json[\"thread_id\"]}}/state",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"last_processed_inbound_wa_message_id\": \"{{$node['Webhook'].json['body']['wa_message_id']}}\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        4784,
+        1408
+      ],
+      "id": "050e2f98-438a-4f52-8192-2b447a7b224a",
+      "name": "Patch Thread State - Mark Processed"
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=http://backend:8000/api/whatsapp/thread/{{$node[\"Get Thread\"].json[\"thread_id\"]}}/state",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"last_processed_inbound_wa_message_id\": \"{{$node['Webhook'].json['body']['wa_message_id']}}\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        5216,
+        2176
+      ],
+      "id": "5730049d-d593-4e69-a4df-a4f16486e063",
+      "name": "Patch Thread State - Mark Processed1"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://backend:8000/api/pricing/quote",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"tipo_vehiculo\": \"{{$json['tipo_vehiculo']}}\",\n  \"zone_group\": \"{{$json['zone_group']}}\",\n  \"zone_detail\": \"{{$json['zone_detail']}}\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        3152,
+        1424
+      ],
+      "id": "ed58652b-a5ec-446b-b9f4-d917821de8c0",
+      "name": "Request Backend Price"
+    },
+    {
+      "parameters": {
+        "jsCode": "const crm = $node[\"Parser Updater Output\"].json.crm_mirror || {};\n\nconst ESTADO_MAP = {\n  \"Consulta nueva\": \"CONSULTA_NUEVA\",\n  \"Coordinar disponibilidad\": \"COORDINAR_DISPONIBILIDAD\",\n  \"Agendado\": \"AGENDADO\",\n  \"Revisión completa\": \"REVISION_COMPLETA\",\n  \"Atención humana\": \"ATENCION_HUMANA\",\n\n  CONSULTA_NUEVA: \"CONSULTA_NUEVA\",\n  COORDINAR_DISPONIBILIDAD: \"COORDINAR_DISPONIBILIDAD\",\n  AGENDADO: \"AGENDADO\",\n  REVISION_COMPLETA: \"REVISION_COMPLETA\",\n  ATENCION_HUMANA: \"ATENCION_HUMANA\",\n};\n\nconst FLAG_MAP = {\n  \"Presupuestando\": \"PRESUPUESTANDO\",\n  \"Presupuesto enviado\": \"PRESUPUESTO_ENVIADO\",\n  \"Aceptado\": \"ACEPTADO\",\n  \"Re-compra\": \"RECOMPRA\",\n  \"Perdido\": \"PERDIDO\",\n\n  PRESUPUESTANDO: \"PRESUPUESTANDO\",\n  PRESUPUESTO_ENVIADO: \"PRESUPUESTO_ENVIADO\",\n  ACEPTADO: \"ACEPTADO\",\n  RECOMPRA: \"RECOMPRA\",\n  PERDIDO: \"PERDIDO\",\n};\n\nconst mappedEstado = crm.estado ? ESTADO_MAP[crm.estado] ?? null : null;\nconst mappedFlag = crm.flag ? FLAG_MAP[crm.flag] ?? null : null;\n\nconst patch = {\n  estado: mappedEstado,\n  flag: mappedFlag,\n  necesita_humano: crm.necesita_humano,\n};\n\n// only include motivo_perdida when flag is PERDIDO\nif (mappedFlag === \"PERDIDO\" && crm.motivo_perdida) {\n  patch.motivo_perdida = crm.motivo_perdida;\n}\n\nconst clean = Object.fromEntries(\n  Object.entries(patch).filter(([, v]) => v !== null && v !== undefined)\n);\n\nreturn [{ json: clean }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -3840,
+        992
+      ],
+      "id": "59392f40-344f-46b0-92e7-8f1d288e2d1a",
+      "name": "Sanitize Lead Patch"
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=http://backend:8000/leads/{{$node[\"Get Lead\"].json[\"id\"]}}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -3360,
+        976
+      ],
+      "id": "c00b9962-f6bf-4126-848d-951c516d9a91",
+      "name": "Sync Lead State"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "7b25e278-67f6-4160-a133-9570a846e97c",
+              "leftValue": "={{ Object.keys($json).length > 0 }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -3632,
+        992
+      ],
+      "id": "76b84350-ef1c-4997-aba4-fdeda21e0f9d",
+      "name": "IF - Has Lead Patch"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "440990b4-4d57-44cc-a6c5-c7c8ecb8d23d",
+              "leftValue": "={{ $json[\"current_revision_id\"] != null }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -2768,
+        1520
+      ],
+      "id": "ddca386c-d001-44e5-8c91-7be6b33e35b4",
+      "name": "IF - Has Current Revision?"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "53b7dcbc-408b-44ed-965b-4091dac45b00",
+              "name": "effective_revision_id",
+              "value": "={{$node[\"Refresh Thread State\"].json[\"current_revision_id\"]}}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -2048,
+        1536
+      ],
+      "id": "87ff7fe5-9cc8-42c9-90c6-2f72991d3952",
+      "name": "Effective Revision Id (existing)"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "b28dd17e-2b28-4306-9786-4790841b0a4d",
+              "name": "effective_revision_id",
+              "value": "=  0",
+              "type": "number"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -1776,
+        1392
+      ],
+      "id": "159118bf-4501-4bd3-b201-631dfa173f18",
+      "name": "Effective Revision Id (created)"
+    },
+    {
+      "parameters": {
+        "jsCode": "const revisionPatch = $node[\"Parser Updater Output\"].json.lead_revision_patch || {};\nconst effectiveRevisionId = ($json.effective_revision_id && $json.effective_revision_id !== 0) ? $json.effective_revision_id : null;\n\nconst cleanPatch = Object.fromEntries(\n  Object.entries(revisionPatch).filter(([, v]) => v !== null && v !== undefined && v !== \"\")\n);\n\n// Inject approval PENDING when a scheduled date is being set\nif (cleanPatch.scheduled_date) {\n  cleanPatch.appointment_approval_status = \"PENDING\";\n  cleanPatch.appointment_approval_sent_at = new Date().toISOString();\n}\n\nreturn [\n  {\n    json: {\n      effective_revision_id: effectiveRevisionId,\n      revision_patch: cleanPatch\n    }\n  }\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1584,
+        1536
+      ],
+      "id": "80074068-336b-4a57-ac08-d63a865f3e74",
+      "name": "Sanitize Revision Patch"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "9042efca-dfca-4715-8cd8-a18d4a4df7cd",
+              "leftValue": "={{ Object.keys($json[\"revision_patch\"] || {}).length > 0 }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -1296,
+        1536
+      ],
+      "id": "6b5a3364-499a-4d26-b2bd-0c02a67cdff6",
+      "name": "IF - Has Revision Patch"
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=http://backend:8000/api/revisions/{{$json[\"effective_revision_id\"]}}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json[\"revision_patch\"] }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -1040,
+        1184
+      ],
+      "id": "4182f515-09f9-4590-9918-65eb9daa68d0",
+      "name": "Patch Revision"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://backend:8000/api/revisions",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"thread_id\": {{$node[\"Refresh Thread State\"].json[\"thread_id\"]}},\n  \"candidate_id\": {{$node[\"Refresh Thread State\"].json[\"current_focus_candidate_id\"]}}\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        752,
+        800
+      ],
+      "id": "f18dca43-4186-4f79-bfd0-88722d179776",
+      "name": "Create Revision2"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "89b44dec-d7ca-44ea-a630-98c677317ebd",
+              "leftValue": "={{ $node[\"Refresh Thread State\"].json[\"current_focus_candidate_id\"] != null }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -2480,
+        1408
+      ],
+      "id": "e86d3879-1313-49b1-ae31-98062c608cc1",
+      "name": "IF - Has Focus Candidate?"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "765939d3-7207-46c4-9384-149a1bfb5e1a",
+              "leftValue": "={{ $node[\"Parser Updater Output\"].json[\"booking_signals\"][\"quote_accepted\"] }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -848,
+        1296
+      ],
+      "id": "a961d0c3-6878-4bb4-80d1-3adbeff3d3c3",
+      "name": "IF - Has Booking Intent?"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://backend:8000/api/schedule/check",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "address",
+              "value": "={{$json[\"address\"]}}"
+            },
+            {
+              "name": "preferred_day",
+              "value": "={{$json[\"preferred_day\"]}}"
+            },
+            {
+              "name": "preferred_time",
+              "value": "={{$json[\"preferred_time\"]}}"
+            },
+            {
+              "name": "zone_group",
+              "value": "={{$json[\"zone_group\"]}}"
+            },
+            {
+              "name": "zone_detail",
+              "value": "={{$json[\"zone_detail\"]}}"
+            },
+            {
+              "name": "distance_km",
+              "value": "={{$json[\"distance_km\"]}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        336,
+        1088
+      ],
+      "id": "cc437b99-82d4-4039-acff-c68a53d720a6",
+      "name": "Check Schedule"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "f09f2489-c352-48ea-b5b3-017f290aa3d3",
+              "leftValue": "={{ $json[\"valid\"] }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        576,
+        1088
+      ],
+      "id": "ac39c1bd-050e-4252-a2bf-d865daf79cc8",
+      "name": "IF - Schedule Valid?"
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=http://backend:8000/leads/{{$node[\"Get Lead\"].json[\"id\"]}}",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "flag",
+              "value": "ACEPTADO"
+            },
+            {
+              "name": "necesita_humano",
+              "value": "true"
+            },
+            {
+              "name": "nombre",
+              "value": "={{$node[\"Refresh Thread State\"].json[\"customer_name\"].split(\" \")[0]}}"
+            },
+            {
+              "name": "apellido",
+              "value": "={{$node[\"Refresh Thread State\"].json[\"customer_name\"].split(\" \").slice(1).join(\" \")}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        1376,
+        624
+      ],
+      "id": "8ccdab4d-426e-4718-84d8-a344c4e9e1d6",
+      "name": "Mark Lead Agendado"
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=http://backend:8000/api/revisions/{{$node[\"Create Revision2\"].json[\"revision_id\"]}}",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "status",
+              "value": "booked"
+            },
+            {
+              "name": "buyer_name",
+              "value": "={{($node[\"Parser Updater Output\"].json[\"lead_patch\"][\"nombre\"] ?? \"\") + \" \" + ($node[\"Parser Updater Output\"].json[\"lead_patch\"][\"apellido\"] ?? \"\")}}"
+            },
+            {
+              "name": "seller_type",
+              "value": "={{$node[\"Parser Updater Output\"].json[\"lead_revision_patch\"][\"vendedor_tipo\"]}}"
+            },
+            {
+              "name": "seller_name",
+              "value": "={{$node[\"Parser Updater Output\"].json[\"lead_revision_patch\"][\"tipo_vendedor\"]}}"
+            },
+            {
+              "name": "address",
+              "value": "={{$node[\"Date Parser\"].json[\"address\"]}}"
+            },
+            {
+              "name": "scheduled_date",
+              "value": "={{$node[\"Date Parser\"].json[\"preferred_day\"]}}"
+            },
+            {
+              "name": "scheduled_time",
+              "value": "={{$node[\"Date Parser\"].json[\"preferred_time\"]}}"
+            },
+            {
+              "name": "tipo_vehiculo ",
+              "value": "={{$node[\"Date Parser\"].json[\"lead_revision_patch\"][\"tipo_vehiculo\"]}}"
+            },
+            {
+              "name": "marca",
+              "value": "={{$node[\"Date Parser\"].json[\"lead_revision_patch\"][\"marca\"]}}"
+            },
+            {
+              "name": "modelo",
+              "value": "={{$node[\"Date Parser\"].json[\"lead_revision_patch\"][\"modelo\"]}}"
+            },
+            {
+              "name": "anio",
+              "value": "={{parseInt($node[\"Date Parser\"].json[\"lead_revision_patch\"][\"anio\"])}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        1376,
+        416
+      ],
+      "id": "31bc4244-f453-4ef3-8b69-d812d08ac708",
+      "name": "Patch Revision Booked"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "442f23b0-d775-410a-8832-390cd9b1cbd4",
+              "name": "suggested_slots",
+              "value": "={{ $json[\"suggested_slots\"] }}",
+              "type": "string"
+            },
+            {
+              "id": "38d7ea83-dc2d-4f03-bb18-27e194a57aab",
+              "name": "reasons",
+              "value": "={{ $json[\"reasons\"] }}",
+              "type": "string"
+            },
+            {
+              "id": "1daa0ada-602d-4447-9829-cd161a08ed1a",
+              "name": "schedule_valid",
+              "value": "false",
+              "type": "string"
+            },
+            {
+              "id": "81207f6b-a72b-44e9-b581-106f8446e683",
+              "name": "final_reply_text",
+              "value": "={{'El horario solicitado no está disponible. ' + $json[\"reasons\"][0] + '\\n\\nTe propongo estas alternativas:\\n' + $json[\"suggested_slots\"].map((s, i) => (i+1) + '. ' + s).join('\\n') + '\\n\\n¿Cuál te viene bien?'}}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1120,
+        1968
+      ],
+      "id": "676486ac-00e7-4964-a1f1-b8b208a2bbbf",
+      "name": "Schedule Alternatives"
+    },
+    {
+      "parameters": {
+        "fromEmail": "ridecheckassistance@gmail.com",
+        "toEmail": "ridecheckassistance@gmail.com",
+        "subject": "={{'🔔 Nuevo turno — ' + ($node[\"Parser Updater Output\"].json[\"lead_patch\"][\"nombre\"] ?? \"\") + ' ' + ($node[\"Parser Updater Output\"].json[\"lead_patch\"][\"apellido\"] ?? \"\") + ' Lead #' + $node[\"Get Lead\"].json[\"id\"]}}",
+        "html": "={{\n'<html><body style=\"font-family:Arial,sans-serif;font-size:14px;color:#333;\">' +\n\n'<h3>📋 Nueva solicitud de turno recibida</h3>' +\n\n'<p><strong>CLIENTE</strong><br>' +\n'Lead ID: ' + $node[\"Get Lead\"].json[\"id\"] + '<br>' +\n'Nombre: ' + ($node[\"Parser Updater Output\"].json[\"lead_patch\"][\"nombre\"] ?? \"\") + ' ' + ($node[\"Parser Updater Output\"].json[\"lead_patch\"][\"apellido\"] ?? \"\") + '<br>' +\n'Teléfono: ' + ($node[\"Get Lead\"].json[\"telefono\"] ?? \"\") + '</p>' +\n\n'<p><strong>VEHÍCULO</strong><br>' +\n($node[\"Date Parser\"].json[\"lead_revision_patch\"][\"tipo_vehiculo\"] ?? \"\") + ' — ' +\n($node[\"Date Parser\"].json[\"lead_revision_patch\"][\"marca\"] ?? \"\") + ' ' +\n($node[\"Date Parser\"].json[\"lead_revision_patch\"][\"modelo\"] ?? \"\") + ' ' +\n($node[\"Date Parser\"].json[\"lead_revision_patch\"][\"anio\"] ?? \"\") + '</p>' +\n\n'<p><strong>UBICACIÓN</strong><br>' +\n($node[\"Date Parser\"].json[\"lead_revision_patch\"][\"zone_detail\"] ?? \"\") + ', ' +\n($node[\"Date Parser\"].json[\"lead_revision_patch\"][\"zone_group\"] ?? \"\") + '<br>' +\n($node[\"Date Parser\"].json[\"lead_revision_patch\"][\"direccion_texto\"] ?? \"\") + '</p>' +\n\n'<p><strong>TURNO SOLICITADO</strong><br>' +\n($node[\"Date Parser\"].json[\"preferred_day\"] ?? \"Sin fecha\") + ' — ' +\n($node[\"Date Parser\"].json[\"preferred_time\"] ?? \"Sin hora\") + '</p>' +\n\n'<p>Revisión ID: ' + ($node[\"Refresh Thread State\"].json[\"current_revision_id\"] ?? \"pendiente\") + '</p>' +\n\n'<p>⚠️ <strong>Requiere confirmación antes de comunicar al cliente.</strong></p>' +\n\n'<p>' +\n'<a href=\"https://TU_DOMINIO/kanban#lead-' + $node[\"Get Lead\"].json[\"id\"] + '\" ' +\n'style=\"display:inline-block;padding:10px 20px;background-color:#4A90D9;color:white;text-decoration:none;border-radius:5px;margin-right:10px;\">🔍 Ver en CRM</a>' +\n'</p>' +\n\n'</body></html>'\n}}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1712,
+        1040
+      ],
+      "id": "6fb7308c-0980-42b2-86be-a828679424fb",
+      "name": "Send an Email",
+      "webhookId": "f04da85a-1169-411a-a856-3802eaf58b4d",
+      "credentials": {
+        "smtp": {
+          "id": "pTbAWghTxGsCxKwb",
+          "name": "SMTP account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "40bcc71e-9cc4-4692-9882-b895db99c36a",
+              "name": "final_reply_text",
+              "value": "={{'Perfecto — tu solicitud de turno quedó registrada. El equipo va a confirmar disponibilidad y te avisa a la brevedad.'}}",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1376,
+        176
+      ],
+      "id": "813f01f8-710a-4736-9924-a1298b7065ec",
+      "name": "Booking Confirmed Reply"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "7aea41b5-b4eb-47da-affd-c3a3e643cbf5",
+              "leftValue": "={{ $json[\"effective_revision_id\"] !== null && $json[\"effective_revision_id\"] !== undefined }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -1328,
+        1216
+      ],
+      "id": "06975741-b506-4d95-acf7-57eb81a873b6",
+      "name": "IF - Has Effective Rev Id?"
+    },
+    {
+      "parameters": {
+        "jsCode": "const updater = $node[\"Parser Updater Output\"].json;\nconst bookingSignals = updater.booking_signals || {};\nconst revPatch = updater.lead_revision_patch || {};\n\nconst dayText = (bookingSignals.preferred_day_text || \"\").toLowerCase().trim();\nconst today = new Date();\nlet targetDate = new Date(today);\n\nif (dayText.match(/^\\d{4}-\\d{2}-\\d{2}/)) {\n  const parsed = new Date(dayText.match(/\\d{4}-\\d{2}-\\d{2}/)[0] + \"T12:00:00\");\n  if (parsed > today) {\n    targetDate = parsed;\n  } else {\n    targetDate = new Date(parsed);\n    targetDate.setDate(parsed.getDate() + 7);\n  }\n} else if (dayText.includes(\"mañana\")) {\n  targetDate.setDate(today.getDate() + 1);\n} else if (dayText.includes(\"pasado\")) {\n  targetDate.setDate(today.getDate() + 2);\n} else {\n  const dayMap = {\n    \"lunes\": 1, \"martes\": 2, \"miércoles\": 3, \"miercoles\": 3,\n    \"jueves\": 4, \"viernes\": 5, \"sábado\": 6, \"sabado\": 6, \"domingo\": 0\n  };\n  const targetDay = dayMap[dayText];\n  if (targetDay !== undefined) {\n    const todayDay = today.getDay();\n    let daysAhead = targetDay - todayDay;\n    if (daysAhead <= 0) daysAhead += 7;\n    targetDate.setDate(today.getDate() + daysAhead);\n  }\n}\n\nconst preferred_day = targetDate.toISOString().split(\"T\")[0];\n\nconst timeRaw = (bookingSignals.preferred_time_text || revPatch.turno_hora || \"10:00\").toString().trim();\nlet preferred_time = \"10:00\";\nconst match = timeRaw.match(/^(\\d{1,2})[\\s:hH]?(\\d{0,2})/);\nif (match) {\n  const hours = match[1].padStart(2, \"0\");\n  const minutes = (match[2] && match[2].length === 2) ? match[2] : \"00\";\n  preferred_time = `${hours}:${minutes}`;\n}\n\nconst direccion = revPatch.direccion_texto || \"\";\nconst zoneDetail = revPatch.zone_detail || \"\";\nconst zoneGroup = revPatch.zone_group || \"\";\nconst address = [direccion, zoneDetail, zoneGroup].filter(Boolean).join(\", \");\n\nreturn [{\n  json: {\n    address: address || \"Sin direccion\",\n    preferred_day,\n    preferred_time,\n    zone_group: zoneGroup,\n    zone_detail: zoneDetail,\n    lead_revision_patch: revPatch,\n    booking_signals: bookingSignals\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -736,
+        1088
+      ],
+      "id": "41c419ba-e499-43ab-af3c-5ef04942296c",
+      "name": "Date Parser"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "0c9ecbb4-76cf-4971-ba91-abe2ec0f36bc",
+              "name": "ready_for_price",
+              "value": "={{$json[\"ready_for_price\"] === true}}",
+              "type": "boolean"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1824,
+        1360
+      ],
+      "id": "e27fbe4b-083f-4c31-be21-9697417c8723",
+      "name": "Carry Price Flag"
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=http://backend:8000/api/whatsapp/thread/{{$node[\"Get Thread\"].json[\"thread_id\"]}}/display-name",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"display_name\": \"{{$node[\"Refresh Thread State\"].json[\"customer_name\"]}}\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        1376,
+        832
+      ],
+      "id": "34b28e06-c7a3-4a4d-a01f-f81d2f31d7d3",
+      "name": "Change Thread Name"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://backend:8000/leads/{{$node[\"Get Lead\"].json[\"id\"]}}/revisions",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"tipo_vehiculo\": \"{{$node['Date Parser'].json['lead_revision_patch']['tipo_vehiculo']}}\",\n  \"marca\": \"{{$node['Date Parser'].json['lead_revision_patch']['marca']}}\",\n  \"modelo\": \"{{$node['Date Parser'].json['lead_revision_patch']['modelo']}}\",\n  \"anio\": {{parseInt($node['Date Parser'].json['lead_revision_patch']['anio'])}},\n  \"vendedor_tipo\": \"{{$node['Date Parser'].json['lead_revision_patch']['vendedor_tipo']}}\",\n  \"zone_group\": \"{{$node['Date Parser'].json['lead_revision_patch']['zone_group']}}\",\n  \"zone_detail\": \"{{$node['Date Parser'].json['lead_revision_patch']['zone_detail']}}\",\n  \"direccion_texto\": \"{{$node['Date Parser'].json['lead_revision_patch']['direccion_texto']}}\",\n  \"turno_fecha\": \"{{$node['Date Parser'].json['preferred_day']}}\",\n  \"turno_hora\": \"{{$node['Date Parser'].json['preferred_time']}}\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        1376,
+        0
+      ],
+      "id": "b2ce3979-c188-4bd5-964d-a7db77e1ee09",
+      "name": "Create CRM Revision"
+    },
+    {
+      "parameters": {
+        "amount": 2
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1376,
+        1040
+      ],
+      "id": "6bc64526-03dc-46e0-b876-68856f920bfc",
+      "name": "Wait",
+      "webhookId": "01c32524-559c-46b2-b765-f202e0364a50"
+    },
+    {
+      "parameters": {
+        "url": "http://backend:8000/api/settings/ai-enabled",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -12192,
+        1568
+      ],
+      "id": "cfb9e821-9b3b-4e7a-a26d-1548651aa100",
+      "name": "Get AI Status"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "9f0414e5-48f9-448a-966d-6614b28199f1",
+              "leftValue": "={{$json[\"ai_enabled\"]}}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -11952,
+        1568
+      ],
+      "id": "08de621b-45f7-4ca2-afb4-2d408420a9f8",
+      "name": "IF - AI Enabled?"
+    },
+    {
+      "parameters": {
+        "url": "=http://backend:8000/api/excluded-phones/check/{{$node[\"Webhook\"].json.body.wa_id}}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -11744,
+        1568
+      ],
+      "id": "a147cace-3d08-407d-9d6c-3fb8802135f1",
+      "name": "Check Excluded Phone"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "d057b078-304c-4143-b1a5-10a2786c9665",
+              "leftValue": "={{$json[\"excluded\"]}}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            },
+            {
+              "id": "af545a74-9014-46cd-83e1-1399f1fa655c",
+              "leftValue": "={{$node[\"Webhook\"].json.body.wa_id}}",
+              "rightValue": "@g.us",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            }
+          ],
+          "combinator": "or"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -11536,
+        1568
+      ],
+      "id": "c233d1c3-6ab7-4e63-a616-cd7f98d738f4",
+      "name": "IF - Phone Excluded?"
+    },
+    {
+      "parameters": {
+        "url": "=http://backend:8000/api/schedule/appointments-that-day?date={{$json[\"preferred_day\"]}}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -544,
+        1088
+      ],
+      "id": "1576e61c-0533-41e0-9b67-93d21dcc5e8b",
+      "name": "Get Day Appointments",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const ZONA_CERO = {\n  MELO: \"Melo y Panamericana, Nordelta, Buenos Aires, Argentina\",\n  SANTA_CATALINA: \"Santa Catalina Puerta 2, Benavidez, Buenos Aires, Argentina\"\n};\n\nfunction isAlternatingWeek(dateStr) {\n  const anchor = new Date(\"2026-04-06T00:00:00\");\n  const target = new Date(dateStr + \"T00:00:00\");\n  const deltaDays = Math.floor((target - anchor) / (1000 * 60 * 60 * 24));\n  if (deltaDays < 0) return false;\n  return (Math.floor(deltaDays / 7) % 2) === 0;\n}\n\nfunction getZonaCero(dateStr) {\n  const date = new Date(dateStr + \"T00:00:00\");\n  const dow = date.getDay();\n  const alternating = isAlternatingWeek(dateStr);\n  if (dow === 1) return alternating ? ZONA_CERO.MELO : ZONA_CERO.SANTA_CATALINA;\n  if (dow === 2) return ZONA_CERO.SANTA_CATALINA;\n  if (dow === 3) return ZONA_CERO.SANTA_CATALINA;\n  if (dow === 4) return ZONA_CERO.MELO;\n  if (dow === 5) return ZONA_CERO.MELO;\n  if (dow === 6) return ZONA_CERO.SANTA_CATALINA;\n  return ZONA_CERO.MELO;\n}\n\nconst dateParserOutput = $node[\"Date Parser\"].json;\nconst preferred_day = dateParserOutput[\"preferred_day\"];\nconst preferred_time = dateParserOutput[\"preferred_time\"];\nconst address = dateParserOutput[\"address\"];\nconst zone_group = dateParserOutput[\"zone_group\"];\nconst zone_detail = dateParserOutput[\"zone_detail\"];\nconst lead_revision_patch = dateParserOutput[\"lead_revision_patch\"];\nconst booking_signals = dateParserOutput[\"booking_signals\"];\n\n// Get appointments from previous node\nconst appointments = $input.all().map(i => i.json).filter(i => i.time);\n\nlet origin = getZonaCero(preferred_day);\n\nif (appointments && appointments.length > 0) {\n  const sorted = appointments.sort((a, b) => a.time.localeCompare(b.time));\n  const proposedMinutes = parseInt(preferred_time.split(\":\")[0]) * 60 + parseInt(preferred_time.split(\":\")[1]);\n  \n  let lastBefore = null;\n  for (const apt of sorted) {\n    const aptMinutes = parseInt(apt.time.split(\":\")[0]) * 60 + parseInt(apt.time.split(\":\")[1]);\n    if (aptMinutes < proposedMinutes) lastBefore = apt;\n  }\n  \n  if (lastBefore && lastBefore.address) origin = lastBefore.address;\n}\n\nreturn [{\n  json: {\n    address,\n    preferred_day,\n    preferred_time,\n    zone_group,\n    zone_detail,\n    origin_used: origin,\n    lead_revision_patch,\n    booking_signals\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -320,
+        1088
+      ],
+      "id": "494a5580-40a5-4bfb-813c-77a636b370bd",
+      "name": "Calculate Distance",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "url": "=https://maps.googleapis.com/maps/api/distancematrix/json?origins={{encodeURIComponent($json[\"origin_used\"])}}&destinations={{encodeURIComponent($json[\"address\"])}}&mode=driving&key=AIzaSyB6XkInd9zNlycyBTNig0cbi8bPJ_61r18",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -112,
+        1088
+      ],
+      "id": "85a807c0-f7b3-4ece-9f9a-a29847367b5f",
+      "name": "Google Maps Distance",
+      "alwaysOutputData": false
+    },
+    {
+      "parameters": {
+        "jsCode": "const mapsResult = $json;\nconst dateParserOutput = $node[\"Date Parser\"].json;\nconst calcOutput = $node[\"Calculate Distance\"].json;\n\nconst element = mapsResult.rows?.[0]?.elements?.[0];\nlet distanceKm = 5; // fallback\nif (element?.status === \"OK\") {\n  distanceKm = Math.round((element.distance.value / 1000) * 10) / 10;\n}\n\nreturn [{\n  json: {\n    address: calcOutput.address,\n    preferred_day: calcOutput.preferred_day,\n    preferred_time: calcOutput.preferred_time,\n    zone_group: calcOutput.zone_group,\n    zone_detail: calcOutput.zone_detail,\n    distance_km: distanceKm,\n    origin_used: calcOutput.origin_used,\n    lead_revision_patch: calcOutput.lead_revision_patch,\n    booking_signals: calcOutput.booking_signals\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        96,
+        1088
+      ],
+      "id": "7f15cc66-c151-4e18-9eac-cfbdcc4dd59a",
+      "name": "Extract Distance"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "01737571-4235-42f7-bb88-7f3c76423397",
+              "leftValue": "={{$node[\"Webhook\"].json.body.message_type}}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            },
+            {
+              "id": "002543bd-09ef-4250-86f7-46ae8030aec5",
+              "leftValue": "={{$node[\"Webhook\"].json.body.message_type}}",
+              "rightValue": "\"text\"",
+              "operator": {
+                "type": "string",
+                "operation": "notEquals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -11328,
+        1568
+      ],
+      "id": "b3b28d14-bbd8-4dd4-aca2-ab57fbda61bb",
+      "name": "IF - Is Media Message?"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "0ed7fc22-95ee-477d-bd14-1b80baa3a288",
+              "leftValue": "={{$node[\"Webhook\"].json.body.message_type}}",
+              "rightValue": "\"audio\"",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -11200,
+        976
+      ],
+      "id": "6c59ac6b-e54e-4c35-844c-537c900f5f12",
+      "name": "IF - Is Audio?"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "4ce6b166-9e02-436a-b17c-5dd10681f508",
+              "name": "message_type",
+              "value": "=text",
+              "type": "string"
+            },
+            {
+              "id": "42abb6a0-7516-444d-b4cb-fa1ca279c76c",
+              "name": "text",
+              "value": "={{$json[\"text\"]}}",
+              "type": "string"
+            },
+            {
+              "id": "0c5baf2c-f608-441c-8d70-d2b92de9a39e",
+              "name": "thread_id",
+              "value": "={{$node[\"Webhook\"].json.body.thread_id}}",
+              "type": "string"
+            },
+            {
+              "id": "122c1209-514a-4642-a7b1-f8d7753f2431",
+              "name": "wa_id",
+              "value": "={{$node[\"Webhook\"].json.body.wa_id}}",
+              "type": "string"
+            },
+            {
+              "id": "3083c01b-31d1-4696-b829-e23a6339e081",
+              "name": "wa_message_id",
+              "value": "={{$node[\"Webhook\"].json.body.wa_message_id}}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -10336,
+        960
+      ],
+      "id": "ac83d28a-b013-44c0-a667-07ce41c6a2fc",
+      "name": "Set Text From Audio"
+    },
+    {
+      "parameters": {
+        "url": "=http://backend:8000/api/whatsapp/media/{{$node[\"Webhook\"].json.body.media_id}}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -11136,
+        1216
+      ],
+      "id": "0082d8bd-b1c4-4c39-a8c3-22cfb8024f45",
+      "name": "Get Image"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "specifyHeaders": "json",
+        "jsonHeaders": "={\n  \"model\": \"gpt-4o\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": [\n        {\n          \"type\": \"text\",\n          \"text\": \"Este es un mensaje de WhatsApp con una imagen. Describí en detalle qué muestra la imagen, especialmente si contiene texto, datos de un vehículo, dirección, nombre u otra información relevante para agendar una revisión de auto. Respondé en español.\"\n        },\n        {\n          \"type\": \"image_url\",\n          \"image_url\": {\n            \"url\": \"data:{{$node['Get Image'].json['mimeType']}};base64,{{$binary.data.toString('base64')}}\"\n          }\n        }\n      ]\n    }\n  ],\n  \"max_tokens\": 500\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -10928,
+        1216
+      ],
+      "id": "2c853dc0-5f86-4249-9daf-2f6684a2eae6",
+      "name": "Describe Image",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "w6Wrrt7d5r97Zpe8",
+          "name": "Header Auth account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "7ad137db-9a10-4344-b9ce-0c076ae7692e",
+              "name": "message_type",
+              "value": "=text",
+              "type": "string"
+            },
+            {
+              "id": "42b8323e-35b6-4c41-a755-95e5c082e920",
+              "name": "text",
+              "value": "={{$json[\"choices\"][0][\"message\"][\"content\"]}}",
+              "type": "string"
+            },
+            {
+              "id": "7d5a2680-9d14-4751-8cf2-df7ff75af620",
+              "name": "thread_id",
+              "value": "={{$node[\"Webhook\"].json.body.thread_id}}",
+              "type": "string"
+            },
+            {
+              "id": "b7383fc9-9533-47a2-903a-10db4dfa391d",
+              "name": "wa_id",
+              "value": "={{$node[\"Webhook\"].json.body.wa_id}}",
+              "type": "string"
+            },
+            {
+              "id": "2015e8c5-698f-4e50-900a-287e1b2ba9cd",
+              "name": "wa_message_id",
+              "value": "={{$node[\"Webhook\"].json.body.wa_message_id}}",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -10720,
+        1216
+      ],
+      "id": "745b8509-18c5-44c9-a8ca-23fdf7fa4147",
+      "name": "Set Text From Image"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://backend:8000/api/whatsapp/media/{{$node[\"Webhook\"].json.body.media_id}}/transcribe",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -10768,
+        960
+      ],
+      "id": "33b9a9e7-a50b-4f92-a332-5cbfc8eef54a",
+      "name": "Transcribe Audio"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Get AI Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Thread": {
+      "main": [
+        [
+          {
+            "node": "If - Does this thread already have a lead linked?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Lead By Phone": {
+      "main": [
+        [
+          {
+            "node": "Pick First Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lead found?": {
+      "main": [
+        [
+          {
+            "node": "Link Thread To Existing Lead",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Lead": {
+      "main": [
+        [
+          {
+            "node": "Link Thread To New Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pick First Lead": {
+      "main": [
+        [
+          {
+            "node": "Lead found?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If - Does this thread already have a lead linked?": {
+      "main": [
+        [
+          {
+            "node": "Find Lead By Phone",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Lead Context (existing)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Link Thread To Existing Lead": {
+      "main": [
+        [
+          {
+            "node": "Get Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Link Thread To New Lead": {
+      "main": [
+        [
+          {
+            "node": "Lead Context (new)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lead Context (existing)": {
+      "main": [
+        [
+          {
+            "node": "Get Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lead Context (new)": {
+      "main": [
+        [
+          {
+            "node": "Get Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Revisions": {
+      "main": [
+        [
+          {
+            "node": "Get Thread Messages 1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If - Revision exists?": {
+      "main": [
+        [
+          {
+            "node": "Create Revision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Lead": {
+      "main": [
+        [
+          {
+            "node": "Get Revisions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Router",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parser Router Output": {
+      "main": [
+        [
+          {
+            "node": "IF - needs human=?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Router": {
+      "main": [
+        [
+          {
+            "node": "Parser Router Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - needs human=?": {
+      "main": [
+        [
+          {
+            "node": "Mark Leads Needs Human",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "IF - Should AI Reply?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Should AI Reply?": {
+      "main": [
+        [
+          {
+            "node": "Candidate /State Updater",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "NO AI Reply Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model1": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Reply Planner",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Reply Planner": {
+      "main": [
+        [
+          {
+            "node": "Parser Planner Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parser Planner Output": {
+      "main": [
+        [
+          {
+            "node": "If - Ready For Price Calc?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If - Ready For Price Calc?": {
+      "main": [
+        [
+          {
+            "node": "Price Inputs",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Final Answer from Planner",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Price Inputs": {
+      "main": [
+        [
+          {
+            "node": "Request Backend Price",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model2": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Final Answer Maker",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Final Answer Maker": {
+      "main": [
+        [
+          {
+            "node": "Parse Final Answer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Final Answer": {
+      "main": [
+        [
+          {
+            "node": "IF - Has Reply Text?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Final Answer from Planner": {
+      "main": [
+        [
+          {
+            "node": "IF - Has Reply Text?1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Debug Final Reply": {
+      "main": [
+        [
+          {
+            "node": "Send Whatsapp Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Has Reply Text?": {
+      "main": [
+        [
+          {
+            "node": "Debug Final Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Human Handoff Result": {
+      "main": [
+        [
+          {
+            "node": "IF - Has Reply Text?2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Leads Needs Human": {
+      "main": [
+        [
+          {
+            "node": "Human Handoff Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Has Reply Text?1": {
+      "main": [
+        [
+          {
+            "node": "Debug Final Reply1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Debug Final Reply1": {
+      "main": [
+        [
+          {
+            "node": "Send Whatsapp Reply1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Whatsapp Reply1": {
+      "main": [
+        [
+          {
+            "node": "Send Result 1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Has Reply Text?2": {
+      "main": [
+        [
+          {
+            "node": "Debug Final Reply2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Debug Final Reply2": {
+      "main": [
+        [
+          {
+            "node": "Send Whatsapp Reply2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Whatsapp Reply": {
+      "main": [
+        [
+          {
+            "node": "Send Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Whatsapp Reply2": {
+      "main": [
+        [
+          {
+            "node": "Send Result 2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Thread State": {
+      "main": [
+        [
+          {
+            "node": "IF - Already Processed Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Thread Candidates": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Thread Messages 1": {
+      "main": [
+        [
+          {
+            "node": "Wait (20 sec)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Thread Messages 2": {
+      "main": [
+        [
+          {
+            "node": "Debug Latest Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Latest Execution?": {
+      "main": [
+        [
+          {
+            "node": "Get Thread State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Conversation Context": {
+      "main": [
+        [
+          {
+            "node": "AI Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "Build Conversation Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Candidate /State Updater": {
+      "main": [
+        [
+          {
+            "node": "Parser Updater Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model3": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Candidate /State Updater",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parser Updater Output": {
+      "main": [
+        [
+          {
+            "node": "Sanitize Lead Patch",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "IF - Create Candidate?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Patch Thread State",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "IF - Patch Candidate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Patch Thread State": {
+      "main": [
+        [
+          {
+            "node": "Wait (1sec)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Create Candidate?": {
+      "main": [
+        [
+          {
+            "node": "Create Candidate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Candidate": {
+      "main": [
+        [
+          {
+            "node": "IF - candidate focus after create",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Refresh Thread State": {
+      "main": [
+        [
+          {
+            "node": "IF - Has Current Revision?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Refresh Thread Candidates": {
+      "main": [
+        [
+          {
+            "node": "Normalize Thread Candidates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Thread Candidates": {
+      "main": [
+        [
+          {
+            "node": "Build Effective Quote Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Effective Quote Input": {
+      "main": [
+        [
+          {
+            "node": "Carry Price Flag",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - candidate focus after create": {
+      "main": [
+        [
+          {
+            "node": "Patch Thread State Focus After Create",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Patch Candidate": {
+      "main": [
+        [
+          {
+            "node": "Patch Candidate node",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Debug Latest Check": {
+      "main": [
+        [
+          {
+            "node": "IF - Latest Execution?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait (1sec)": {
+      "main": [
+        [
+          {
+            "node": "Refresh Thread State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait (20 sec)": {
+      "main": [
+        [
+          {
+            "node": "Get Thread Messages 2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Already Processed Message": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Get Thread Candidates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Result": {
+      "main": [
+        [
+          {
+            "node": "Patch Thread State - Mark Processed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Result 1": {
+      "main": [
+        [
+          {
+            "node": "Patch Thread State - Mark Processed1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Request Backend Price": {
+      "main": [
+        [
+          {
+            "node": "Final Answer Maker",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitize Lead Patch": {
+      "main": [
+        [
+          {
+            "node": "IF - Has Lead Patch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Has Lead Patch": {
+      "main": [
+        [
+          {
+            "node": "Sync Lead State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Has Current Revision?": {
+      "main": [
+        [
+          {
+            "node": "Effective Revision Id (existing)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "IF - Has Focus Candidate?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Effective Revision Id (existing)": {
+      "main": [
+        [
+          {
+            "node": "Sanitize Revision Patch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitize Revision Patch": {
+      "main": [
+        [
+          {
+            "node": "IF - Has Revision Patch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Has Revision Patch": {
+      "main": [
+        [
+          {
+            "node": "IF - Has Effective Rev Id?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "IF - Has Booking Intent?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Patch Revision": {
+      "main": [
+        [
+          {
+            "node": "IF - Has Booking Intent?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Revision2": {
+      "main": [
+        [
+          {
+            "node": "Patch Revision Booked",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Mark Lead Agendado",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Change Thread Name",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Booking Confirmed Reply",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Create CRM Revision",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Wait",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Effective Revision Id (created)": {
+      "main": [
+        [
+          {
+            "node": "Sanitize Revision Patch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Has Focus Candidate?": {
+      "main": [
+        [
+          {
+            "node": "Effective Revision Id (created)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Effective Revision Id (existing)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Has Booking Intent?": {
+      "main": [
+        [
+          {
+            "node": "Date Parser",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Refresh Thread Candidates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Schedule": {
+      "main": [
+        [
+          {
+            "node": "IF - Schedule Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Schedule Valid?": {
+      "main": [
+        [
+          {
+            "node": "Create Revision2",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Schedule Alternatives",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Alternatives": {
+      "main": [
+        [
+          {
+            "node": "Send Whatsapp Reply1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Booking Confirmed Reply": {
+      "main": [
+        [
+          {
+            "node": "Send Whatsapp Reply1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Has Effective Rev Id?": {
+      "main": [
+        [
+          {
+            "node": "Patch Revision",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "IF - Has Booking Intent?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Date Parser": {
+      "main": [
+        [
+          {
+            "node": "Get Day Appointments",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Carry Price Flag": {
+      "main": [
+        [
+          {
+            "node": "AI Reply Planner",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait": {
+      "main": [
+        [
+          {
+            "node": "Send an Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Change Thread Name": {
+      "main": [
+        []
+      ]
+    },
+    "Get AI Status": {
+      "main": [
+        [
+          {
+            "node": "IF - AI Enabled?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - AI Enabled?": {
+      "main": [
+        [
+          {
+            "node": "Check Excluded Phone",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Excluded Phone": {
+      "main": [
+        [
+          {
+            "node": "IF - Phone Excluded?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Phone Excluded?": {
+      "main": [
+        [],
+        [
+          {
+            "node": "IF - Is Media Message?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Day Appointments": {
+      "main": [
+        [
+          {
+            "node": "Calculate Distance",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate Distance": {
+      "main": [
+        [
+          {
+            "node": "Google Maps Distance",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Maps Distance": {
+      "main": [
+        [
+          {
+            "node": "Extract Distance",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Distance": {
+      "main": [
+        [
+          {
+            "node": "Check Schedule",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Is Media Message?": {
+      "main": [
+        [
+          {
+            "node": "IF - Is Audio?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Get Thread",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Is Audio?": {
+      "main": [
+        [
+          {
+            "node": "Transcribe Audio",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Get Image",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set Text From Audio": {
+      "main": [
+        [
+          {
+            "node": "Get Thread",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Image": {
+      "main": [
+        [
+          {
+            "node": "Describe Image",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Describe Image": {
+      "main": [
+        [
+          {
+            "node": "Set Text From Image",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set Text From Image": {
+      "main": [
+        [
+          {
+            "node": "Get Thread",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Transcribe Audio": {
+      "main": [
+        [
+          {
+            "node": "Set Text From Audio",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "bcc2f572-aa56-467f-bedb-5b2e36ce1592",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "a6e4b2b2fb0ab3e4e6970c4cb96072f1c56e6651dbba9cc593315cd603c2f370"
+  },
+  "id": "codWmZJ96hExb7Rw",
+  "tags": []
+}

@@ -12,6 +12,7 @@ class Settings:
     whatsapp_phone_number_id: str = ""
     whatsapp_app_secret: str = ""
     n8n_webhook_url: str = ""
+    openai_api_key: str = ""
 
     @property
     def whatsapp_enabled(self) -> bool:
@@ -44,4 +45,5 @@ def get_settings() -> Settings:
         whatsapp_phone_number_id=_getenv("WHATSAPP_PHONE_NUMBER_ID"),
         whatsapp_app_secret=_getenv("WHATSAPP_APP_SECRET"),
         n8n_webhook_url=_getenv("N8N_WEBHOOK_URL"),
+        openai_api_key=_getenv("OPENAI_API_KEY"),
     )
