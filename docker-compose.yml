@@ -24,7 +24,7 @@
       WHATSAPP_PHONE_NUMBER_ID: "123"
       WHATSAPP_APP_SECRET: ""
       N8N_WEBHOOK_URL: "http://n8n:5678/webhook/ridecheck-inbound"
-      OPENAI_API_KEY: "${OPENAI_API_KEY}"
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
     ports:
       - "8000:8000"
     depends_on:
