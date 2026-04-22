@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class WhatsAppThreadOut(BaseModel):
@@ -59,6 +59,11 @@ class WhatsAppThreadStateRead(BaseModel):
     last_stage: str | None = None
     needs_human: bool = False
     current_focus_candidate_id: int | None = None
+
+    @field_validator("needs_human", mode="before")
+    @classmethod
+    def _coerce_needs_human(cls, v: object) -> bool:
+        return False if v is None else bool(v)
     current_revision_id: int | None = None
     last_processed_inbound_wa_message_id: str | None = None
     customer_name: str | None = None
