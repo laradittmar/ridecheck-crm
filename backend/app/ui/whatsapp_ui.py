@@ -17,6 +17,7 @@ from ..db import get_db
 from ..models import Lead, WhatsAppContact, WhatsAppMessage, WhatsAppThread
 from ..schemas.whatsapp_api import WhatsAppThreadOut
 from ..services.db_errors import commit_or_400
+from ..services.unanswered_alert import reset_unanswered_alert
 from ..services.whatsapp_threads import load_thread_payload
 from ..settings import get_settings
 from .components import render_sidebar_nav, render_whatsapp_icon_svg
@@ -1851,6 +1852,8 @@ def whatsapp_thread_send(thread_id: int, payload: WhatsAppSendPayload, db: Sessi
         db.add(outbound)
         thread.last_message_at = now_utc
         db.commit()
+    reset_unanswered_alert(db, thread_id)
+    db.commit()
     db.refresh(outbound)
 
     try:

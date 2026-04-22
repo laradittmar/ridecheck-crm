@@ -138,7 +138,7 @@ class FakeDB:
             return _FakeResult(None)
 
     def _dispatch(self, stmt):
-        froms = list(stmt.froms)
+        froms = list(stmt.get_final_froms())
         if not froms:
             return _FakeResult(None)
         table = froms[0].name

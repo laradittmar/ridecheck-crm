@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import random
@@ -35,6 +36,7 @@ from .auth import (
 from .db import Base, engine, get_db
 from .models import User
 from .routes.whatsapp import router as whatsapp_router
+from .services.unanswered_alert import unanswered_alert_loop
 from .settings import get_settings
 from .ui.kanban import router as ui_router
 from .ui.whatsapp_ui import router as whatsapp_ui_router
@@ -390,6 +392,22 @@ def logout_action():
     resp = RedirectResponse(url="/login", status_code=303)
     resp.delete_cookie(SESSION_COOKIE, path="/")
     return resp
+
+
+@app.on_event("startup")
+def _migrate_unanswered_alert_column() -> None:
+    from sqlalchemy import text
+    with engine.connect() as conn:
+        conn.execute(text(
+            "ALTER TABLE whatsapp_thread_states "
+            "ADD COLUMN IF NOT EXISTS unanswered_alert_sent_at TIMESTAMPTZ"
+        ))
+        conn.commit()
+
+
+@app.on_event("startup")
+async def _start_unanswered_alert_task() -> None:
+    asyncio.create_task(unanswered_alert_loop())
 
 
 @app.on_event("startup")

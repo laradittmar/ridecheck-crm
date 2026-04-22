@@ -321,6 +321,7 @@ class WhatsAppThreadState(Base):
     customer_name: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
     home_zone_group: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     home_zone_detail: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    unanswered_alert_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

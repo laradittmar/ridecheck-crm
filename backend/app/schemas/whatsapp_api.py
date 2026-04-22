@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class WhatsAppThreadOut(BaseModel):
@@ -72,8 +72,7 @@ class WhatsAppThreadStateRead(BaseModel):
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class WhatsAppThreadStatePatch(BaseModel):
@@ -105,8 +104,7 @@ class WhatsAppThreadCandidateRead(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class WhatsAppThreadCandidateCreate(BaseModel):

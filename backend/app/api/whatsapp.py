@@ -36,6 +36,7 @@ from ..schemas.whatsapp_api import (
 )
 from ..settings import get_settings
 from ..services.db_errors import commit_or_400
+from ..services.unanswered_alert import reset_unanswered_alert
 from ..services.whatsapp_thread_state import build_thread_state_read, upsert_thread_state
 from ..services.whatsapp_threads import load_recent_thread_messages, load_thread_payload
 from ..ui.whatsapp_ui import _send_whatsapp_cloud_text
@@ -403,6 +404,8 @@ def send_thread_text(thread_id: int, payload: WhatsAppSendTextIn, db: Session = 
         db.add(outbound)
         thread.last_message_at = now_utc
         db.commit()
+    reset_unanswered_alert(db, thread_id)
+    db.commit()
 
     try:
         wa_message_id, _ = _send_whatsapp_cloud_text(to_wa_id=to_wa_id, text=text)
