@@ -1,7 +1,7 @@
 # app/ui/kanban_actions.py
 from __future__ import annotations
 
-from datetime import date, time, datetime, timedelta
+from datetime import date, time, datetime, timedelta, timezone
 from typing import Any
 from threading import Lock
 import secrets
@@ -348,6 +348,8 @@ def ui_lead_flag_set(
         lead.flag = flag
     if _has(lead, "motivo_perdida") and flag != "PERDIDO":
         lead.motivo_perdida = None
+    if _has(lead, "buscando_auto_set_at"):
+        lead.buscando_auto_set_at = datetime.now(timezone.utc) if flag == "BUSCANDO_AUTO" else None
     db.commit()
     return RedirectResponse(url="/kanban", status_code=303)
 

@@ -1,4 +1,6 @@
 # app/api/leads.py
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -28,6 +30,7 @@ FLAG_VALUES = {
     "ACEPTADO",
     "RECOMPRA",
     "PERDIDO",
+    "BUSCANDO_AUTO",
 }
 
 MOTIVOS_PERDIDA_VALIDOS = {"PRECIO", "DISPONIBILIDAD", "OTRO"}
@@ -85,6 +88,10 @@ def update_lead(lead_id: int, payload: LeadUpdate, db: Session = Depends(get_db)
         lead.flag = payload.flag
         if payload.flag != "PERDIDO":
             lead.motivo_perdida = None
+        if payload.flag == "BUSCANDO_AUTO":
+            lead.buscando_auto_set_at = datetime.now(timezone.utc)
+        else:
+            lead.buscando_auto_set_at = None
 
     if payload.motivo_perdida is not None:
         if lead.flag != "PERDIDO":

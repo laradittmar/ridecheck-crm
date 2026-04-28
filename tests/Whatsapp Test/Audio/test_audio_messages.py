@@ -168,7 +168,7 @@ class FakeDB:
     def rollback(self): pass
     def refresh(self, obj): pass
 
-    def execute(self, stmt):
+    def execute(self, stmt, params=None):
         try:
             return self._dispatch(stmt)
         except Exception:

@@ -1205,6 +1205,7 @@ FLAG_VALUES = [
     "ACEPTADO",
     "RECOMPRA",
     "PERDIDO",
+    "BUSCANDO_AUTO",
 ]
 
 FLAG_LABELS = {
@@ -1213,6 +1214,7 @@ FLAG_LABELS = {
     "ACEPTADO": "Aceptado",
     "RECOMPRA": "Re-compra",
     "PERDIDO": "Perdido",
+    "BUSCANDO_AUTO": "Buscando auto",
 }
 
 FLAG_FROM_ESTADO = {

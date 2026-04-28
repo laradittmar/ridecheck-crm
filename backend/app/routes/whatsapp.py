@@ -14,6 +14,8 @@ from sqlalchemy.orm import Session
 
 from ..db import get_db
 from ..models import AiEvent, WhatsAppContact, WhatsAppMessage, WhatsAppThread
+from ..services.buscando_followup import reset_buscando_followup
+from ..services.quote_followup import reset_quote_followup
 from ..settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -291,6 +293,9 @@ async def inbound_webhook(request: Request, db: Session = Depends(get_db)):
                         )
                         thread.last_message_at = message_ts
                         thread.unread_count = (thread.unread_count or 0) + 1
+                        db.commit()
+                        reset_quote_followup(db, thread.id)
+                        reset_buscando_followup(db, thread.id)
                         db.commit()
                         text_preview = ((text or "").replace("\r", " ").replace("\n", " "))[:80]
                         logger.info(

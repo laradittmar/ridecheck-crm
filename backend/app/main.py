@@ -36,6 +36,8 @@ from .auth import (
 from .db import Base, engine, get_db
 from .models import User
 from .routes.whatsapp import router as whatsapp_router
+from .services.buscando_followup import buscando_followup_loop
+from .services.quote_followup import quote_followup_loop
 from .services.unanswered_alert import unanswered_alert_loop
 from .settings import get_settings
 from .ui.kanban import router as ui_router
@@ -406,8 +408,33 @@ def _migrate_unanswered_alert_column() -> None:
 
 
 @app.on_event("startup")
+def _migrate_followup_columns() -> None:
+    from sqlalchemy import text
+    with engine.connect() as conn:
+        conn.execute(text(
+            "ALTER TABLE whatsapp_thread_states "
+            "ADD COLUMN IF NOT EXISTS quote_followup_sent_at TIMESTAMPTZ"
+        ))
+        conn.execute(text(
+            "ALTER TABLE whatsapp_thread_states "
+            "ADD COLUMN IF NOT EXISTS buscando_followup_sent_at TIMESTAMPTZ"
+        ))
+        conn.execute(text(
+            "ALTER TABLE leads "
+            "ADD COLUMN IF NOT EXISTS buscando_auto_set_at TIMESTAMPTZ"
+        ))
+        conn.commit()
+
+
+@app.on_event("startup")
 async def _start_unanswered_alert_task() -> None:
     asyncio.create_task(unanswered_alert_loop())
+
+
+@app.on_event("startup")
+async def _start_followup_tasks() -> None:
+    asyncio.create_task(quote_followup_loop())
+    asyncio.create_task(buscando_followup_loop())
 
 
 @app.on_event("startup")
