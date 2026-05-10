@@ -150,6 +150,6 @@ async def unanswered_alert_loop() -> None:
     while True:
         await asyncio.sleep(_CHECK_INTERVAL_SECONDS)
         try:
-            _run_check()
+            await asyncio.to_thread(_run_check)
         except Exception:
             logger.exception("unanswered_alert_loop unhandled error")

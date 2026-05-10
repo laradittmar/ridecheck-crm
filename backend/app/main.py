@@ -426,15 +426,25 @@ def _migrate_followup_columns() -> None:
         conn.commit()
 
 
+# Strong references prevent the event loop's WeakSet from GC-ing tasks mid-sleep.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _keep(task: asyncio.Task) -> None:
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
 @app.on_event("startup")
 async def _start_unanswered_alert_task() -> None:
-    asyncio.create_task(unanswered_alert_loop())
+    _keep(asyncio.create_task(unanswered_alert_loop(), name="unanswered_alert"))
+    logger.info("unanswered_alert_loop task started")
 
 
 @app.on_event("startup")
 async def _start_followup_tasks() -> None:
-    asyncio.create_task(quote_followup_loop())
-    asyncio.create_task(buscando_followup_loop())
+    _keep(asyncio.create_task(quote_followup_loop(), name="quote_followup"))
+    _keep(asyncio.create_task(buscando_followup_loop(), name="buscando_followup"))
 
 
 @app.on_event("startup")
