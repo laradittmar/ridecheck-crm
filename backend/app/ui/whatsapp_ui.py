@@ -6,6 +6,8 @@ import logging
 from datetime import date, datetime, timezone
 from urllib import error, request as urlrequest
 
+from zoneinfo import ZoneInfo
+
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
@@ -25,6 +27,18 @@ from .kanban_view import _base_css, _sidebar_user_block
 
 router = APIRouter(tags=["ui"])
 logger = logging.getLogger(__name__)
+
+_AR_TZ = ZoneInfo("America/Argentina/Buenos_Aires")
+
+
+def _to_ar(dt: datetime | None) -> datetime | None:
+    """Convert a UTC datetime (naive or aware) to Argentina local time."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(_AR_TZ)
+
 
 QUICK_REPLIES = [
     "Gracias por tu mensaje.",
@@ -229,7 +243,7 @@ def _render_list_item(
     active_thread_id: int | None = None,
 ) -> str:
     name = (display_name or "").strip() or (wa_id or "-")
-    item_ts = last_message_at.strftime("%H:%M") if last_message_at else "-"
+    item_ts = _to_ar(last_message_at).strftime("%H:%M") if last_message_at else "-"
     item_preview = (preview or "-").replace("\r", " ").replace("\n", " ")
     active_cls = " wa-chat-item-active" if active_thread_id is not None and thread_id == active_thread_id else ""
     unread = int(unread_count or 0)
@@ -1460,8 +1474,8 @@ def whatsapp_thread(thread_id: str, request: Request, db: Session = Depends(get_
     default_replies_json = html_lib.escape(json.dumps(QUICK_REPLIES, ensure_ascii=False), quote=True)
     wa_bg_style = _wa_background_style_attr(request)
     last_message_id = int(message_rows[-1].id) if message_rows else 0
-    thread_created_txt = (thread_created_at.strftime("%d/%m/%Y %H:%M") if thread_created_at else "Sin fecha")
-    thread_last_msg_txt = (thread_last_message_at.strftime("%d/%m/%Y %H:%M") if thread_last_message_at else "Sin mensaje")
+    thread_created_txt = (_to_ar(thread_created_at).strftime("%d/%m/%Y %H:%M") if thread_created_at else "Sin fecha")
+    thread_last_msg_txt = (_to_ar(thread_last_message_at).strftime("%d/%m/%Y %H:%M") if thread_last_message_at else "Sin mensaje")
     if thread_lead_id is not None:
         thread_lead_id_txt = f"#{int(thread_lead_id)}"
     else:
@@ -1470,10 +1484,10 @@ def whatsapp_thread(thread_id: str, request: Request, db: Session = Depends(get_
     if message_rows:
         msg_html = []
         text_by_id: dict[int, str] = {}
-        today = date.today()
+        today = datetime.now(_AR_TZ).date()
         last_day_key: str | None = None
         for m in message_rows:
-            msg_day = m.timestamp.date() if m.timestamp else None
+            msg_day = _to_ar(m.timestamp).date() if m.timestamp else None
             day_key = msg_day.isoformat() if msg_day else "no-date"
             if day_key != last_day_key:
                 if msg_day is None:
@@ -1491,7 +1505,7 @@ def whatsapp_thread(thread_id: str, request: Request, db: Session = Depends(get_
                 )
                 last_day_key = day_key
             msg_id = str(m.id or "")
-            ts = m.timestamp.strftime("%H:%M") if m.timestamp else "-"
+            ts = _to_ar(m.timestamp).strftime("%H:%M") if m.timestamp else "-"
             direction = (m.direction or "").strip().lower()
             side_cls = "wa-msg-out" if direction == "out" else "wa-msg-in"
             msg_text = m.text or "-"
