@@ -7,7 +7,7 @@ from datetime import date, datetime, timezone
 from urllib import error, request as urlrequest
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -745,6 +745,12 @@ def _render_whatsapp_shell(user_email: str, title: str, body_html: str) -> str:
             window.location.href = app.getAttribute("data-wa-thread-url") || window.location.href;
           }).catch(function(){
             if (submitBtn) submitBtn.disabled = false;
+            var toastEl = app.querySelector(".wa-toast");
+            if (toastEl) {
+              toastEl.textContent = "Error al enviar mensaje";
+              toastEl.classList.add("wa-show");
+              setTimeout(function(){ toastEl.classList.remove("wa-show"); }, 3000);
+            }
           });
         });
       }
@@ -1832,7 +1838,7 @@ def whatsapp_thread_send(thread_id: int, payload: WhatsAppSendPayload, db: Sessi
     if not to_wa_id:
         raise HTTPException(status_code=400, detail="Thread has no wa_id")
 
-    now_utc = datetime.now(timezone.utc)
+    from zoneinfo import ZoneInfo; now_utc = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
     outbound = WhatsAppMessage(
         thread_id=thread_id,
         wa_message_id=None,
@@ -1860,13 +1866,18 @@ def whatsapp_thread_send(thread_id: int, payload: WhatsAppSendPayload, db: Sessi
         wa_message_id, _ = _send_whatsapp_cloud_text(to_wa_id=to_wa_id, text=text)
         outbound.status = "sent"
         outbound.wa_message_id = wa_message_id
+        db.add(outbound)
         db.commit()
-    except Exception:
+    except Exception as exc:
         db.rollback()
         outbound.status = "failed"
         db.add(outbound)
         db.commit()
-        logger.exception("WHATSAPP_OUTBOUND_SEND_FAILED thread_id=%s", thread_id)
+        logger.exception(
+            "WHATSAPP_OUTBOUND_SEND_FAILED thread_id=%s to=%s error=%s",
+            thread_id, to_wa_id, exc,
+        )
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
 
     return RedirectResponse(url=f"/whatsapp/thread/{thread_id}", status_code=303)
 

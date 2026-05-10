@@ -10,7 +10,6 @@ from ..db import SessionLocal
 
 logger = logging.getLogger(__name__)
 
-_ALERT_TO_WA_ID = "5491153368330"
 _UNANSWERED_MINUTES = 1  # TODO: restore to 6 after testing
 _CHECK_INTERVAL_SECONDS = 60
 
@@ -106,15 +105,12 @@ def _run_check() -> None:
             thread_id: int = row.thread_id
             customer_name: str = row.customer_name or "desconocido"
             try:
-                from ..ui.whatsapp_ui import _send_whatsapp_cloud_text
-                msg = (
-                    f"Hilo #{thread_id} de {customer_name} "
-                    f"lleva más de {_UNANSWERED_MINUTES} minutos sin respuesta."
+                logger.warning(
+                    "unanswered_alert: Hilo #%s de %s lleva más de %d minutos sin respuesta.",
+                    thread_id, customer_name, _UNANSWERED_MINUTES,
                 )
-                _send_whatsapp_cloud_text(to_wa_id=_ALERT_TO_WA_ID, text=msg)
                 db.execute(_UPSERT_ALERT_SQL, {"thread_id": thread_id})
                 db.commit()
-                logger.info("unanswered_alert sent thread_id=%s customer=%s", thread_id, customer_name)
             except Exception:
                 db.rollback()
                 logger.exception("unanswered_alert failed thread_id=%s", thread_id)
