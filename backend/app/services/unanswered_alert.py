@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import smtplib
+from email.message import EmailMessage
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ..db import SessionLocal
+from ..settings import get_settings
 
 logger = logging.getLogger(__name__)
 
-_UNANSWERED_MINUTES = 1  # TODO: restore to 6 after testing
+_UNANSWERED_MINUTES = 5
+_ALERT_EMAIL = "ridecheckassistance@gmail.com"
 _CHECK_INTERVAL_SECONDS = 60
 
 _FIND_UNANSWERED_SQL = text("""
@@ -50,6 +54,26 @@ _RESET_ALERT_SQL = text("""
         updated_at = NOW()
     WHERE thread_id = :thread_id
 """)
+
+
+def _send_alert_email(thread_id: int, customer_name: str) -> None:
+    s = get_settings()
+    if not s.smtp_host or not s.smtp_user or not s.smtp_password:
+        logger.warning("unanswered_alert: SMTP not configured, skipping email for thread_id=%s", thread_id)
+        return
+    body = (
+        f"Hilo #{thread_id} de {customer_name} "
+        f"lleva más de {_UNANSWERED_MINUTES} minutos sin respuesta."
+    )
+    msg = EmailMessage()
+    msg["Subject"] = f"Hilo #{thread_id} sin respuesta - {customer_name}"
+    msg["From"] = s.smtp_from or s.smtp_user
+    msg["To"] = _ALERT_EMAIL
+    msg.set_content(body)
+    with smtplib.SMTP(s.smtp_host, s.smtp_port, timeout=15) as conn:
+        conn.starttls()
+        conn.login(s.smtp_user, s.smtp_password)
+        conn.send_message(msg)
 
 
 def reset_unanswered_alert(db: Session, thread_id: int) -> None:
@@ -109,6 +133,7 @@ def _run_check() -> None:
                     "unanswered_alert: Hilo #%s de %s lleva más de %d minutos sin respuesta.",
                     thread_id, customer_name, _UNANSWERED_MINUTES,
                 )
+                _send_alert_email(thread_id, customer_name)
                 db.execute(_UPSERT_ALERT_SQL, {"thread_id": thread_id})
                 db.commit()
             except Exception:

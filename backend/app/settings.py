@@ -13,6 +13,11 @@ class Settings:
     whatsapp_app_secret: str = ""
     n8n_webhook_url: str = ""
     openai_api_key: str = ""
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_user: str = ""
+    smtp_password: str = ""
+    smtp_from: str = ""
 
     @property
     def whatsapp_enabled(self) -> bool:
@@ -46,4 +51,9 @@ def get_settings() -> Settings:
         whatsapp_app_secret=_getenv("WHATSAPP_APP_SECRET"),
         n8n_webhook_url=_getenv("N8N_WEBHOOK_URL"),
         openai_api_key=_getenv("OPENAI_API_KEY"),
+        smtp_host=_getenv("SMTP_HOST"),
+        smtp_port=int(_getenv("SMTP_PORT", "587")),
+        smtp_user=_getenv("SMTP_USER"),
+        smtp_password=_getenv("SMTP_PASSWORD"),
+        smtp_from=_getenv("SMTP_FROM"),
     )

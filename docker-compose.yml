@@ -19,12 +19,18 @@
     build: ./backend
     environment:
       DATABASE_URL: postgresql+psycopg://crm:crm@postgres:5432/crm
-      WHATSAPP_TOKEN: "dummy"
+      WHATSAPP_TOKEN: "EAAW5PLcFtPsBReTsCEEYPCojF39LbepZBuoO4ESLs7pPvt3OUjWlOCEZBBzeu5qpBaNjjXRmCYtPaBMSDQFNSpNTmxRz6UCx6oZBKpdJSxHvVfkLNKnNdn26kewz3KMDDFkfKSDwz87rSG5MQDB0vmocXIHpTUlAsDwFnaDXkNZAFc9ABOH5WRsC8SsZBCA0AZAQZDZD"
       WHATSAPP_VERIFY_TOKEN: "ridecheck_whatsapp_verify_2026"
-      WHATSAPP_PHONE_NUMBER_ID: "123"
+      WHATSAPP_PHONE_NUMBER_ID: "1196075770246218"
       WHATSAPP_APP_SECRET: ""
       N8N_WEBHOOK_URL: "http://n8n:5678/webhook/ridecheck-inbound"
       OPENAI_API_KEY: ${OPENAI_API_KEY}
+      TZ: "America/Argentina/Buenos_Aires"
+      SMTP_HOST: "smtp.gmail.com"
+      SMTP_PORT: "587"
+      SMTP_USER: "ridecheckassistance@gmail.com"
+      SMTP_PASSWORD: ""
+      SMTP_FROM: "ridecheckassistance@gmail.com"
     ports:
       - "8000:8000"
     depends_on:
@@ -37,12 +43,14 @@
     ports:
       - "5678:5678"
     environment:
-      - N8N_HOST=localhost
+      - N8N_HOST=n8n.ridecheck.ar
       - N8N_PORT=5678
-      - N8N_PROTOCOL=http
+      - N8N_PROTOCOL=https
       - NODE_ENV=production
-      - WEBHOOK_URL=http://localhost:5678
+      - WEBHOOK_URL=https://n8n.ridecheck.ar
       - GENERIC_TIMEZONE=America/Argentina/Buenos_Aires
+      - N8N_SECURE_COOKIE=true
+
     volumes:
       - n8n_data:/home/node/.n8n
 
