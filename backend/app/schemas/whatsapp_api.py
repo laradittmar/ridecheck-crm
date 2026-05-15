@@ -127,6 +127,15 @@ class WhatsAppThreadCandidateCreate(BaseModel):
     status: str | None = Field(default="mentioned", max_length=30)
 
 
+class SetLatestInboundIn(BaseModel):
+    wa_message_id: str
+
+
+class LatestInboundOut(BaseModel):
+    thread_id: int
+    wa_message_id: str | None = None
+
+
 class WhatsAppThreadCandidatePatch(BaseModel):
     label: str | None = Field(default=None, max_length=120)
     marca: str | None = Field(default=None, max_length=50)

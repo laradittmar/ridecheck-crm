@@ -23,6 +23,8 @@ from ..models import (
 )
 from ..schemas.whatsapp_api import (
     LatestInboundMessageOut,
+    LatestInboundOut,
+    SetLatestInboundIn,
     WhatsAppThreadCandidateCreate,
     WhatsAppThreadCandidatePatch,
     WhatsAppThreadCandidateRead,
@@ -44,6 +46,9 @@ from ..ui.whatsapp_ui import _send_whatsapp_cloud_text
 
 router = APIRouter(prefix="/api/whatsapp", tags=["whatsapp"])
 thread_router = APIRouter(tags=["whatsapp"])
+
+# Ephemeral store: thread_id → latest inbound wa_message_id received from webhook
+latest_inbound: dict[int, str] = {}
 
 
 class WhatsAppMediaInfoOut(BaseModel):
@@ -469,6 +474,17 @@ def unlink_thread(thread_id: int, db: Session = Depends(get_db)):
     if refreshed is None:
         raise HTTPException(status_code=404, detail="Thread not found")
     return refreshed
+
+
+@router.post("/thread/{thread_id}/set-latest", response_model=LatestInboundOut)
+def set_thread_latest_inbound(thread_id: int, payload: SetLatestInboundIn):
+    latest_inbound[thread_id] = payload.wa_message_id
+    return LatestInboundOut(thread_id=thread_id, wa_message_id=payload.wa_message_id)
+
+
+@router.get("/thread/{thread_id}/get-latest", response_model=LatestInboundOut)
+def get_thread_latest_inbound_ephemeral(thread_id: int):
+    return LatestInboundOut(thread_id=thread_id, wa_message_id=latest_inbound.get(thread_id))
 
 
 @thread_router.post("/whatsapp/thread/{thread_id}/link-lead", response_model=WhatsAppThreadOut)
