@@ -268,8 +268,20 @@ def get_thread_messages(thread_id: int, limit: int = Query(default=10, ge=1, le=
 
 
 @router.get("/thread/{thread_id}/latest-inbound", response_model=LatestInboundMessageOut)
-def get_thread_latest_inbound(thread_id: int, before: datetime | None = Query(default=None), db: Session = Depends(get_db)):
+def get_thread_latest_inbound(
+    thread_id: int,
+    before: datetime | None = Query(default=None),
+    before_message_id: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
     _require_thread(db, thread_id)
+    if before_message_id is not None:
+        row = db.execute(
+            select(WhatsAppMessage.timestamp).where(WhatsAppMessage.wa_message_id == before_message_id)
+        ).first()
+        if row is None:
+            raise HTTPException(status_code=404, detail="before_message_id not found")
+        before = row.timestamp
     return load_latest_inbound_message(db=db, thread_id=thread_id, before=before)
 
 
