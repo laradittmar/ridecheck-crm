@@ -21,6 +21,7 @@ from ..schemas.schedule import (
 SERVICE_MINUTES = 45
 BUFFER_MINUTES = 15
 ANCHOR_MONDAY = date(2026, 4, 6)
+FRIDAY_REF = date(2026, 5, 15)
 APPROVAL_TAG = "Esperando aprobación"
 PRIORITY_CUTOFF = time(12, 0)
 SPECIAL_EXTENSION_ZONES = ("san isidro", "vicente lopez")
@@ -336,27 +337,28 @@ class ScheduleService:
 
         weekday = preferred_day.weekday()
         if weekday == 0:
-            return _BusinessHours(
-                start=time(13, 0),
-                end=time(18, 0),
-                alternating_note="Lunes alternado: la jornada arranca en la zona cero correspondiente",
-            )
+            return _BusinessHours(start=time(9, 0), end=time(18, 0))
         if weekday == 1:
             end_time = time(15, 0) if self._has_special_extension(normalized_context) else time(14, 0)
             return _BusinessHours(start=time(9, 30), end=end_time, extended_for_zone=end_time == time(15, 0))
         if weekday == 2:
             return _BusinessHours(start=time(9, 0), end=time(18, 0))
         if weekday == 3:
+            if self._has_special_extension(normalized_context):
+                return _BusinessHours(start=time(9, 30), end=time(15, 0), extended_for_zone=True)
             return _BusinessHours(start=time(9, 0), end=time(14, 0))
         if weekday == 4:
-            start_time = time(9, 0)
-            end_time = time(18, 0)
-            note = "Viernes: jornada normal de 09:00 a 18:00"
+            dias_desde_ref = (preferred_day - FRIDAY_REF).days
+            if (dias_desde_ref // 7) % 2 == 0:
+                return _BusinessHours(
+                    start=time(9, 0),
+                    end=time(15, 0),
+                    alternating_note="Viernes corto: 09:00 a 15:00",
+                )
             return _BusinessHours(
-                start=start_time,
-                end=end_time,
-                extended_for_zone=False,
-                alternating_note=note,
+                start=time(9, 0),
+                end=time(18, 0),
+                alternating_note="Viernes largo: 09:00 a 18:00",
             )
         if weekday == 5:
             return _BusinessHours(start=time(9, 0), end=time(15, 0))
