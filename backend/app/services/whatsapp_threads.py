@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -80,13 +82,16 @@ def load_recent_thread_messages(db: Session, thread_id: int, limit: int) -> list
     ]
 
 
-def load_latest_inbound_message(db: Session, thread_id: int) -> LatestInboundMessageOut:
-    row = db.execute(
+def load_latest_inbound_message(db: Session, thread_id: int, before: datetime | None = None) -> LatestInboundMessageOut:
+    q = (
         select(WhatsAppMessage.wa_message_id, WhatsAppMessage.timestamp)
         .where(WhatsAppMessage.thread_id == thread_id)
         .where(WhatsAppMessage.direction == "in")
-        .order_by(WhatsAppMessage.timestamp.desc(), WhatsAppMessage.id.desc())
-        .limit(1)
+    )
+    if before is not None:
+        q = q.where(WhatsAppMessage.timestamp <= before)
+    row = db.execute(
+        q.order_by(WhatsAppMessage.timestamp.desc(), WhatsAppMessage.id.desc()).limit(1)
     ).first()
     if row is None:
         return LatestInboundMessageOut(thread_id=thread_id)

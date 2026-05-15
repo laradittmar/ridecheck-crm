@@ -268,9 +268,9 @@ def get_thread_messages(thread_id: int, limit: int = Query(default=10, ge=1, le=
 
 
 @router.get("/thread/{thread_id}/latest-inbound", response_model=LatestInboundMessageOut)
-def get_thread_latest_inbound(thread_id: int, db: Session = Depends(get_db)):
+def get_thread_latest_inbound(thread_id: int, before: datetime | None = Query(default=None), db: Session = Depends(get_db)):
     _require_thread(db, thread_id)
-    return load_latest_inbound_message(db=db, thread_id=thread_id)
+    return load_latest_inbound_message(db=db, thread_id=thread_id, before=before)
 
 
 @router.get("/thread/{thread_id}/state", response_model=WhatsAppThreadStateRead)
