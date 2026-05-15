@@ -22,6 +22,7 @@ from ..models import (
     WhatsAppThreadCandidate,
 )
 from ..schemas.whatsapp_api import (
+    LatestInboundMessageOut,
     WhatsAppThreadCandidateCreate,
     WhatsAppThreadCandidatePatch,
     WhatsAppThreadCandidateRead,
@@ -38,7 +39,7 @@ from ..settings import get_settings
 from ..services.db_errors import commit_or_400
 from ..services.unanswered_alert import reset_unanswered_alert
 from ..services.whatsapp_thread_state import build_thread_state_read, upsert_thread_state
-from ..services.whatsapp_threads import load_recent_thread_messages, load_thread_payload
+from ..services.whatsapp_threads import load_latest_inbound_message, load_recent_thread_messages, load_thread_payload
 from ..ui.whatsapp_ui import _send_whatsapp_cloud_text
 
 router = APIRouter(prefix="/api/whatsapp", tags=["whatsapp"])
@@ -266,6 +267,12 @@ def get_thread_messages(thread_id: int, limit: int = Query(default=10, ge=1, le=
     return WhatsAppThreadMessagesOut(thread_id=thread_id, messages=messages)
 
 
+@router.get("/thread/{thread_id}/latest-inbound", response_model=LatestInboundMessageOut)
+def get_thread_latest_inbound(thread_id: int, db: Session = Depends(get_db)):
+    _require_thread(db, thread_id)
+    return load_latest_inbound_message(db=db, thread_id=thread_id)
+
+
 @router.get("/thread/{thread_id}/state", response_model=WhatsAppThreadStateRead)
 def get_thread_state(thread_id: int, db: Session = Depends(get_db)):
     thread = _require_thread(db, thread_id)
@@ -382,7 +389,7 @@ def send_thread_text(thread_id: int, payload: WhatsAppSendTextIn, db: Session = 
     if not to_wa_id:
         raise HTTPException(status_code=400, detail="Thread has no wa_id")
 
-    now_utc = datetime.now(timezone.utc)
+    from zoneinfo import ZoneInfo; now_utc = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
     outbound = WhatsAppMessage(
         thread_id=thread_id,
         wa_message_id=None,

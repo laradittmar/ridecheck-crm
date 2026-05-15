@@ -4,7 +4,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..models import WhatsAppContact, WhatsAppMessage, WhatsAppThread
-from ..schemas.whatsapp_api import WhatsAppMessageOut, WhatsAppThreadOut
+from ..schemas.whatsapp_api import LatestInboundMessageOut, WhatsAppMessageOut, WhatsAppThreadOut
 
 
 def _thread_preview(text: str | None) -> str | None:
@@ -78,3 +78,20 @@ def load_recent_thread_messages(db: Session, thread_id: int, limit: int) -> list
         )
         for row in rows_asc
     ]
+
+
+def load_latest_inbound_message(db: Session, thread_id: int) -> LatestInboundMessageOut:
+    row = db.execute(
+        select(WhatsAppMessage.wa_message_id, WhatsAppMessage.timestamp)
+        .where(WhatsAppMessage.thread_id == thread_id)
+        .where(WhatsAppMessage.direction == "in")
+        .order_by(WhatsAppMessage.timestamp.desc(), WhatsAppMessage.id.desc())
+        .limit(1)
+    ).first()
+    if row is None:
+        return LatestInboundMessageOut(thread_id=thread_id)
+    return LatestInboundMessageOut(
+        thread_id=thread_id,
+        latest_inbound_wa_message_id=row.wa_message_id,
+        timestamp=row.timestamp,
+    )

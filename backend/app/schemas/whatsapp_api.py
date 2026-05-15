@@ -40,6 +40,12 @@ class WhatsAppThreadMessagesOut(BaseModel):
     messages: list[WhatsAppMessageOut]
 
 
+class LatestInboundMessageOut(BaseModel):
+    thread_id: int
+    latest_inbound_wa_message_id: str | None = None
+    timestamp: datetime | None = None
+
+
 class WhatsAppSendTextIn(BaseModel):
     text: str
     reply_to_message_id: int | None = None
