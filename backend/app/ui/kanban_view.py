@@ -495,6 +495,7 @@ def _base_css(extra_css: str = "") -> str:
       .pill-count {{ background:#ecfeff; border-color:#a5f3fc; }}
       .pill-prof {{ background:#ecfdf3; border-color:#86efac; color:#166534; }}
       .pill-approval-pending {{ background:#fffbeb; border-color:#fcd34d; color:#92400e; }}
+      .pill-approval-pending:hover {{ background:#f0c040; color:#7a5c00; }}
       .pill-approval-approved {{ background:#ecfdf3; border-color:#86efac; color:#166534; }}
       .pill-approval-rejected {{ background:#fef2f2; border-color:#fca5a5; color:#991b1b; }}
       .leadIdBadge {{
@@ -1161,12 +1162,17 @@ def _revision_approval_tag(rev: Revision) -> str | None:
     return None
 
 
-def _render_revision_approval_ui(rev: Revision, include_actions: bool = False) -> str:
+def _render_revision_approval_ui(rev: Revision, include_actions: bool = False, lead_id: int | None = None) -> str:
     status = _revision_approval_status(rev)
     if not status:
         return ""
     if status == "PENDING":
-        label_html = '<span class="pill pill-approval-pending">Aprobacion turno: pendiente</span>'
+        if lead_id is not None:
+            tf = getattr(rev, "turno_fecha", None)
+            week_param = f"&week={(tf - timedelta(days=tf.weekday())).isoformat()}" if tf else ""
+            label_html = f'<a class="pill pill-approval-pending" href="/calendar?highlight_lead_id={lead_id}{week_param}" style="cursor:pointer;text-decoration:none;">Aprobacion turno: pendiente</a>'
+        else:
+            label_html = '<span class="pill pill-approval-pending">Aprobacion turno: pendiente</span>'
         if include_actions:
             return (
                 '<div class="revApprovalRow">'
@@ -3239,6 +3245,7 @@ def render_calendar_page(
     profesionales: list[Profesional] | None = None,
     week: str | None = None,
     user_email: str = "",
+    highlight_lead_id: int | None = None,
 ) -> str:
     base_monday: date | None = None
     if week:
@@ -3379,6 +3386,11 @@ def render_calendar_page(
       .calTopLinks { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
       @media (max-width: 900px) { .calGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
       @media (max-width: 520px) { .calGrid { grid-template-columns: 1fr; } }
+      .calAppt-highlight { outline: 3px solid #f59e0b; outline-offset: 2px; animation: calHighlightPulse 2s ease-out 0.2s forwards; }
+      @keyframes calHighlightPulse {
+        0%   { box-shadow: 0 0 0 10px rgba(245,158,11,.45), var(--shadow2); }
+        100% { box-shadow: 0 0 0  4px rgba(245,158,11,.10), var(--shadow2); }
+      }
     """
 
     css = _base_css(extra_css=calendar_css)
@@ -3491,6 +3503,10 @@ def render_calendar_page(
                     appt_cls = "past"
                 else:
                     appt_cls = "future-ok" if estado_val == "CONFIRMADO" else "future-pending"
+                lead_id_val = _get(l, "id")
+                is_highlighted = highlight_lead_id is not None and lead_id_val == highlight_lead_id
+                highlight_cls = " calAppt-highlight" if is_highlighted else ""
+                highlight_id = ' id="cal-highlight-appt"' if is_highlighted else ""
                 approval_status = _revision_approval_status(r)
                 approval_tag = _revision_approval_tag(r)
                 approval_ui = _render_revision_approval_ui(r)
@@ -3509,7 +3525,7 @@ def render_calendar_page(
                     )
                     approval_suffix = "</div></div>"
                 html.append(f"""
-                    <a class="calAppt {appt_cls}" href="{href}" data-search="{search_text}">
+                    <a class="calAppt {appt_cls}{highlight_cls}" href="{href}" data-search="{search_text}"{highlight_id}>
                       {approval_prefix}
                       <div class="calRow"><b>{_txt(n)}</b><span class="pill">{time_txt}</span></div>
                       <div class="calMeta calMetaVehicle">Vehículo: {_txt(veh)}</div>
@@ -3621,6 +3637,10 @@ def render_calendar_page(
             applyCalendarSearch();
             if (searchInput && (searchInput.value || "").trim()) {
               openCalendarSearch(false);
+            }
+            var highlighted = document.getElementById("cal-highlight-appt");
+            if (highlighted) {
+              highlighted.scrollIntoView({ behavior: "smooth", block: "center" });
             }
           });
           document.addEventListener("keydown", function (e) {
@@ -4184,7 +4204,7 @@ def render_lead_card(
             <div class="cardHeaderBottom">
               <span class="pill pill-veh">{vehicle_badge}</span>
               <span class="pill pill-prof">Profesional: {_txt(last_prof_label)}</span>
-              {(_render_revision_approval_ui(last_rev) if last_rev else "")}
+              {(_render_revision_approval_ui(last_rev, lead_id=l.id) if last_rev else "")}
             </div>
           </div>
 
@@ -4209,7 +4229,7 @@ def render_lead_card(
               )}
               {''.join(f"<div>{x}</div>" for x in rev_lines)}
               <div>Estado operativo: {_txt(last_rev.estado_revision) if last_rev else "-"}</div>
-              {(_render_revision_approval_ui(last_rev) if last_rev else "")}
+              {(_render_revision_approval_ui(last_rev, lead_id=l.id) if last_rev else "")}
             </div>
           </div>
         </div>
@@ -4325,7 +4345,7 @@ def render_revisions_block(
             elif approval_status == "APPROVED":
                 approval_html = '<div class="revApprovalRow"><span class="pill pill-prof">✓ Turno confirmado</span></div>'
 
-            approval_html = _render_revision_approval_ui(r, include_actions=True)
+            approval_html = _render_revision_approval_ui(r, include_actions=True, lead_id=l.id)
             chunks.append(f"""
               <div class="rev" id="rev-{l.id}-{r.id}">
                 <div class="revHead">
@@ -4727,7 +4747,7 @@ def render_edit_latest_revision_form(
                       <textarea name="turno_notas">{_val(last_rev.turno_notas)}</textarea>
                     </div>
                   </div>
-                  {_render_revision_approval_ui(last_rev, include_actions=True)}
+                  {_render_revision_approval_ui(last_rev, include_actions=True, lead_id=lead_id)}
                 </div>
               </fieldset>
 

@@ -452,6 +452,7 @@ def calendar(
     modelo: str | None = Query(default=None),
     zone_detail: str | None = Query(default=None),
     estado_revision: str | None = Query(default=None),
+    highlight_lead_id: int | None = Query(default=None),
 ):
     leads, _ = _load_filtered_leads(
         db=db,
@@ -478,6 +479,7 @@ def calendar(
             profesionales=profesionales,
             week=week,
             user_email=getattr(request.state, "user_email", ""),
+            highlight_lead_id=highlight_lead_id,
         ),
         media_type="text/html; charset=utf-8",
     )
