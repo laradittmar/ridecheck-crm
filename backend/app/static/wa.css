@@ -1746,14 +1746,57 @@
   gap: 6px;
 }
 
+.wa-back-btn {
+  display: none;
+}
+
+.wa-app .wa-msg-audio {
+  display: block;
+  width: 100%;
+  min-width: 200px;
+  max-width: 100%;
+  height: 36px;
+  outline: none;
+}
+
 @media (max-width: 900px) {
   .wa-app {
-    width: 94vw;
     flex-direction: column;
-    min-height: 520px;
-    height: min(82vh, 760px);
+    height: 100svh;
+    width: 100%;
   }
   .wa-app .wa-left {
+    display: flex !important;
+    flex: 1 1 auto;
+    width: 100%;
+  }
+  .wa-app .wa-right {
+    display: none !important;
+  }
+  .wa-app.thread-selected .wa-left {
+    display: none !important;
+  }
+  .wa-app.thread-selected .wa-right {
+    display: grid !important;
+    flex: 1 1 auto;
+    width: 100%;
+    height: 100%;
+  }
+  .wa-back-btn {
+    display: inline-flex !important;
+  }
+  .wa-empty-state {
+    display: none !important;
+  }
+}
+
+@media (max-width: 768px) {
+  .waPlaceholder > .wa-top-bar,
+  .waPlaceholder > h1 {
     display: none;
+  }
+  .wa-app {
+    height: calc(100svh - 52px);
+    min-height: 0;
   }
 }

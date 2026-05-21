@@ -322,6 +322,9 @@ def _render_whatsapp_shell(user_email: str, title: str, body_html: str) -> str:
         margin:0 0 10px 0;
         font-size:22px;
       }
+      @media (max-width: 768px) {
+        .main { padding: 52px 0 0 0; }
+      }
     """
     )
 
@@ -1345,14 +1348,14 @@ def whatsapp_inbox(request: Request, db: Session = Depends(get_db)) -> HTMLRespo
                 )
             )
         body_html = f"""
-<div class="wa-app"{wa_bg_style}>
+<div class="wa-app"{wa_bg_style} data-wa-page="inbox">
 {_render_left_panel("".join(body_cards))}
 <section class="wa-right wa-empty-state">{_render_empty_chat_state()}</section>
 </div>
 """
     else:
         body_html = f"""
-<div class="wa-app"{wa_bg_style}>
+<div class="wa-app"{wa_bg_style} data-wa-page="inbox">
 {_render_left_panel('<div class="wa-empty">No threads.</div>')}
 <section class="wa-right wa-empty-state">{_render_empty_chat_state()}</section>
 </div>
@@ -1447,7 +1450,7 @@ def whatsapp_thread(thread_id: str, request: Request, db: Session = Depends(get_
                 thread_created_at = thread.created_at
                 thread.unread_count = 0
                 db.commit()
-            message_rows = db.execute(
+            message_rows = list(reversed(db.execute(
                 select(
                     WhatsAppMessage.id,
                     WhatsAppMessage.timestamp,
@@ -1458,12 +1461,15 @@ def whatsapp_thread(thread_id: str, request: Request, db: Session = Depends(get_
                     WhatsAppContact.display_name,
                     WhatsAppMessage.text,
                     WhatsAppMessage.raw_payload,
+                    WhatsAppMessage.message_type,
+                    WhatsAppMessage.media_id,
                 )
                 .join(WhatsAppThread, WhatsAppMessage.thread_id == WhatsAppThread.id)
                 .join(WhatsAppContact, WhatsAppThread.contact_id == WhatsAppContact.id)
                 .where(WhatsAppMessage.thread_id == tid)
-                .order_by(WhatsAppMessage.timestamp.asc(), WhatsAppMessage.id.asc())
-            ).all()
+                .order_by(WhatsAppMessage.timestamp.desc(), WhatsAppMessage.id.desc())
+                .limit(50)
+            ).all()))
         except Exception:
             db.rollback()
             message_rows = []
@@ -1509,6 +1515,8 @@ def whatsapp_thread(thread_id: str, request: Request, db: Session = Depends(get_
             direction = (m.direction or "").strip().lower()
             side_cls = "wa-msg-out" if direction == "out" else "wa-msg-in"
             msg_text = m.text or "-"
+            msg_type = (m.message_type or "text").strip().lower()
+            media_id_val = (m.media_id or "").strip()
             raw_payload = m.raw_payload if isinstance(m.raw_payload, dict) else {}
             reply_to_raw = raw_payload.get("reply_to_message_id")
             reaction = str(raw_payload.get("local_reaction") or "").strip()
@@ -1548,8 +1556,13 @@ def whatsapp_thread(thread_id: str, request: Request, db: Session = Depends(get_
                 f'    <div class="wa-msg-bubble">'
                 f'      <button type="button" class="wa-msg-menu-btn wa-msg-menu-toggle" aria-label="Message options" data-wa-menu-toggle="1" data-wa-msg-id="{html_lib.escape(msg_id, quote=True)}" data-wa-msg-text="{html_lib.escape(msg_text, quote=True)}"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"></polyline></svg></button>'
                 f"      {quote_html}"
-                f'      <div class="wa-msg-text">{html_lib.escape(msg_text)}</div>'
-                f'      <div class="wa-msg-meta"><span class="wa-msg-time">{html_lib.escape(ts)}</span>{status_html}</div>'
+                + (
+                    f'      <audio class="wa-msg-audio" controls src="/api/whatsapp/media/{html_lib.escape(media_id_val, quote=True)}"></audio>'
+                    + (f'<div class="wa-msg-text">{html_lib.escape(msg_text)}</div>' if msg_text != "-" else "")
+                    if msg_type == "audio" and media_id_val
+                    else f'      <div class="wa-msg-text">{html_lib.escape(msg_text)}</div>'
+                )
+                + f'      <div class="wa-msg-meta"><span class="wa-msg-time">{html_lib.escape(ts)}</span>{status_html}</div>'
                 f"    </div>"
                 f"    {reaction_html}"
                 f'  </div>'
@@ -1564,10 +1577,13 @@ def whatsapp_thread(thread_id: str, request: Request, db: Session = Depends(get_
             for q in QUICK_REPLIES
         )
         body_html = f"""
-<div class="wa-app"{wa_bg_style} data-wa-default-replies="{default_replies_json}" data-wa-thread-url="/whatsapp/thread/{tid}" data-wa-current-thread-id="{tid}" data-wa-last-message-id="{last_message_id}">
+<div class="wa-app thread-selected"{wa_bg_style} data-wa-page="thread" data-wa-default-replies="{default_replies_json}" data-wa-thread-url="/whatsapp/thread/{tid}" data-wa-current-thread-id="{tid}" data-wa-last-message-id="{last_message_id}">
 {_render_left_panel("".join(list_html))}
 <section class="wa-right">
 <div class="wa-thread-head">
+  <a href="/whatsapp/inbox" class="wa-back-btn wa-head-icon-btn" aria-label="Volver a conversaciones">
+    <svg viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6"/></svg>
+  </a>
   <span class="wa-avatar wa-avatar-head">{html_lib.escape(_avatar_initials(display_name))}</span>
   <div class="wa-thread-head-main">
     <div class="wa-thread-title" role="button" tabindex="0" aria-label="Ver información de contacto">{html_lib.escape((display_name or "").strip() or wa_id)}</div>
@@ -1695,10 +1711,13 @@ def whatsapp_thread(thread_id: str, request: Request, db: Session = Depends(get_
 """
     else:
         body_html = f"""
-<div class="wa-app"{wa_bg_style} data-wa-default-replies="{default_replies_json}" data-wa-thread-url="/whatsapp/thread/{tid}" data-wa-current-thread-id="{tid}" data-wa-last-message-id="{last_message_id}">
+<div class="wa-app thread-selected"{wa_bg_style} data-wa-page="thread" data-wa-default-replies="{default_replies_json}" data-wa-thread-url="/whatsapp/thread/{tid}" data-wa-current-thread-id="{tid}" data-wa-last-message-id="{last_message_id}">
 {_render_left_panel("".join(list_html))}
 <section class="wa-right">
 <div class="wa-thread-head">
+  <a href="/whatsapp/inbox" class="wa-back-btn wa-head-icon-btn" aria-label="Volver a conversaciones">
+    <svg viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6"/></svg>
+  </a>
   <span class="wa-avatar wa-avatar-head">{html_lib.escape(_avatar_initials(display_name))}</span>
   <div class="wa-thread-head-main">
     <div class="wa-thread-title" role="button" tabindex="0" aria-label="Ver información de contacto">
