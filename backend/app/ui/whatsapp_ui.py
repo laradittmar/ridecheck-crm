@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import hashlib
 import html as html_lib
 import json
 import logging
@@ -227,6 +228,36 @@ def _wa_background_style_attr(request: Request) -> str:
         f' style="--wa-empty-bg:url(\'{empty_bg_url}\'); '
         f"--wa-empty-state-art:url('{empty_png_url}'), url('{empty_bg_url}'); "
         f"--wa-chat-bg:url('{chat_bg_url}');\""
+    )
+
+
+def _render_audio_player(media_id: str) -> str:
+    seed = int(hashlib.md5(media_id.encode()).hexdigest()[:8], 16)
+    bars = []
+    for _ in range(30):
+        seed = (seed * 1664525 + 1013904223) & 0xFFFFFFFF
+        h = 6 + (seed % 22)
+        bars.append(f'<i class="wa-audio-bar" style="--h:{h}px"></i>')
+    safe_src = html_lib.escape(f"/api/whatsapp/media/{media_id}", quote=True)
+    mic_svg = (
+        '<svg class="wa-audio-mic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+        '<rect x="9" y="2" width="6" height="11" rx="3"/>'
+        '<path d="M19 10a7 7 0 0 1-14 0"/>'
+        '<line x1="12" y1="19" x2="12" y2="23"/>'
+        '<line x1="8" y1="23" x2="16" y2="23"/>'
+        '</svg>'
+    )
+    return (
+        f'<div class="wa-audio-player" data-src="{safe_src}">'
+        f'<button type="button" class="wa-audio-play-btn" aria-label="Reproducir">'
+        f'<svg class="wa-audio-icon-play" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>'
+        f'<svg class="wa-audio-icon-pause" viewBox="0 0 24 24" fill="currentColor" style="display:none"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>'
+        f'</button>'
+        f'<div class="wa-audio-track">'
+        f'<div class="wa-audio-bars">{"".join(bars)}</div>'
+        f'<div class="wa-audio-foot"><span class="wa-audio-dur">0:00</span>{mic_svg}</div>'
+        f'</div>'
+        f'</div>'
     )
 
 
@@ -1245,6 +1276,80 @@ def _render_whatsapp_shell(user_email: str, title: str, body_html: str) -> str:
         });
         render();
       };
+      function wireAudioPlayers(app){
+        var players = app.querySelectorAll(".wa-audio-player");
+        if (!players.length) return;
+        players.forEach(function(player){
+          var src = player.getAttribute("data-src") || "";
+          if (!src) return;
+          var playBtn = player.querySelector(".wa-audio-play-btn");
+          var iconPlay = player.querySelector(".wa-audio-icon-play");
+          var iconPause = player.querySelector(".wa-audio-icon-pause");
+          var bars = Array.prototype.slice.call(player.querySelectorAll(".wa-audio-bar"));
+          var barsWrap = player.querySelector(".wa-audio-bars");
+          var durEl = player.querySelector(".wa-audio-dur");
+          var audio = null;
+          function fmt(s){
+            s = isFinite(s) ? Math.floor(s) : 0;
+            return Math.floor(s/60) + ":" + ("0" + (s % 60)).slice(-2);
+          }
+          function updateBars(){
+            if (!audio) return;
+            var pct = audio.duration ? audio.currentTime / audio.duration : 0;
+            var cutoff = Math.round(pct * bars.length);
+            bars.forEach(function(b, i){ b.classList.toggle("wa-played", i < cutoff); });
+            if (durEl) durEl.textContent = audio.paused ? fmt(audio.duration) : fmt(audio.currentTime);
+          }
+          function setPlayState(playing){
+            if (iconPlay) iconPlay.style.display = playing ? "none" : "";
+            if (iconPause) iconPause.style.display = playing ? "" : "none";
+          }
+          function stopOthers(){
+            document.querySelectorAll(".wa-audio-player").forEach(function(p){
+              if (p === player) return;
+              var a = p.__waAudio;
+              if (a && !a.paused){
+                a.pause();
+                var ip = p.querySelector(".wa-audio-icon-play");
+                var ipau = p.querySelector(".wa-audio-icon-pause");
+                if (ip) ip.style.display = "";
+                if (ipau) ipau.style.display = "none";
+              }
+            });
+          }
+          function ensureAudio(){
+            if (audio) return;
+            audio = new Audio(src);
+            player.__waAudio = audio;
+            audio.addEventListener("timeupdate", updateBars);
+            audio.addEventListener("ended", function(){ setPlayState(false); updateBars(); });
+            audio.addEventListener("loadedmetadata", function(){ if (durEl) durEl.textContent = fmt(audio.duration); });
+          }
+          if (playBtn){
+            playBtn.addEventListener("click", function(e){
+              e.stopPropagation();
+              ensureAudio();
+              stopOthers();
+              if (audio.paused){
+                audio.play().then(function(){ setPlayState(true); }).catch(function(){});
+              } else {
+                audio.pause();
+                setPlayState(false);
+              }
+            });
+          }
+          if (barsWrap){
+            barsWrap.addEventListener("click", function(e){
+              ensureAudio();
+              if (!audio.duration) return;
+              var rect = barsWrap.getBoundingClientRect();
+              var pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+              audio.currentTime = pct * audio.duration;
+              updateBars();
+            });
+          }
+        });
+      }
       function waInitWarnOnce(message, extra){
         if (window.__waInitWarned) return;
         window.__waInitWarned = true;
@@ -1268,6 +1373,7 @@ def _render_whatsapp_shell(user_email: str, title: str, body_html: str) -> str:
               wireComposer(app);
               wireComposerExtras(app);
               wireMessageMenus(app);
+              wireAudioPlayers(app);
               var isThreadView = !!(app.getAttribute("data-wa-current-thread-id") || "").trim();
               if (isThreadView && (!app.querySelector(".wa-compose-form") || !app.querySelector(".wa-compose-input"))) {
                 waInitWarnOnce("WhatsApp init failed: composer nodes missing", app);
@@ -1539,12 +1645,50 @@ def whatsapp_thread(thread_id: str, request: Request, db: Session = Depends(get_
                     )
             status_html = ""
             if direction == "out":
-                indicator = _status_indicator(m.status)
-                status_html = (
-                    f'<span class="wa-msg-status" title="{html_lib.escape(m.status or "-", quote=True)}">'
-                    f"{html_lib.escape(indicator)}"
-                    "</span>"
-                )
+                _s = str(m.status or "").strip().lower()
+                if _s == "read":
+                    _tick = (
+                        '<svg class="wa-tick" viewBox="0 0 20 11" fill="none" xmlns="http://www.w3.org/2000/svg">'
+                        '<path d="M1 6L5 10L13 2" stroke="#53bdeb" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>'
+                        '<path d="M7 6L11 10L19 2" stroke="#53bdeb" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>'
+                        '</svg>'
+                    )
+                elif _s == "delivered":
+                    _tick = (
+                        '<svg class="wa-tick" viewBox="0 0 20 11" fill="none" xmlns="http://www.w3.org/2000/svg">'
+                        '<path d="M1 6L5 10L13 2" stroke="#92a5b0" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>'
+                        '<path d="M7 6L11 10L19 2" stroke="#92a5b0" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>'
+                        '</svg>'
+                    )
+                elif _s == "sent":
+                    _tick = (
+                        '<svg class="wa-tick" viewBox="0 0 16 11" fill="none" xmlns="http://www.w3.org/2000/svg">'
+                        '<path d="M2 6L6 10L14 2" stroke="#92a5b0" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>'
+                        '</svg>'
+                    )
+                elif _s == "pending":
+                    _tick = (
+                        '<svg class="wa-tick wa-tick-sq" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">'
+                        '<circle cx="8" cy="8" r="6.5" stroke="#92a5b0" stroke-width="1.5"/>'
+                        '<path d="M8 5V8.5L10.5 10" stroke="#92a5b0" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>'
+                        '</svg>'
+                    )
+                elif _s == "failed":
+                    _tick = (
+                        '<svg class="wa-tick wa-tick-sq" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">'
+                        '<circle cx="8" cy="8" r="6.5" stroke="#ef4444" stroke-width="1.5"/>'
+                        '<path d="M8 5V9" stroke="#ef4444" stroke-width="1.5" stroke-linecap="round"/>'
+                        '<circle cx="8" cy="11.5" r="0.8" fill="#ef4444"/>'
+                        '</svg>'
+                    )
+                else:
+                    _tick = ""
+                if _tick:
+                    status_html = (
+                        f'<span class="wa-msg-status" title="{html_lib.escape(m.status or "-", quote=True)}">'
+                        f"{_tick}"
+                        "</span>"
+                    )
             reaction_html = (
                 f'<div class="wa-msg-reaction" data-wa-msg-reaction="1">{html_lib.escape(reaction)}</div>'
                 if reaction
@@ -1557,8 +1701,8 @@ def whatsapp_thread(thread_id: str, request: Request, db: Session = Depends(get_
                 f'      <button type="button" class="wa-msg-menu-btn wa-msg-menu-toggle" aria-label="Message options" data-wa-menu-toggle="1" data-wa-msg-id="{html_lib.escape(msg_id, quote=True)}" data-wa-msg-text="{html_lib.escape(msg_text, quote=True)}"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"></polyline></svg></button>'
                 f"      {quote_html}"
                 + (
-                    f'      <audio class="wa-msg-audio" controls src="/api/whatsapp/media/{html_lib.escape(media_id_val, quote=True)}"></audio>'
-                    + (f'<div class="wa-msg-text">{html_lib.escape(msg_text)}</div>' if msg_text != "-" else "")
+                    _render_audio_player(media_id_val)
+                    + (f'<div class="wa-msg-text">{html_lib.escape(msg_text)}</div>' if msg_text and msg_text != "-" else "")
                     if msg_type == "audio" and media_id_val
                     else f'      <div class="wa-msg-text">{html_lib.escape(msg_text)}</div>'
                 )

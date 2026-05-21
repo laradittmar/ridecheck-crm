@@ -135,6 +135,7 @@
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
   gap: 8px;
+  flex: 1 1 auto;
   text-decoration: none;
   color: inherit;
   padding: 8px;
@@ -144,38 +145,30 @@
   box-sizing: border-box;
   align-items: center;
   margin-bottom: 2px;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
 }
 
+/* mobile-first: row is a flex container, menu btn is always visible in-flow */
 .wa-app .wa-chat-row {
-  position: relative;
+  display: flex;
+  align-items: stretch;
   border-radius: 8px;
 }
 
 .wa-app .wa-chat-row-menu-btn {
-  position: absolute;
-  top: 50%;
-  right: 8px;
-  width: 26px;
-  height: 26px;
-  transform: translateY(-50%);
+  flex: 0 0 40px;
   border: none;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.92);
+  border-radius: 0;
+  background: transparent;
   color: #6b7280;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   z-index: 3;
-  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.08);
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity .12s ease, background-color .12s ease;
-}
-
-.wa-app .wa-chat-row:hover .wa-chat-row-menu-btn,
-.wa-app .wa-chat-row-menu-btn:focus-visible {
   opacity: 1;
   pointer-events: auto;
+  transition: opacity .12s ease, background-color .12s ease;
 }
 
 .wa-app .wa-chat-row-menu-btn svg {
@@ -188,12 +181,35 @@
   stroke-linejoin: round;
 }
 
-.wa-app .wa-chat-row-menu-btn:hover {
-  background: #fff;
-}
-
-.wa-app .wa-chat-item:hover {
-  background: #eef2f7;
+@media (hover: hover) {
+  .wa-app .wa-chat-item:hover {
+    background: #eef2f7;
+  }
+  .wa-app .wa-chat-row {
+    position: relative;
+  }
+  .wa-app .wa-chat-row-menu-btn {
+    position: absolute;
+    top: 50%;
+    right: 8px;
+    width: 26px;
+    height: 26px;
+    flex: 0 0 auto;
+    transform: translateY(-50%);
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.92);
+    box-shadow: 0 2px 8px rgba(15, 23, 42, 0.08);
+    opacity: 0;
+    pointer-events: none;
+  }
+  .wa-app .wa-chat-row:hover .wa-chat-row-menu-btn,
+  .wa-app .wa-chat-row-menu-btn:focus-visible {
+    opacity: 1;
+    pointer-events: auto;
+  }
+  .wa-app .wa-chat-row-menu-btn:hover {
+    background: #fff;
+  }
 }
 
 .wa-app .wa-chat-item-active {
@@ -1750,13 +1766,129 @@
   display: none;
 }
 
-.wa-app .wa-msg-audio {
-  display: block;
-  width: 100%;
+/* ── Custom audio player ── */
+.wa-audio-player {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   min-width: 200px;
-  max-width: 100%;
+  width: 100%;
+  padding: 4px 0;
+  user-select: none;
+}
+
+.wa-audio-play-btn {
+  width: 36px;
   height: 36px;
-  outline: none;
+  flex: 0 0 36px;
+  border-radius: 0;
+  border: none;
+  background: transparent;
+  color: #1a2533;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0;
+  transition: opacity 0.12s ease;
+}
+
+.wa-audio-play-btn:hover {
+  opacity: 0.75;
+}
+
+.wa-audio-icon-play,
+.wa-audio-icon-pause {
+  width: 13px;
+  height: 13px;
+  display: block;
+}
+
+.wa-audio-track {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.wa-audio-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 28px;
+  cursor: pointer;
+}
+
+.wa-audio-bar {
+  display: block;
+  width: 3px;
+  height: var(--h, 8px);
+  border-radius: 2px;
+  background: rgba(0, 0, 0, 0.22);
+  flex-shrink: 0;
+  transition: background 0.06s;
+}
+
+.wa-audio-bar.wa-played {
+  background: #11939a;
+}
+
+.wa-audio-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.wa-audio-dur {
+  font-size: 11px;
+  color: rgba(0, 0, 0, 0.45);
+  line-height: 1;
+}
+
+.wa-audio-mic {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 14px;
+  color: rgba(0, 0, 0, 0.35);
+}
+
+.wa-msg-out .wa-audio-play-btn {
+  background: transparent;
+  color: rgba(255, 255, 255, 0.9);
+}
+
+.wa-msg-out .wa-audio-play-btn:hover {
+  opacity: 0.75;
+}
+
+.wa-msg-out .wa-audio-bar {
+  background: rgba(255, 255, 255, 0.45);
+}
+
+.wa-msg-out .wa-audio-bar.wa-played {
+  background: rgba(255, 255, 255, 0.9);
+}
+
+.wa-msg-out .wa-audio-dur {
+  color: rgba(255, 255, 255, 0.70);
+}
+
+.wa-msg-out .wa-audio-mic {
+  color: rgba(255, 255, 255, 0.65);
+}
+
+.wa-tick {
+  height: 14px;
+  width: auto;
+  display: inline-block;
+  vertical-align: middle;
+  flex-shrink: 0;
+}
+
+.wa-tick.wa-tick-sq {
+  height: 16px;
+  width: 16px;
 }
 
 @media (max-width: 900px) {
