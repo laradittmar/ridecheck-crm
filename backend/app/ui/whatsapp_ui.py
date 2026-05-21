@@ -231,7 +231,7 @@ def _wa_background_style_attr(request: Request) -> str:
     )
 
 
-def _render_audio_player(media_id: str) -> str:
+def _render_audio_player(media_id: str, ts: str = "", status_html: str = "") -> str:
     seed = int(hashlib.md5(media_id.encode()).hexdigest()[:8], 16)
     bars = []
     for _ in range(30):
@@ -247,6 +247,10 @@ def _render_audio_player(media_id: str) -> str:
         '<line x1="8" y1="23" x2="16" y2="23"/>'
         '</svg>'
     )
+    ts_html = (
+        f'<span class="wa-audio-ts">{html_lib.escape(ts)}{status_html}</span>'
+        if ts or status_html else ""
+    )
     return (
         f'<div class="wa-audio-player" data-src="{safe_src}">'
         f'<button type="button" class="wa-audio-play-btn" aria-label="Reproducir">'
@@ -254,8 +258,8 @@ def _render_audio_player(media_id: str) -> str:
         f'<svg class="wa-audio-icon-pause" viewBox="0 0 24 24" fill="currentColor" style="display:none"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>'
         f'</button>'
         f'<div class="wa-audio-track">'
-        f'<div class="wa-audio-bars">{"".join(bars)}</div>'
-        f'<div class="wa-audio-foot"><span class="wa-audio-dur">0:00</span>{mic_svg}</div>'
+        f'<div class="wa-audio-bars">{"".join(bars)}{mic_svg}</div>'
+        f'<div class="wa-audio-foot"><span class="wa-audio-dur">0:00</span>{ts_html}</div>'
         f'</div>'
         f'</div>'
     )
@@ -1319,12 +1323,17 @@ def _render_whatsapp_shell(user_email: str, title: str, body_html: str) -> str:
           }
           function ensureAudio(){
             if (audio) return;
-            audio = new Audio(src);
+            audio = new Audio();
+            audio.preload = "metadata";
+            audio.src = src;
             player.__waAudio = audio;
             audio.addEventListener("timeupdate", updateBars);
+            audio.addEventListener("pause", updateBars);
+            audio.addEventListener("play", function(){ if (durEl) durEl.textContent = fmt(audio.currentTime); });
             audio.addEventListener("ended", function(){ setPlayState(false); updateBars(); });
             audio.addEventListener("loadedmetadata", function(){ if (durEl) durEl.textContent = fmt(audio.duration); });
           }
+          ensureAudio();
           if (playBtn){
             playBtn.addEventListener("click", function(e){
               e.stopPropagation();
@@ -1701,13 +1710,15 @@ def whatsapp_thread(thread_id: str, request: Request, db: Session = Depends(get_
                 f'      <button type="button" class="wa-msg-menu-btn wa-msg-menu-toggle" aria-label="Message options" data-wa-menu-toggle="1" data-wa-msg-id="{html_lib.escape(msg_id, quote=True)}" data-wa-msg-text="{html_lib.escape(msg_text, quote=True)}"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"></polyline></svg></button>'
                 f"      {quote_html}"
                 + (
-                    _render_audio_player(media_id_val)
+                    _render_audio_player(media_id_val, ts=ts, status_html=status_html)
                     + (f'<div class="wa-msg-text">{html_lib.escape(msg_text)}</div>' if msg_text and msg_text != "-" else "")
                     if msg_type == "audio" and media_id_val
-                    else f'      <div class="wa-msg-text">{html_lib.escape(msg_text)}</div>'
+                    else (
+                        f'      <div class="wa-msg-text">{html_lib.escape(msg_text)}</div>'
+                        + f'      <div class="wa-msg-meta"><span class="wa-msg-time">{html_lib.escape(ts)}</span>{status_html}</div>'
+                    )
                 )
-                + f'      <div class="wa-msg-meta"><span class="wa-msg-time">{html_lib.escape(ts)}</span>{status_html}</div>'
-                f"    </div>"
+                + f"    </div>"
                 f"    {reaction_html}"
                 f'  </div>'
                 f"</div>"

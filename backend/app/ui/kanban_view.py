@@ -94,6 +94,7 @@ ICON_WHATSAPP = render_whatsapp_icon_svg()
 def _base_css(extra_css: str = "") -> str:
     css = f"""
     <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
       :root{{
         --bg:#f3f4f6;
@@ -779,6 +780,8 @@ def _base_css(extra_css: str = "") -> str:
       }}
       .msItem:hover {{ background:#f3f4f6; }}
       .msItem input {{ width:16px; height:16px; }}
+      .kanban-mobile-tabs {{ display:none; }}
+
       @media (max-width: 420px) {{
         .estadoGrid {{ grid-template-columns: 1fr; }}
       }}
@@ -813,6 +816,146 @@ def _base_css(extra_css: str = "") -> str:
         background: #eef2ff;
         transition: box-shadow .3s ease, background .3s ease;
       }}
+
+      @media (max-width: 768px) {{
+        html {{ scroll-behavior: smooth; scroll-padding-top: 96px; }}
+        /* Fix 1: sidebar → fixed top icon bar */
+        .sidebar {{
+          position: fixed;
+          top: 0; left: 0; right: 0;
+          width: 100% !important;
+          height: 52px;
+          min-height: 52px;
+          flex-direction: row;
+          align-items: center;
+          padding: 0 8px;
+          z-index: 100;
+          overflow: hidden;
+        }}
+        .sidebar.collapsed {{
+          width: 100% !important;
+          height: 52px;
+        }}
+        .brandRow, .sidebarToggle, .sidebarFooter {{ display: none !important; }}
+        .nav {{
+          display: flex !important;
+          flex-direction: row;
+          align-items: center;
+          flex: 1;
+          gap: 0;
+          padding-bottom: 0;
+          border-bottom: none;
+          justify-content: space-around;
+          width: 100%;
+        }}
+        .nav a {{
+          flex-direction: column;
+          padding: 6px;
+          margin-bottom: 0;
+          gap: 2px;
+          flex: 1;
+          justify-content: center;
+          align-items: center;
+        }}
+        .navLabel {{ display: none !important; }}
+        .main {{ padding-top: calc(52px + clamp(18px, 1vw, 28px)); }}
+        .kanbanTopBar {{ display: none; }}
+        .main {{
+          padding-top: 52px;
+          padding-left: 0;
+          padding-right: 0;
+          overflow-x: hidden;
+        }}
+        /* board: horizontal snap scroll */
+        .board {{
+          display: flex;
+          flex-direction: row;
+          overflow-x: scroll;
+          overflow-y: visible;
+          scroll-snap-type: x mandatory;
+          width: 100vw;
+          scroll-behavior: smooth;
+          -webkit-overflow-scrolling: touch;
+          gap: 0;
+          padding: 0;
+          box-sizing: border-box;
+        }}
+        .kanban-column {{
+          flex: 0 0 100vw;
+          width: 100vw;
+          min-width: 100vw;
+          max-width: 100vw;
+          scroll-snap-align: start;
+          overflow-y: auto;
+          overflow-x: hidden;
+          height: calc(100svh - 104px);
+          box-sizing: border-box;
+          padding: 0 12px;
+          border-radius: 0;
+          border-left: none;
+          border-right: none;
+        }}
+        .kanban-column-cards {{ margin-top: var(--gap); }}
+        .card, .leadCard {{
+          width: 100%;
+          box-sizing: border-box;
+          overflow: hidden;
+        }}
+        .cardHeaderRow, .card-header {{
+          box-sizing: border-box;
+          max-width: 100%;
+          overflow: hidden;
+        }}
+        .lead-head {{
+          box-sizing: border-box;
+          width: 100%;
+        }}
+        /* sticky mobile tab bar */
+        .kanban-mobile-tabs {{
+          display: flex;
+          align-items: stretch;
+          position: sticky;
+          top: 52px;
+          z-index: 30;
+          height: 52px;
+          background: rgba(255,255,255,.97);
+          border-bottom: 1px solid var(--border);
+          box-shadow: 0 2px 8px rgba(0,0,0,.06);
+        }}
+        .kanban-mobile-tabs-inner {{
+          display: flex;
+          align-items: center;
+          overflow-x: auto;
+          scrollbar-width: none;
+          gap: 6px;
+          padding: 0 8px;
+          width: 100%;
+        }}
+        .kanban-mobile-tabs-inner::-webkit-scrollbar {{ display: none; }}
+        .kanban-tab {{
+          flex: 0 0 auto;
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+          padding: 5px 12px;
+          border-radius: 999px;
+          border: 1px solid var(--border);
+          background: #f9fafb;
+          color: #111827;
+          font-size: 12px;
+          font-weight: 600;
+          white-space: nowrap;
+          cursor: pointer;
+          text-decoration: none;
+        }}
+        .kanban-tab:hover {{ background: #eef2f7; }}
+        .kanban-tab.active {{
+          background: #111827;
+          color: #fff;
+          border-color: #111827;
+        }}
+      }}
+
       {extra_css}
     </style>
     """
@@ -1477,6 +1620,18 @@ def render_page(
           <div class="addLeadError" data-add-lead-error="1" aria-live="polite"></div>
         </form>
     """ % "".join([f'<option value="{c}">{c}</option>' for c in CANAL_OPCIONES])
+    _mobile_tab_items = "".join(
+        f'<button type="button" class="kanban-tab" data-col-index="{i}" data-col-key="{k}">'
+        f'<span>{KANBAN_LABELS.get(k, k)}</span>'
+        f'<span class="badge">{len(buckets.get(k, []))}</span>'
+        f'</button>'
+        for i, k in enumerate(KANBAN_ORDER)
+    )
+    html.append(
+        f'<nav class="kanban-mobile-tabs" aria-label="Columnas kanban">'
+        f'<div class="kanban-mobile-tabs-inner">{_mobile_tab_items}</div>'
+        f'</nav>'
+    )
     html.append('<div class="board">')
 
     for estado_k in KANBAN_ORDER:
@@ -1496,17 +1651,17 @@ def render_page(
 
         estado_label = KANBAN_LABELS.get(estado_k, estado_k)
         html.append(
-            f'<div class="kanban-column kanbanCol" data-estado="{estado_k}" data-estado-label="{estado_label}"><h2><span>{estado_label}</span> '
+            f'<div id="kanban-col-{estado_k}" class="kanban-column kanbanCol" data-estado="{estado_k}" data-estado-label="{estado_label}" data-card-count="{len(col)}"><h2 class="kanban-column-header"><span>{estado_label}</span> '
             f'<span class="badge">{len(col)}</span> {header_actions}</h2>'
+            f'<div class="kanban-column-cards">'
         )
         for l in col:
             html.append(render_lead_card(l, zones_map, profesionales=profesionales or [], agencias=agencias or []))
-        html.append("</div>")
+        html.append("</div></div>")
 
     html.append("</div>")  # board
     html.append('<div id="popover-root"></div>')
     html.append('<div id="toast-root" class="toastWrap"></div>')
-
     zones_json = json.dumps(zones_map or {}, ensure_ascii=False).replace("</", "<\\/")
 
     html.append(f"""
@@ -2547,6 +2702,47 @@ def render_page(
       </script>
     """)
 
+    html.append("""
+      <script>
+        (function () {
+          var board = document.querySelector('.board');
+          var tabs = Array.prototype.slice.call(document.querySelectorAll('.kanban-tab[data-col-index]'));
+          var columns = Array.prototype.slice.call(document.querySelectorAll('.kanban-column'));
+          if (!board || !tabs.length || !columns.length) return;
+
+          function setActiveTab(index) {
+            tabs.forEach(function (t, i) {
+              t.classList.toggle('active', i === index);
+            });
+          }
+
+          // First tab active on load
+          setActiveTab(0);
+
+          // Tab click → scroll board to column
+          tabs.forEach(function (tab) {
+            tab.addEventListener('click', function () {
+              var idx = parseInt(tab.getAttribute('data-col-index'), 10);
+              board.scrollTo({ left: idx * window.innerWidth, behavior: 'smooth' });
+            });
+          });
+
+          // IntersectionObserver: mark tab active when column >50% visible
+          if (typeof IntersectionObserver !== 'undefined') {
+            var observer = new IntersectionObserver(function (entries) {
+              entries.forEach(function (entry) {
+                if (entry.intersectionRatio > 0.5) {
+                  var idx = columns.indexOf(entry.target);
+                  if (idx !== -1) setActiveTab(idx);
+                }
+              });
+            }, { root: board, threshold: 0.5 });
+            columns.forEach(function (col) { observer.observe(col); });
+          }
+        })();
+      </script>
+    """)
+
     html.append("</main></div>")  # main + layout
     return "\n".join(html)
 
@@ -2572,8 +2768,8 @@ def render_table_page(
     open_filters: bool = False,
 ) -> str:
     table_css = """
-      .tableWrap { overflow: auto; background: rgba(255,255,255,.7); border: 1px solid var(--border); border-radius: 14px; box-shadow: var(--shadow); max-height: calc(100vh - 160px); }
-      table { width: 100%; border-collapse: collapse; min-width: 1100px; }
+      .tableWrap { overflow-x: auto; max-width: 100%; background: rgba(255,255,255,.7); border: 1px solid var(--border); border-radius: 14px; box-shadow: var(--shadow); max-height: calc(100vh - 160px); }
+      table { width: 100%; border-collapse: collapse; min-width: max-content; }
       th, td { padding: 8px 10px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
       th { position: relative; }
       thead th { font-size: 12px; color: #374151; background: #fff; position: sticky; top: 0; z-index: 5; box-shadow: 0 1px 0 rgba(0,0,0,.08); }

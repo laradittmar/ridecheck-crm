@@ -1814,7 +1814,7 @@
 
 .wa-audio-bars {
   display: flex;
-  align-items: flex-end;
+  align-items: center;
   gap: 2px;
   height: 28px;
   cursor: pointer;
@@ -1846,11 +1846,21 @@
   line-height: 1;
 }
 
+.wa-audio-ts {
+  font-size: 11px;
+  color: rgba(0, 0, 0, 0.45);
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
 .wa-audio-mic {
   width: 14px;
   height: 14px;
   flex: 0 0 14px;
   color: rgba(0, 0, 0, 0.35);
+  pointer-events: none;
 }
 
 .wa-msg-out .wa-audio-play-btn {
@@ -1871,6 +1881,10 @@
 }
 
 .wa-msg-out .wa-audio-dur {
+  color: rgba(255, 255, 255, 0.70);
+}
+
+.wa-msg-out .wa-audio-ts {
   color: rgba(255, 255, 255, 0.70);
 }
 
