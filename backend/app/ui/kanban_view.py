@@ -3576,19 +3576,23 @@ def render_calendar_page(
     calendar_css = """
       /* ── Calendar: shared font ── */
       .calWrap * { font-family: 'Bahnschrift','Segoe UI','Arial Narrow',Arial,sans-serif; }
-      /* Fix: push content below fixed 52px top nav on mobile */
+      /* Fix: push content below fixed top nav on mobile */
       @media (max-width: 768px) { .main { padding-top: 56px !important; } }
+      /* Desktop: cap calendar width so cards do not stretch full-screen */
+      @media (min-width: 769px) {
+        .calWrap { max-width: 800px; margin: 0 auto; }
+      }
 
       /* ── View pills ── */
       .calViewPills {
-        display: flex; gap: 8px; justify-content: center;
-        padding: 10px 16px;
-        background: rgba(255,255,255,.12); border-radius: 14px; margin: 8px 12px;
+        display: flex; gap: 6px; justify-content: center;
+        padding: 8px 12px;
+        background: rgba(255,255,255,.11); border-radius: 12px; margin: 6px 12px 4px;
       }
       .calPill {
-        padding: 6px 22px; border-radius: 999px; font-size: 14px; font-weight: 700;
-        border: 2px solid rgba(255,255,255,.55); background: transparent;
-        cursor: pointer; color: rgba(255,255,255,.7);
+        padding: 5px 18px; border-radius: 999px; font-size: 12.5px; font-weight: 700;
+        border: 2px solid rgba(255,255,255,.45); background: transparent;
+        cursor: pointer; color: rgba(255,255,255,.65);
         transition: background .15s, color .15s, border-color .15s;
         font-family: 'Bahnschrift','Segoe UI','Arial Narrow',Arial,sans-serif;
       }
@@ -3598,27 +3602,27 @@ def render_calendar_page(
       /* ── Date header ── */
       .calDateHeader {
         display: flex; align-items: center; justify-content: center;
-        gap: 16px; padding: 4px 0 8px;
+        gap: 12px; padding: 2px 0 6px;
       }
       .calNavArrow {
-        background: none; border: 2px solid rgba(255,255,255,.35); border-radius: 50%;
-        width: 36px; height: 36px; font-size: 20px; cursor: pointer; color: #fff;
+        background: none; border: 2px solid rgba(255,255,255,.3); border-radius: 50%;
+        width: 30px; height: 30px; font-size: 17px; cursor: pointer; color: #fff;
         display: inline-flex; align-items: center; justify-content: center;
         flex-shrink: 0; transition: background .15s, border-color .15s;
       }
-      .calNavArrow:hover { background: rgba(255,255,255,.15); border-color: rgba(255,255,255,.7); }
-      .calDateHeadCenter { text-align: center; min-width: 180px; }
+      .calNavArrow:hover { background: rgba(255,255,255,.15); border-color: rgba(255,255,255,.65); }
+      .calDateHeadCenter { text-align: center; min-width: 150px; }
       .calDateBig {
-        font-size: 1.65rem; font-weight: 800; color: #fff; line-height: 1.15;
+        font-size: 1.25rem; font-weight: 800; color: #fff; line-height: 1.2;
         font-family: 'Bahnschrift','Segoe UI','Arial Narrow',Arial,sans-serif;
         letter-spacing: .01em; text-align: center;
       }
       @media (min-width: 769px) {
-        .calDateBig { font-size: 1.45rem; }
+        .calDateBig { font-size: 1.1rem; }
       }
       .calDateSub {
-        font-size: .9rem; font-weight: 600; color: rgba(255,255,255,.75);
-        text-transform: capitalize; margin-top: 2px; text-align: center;
+        font-size: .78rem; font-weight: 500; color: rgba(255,255,255,.6);
+        text-transform: capitalize; margin-top: 1px; text-align: center;
         font-family: 'Bahnschrift','Segoe UI','Arial Narrow',Arial,sans-serif;
       }
 
@@ -3626,130 +3630,147 @@ def render_calendar_page(
       .calViewPanel { display: none; }
       .calViewPanel.active { display: block; }
 
-      /* ── Day view: time slot cards ── */
-      .calDaySlots { display: flex; flex-direction: column; gap: 6px; padding: 8px 12px; }
+      /* ── Day view ── */
+      .calDaySlots { display: flex; flex-direction: column; gap: 2px; padding: 6px 12px; }
+      /* Empty hour slots: thin, barely-there marker */
       .calDaySlotCard {
-        display: flex; align-items: stretch;
-        border-radius: 14px; overflow: hidden;
-        background: rgba(255,255,255,.07);
-        min-height: 72px;
+        display: flex; align-items: center;
+        border-radius: 7px; overflow: hidden;
+        background: rgba(255,255,255,.04);
+        min-height: 26px;
       }
-      .calDaySlotCard.has-appt { background: #fff; box-shadow: 0 2px 12px rgba(0,0,0,.18); }
-      .calDaySlotCard.has-appt:hover { box-shadow: 0 4px 18px rgba(0,0,0,.28); }
+      /* Appointment cards: stand out with white bg and subtle shadow */
+      .calDaySlotCard.has-appt {
+        background: #fff; box-shadow: 0 1px 6px rgba(0,0,0,.11);
+        border-radius: 11px; min-height: 52px; align-items: stretch;
+      }
+      .calDaySlotCard.has-appt:hover { box-shadow: 0 3px 12px rgba(0,0,0,.2); }
       .calDaySlotCard.past-appt { background: #f3f4f6; }
       .calDaySlotCard.confirmed-appt { background: #ecfdf5; }
       .calDaySlotCard.pending-appt { background: #fff7ed; }
       .calDaySlotTime {
-        flex: 0 0 56px; display: flex; align-items: center; justify-content: center;
-        font-size: 12px; font-weight: 700; color: rgba(255,255,255,.38);
+        flex: 0 0 46px; display: flex; align-items: center; justify-content: center;
+        font-size: 10.5px; font-weight: 600; color: rgba(255,255,255,.22);
         padding: 0 4px;
         font-family: 'Bahnschrift','Segoe UI','Arial Narrow',Arial,sans-serif;
       }
-      .calDaySlotCard.has-appt .calDaySlotTime { color: #9ca3af; }
+      .calDaySlotCard.has-appt .calDaySlotTime {
+        color: #b0b7c3; font-size: 10.5px; font-weight: 700;
+        align-items: flex-start; padding-top: 10px;
+      }
       .calDaySlotBody {
-        flex: 1; min-width: 0; padding: 10px 14px 10px 0;
+        flex: 1; min-width: 0; padding: 9px 12px 8px 0;
         text-decoration: none; color: inherit; display: block;
       }
+      /* Typography hierarchy: name > vehicle > address/prof */
       .calApptName {
-        font-size: .95rem; font-weight: 800; color: #111827; line-height: 1.25;
+        font-size: .87rem; font-weight: 800; color: #111827; line-height: 1.25;
         font-family: 'Bahnschrift','Segoe UI','Arial Narrow',Arial,sans-serif;
       }
-      @media (min-width: 769px) {
-        .calApptName { font-size: .88rem; }
-      }
-      .calApptMeta { font-size: 11.5px; color: #6b7280; margin-top: 2px; line-height: 1.45; }
+      /* First meta (vehicle): medium-dark */
+      .calApptName + .calApptMeta { color: #374151; font-weight: 600; font-size: 11px; }
+      /* Second meta (address/prof): soft */
+      .calApptMeta ~ .calApptMeta { color: #9ca3af; font-weight: 400; font-size: 10.5px; }
+      .calApptMeta { margin-top: 2px; line-height: 1.35; }
       .calApptMeta a { color: #3b82f6; text-decoration: none; }
       .calApptStatus {
-        display: inline-block; font-size: 11px; font-weight: 700;
-        border-radius: 999px; padding: 1px 8px; margin-top: 4px;
+        display: inline-block; font-size: 9.5px; font-weight: 700; letter-spacing: .025em;
+        border-radius: 999px; padding: 1px 6px; margin-top: 4px;
         background: #e0f2fe; color: #0369a1;
       }
       .calApptStatus.confirmed { background: #dcfce7; color: #166534; }
-      .calApptStatus.past { background: #f3f4f6; color: #6b7280; }
+      .calApptStatus.past { background: #f1f5f9; color: #94a3b8; }
 
       /* ── Week view ── */
-      .calWeekList { display: flex; flex-direction: column; gap: 8px; padding: 8px 12px; }
-      .calWeekDayCard { border-radius: 14px; overflow: hidden; background: rgba(255,255,255,.07); }
-      .calWeekDayCard.has-appt { background: #fff; box-shadow: 0 2px 10px rgba(0,0,0,.15); }
+      .calWeekList { display: flex; flex-direction: column; gap: 5px; padding: 6px 12px; }
+      .calWeekDayCard { border-radius: 12px; overflow: hidden; background: rgba(255,255,255,.06); }
+      .calWeekDayCard.has-appt { background: #fff; box-shadow: 0 1px 6px rgba(0,0,0,.1); }
       .calWeekDayHead {
-        display: flex; align-items: center; justify-content: space-between; padding: 8px 14px;
+        display: flex; align-items: center; justify-content: space-between; padding: 6px 12px;
       }
       .calWeekDayCard.has-appt .calWeekDayHead { border-bottom: 1px solid #f3f4f6; }
       .calWeekDayName {
-        font-size: 13px; font-weight: 800; color: rgba(255,255,255,.5);
+        font-size: 11px; font-weight: 800; color: rgba(255,255,255,.4);
         font-family: 'Bahnschrift','Segoe UI','Arial Narrow',Arial,sans-serif;
-        text-transform: uppercase; letter-spacing: .05em;
+        text-transform: uppercase; letter-spacing: .07em;
       }
       .calWeekDayCard.has-appt .calWeekDayName { color: #374151; }
-      .calWeekDayDate { font-size: 13px; font-weight: 600; color: rgba(255,255,255,.35); }
+      .calWeekDayDate { font-size: 11px; font-weight: 500; color: rgba(255,255,255,.28); }
       .calWeekDayCard.has-appt .calWeekDayDate { color: #9ca3af; }
       .calWeekApptRow {
-        display: flex; align-items: flex-start; gap: 10px;
-        padding: 10px 14px; border-top: 1px solid #f3f4f6;
+        display: flex; align-items: flex-start; gap: 8px;
+        padding: 8px 12px; border-top: 1px solid #f3f4f6;
         text-decoration: none; color: inherit;
       }
       .calWeekApptRow:hover { background: #f9fafb; }
       .calWeekApptInfo { order: 1; flex: 1; min-width: 0; }
       .calWeekApptTime {
-        order: 2; flex: 0 0 44px; margin-left: auto; padding-left: 8px; flex-shrink: 0;
-        font-size: 13px; font-weight: 700; color: #6b7280;
+        order: 2; flex: 0 0 40px; margin-left: auto; padding-left: 6px; flex-shrink: 0;
+        font-size: 11px; font-weight: 700; color: #9ca3af;
         padding-top: 2px; text-align: right;
         font-family: 'Bahnschrift','Segoe UI','Arial Narrow',Arial,sans-serif;
       }
-      /* ribbon case: make calApptBody flex so order applies */
+      /* ribbon case */
       .calApptBody {
-        display: flex; flex-direction: row; gap: 10px; align-items: flex-start;
-        flex: 1; min-width: 0; padding: 4px 8px;
+        display: flex; flex-direction: row; gap: 8px; align-items: flex-start;
+        flex: 1; min-width: 0; padding: 3px 8px;
       }
       .calApptBody .calWeekApptInfo { order: 1; flex: 1; min-width: 0; }
       .calApptBody .calWeekApptTime { order: 2; margin-left: auto; }
       .calWeekApptName {
-        font-size: .9rem; font-weight: 800; color: #111827;
+        font-size: .85rem; font-weight: 800; color: #111827;
         font-family: 'Bahnschrift','Segoe UI','Arial Narrow',Arial,sans-serif;
       }
-      .calWeekApptMeta { font-size: 11.5px; color: #6b7280; margin-top: 2px; line-height: 1.45; }
+      /* First meta after name (vehicle): slightly darker */
+      .calWeekApptName + .calWeekApptMeta { color: #4b5563; font-weight: 600; }
+      /* Second meta (address/prof): muted */
+      .calWeekApptMeta ~ .calWeekApptMeta { color: #9ca3af; font-weight: 400; font-size: 10.5px; }
+      .calWeekApptMeta { font-size: 11px; color: #6b7280; margin-top: 1px; line-height: 1.35; }
       .calWeekApptMeta a { color: #3b82f6; text-decoration: none; }
 
       /* ── Month view ── */
-      .calMonthWrap { padding: 8px 12px; }
-      .calMonthGrid { display: grid; grid-template-columns: repeat(7,1fr); gap: 3px; margin-bottom: 10px; }
+      .calMonthWrap { padding: 6px 12px; }
+      .calMonthGrid { display: grid; grid-template-columns: repeat(7,1fr); gap: 2px; margin-bottom: 8px; }
       .calMonthDayHead {
-        font-size: 10px; font-weight: 800; color: rgba(255,255,255,.45);
-        text-align: center; padding: 4px 0; text-transform: uppercase; letter-spacing: .04em;
+        font-size: 9px; font-weight: 800; color: rgba(255,255,255,.38);
+        text-align: center; padding: 3px 0; text-transform: uppercase; letter-spacing: .05em;
       }
-      .calMonthCell { min-height: 40px; border-radius: 10px; padding: 4px 2px; text-align: center; cursor: pointer; position: relative; }
+      .calMonthCell { min-height: 36px; border-radius: 8px; padding: 3px 2px; text-align: center; cursor: pointer; position: relative; }
       .calMonthCell:hover { background: rgba(255,255,255,.1); }
       .calMonthCell.today-cell .calMonthNum {
         background: #fff !important; color: #111827 !important; border-radius: 50%;
-        width: 28px; height: 28px; line-height: 28px; display: inline-block; padding: 0;
+        width: 26px; height: 26px; line-height: 26px; display: inline-block; padding: 0;
       }
       .calMonthCell.selected-cell { background: rgba(255,255,255,.12); }
-      .calMonthCell.other-month { opacity: .3; }
+      .calMonthCell.other-month { opacity: .28; }
       .calMonthNum {
-        display: block; font-size: .95rem; font-weight: 700; line-height: 1.8; color: #fff;
+        display: block; font-size: .85rem; font-weight: 700; line-height: 1.9; color: #fff;
         font-family: 'Bahnschrift','Segoe UI','Arial Narrow',Arial,sans-serif;
       }
-      .calMonthDot { display: block; width: 6px; height: 6px; border-radius: 50%; background: #ef4444; margin: 0 auto; }
-      .calMonthDetail { border-radius: 16px; background: rgba(255,255,255,.07); padding: 12px; margin-top: 4px; }
+      .calMonthDot { display: block; width: 5px; height: 5px; border-radius: 50%; background: #ef4444; margin: 0 auto; }
+      .calMonthDetail { border-radius: 13px; background: rgba(255,255,255,.07); padding: 10px; margin-top: 4px; }
       .calMonthDetailTitle {
-        font-size: .95rem; font-weight: 800; color: rgba(255,255,255,.85); margin-bottom: 10px;
+        font-size: .83rem; font-weight: 800; color: rgba(255,255,255,.82); margin-bottom: 8px;
         font-family: 'Bahnschrift','Segoe UI','Arial Narrow',Arial,sans-serif;
       }
-      .calMonthDetailList { display: flex; flex-direction: column; gap: 8px; }
+      .calMonthDetailList { display: flex; flex-direction: column; gap: 5px; }
       .calMonthApptCard {
-        background: #fff; border-radius: 12px; padding: 10px 12px;
+        background: #fff; border-radius: 9px; padding: 7px 10px;
         text-decoration: none; color: inherit; display: block;
-        box-shadow: 0 1px 6px rgba(0,0,0,.12);
+        box-shadow: 0 1px 4px rgba(0,0,0,.09);
       }
-      .calMonthApptCard:hover { box-shadow: 0 3px 12px rgba(0,0,0,.2); }
+      .calMonthApptCard:hover { box-shadow: 0 2px 10px rgba(0,0,0,.17); }
       .calMonthApptCard.past { background: #f9fafb; }
       .calMonthApptCard.confirmed { background: #f0fdf4; }
       .calMonthApptCard.pending { background: #fff7ed; }
       .calMonthApptName {
-        font-size: .95rem; font-weight: 800; color: #111827;
+        font-size: .83rem; font-weight: 800; color: #111827;
         font-family: 'Bahnschrift','Segoe UI','Arial Narrow',Arial,sans-serif;
       }
-      .calMonthApptMeta { font-size: 12px; color: #6b7280; margin-top: 3px; line-height: 1.5; }
+      /* Month card: vehicle line slightly darker, address softer */
+      .calMonthApptName + .calMonthApptMeta { color: #4b5563; font-weight: 600; font-size: 10.5px; }
+      .calMonthApptMeta ~ .calMonthApptMeta { color: #9ca3af; font-size: 10px; }
+      .calMonthApptMeta { font-size: 10.5px; color: #6b7280; margin-top: 2px; line-height: 1.35; }
       .calMonthApptMeta a { color: #3b82f6; text-decoration: none; }
 
       /* ── Highlight ── */
@@ -3761,9 +3782,9 @@ def render_calendar_page(
       }
 
       /* ── Approval ribbon ── */
-      .calApptApproval { display:flex; align-items:stretch; gap:0; min-height:72px; }
+      .calApptApproval { display:flex; align-items:stretch; gap:0; min-height:52px; }
       .calStatusRibbon {
-        position:relative; flex:0 0 24px; width:24px; margin:1px 0 1px 1px;
+        position:relative; flex:0 0 22px; width:22px; margin:1px 0 1px 1px;
         display:flex; align-items:center; justify-content:center;
         border-radius:8px 0 0 8px; background:linear-gradient(180deg,#fffdf4,#f8efcf);
         border-right:1px solid rgba(207,148,27,.18); overflow:hidden;
