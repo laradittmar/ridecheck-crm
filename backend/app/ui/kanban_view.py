@@ -160,6 +160,8 @@ def _base_css(extra_css: str = "") -> str:
       .sidebar.collapsed .navLabel{{ display:none; }}
       .sidebar.collapsed .nav a{{ justify-content:center; }}
       .nav a:hover{{ background: rgba(255,255,255,.08); }}
+      .nav a.active{{ color:#fff; }}
+      .nav a.active .icon, .nav a.active svg {{ filter: brightness(0) invert(1); }}
       .sidebarFooter {{
         margin-top:auto;
         padding-top:12px;
@@ -484,6 +486,20 @@ def _base_css(extra_css: str = "") -> str:
         .revModal {{
           width: calc(100vw - 24px);
           height: min(88vh, 720px);
+        }}
+      }}
+      @media (max-width: 768px) {{
+        .revModal {{
+          position: fixed;
+          top: 104px;
+          left: 0;
+          right: 0;
+          bottom: 0;
+          width: 100% !important;
+          max-width: 100% !important;
+          height: auto !important;
+          max-height: none !important;
+          border-radius: 14px 14px 0 0;
         }}
       }}
       @media (max-width: 520px) {{
@@ -818,7 +834,7 @@ def _base_css(extra_css: str = "") -> str:
       }}
 
       @media (max-width: 768px) {{
-        html {{ scroll-behavior: smooth; scroll-padding-top: 96px; }}
+        html {{ scroll-behavior: smooth; scroll-padding-top: 110px; }}
         /* Fix 1: sidebar → fixed top icon bar */
         .sidebar {{
           position: fixed;
@@ -857,11 +873,12 @@ def _base_css(extra_css: str = "") -> str:
           justify-content: center;
           align-items: center;
         }}
+        .nav a.active {{ color:#fff; }}
+        .nav a.active .icon, .nav a.active svg {{ filter: brightness(0) invert(1); }}
         .navLabel {{ display: none !important; }}
-        .main {{ padding-top: calc(52px + clamp(18px, 1vw, 28px)); }}
         .kanbanTopBar {{ display: none; }}
         .main {{
-          padding-top: 52px;
+          padding-top: 0;
           padding-left: 0;
           padding-right: 0;
           overflow-x: hidden;
@@ -878,7 +895,12 @@ def _base_css(extra_css: str = "") -> str:
           -webkit-overflow-scrolling: touch;
           gap: 0;
           padding: 0;
+          margin-bottom: 0;
+          padding-bottom: 0;
           box-sizing: border-box;
+          background: var(--bg);
+          min-height: calc(100svh - 104px);
+          align-items: stretch;
         }}
         .kanban-column {{
           flex: 0 0 100vw;
@@ -886,11 +908,12 @@ def _base_css(extra_css: str = "") -> str:
           min-width: 100vw;
           max-width: 100vw;
           scroll-snap-align: start;
+          scroll-margin-top: 100px;
           overflow-y: auto;
           overflow-x: hidden;
-          height: calc(100svh - 104px);
+          min-height: calc(100svh - 104px);
           box-sizing: border-box;
-          padding: 0 12px;
+          padding: 52px 12px 100px;
           border-radius: 0;
           border-left: none;
           border-right: none;
@@ -918,7 +941,8 @@ def _base_css(extra_css: str = "") -> str:
           top: 52px;
           z-index: 30;
           height: 52px;
-          background: rgba(255,255,255,.97);
+          margin-top: 0;
+          background: var(--bg);
           border-bottom: 1px solid var(--border);
           box-shadow: 0 2px 8px rgba(0,0,0,.06);
         }}
@@ -1392,6 +1416,22 @@ VENDEDOR_TIPOS = ["PARTICULAR", "AGENCIA"]
 REVISION_COMPRO_OPCIONES = ["SI", "NO", "OFRECIDO"]
 TIPOS_VEHICULO = ["AUTO", "SUV_4X4_DEPORTIVO", "CLASICO", "ESCANEO_MOTOR", "MOTO"]
 
+TIPO_VEHICULO_LABELS: dict[str, str] = {
+    "AUTO": "Auto",
+    "SUV_4X4_DEPORTIVO": "SUV",
+    "CLASICO": "Clásico",
+    "ESCANEO_MOTOR": "Escaneo",
+    "MOTO": "Moto",
+}
+
+
+def _friendly_tipo_vehiculo(val: str | None) -> str:
+    """Return the human-readable label for a tipo_vehiculo enum value."""
+    if not val:
+        return ""
+    return TIPO_VEHICULO_LABELS.get(val, val.replace("_", " ").title())
+
+
 CANAL_OPCIONES = [
     "IG_DM",
     "IG_WHATSAPP",
@@ -1661,6 +1701,7 @@ def render_page(
 
     html.append("</div>")  # board
     html.append('<div id="popover-root"></div>')
+    html.append('<button id="mobile-add-lead-btn" onclick="window._mobileAddLead()" style="display:none;position:fixed;bottom:24px;right:24px;width:56px;height:56px;border-radius:50%;background:#111827;color:white;font-size:24px;line-height:1;display:flex;align-items:center;justify-content:center;border:none;z-index:1700;box-shadow:0 4px 12px rgba(0,0,0,.3);cursor:pointer;">+</button>')
     html.append('<div id="toast-root" class="toastWrap"></div>')
     zones_json = json.dumps(zones_map or {}, ensure_ascii=False).replace("</", "<\\/")
 
@@ -1836,6 +1877,7 @@ def render_page(
               document.body.classList.remove("modal-open");
             }
           };
+          window._mobileAddLead = function() { var s = document.getElementById("kanban-col-CONSULTA_NUEVA"); if(s) { var btn = s.querySelector(".addLeadSummary"); if(btn) btn.click(); } };
           window.closeAddLeadPopover = function () {
             closeAllOpenPopovers();
           };
@@ -2178,6 +2220,13 @@ def render_page(
             ensureInViewport(triggerEl, { center: true, padding: 24 });
             positionMenuPanel(triggerEl, panel);
             ensureInViewport(panel, { padding: 12 });
+          }
+
+          function openAddLeadPopover(e) {
+            if (e) { e.stopPropagation(); e.preventDefault(); }
+            var summary = document.querySelector('#kanban-col-CONSULTA_NUEVA .addLeadSummary');
+            if (!summary) return;
+            summary.click();
           }
 
           function scrollBoardToEstado(estado) {
@@ -2791,6 +2840,11 @@ def render_table_page(
       .tableTopActions { display:flex; gap:8px; align-items:center; }
       .iconActionBtn { border:1px solid var(--border); background:#fff; border-radius:10px; padding:6px 8px; cursor:pointer; display:inline-flex; align-items:center; }
       .iconActionBtn:hover { background:#f9fafb; }
+      @media (max-width: 768px) {
+        .kanbanTopBar { display: flex !important; top: 52px; }
+        .kanbanTopBarTitle, .buildStamp { display: none !important; }
+        .main { padding: 0 12px; }
+      }
       .colResizer { position:absolute; right:0; top:0; width:8px; height:100%; cursor:col-resize; }
       body.colResizing { cursor: col-resize; user-select: none; }
       .chips { display:flex; flex-wrap:wrap; gap:8px; margin: 8px 0 12px; }
@@ -3493,100 +3547,234 @@ def render_calendar_page(
     for it in items:
         by_day[it["day"]].append(it)
 
+    today = date.today()
+    import calendar as _cal_mod
+    month_start = week_start.replace(day=1)
+    month_last = _cal_mod.monthrange(month_start.year, month_start.month)[1]
+    month_end_dt = month_start.replace(day=month_last)
+    month_appts: list[dict[str, Any]] = []
+    for _ml0 in leads:
+        for _mr0 in (_get(_ml0, "revisions") or []):
+            if not _mr0.turno_fecha:
+                continue
+            if _mr0.turno_fecha < month_start or _mr0.turno_fecha > month_end_dt:
+                continue
+            month_appts.append({"lead": _ml0, "rev": _mr0, "day": _mr0.turno_fecha, "time": _mr0.turno_hora})
+    month_appts.sort(key=sort_key)
+    by_day_month: dict[date, list[dict[str, Any]]] = {}
+    for _mit0 in month_appts:
+        by_day_month.setdefault(_mit0["day"], []).append(_mit0)
+
+    _MONTHS_ES_CAP = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"]
+    week_label_str = f"{week_start.strftime('%d/%m')} – {week_end.strftime('%d/%m')}"
+    month_label_str = f"{_MONTHS_ES_CAP[month_start.month - 1]} {month_start.year}"
+    _prev_month_first = (month_start - timedelta(days=1)).replace(day=1)
+    prev_month_monday = _prev_month_first - timedelta(days=_prev_month_first.weekday())
+    _next_month_first = month_end_dt + timedelta(days=1)
+    next_month_monday = _next_month_first - timedelta(days=_next_month_first.weekday())
+
     calendar_css = """
-      .calGrid { display:grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap:10px; }
-      .calCol { background: rgba(255,255,255,.7); border: 1px solid var(--border); border-radius: 14px; padding: 10px; box-shadow: var(--shadow); min-height: 140px; }
-      .calHead { font-weight:700; font-size:12px; color:#111827; margin-bottom:8px; display:flex; justify-content:space-between; align-items:center; }
-      .calAppt { display:block; text-decoration:none; color:inherit; background:#fff; border:1px solid var(--border); border-radius:12px; padding:8px; margin-bottom:8px; box-shadow: var(--shadow); }
-      .calAppt:hover { box-shadow: var(--shadow2); }
-      .calAppt.past { background:#f3f4f6; border-color:#d1d5db; color:#6b7280; }
-      .calAppt.future-ok { background:#ecfdf3; border-color:#86efac; }
-      
-      .calAppt {
-        display: block;
-        text-decoration: none;
-        color: inherit;
-        background: #fff;
-        border: 1px solid var(--border);
-        border-radius: 12px;
-        padding: 4px;
-        margin-bottom: 8px;
-        box-shadow: var(--shadow);
-        }
+      /* ── Calendar: shared font ── */
+      .calWrap * { font-family: 'Bahnschrift','Segoe UI','Arial Narrow',Arial,sans-serif; }
+      /* Fix: push content below fixed 52px top nav on mobile */
+      @media (max-width: 768px) { .main { padding-top: 56px !important; } }
 
-      .calAppt.future-pending {
-        background: #fee2e2;
-        border-color: #fca5a5;
-        }
-
-      .calApptApproval {
-        display: flex;
-       align-items: stretch;
-        gap: 0;
-        margin: 0;
-        min-height: 92px;
-        }
-
-    .calStatusRibbon {
-      position: relative;
-      flex: 0 0 26px;
-      width: 26px;
-      margin: 1px 0 1px 1px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      border-radius: 8px 0 0 8px;
-      background: linear-gradient(180deg, #fffdf4 0%, #f8efcf 100%);
-      color: #c58a00;
-      border-right: 1px solid rgba(207, 148, 27, .18);
-      box-shadow: none;
-      overflow: hidden;
-        }
-
-    .calStatusRibbonInner {
-      position: absolute;
-      top: 50%;
-      left: 50%;
-      transform: translate(-50%, -50%) rotate(-90deg);
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      gap: 2px;
-      white-space: nowrap;
-        }
-
-    .calStatusRibbonWord {
-      display: block;
-      font-size: 7px;
-      line-height: 1;
-      font-weight: 800;
-      letter-spacing: .05em;
-      text-transform: uppercase;
-      text-align: center;
-      color: #b88200;
-      text-shadow: 0 1px 1px rgba(0,0,0,0.2);
-        }
-
-    .calApptApproval .calApptBody {
-      flex: 1 1 auto;
-      min-width: 0;
-      padding: 2px 8px 2px 6px;
-        }
-      .calApptApproval .calApptBody { padding-left: 8px; }
-      .calMeta { font-size:12px; color: var(--muted); }
-      .calRow { display:flex; justify-content:space-between; gap:8px; align-items:center; min-width:0; }
-      .calMetaVehicle { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
-      .calTopBar { display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; margin-bottom:12px; }
-      .calTopCenter { font-weight:700; color:#fff; }
-      .calTopLinks { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
-      @media (max-width: 900px) { .calGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-      @media (max-width: 520px) { .calGrid { grid-template-columns: 1fr; } }
-      .calAppt-highlight { outline: 3px solid #f59e0b; outline-offset: 2px; animation: calHighlightPulse 2s ease-out 0.2s forwards; }
-      @keyframes calHighlightPulse {
-        0%   { box-shadow: 0 0 0 10px rgba(245,158,11,.45), var(--shadow2); }
-        100% { box-shadow: 0 0 0  4px rgba(245,158,11,.10), var(--shadow2); }
+      /* ── View pills ── */
+      .calViewPills {
+        display: flex; gap: 8px; justify-content: center;
+        padding: 10px 16px;
+        background: rgba(255,255,255,.12); border-radius: 14px; margin: 8px 12px;
       }
+      .calPill {
+        padding: 6px 22px; border-radius: 999px; font-size: 14px; font-weight: 700;
+        border: 2px solid rgba(255,255,255,.55); background: transparent;
+        cursor: pointer; color: rgba(255,255,255,.7);
+        transition: background .15s, color .15s, border-color .15s;
+        font-family: 'Bahnschrift','Segoe UI','Arial Narrow',Arial,sans-serif;
+      }
+      .calPill.active { background: #111827; color: #fff; border-color: #111827; }
+      .calPill:hover:not(.active) { background: rgba(255,255,255,.1); color: #fff; }
+
+      /* ── Date header ── */
+      .calDateHeader {
+        display: flex; align-items: center; justify-content: center;
+        gap: 16px; padding: 4px 0 8px;
+      }
+      .calNavArrow {
+        background: none; border: 2px solid rgba(255,255,255,.35); border-radius: 50%;
+        width: 36px; height: 36px; font-size: 20px; cursor: pointer; color: #fff;
+        display: inline-flex; align-items: center; justify-content: center;
+        flex-shrink: 0; transition: background .15s, border-color .15s;
+      }
+      .calNavArrow:hover { background: rgba(255,255,255,.15); border-color: rgba(255,255,255,.7); }
+      .calDateHeadCenter { text-align: center; min-width: 180px; }
+      .calDateBig {
+        font-size: 1.65rem; font-weight: 800; color: #fff; line-height: 1.15;
+        font-family: 'Bahnschrift','Segoe UI','Arial Narrow',Arial,sans-serif;
+        letter-spacing: .01em; text-align: center;
+      }
+      @media (min-width: 769px) {
+        .calDateBig { font-size: 1.45rem; }
+      }
+      .calDateSub {
+        font-size: .9rem; font-weight: 600; color: rgba(255,255,255,.75);
+        text-transform: capitalize; margin-top: 2px; text-align: center;
+        font-family: 'Bahnschrift','Segoe UI','Arial Narrow',Arial,sans-serif;
+      }
+
+      /* ── View panels ── */
+      .calViewPanel { display: none; }
+      .calViewPanel.active { display: block; }
+
+      /* ── Day view: time slot cards ── */
+      .calDaySlots { display: flex; flex-direction: column; gap: 6px; padding: 8px 12px; }
+      .calDaySlotCard {
+        display: flex; align-items: stretch;
+        border-radius: 14px; overflow: hidden;
+        background: rgba(255,255,255,.07);
+        min-height: 72px;
+      }
+      .calDaySlotCard.has-appt { background: #fff; box-shadow: 0 2px 12px rgba(0,0,0,.18); }
+      .calDaySlotCard.has-appt:hover { box-shadow: 0 4px 18px rgba(0,0,0,.28); }
+      .calDaySlotCard.past-appt { background: #f3f4f6; }
+      .calDaySlotCard.confirmed-appt { background: #ecfdf5; }
+      .calDaySlotCard.pending-appt { background: #fff7ed; }
+      .calDaySlotTime {
+        flex: 0 0 56px; display: flex; align-items: center; justify-content: center;
+        font-size: 12px; font-weight: 700; color: rgba(255,255,255,.38);
+        padding: 0 4px;
+        font-family: 'Bahnschrift','Segoe UI','Arial Narrow',Arial,sans-serif;
+      }
+      .calDaySlotCard.has-appt .calDaySlotTime { color: #9ca3af; }
+      .calDaySlotBody {
+        flex: 1; min-width: 0; padding: 10px 14px 10px 0;
+        text-decoration: none; color: inherit; display: block;
+      }
+      .calApptName {
+        font-size: .95rem; font-weight: 800; color: #111827; line-height: 1.25;
+        font-family: 'Bahnschrift','Segoe UI','Arial Narrow',Arial,sans-serif;
+      }
+      @media (min-width: 769px) {
+        .calApptName { font-size: .88rem; }
+      }
+      .calApptMeta { font-size: 11.5px; color: #6b7280; margin-top: 2px; line-height: 1.45; }
+      .calApptMeta a { color: #3b82f6; text-decoration: none; }
+      .calApptStatus {
+        display: inline-block; font-size: 11px; font-weight: 700;
+        border-radius: 999px; padding: 1px 8px; margin-top: 4px;
+        background: #e0f2fe; color: #0369a1;
+      }
+      .calApptStatus.confirmed { background: #dcfce7; color: #166534; }
+      .calApptStatus.past { background: #f3f4f6; color: #6b7280; }
+
+      /* ── Week view ── */
+      .calWeekList { display: flex; flex-direction: column; gap: 8px; padding: 8px 12px; }
+      .calWeekDayCard { border-radius: 14px; overflow: hidden; background: rgba(255,255,255,.07); }
+      .calWeekDayCard.has-appt { background: #fff; box-shadow: 0 2px 10px rgba(0,0,0,.15); }
+      .calWeekDayHead {
+        display: flex; align-items: center; justify-content: space-between; padding: 8px 14px;
+      }
+      .calWeekDayCard.has-appt .calWeekDayHead { border-bottom: 1px solid #f3f4f6; }
+      .calWeekDayName {
+        font-size: 13px; font-weight: 800; color: rgba(255,255,255,.5);
+        font-family: 'Bahnschrift','Segoe UI','Arial Narrow',Arial,sans-serif;
+        text-transform: uppercase; letter-spacing: .05em;
+      }
+      .calWeekDayCard.has-appt .calWeekDayName { color: #374151; }
+      .calWeekDayDate { font-size: 13px; font-weight: 600; color: rgba(255,255,255,.35); }
+      .calWeekDayCard.has-appt .calWeekDayDate { color: #9ca3af; }
+      .calWeekApptRow {
+        display: flex; align-items: flex-start; gap: 10px;
+        padding: 10px 14px; border-top: 1px solid #f3f4f6;
+        text-decoration: none; color: inherit;
+      }
+      .calWeekApptRow:hover { background: #f9fafb; }
+      .calWeekApptInfo { order: 1; flex: 1; min-width: 0; }
+      .calWeekApptTime {
+        order: 2; flex: 0 0 44px; margin-left: auto; padding-left: 8px; flex-shrink: 0;
+        font-size: 13px; font-weight: 700; color: #6b7280;
+        padding-top: 2px; text-align: right;
+        font-family: 'Bahnschrift','Segoe UI','Arial Narrow',Arial,sans-serif;
+      }
+      /* ribbon case: make calApptBody flex so order applies */
+      .calApptBody {
+        display: flex; flex-direction: row; gap: 10px; align-items: flex-start;
+        flex: 1; min-width: 0; padding: 4px 8px;
+      }
+      .calApptBody .calWeekApptInfo { order: 1; flex: 1; min-width: 0; }
+      .calApptBody .calWeekApptTime { order: 2; margin-left: auto; }
+      .calWeekApptName {
+        font-size: .9rem; font-weight: 800; color: #111827;
+        font-family: 'Bahnschrift','Segoe UI','Arial Narrow',Arial,sans-serif;
+      }
+      .calWeekApptMeta { font-size: 11.5px; color: #6b7280; margin-top: 2px; line-height: 1.45; }
+      .calWeekApptMeta a { color: #3b82f6; text-decoration: none; }
+
+      /* ── Month view ── */
+      .calMonthWrap { padding: 8px 12px; }
+      .calMonthGrid { display: grid; grid-template-columns: repeat(7,1fr); gap: 3px; margin-bottom: 10px; }
+      .calMonthDayHead {
+        font-size: 10px; font-weight: 800; color: rgba(255,255,255,.45);
+        text-align: center; padding: 4px 0; text-transform: uppercase; letter-spacing: .04em;
+      }
+      .calMonthCell { min-height: 40px; border-radius: 10px; padding: 4px 2px; text-align: center; cursor: pointer; position: relative; }
+      .calMonthCell:hover { background: rgba(255,255,255,.1); }
+      .calMonthCell.today-cell .calMonthNum {
+        background: #fff !important; color: #111827 !important; border-radius: 50%;
+        width: 28px; height: 28px; line-height: 28px; display: inline-block; padding: 0;
+      }
+      .calMonthCell.selected-cell { background: rgba(255,255,255,.12); }
+      .calMonthCell.other-month { opacity: .3; }
+      .calMonthNum {
+        display: block; font-size: .95rem; font-weight: 700; line-height: 1.8; color: #fff;
+        font-family: 'Bahnschrift','Segoe UI','Arial Narrow',Arial,sans-serif;
+      }
+      .calMonthDot { display: block; width: 6px; height: 6px; border-radius: 50%; background: #ef4444; margin: 0 auto; }
+      .calMonthDetail { border-radius: 16px; background: rgba(255,255,255,.07); padding: 12px; margin-top: 4px; }
+      .calMonthDetailTitle {
+        font-size: .95rem; font-weight: 800; color: rgba(255,255,255,.85); margin-bottom: 10px;
+        font-family: 'Bahnschrift','Segoe UI','Arial Narrow',Arial,sans-serif;
+      }
+      .calMonthDetailList { display: flex; flex-direction: column; gap: 8px; }
+      .calMonthApptCard {
+        background: #fff; border-radius: 12px; padding: 10px 12px;
+        text-decoration: none; color: inherit; display: block;
+        box-shadow: 0 1px 6px rgba(0,0,0,.12);
+      }
+      .calMonthApptCard:hover { box-shadow: 0 3px 12px rgba(0,0,0,.2); }
+      .calMonthApptCard.past { background: #f9fafb; }
+      .calMonthApptCard.confirmed { background: #f0fdf4; }
+      .calMonthApptCard.pending { background: #fff7ed; }
+      .calMonthApptName {
+        font-size: .95rem; font-weight: 800; color: #111827;
+        font-family: 'Bahnschrift','Segoe UI','Arial Narrow',Arial,sans-serif;
+      }
+      .calMonthApptMeta { font-size: 12px; color: #6b7280; margin-top: 3px; line-height: 1.5; }
+      .calMonthApptMeta a { color: #3b82f6; text-decoration: none; }
+
+      /* ── Highlight ── */
+      .calAppt-highlight { outline: 3px solid #f59e0b; outline-offset: 2px;
+        animation: calHighlightPulse 2s ease-out .2s forwards; }
+      @keyframes calHighlightPulse {
+        0%   { box-shadow: 0 0 0 10px rgba(245,158,11,.45); }
+        100% { box-shadow: 0 0 0  4px rgba(245,158,11,.10); }
+      }
+
+      /* ── Approval ribbon ── */
+      .calApptApproval { display:flex; align-items:stretch; gap:0; min-height:72px; }
+      .calStatusRibbon {
+        position:relative; flex:0 0 24px; width:24px; margin:1px 0 1px 1px;
+        display:flex; align-items:center; justify-content:center;
+        border-radius:8px 0 0 8px; background:linear-gradient(180deg,#fffdf4,#f8efcf);
+        border-right:1px solid rgba(207,148,27,.18); overflow:hidden;
+      }
+      .calStatusRibbonInner {
+        position:absolute; top:50%; left:50%;
+        transform:translate(-50%,-50%) rotate(-90deg);
+        display:flex; flex-direction:column; align-items:center; gap:2px; white-space:nowrap;
+      }
+      .calStatusRibbonWord { display:block; font-size:7px; font-weight:800; letter-spacing:.05em; text-transform:uppercase; color:#b88200; }
+      .calApptApproval .calApptBody { flex:1 1 auto; min-width:0; padding:2px 8px 2px 6px; }
     """
 
     css = _base_css(extra_css=calendar_css)
@@ -3642,212 +3830,339 @@ def render_calendar_page(
         </div>
       </div>
     """)
-    html.append(f"""
+    html.append("""
       <div class="calTopBar">
-        <div class="calTopLinks">
-          <a class="btn btn-sm" href="/calendar?week={prev_monday.isoformat()}">{ICON_ARROW_LEFT} Semana anterior</a>
-        </div>
-        <div class="calTopCenter">Semana {week_start.strftime("%d/%m/%Y")} a {week_end.strftime("%d/%m/%Y")}</div>
-        <div class="calTopLinks">
-          <a class="btn btn-sm" href="/calendar?week={next_monday.isoformat()}">Semana siguiente {ICON_ARROW_RIGHT}</a>
-          <a class="btn btn-sm" href="/calendar">Hoy</a>
-        </div>
+        <a class="btn btn-sm" href="/calendar">Hoy</a>
       </div>
     """)
-    html.append('<div class="calGrid" style="margin-top:12px;" data-search-scope="calendar">')
+    _MONTHS_ES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+    _MONTHS_CAP = ["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"]
+    _DAY_SHORT = ["Lun","Mar","Mié","Jue","Vie","Sáb","Dom"]
+    _DAYS_FULL = ["Lunes","Martes","Miércoles","Jueves","Viernes","Sábado","Domingo"]
 
+    # ── helpers ────────────────────────────────────────────────────
+    def _acls(rev_obj):
+        _cdt = datetime.combine(rev_obj.turno_fecha, rev_obj.turno_hora if rev_obj.turno_hora else time.min) if rev_obj.turno_fecha else None
+        _past = _cdt is not None and _cdt < now
+        _ev = (rev_obj.estado_revision or "").strip().upper()
+        return "past" if _past else ("confirmed" if _ev == "CONFIRMADO" else "pending")
+
+    def _ahref(l, r): return f"/kanban?open_lead={l.id}&open_rev={r.id}"
+    def _aname(l): return (f"{(_get(l,'nombre') or '').strip()} {(_get(l,'apellido') or '').strip()}").strip() or "-"
+    def _aveh(r):
+        tipo = _friendly_tipo_vehiculo(_val(r.tipo_vehiculo))
+        return " / ".join([x for x in [tipo, _val(r.marca), _val(r.modelo), str(r.anio) if r.anio else ""] if x])
+    def _aaddr(r): return _url_link(r.link_maps) if _safe_url(r.link_maps) else _txt(r.direccion_texto)
+    def _aprof(r):
+        pid = getattr(r, "profesional_id", None)
+        p = prof_by_id.get(pid) if pid else None
+        return _profesional_label(p) if p else ""
+    def _ameta(*parts) -> str:
+        """Join non-empty parts with · — skips blank and '-' values."""
+        kept = [str(p) for p in parts if p and str(p).strip() not in ("", "-")]
+        return " &nbsp;&middot;&nbsp; ".join(kept)
+
+    def _day_slots(appts):
+        by_hr = {}
+        no_hr = []
+        for it in appts:
+            h = it["rev"].turno_hora.hour if it["rev"].turno_hora else None
+            (by_hr.setdefault(h, []) if h is not None else no_hr).append(it)
+        parts = ['<div class="calDaySlots">']
+        for h in range(8, 19):
+            sa = by_hr.get(h, [])
+            if sa:
+                for it in sa:
+                    l, r = it["lead"], it["rev"]
+                    cls = _acls(r); href = _ahref(l, r)
+                    tstr = r.turno_hora.strftime("%H:%M") if r.turno_hora else f"{h:02d}:00"
+                    scls = "confirmed" if cls == "confirmed" else ("past" if cls == "past" else "")
+                    _meta_row = _ameta(_aaddr(r), _aprof(r))
+                    parts.append(
+                        f'<div class="calDaySlotCard has-appt {cls}-appt">'
+                        f'<div class="calDaySlotTime">{tstr}</div>'
+                        f'<a class="calDaySlotBody" href="{href}">'
+                        f'<div class="calApptName">{_txt(_aname(l))}</div>'
+                        f'<div class="calApptMeta">{_txt(_aveh(r))}</div>'
+                        + (f'<div class="calApptMeta">{_meta_row}</div>' if _meta_row else '')
+                        + f'<span class="calApptStatus {scls}">{_txt(r.estado_revision)}</span>'
+                        '</a></div>'
+                    )
+            else:
+                parts.append(
+                    f'<div class="calDaySlotCard">'
+                    f'<div class="calDaySlotTime">{h:02d}:00hs</div>'
+                    '<div class="calDaySlotBody"></div></div>'
+                )
+        for it in no_hr:
+            l, r = it["lead"], it["rev"]
+            cls = _acls(r); href = _ahref(l, r)
+            scls = "confirmed" if cls == "confirmed" else ("past" if cls == "past" else "")
+            _meta_row_nr = _ameta(_aaddr(r), _aprof(r))
+            parts.append(
+                f'<div class="calDaySlotCard has-appt {cls}-appt">'
+                '<div class="calDaySlotTime">--</div>'
+                f'<a class="calDaySlotBody" href="{href}">'
+                f'<div class="calApptName">{_txt(_aname(l))}</div>'
+                f'<div class="calApptMeta">{_txt(_aveh(r))}</div>'
+                + (f'<div class="calApptMeta">{_meta_row_nr}</div>' if _meta_row_nr else '')
+                + f'<span class="calApptStatus {scls}">{_txt(r.estado_revision)}</span>'
+                '</a></div>'
+            )
+        parts.append('</div>')
+        return "".join(parts)
+
+    def _month_card(it):
+        l, r = it["lead"], it["rev"]
+        cls = _acls(r); href = _ahref(l, r)
+        tstr = r.turno_hora.strftime("%H:%M") if r.turno_hora else "-"
+        hl_id = ' id="cal-highlight-appt"' if (highlight_lead_id and _get(l,"id") == highlight_lead_id) else ""
+        hl_cls = " calAppt-highlight" if hl_id else ""
+        _meta_mc = _ameta(_aaddr(r), _aprof(r))
+        return (
+            f'<a class="calMonthApptCard {cls}{hl_cls}" href="{href}"{hl_id}>'
+            f'<div class="calMonthApptName">{_txt(_aname(l))} <span style="font-weight:400;color:#9ca3af;font-size:12px;">{tstr}</span></div>'
+            f'<div class="calMonthApptMeta">{_txt(_aveh(r))}</div>'
+            + (f'<div class="calMonthApptMeta">{_meta_mc}</div>' if _meta_mc else '')
+            + f'<div class="calMonthApptMeta">{_txt(r.estado_revision)}</div>'
+            '</a>'
+        )
+
+    # ── pill + date header (shared) ────────────────────────────────
+    week_big = f"{week_start.day} {_MONTHS_CAP[week_start.month-1]} / {week_end.day} {_MONTHS_CAP[week_end.month-1]}"
+    month_big = f"{_MONTHS_CAP[month_start.month-1]} / {month_start.year}"
+
+    html.append('<div class="calWrap">')
+    html.append(f"""
+      <div class="calViewPills" id="cal-pills">
+        <button class="calPill active" data-view="day" type="button">Día</button>
+        <button class="calPill" data-view="week" type="button">Semana</button>
+        <button class="calPill" data-view="month" type="button">Mes</button>
+      </div>
+      <div id="cal-date-header" class="calDateHeader"
+        data-week-big="{html_lib.escape(week_big, quote=True)}"
+        data-week-sub="{week_start.year}"
+        data-month-big="{html_lib.escape(month_big, quote=True)}"
+        data-prev-week="/calendar?week={prev_monday.isoformat()}"
+        data-next-week="/calendar?week={next_monday.isoformat()}"
+        data-prev-month="/calendar?week={prev_month_monday.isoformat()}"
+        data-next-month="/calendar?week={next_month_monday.isoformat()}">
+        <button id="cal-nav-prev" class="calNavArrow" type="button">&#8249;</button>
+        <div class="calDateHeadCenter">
+          <div id="cal-date-big" class="calDateBig"></div>
+          <div id="cal-date-sub" class="calDateSub"></div>
+        </div>
+        <button id="cal-nav-next" class="calNavArrow" type="button">&#8250;</button>
+      </div>
+    """)
+
+    # ── day view ───────────────────────────────────────────────────
+    html.append(f'<div id="cal-view-day" class="calViewPanel active" data-today="{today.isoformat()}">')
+    html.append(_day_slots(by_day_month.get(today, [])))
+    html.append('</div>')
+
+    # ── week view ──────────────────────────────────────────────────
+    html.append('<div id="cal-view-week" class="calViewPanel" data-search-scope="calendar">')
+    html.append('<div class="calWeekList">')
     for i in range(7):
         day = week_start + timedelta(days=i)
         appts = by_day.get(day, [])
-        html.append(f'<div class="calCol"><div class="calHead"><span>{day_label(day)}</span><span class="muted">{len(appts)}</span></div>')
-        if not appts:
-            html.append('<div class="muted small">Sin turnos.</div>')
-        else:
-            for it in appts:
-                l = it["lead"]
-                r = it["rev"]
-                n = f"{(_get(l,'nombre') or '').strip()} {(_get(l,'apellido') or '').strip()}".strip() or "-"
-                veh = " / ".join([x for x in [
-                    _val(r.tipo_vehiculo),
-                    _val(r.marca),
-                    _val(r.modelo),
-                    str(r.anio) if r.anio else "",
-                ] if x])
-                time_txt = r.turno_hora.strftime("%H:%M") if r.turno_hora else "-"
-                addr = _url_link(r.link_maps) if _safe_url(r.link_maps) else _txt(r.direccion_texto)
-                estado_op = _txt(r.estado_revision)
-                prof_id = getattr(r, "profesional_id", None)
-                prof = prof_by_id.get(prof_id) if prof_id else None
-                prof_label = _profesional_label(prof) if prof else "-"
-                href = f"/kanban?open_lead={l.id}&open_rev={r.id}"
-                search_text = html_lib.escape(" ".join([
-                    _val(n),
-                    _val(veh),
-                    _val(r.direccion_texto),
-                    _val(prof_label),
-                    _val(estado_op),
-                ]), quote=True)
-                appt_dt = None
-                if r.turno_fecha:
-                    if r.turno_hora:
-                        appt_dt = datetime.combine(r.turno_fecha, r.turno_hora)
-                    else:
-                        appt_dt = datetime.combine(r.turno_fecha, time.min)
-                is_past = appt_dt is not None and appt_dt < now
-                estado_val = (r.estado_revision or "").strip().upper()
-                if is_past:
-                    appt_cls = "past"
-                else:
-                    appt_cls = "future-ok" if estado_val == "CONFIRMADO" else "future-pending"
-                lead_id_val = _get(l, "id")
-                is_highlighted = highlight_lead_id is not None and lead_id_val == highlight_lead_id
-                highlight_cls = " calAppt-highlight" if is_highlighted else ""
-                highlight_id = ' id="cal-highlight-appt"' if is_highlighted else ""
-                approval_status = _revision_approval_status(r)
-                approval_tag = _revision_approval_tag(r)
-                approval_ui = _render_revision_approval_ui(r)
-                approval_prefix = ""
-                approval_suffix = ""
-                if approval_status == "PENDING" and not is_past:
-                    approval_prefix = (
-                        '<div class="calApptApproval">'
-                        '<div class="calStatusRibbon">'
-                        '<div class="calStatusRibbonInner">'
-                        '<span class="calStatusRibbonWord">ESPERANDO</span>'
-                        '<span class="calStatusRibbonWord">APROBACI&Oacute;N</span>'
-                        "</div>"
-                        "</div>"
-                        '<div class="calApptBody">'
-                    )
-                    approval_suffix = "</div></div>"
-                html.append(f"""
-                    <a class="calAppt {appt_cls}{highlight_cls}" href="{href}" data-search="{search_text}"{highlight_id}>
-                      {approval_prefix}
-                      <div class="calRow"><b>{_txt(n)}</b><span class="pill">{time_txt}</span></div>
-                      <div class="calMeta calMetaVehicle">Vehículo: {_txt(veh)}</div>
-                      <div class="calMeta">Dirección: {addr}</div>
-                      <div class="calMeta">Profesional: {_txt(prof_label)}</div>
-                      <div class="calMeta">Estado operativo: {_txt(estado_op)}</div>
-                      {approval_ui}
-                      {approval_suffix}
-                    </a>
-                  """)
-        html.append("</div>")
+        has_cls = " has-appt" if appts else ""
+        dn = _DAY_SHORT[day.weekday()]
+        dm = f"{day.day} {_MONTHS_CAP[day.month-1]}"
+        today_sfx = " (Hoy)" if day == today else ""
+        html.append(f'<div class="calWeekDayCard{has_cls}">')
+        html.append(f'<div class="calWeekDayHead"><span class="calWeekDayName">{dn}{today_sfx}</span><span class="calWeekDayDate">{dm}</span></div>')
+        for it in appts:
+            l, r = it["lead"], it["rev"]
+            cls = _acls(r); href = _ahref(l, r)
+            tstr = r.turno_hora.strftime("%H:%M") if r.turno_hora else "-"
+            hl_id = ' id="cal-highlight-appt"' if (highlight_lead_id and _get(l,"id") == highlight_lead_id) else ""
+            hl_cls = " calAppt-highlight" if hl_id else ""
+            search_text = html_lib.escape(" ".join([_val(_aname(l)), _val(_aveh(r)), _val(r.direccion_texto), _val(_aprof(r)), _val(r.estado_revision)]), quote=True)
+            appt_dt = datetime.combine(r.turno_fecha, r.turno_hora if r.turno_hora else time.min) if r.turno_fecha else None
+            is_past = appt_dt is not None and appt_dt < now
+            approval_status = _revision_approval_status(r)
+            approval_ui = _render_revision_approval_ui(r)
+            ribbon = body_close = ""
+            if approval_status == "PENDING" and not is_past:
+                ribbon = ('<div class="calApptApproval"><div class="calStatusRibbon"><div class="calStatusRibbonInner">'
+                          '<span class="calStatusRibbonWord">ESPERANDO</span><span class="calStatusRibbonWord">APROBACIÓN</span>'
+                          '</div></div><div class="calApptBody">')
+                body_close = "</div></div>"
+            _meta_wk = _ameta(_aaddr(r), _aprof(r))
+            html.append(
+                f'<a class="calWeekApptRow{hl_cls}" href="{href}" data-search="{search_text}"{hl_id}>'
+                + ribbon
+                + f'<span class="calWeekApptTime">{tstr}</span>'
+                + f'<div class="calWeekApptInfo"><div class="calWeekApptName">{_txt(_aname(l))}</div>'
+                + f'<div class="calWeekApptMeta">{_txt(_aveh(r))}</div>'
+                + (f'<div class="calWeekApptMeta">{_meta_wk}</div>' if _meta_wk else '')
+                + f'<div class="calWeekApptMeta">{_txt(r.estado_revision)}</div>'
+                + approval_ui + body_close
+                + '</div></a>'
+            )
+        html.append('</div>')
+    html.append('</div>')  # calWeekList
+    html.append('</div>')  # cal-view-week
 
-    html.append("</div>")
+    # ── month view ─────────────────────────────────────────────────
+    _MGRID_START = month_start - timedelta(days=month_start.weekday())
+    html.append('<div id="cal-view-month" class="calViewPanel">')
+    html.append('<div class="calMonthWrap">')
+    html.append('<div class="calMonthGrid">')
+    for _dh in ["L","M","M","J","V","S","D"]:
+        html.append(f'<div class="calMonthDayHead">{_dh}</div>')
+    for _gi in range(42):
+        _gd = _MGRID_START + timedelta(days=_gi)
+        _tcls = " today-cell" if _gd == today else ""
+        _ocls = " other-month" if (_gd.month != month_start.month or _gd.year != month_start.year) else ""
+        _da = by_day_month.get(_gd, [])
+        if _da:
+            _any_ok = any((ax["rev"].estado_revision or "").strip().upper() == "CONFIRMADO" for ax in _da)
+            _dot = f'<span class="calMonthDot{" confirmed" if _any_ok else ""}"></span>'
+        else:
+            _dot = ""
+        html.append(f'<div class="calMonthCell{_tcls}{_ocls}" data-date="{_gd.isoformat()}"><span class="calMonthNum">{_gd.day}</span>{_dot}</div>')
+    html.append('</div>')  # calMonthGrid
+    html.append('<div id="cal-month-detail" class="calMonthDetail"></div>')
+    html.append('<div id="cal-month-days-data" style="display:none;">')
+    for _gi2 in range(42):
+        _gd2 = _MGRID_START + timedelta(days=_gi2)
+        _dappts = by_day_month.get(_gd2, [])
+        _dlabel = f"{_gd2.day} {_MONTHS_CAP[_gd2.month-1]}"
+        html.append(f'<div id="cal-mday-{_gd2.isoformat()}">')
+        html.append(f'<div class="calMonthDetailTitle">{_dlabel}</div><div class="calMonthDetailList">')
+        if not _dappts:
+            html.append('<div style="color:rgba(255,255,255,.4);font-size:13px;">Sin turnos.</div>')
+        else:
+            for _da2 in _dappts:
+                html.append(_month_card(_da2))
+        html.append('</div></div>')  # calMonthDetailList + cal-mday
+    html.append('</div>')  # cal-month-days-data
+    # Pre-render day-view slots for every day in the grid so JS can swap them client-side
+    html.append('<div id="cal-dayslots-data" style="display:none;">')
+    for _gi3 in range(42):
+        _gd3 = _MGRID_START + timedelta(days=_gi3)
+        _dappts3 = by_day_month.get(_gd3, [])
+        html.append(f'<div id="cal-dayslots-{_gd3.isoformat()}">')
+        html.append(_day_slots(_dappts3))
+        html.append('</div>')
+    html.append('</div>')  # cal-dayslots-data
+    html.append('</div>')  # calMonthWrap
+    html.append('</div>')  # cal-view-month
+    html.append('</div>')  # calWrap
+
+    # ── scripts ────────────────────────────────────────────────────
     html.append("""
       <script>
         (function () {
-          var searchControl = document.getElementById("calendar-search-control");
-          var searchInput = document.getElementById("calendar-search-input");
-          var searchToggleBtn = document.getElementById("calendar-search-toggle");
-          var searchCloseBtn = document.getElementById("calendar-search-close");
-          var searchCount = document.getElementById("calendar-search-count");
-          var searchScope = document.querySelector('[data-search-scope="calendar"]');
-          function normalizeSearchText(value) {
-            return (value || "")
-              .toString()
-              .normalize("NFD")
-              .replace(/[\\u0300-\\u036f]/g, "")
-              .toLowerCase()
-              .trim();
+          var sc=document.getElementById("calendar-search-control"),
+              si=document.getElementById("calendar-search-input"),
+              stb=document.getElementById("calendar-search-toggle"),
+              scb=document.getElementById("calendar-search-close"),
+              sct=document.getElementById("calendar-search-count"),
+              ss=document.querySelector('[data-search-scope="calendar"]');
+          function norm(v){return(v||"").toString().normalize("NFD").replace(/[̀-ͯ]/g,"").toLowerCase().trim();}
+          function applySearch(){
+            if(!ss)return;
+            var q=norm(si?si.value:""),nodes=ss.querySelectorAll("[data-search]"),total=nodes.length,vis=0;
+            nodes.forEach(function(n){var show=!q||norm(n.getAttribute("data-search")||"").indexOf(q)!==-1;n.classList.toggle("search-item-hidden",!show);if(show)vis++;});
+            if(sct)sct.textContent=q?(vis+"/"+total):(total+"/"+total);
           }
-          function applyCalendarSearch() {
-            if (!searchScope) return;
-            var q = normalizeSearchText(searchInput ? searchInput.value : "");
-            var dataTargets = searchScope.querySelectorAll("[data-search]");
-            var total = 0;
-            var visible = 0;
-            if (dataTargets.length) {
-              dataTargets.forEach(function (node) {
-                total += 1;
-                var haystack = normalizeSearchText(node.getAttribute("data-search") || "");
-                var show = !q || haystack.indexOf(q) !== -1;
-                node.classList.toggle("search-item-hidden", !show);
-                if (show) visible += 1;
-              });
-            } else {
-              var fallbackCards = searchScope.querySelectorAll(".calAppt");
-              fallbackCards.forEach(function (node) {
-                total += 1;
-                var haystack = normalizeSearchText(node.textContent || "");
-                var show = !q || haystack.indexOf(q) !== -1;
-                node.classList.toggle("search-item-hidden", !show);
-                if (show) visible += 1;
-              });
-            }
-            if (searchCount) {
-              searchCount.textContent = q ? (visible + " / " + total) : (total + " / " + total);
-            }
-          }
-          function openCalendarSearch(focusInput) {
-            if (!searchControl || !searchToggleBtn) return;
-            searchControl.classList.add("open");
-            searchToggleBtn.setAttribute("aria-expanded", "true");
-            if (focusInput && searchInput) {
-              searchInput.focus();
-              searchInput.select();
-            }
-            applyCalendarSearch();
-          }
-          function closeCalendarSearch(clearValue) {
-            if (!searchControl || !searchToggleBtn) return;
-            if (clearValue && searchInput) searchInput.value = "";
-            searchControl.classList.remove("open");
-            searchToggleBtn.setAttribute("aria-expanded", "false");
-            applyCalendarSearch();
-          }
-          if (searchToggleBtn) {
-            searchToggleBtn.addEventListener("click", function () {
-              var isOpen = searchControl && searchControl.classList.contains("open");
-              if (isOpen) {
-                closeCalendarSearch(false);
-                return;
-              }
-              openCalendarSearch(true);
-            });
-          }
-          if (searchCloseBtn) {
-            searchCloseBtn.addEventListener("click", function () {
-              closeCalendarSearch(true);
-            });
-          }
-          if (searchInput) {
-            searchInput.addEventListener("input", applyCalendarSearch);
-          }
-          function setSidebarCollapsed(collapsed) {
-            var sb = document.getElementById("sidebar");
-            if (!sb) return;
-            sb.classList.toggle("collapsed", collapsed);
-            localStorage.setItem("sidebar_collapsed", collapsed ? "1" : "0");
-          }
-          window.toggleSidebar = function () {
-            var sb = document.getElementById("sidebar");
-            if (!sb) return;
-            var collapsed = sb.classList.contains("collapsed");
-            setSidebarCollapsed(!collapsed);
-          };
-          window.addEventListener("DOMContentLoaded", function () {
-            var sbCollapsed = localStorage.getItem("sidebar_collapsed") === "1";
-            setSidebarCollapsed(sbCollapsed);
-            applyCalendarSearch();
-            if (searchInput && (searchInput.value || "").trim()) {
-              openCalendarSearch(false);
-            }
-            var highlighted = document.getElementById("cal-highlight-appt");
-            if (highlighted) {
-              highlighted.scrollIntoView({ behavior: "smooth", block: "center" });
-            }
+          function openSearch(f){if(!sc||!stb)return;sc.classList.add("open");stb.setAttribute("aria-expanded","true");if(f&&si){si.focus();si.select();}applySearch();}
+          function closeSearch(c){if(!sc||!stb)return;if(c&&si)si.value="";sc.classList.remove("open");stb.setAttribute("aria-expanded","false");applySearch();}
+          if(stb)stb.addEventListener("click",function(){sc&&sc.classList.contains("open")?closeSearch(false):openSearch(true);});
+          if(scb)scb.addEventListener("click",function(){closeSearch(true);});
+          if(si)si.addEventListener("input",applySearch);
+          function setSBC(c){var sb=document.getElementById("sidebar");if(!sb)return;sb.classList.toggle("collapsed",c);localStorage.setItem("sidebar_collapsed",c?"1":"0");}
+          window.toggleSidebar=function(){var sb=document.getElementById("sidebar");if(!sb)return;setSBC(!sb.classList.contains("collapsed"));};
+          window.addEventListener("DOMContentLoaded",function(){
+            setSBC(localStorage.getItem("sidebar_collapsed")==="1");
+            applySearch();
+            if(si&&(si.value||"").trim())openSearch(false);
+            var hl=document.getElementById("cal-highlight-appt");
+            if(hl)hl.scrollIntoView({behavior:"smooth",block:"center"});
           });
-          document.addEventListener("keydown", function (e) {
-            if (!(e.ctrlKey || e.metaKey)) return;
-            if ((e.key || "").toLowerCase() !== "f") return;
-            e.preventDefault();
-            openCalendarSearch(true);
-          }, true);
+          document.addEventListener("keydown",function(e){if(!(e.ctrlKey||e.metaKey))return;if((e.key||"").toLowerCase()!=="f")return;e.preventDefault();openSearch(true);},true);
         })();
       </script>
     """)
+    html.append(f"""<script>
+      (function(){{
+        var _pills=document.querySelectorAll('.calPill'),
+            _panels=document.querySelectorAll('.calViewPanel'),
+            _hdr=document.getElementById('cal-date-header'),
+            _big=document.getElementById('cal-date-big'),
+            _sub=document.getElementById('cal-date-sub'),
+            _prev=document.getElementById('cal-nav-prev'),
+            _next=document.getElementById('cal-nav-next');
+        var _MN=["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"];
+        var _DN=["Lunes","Martes","Mi\\u00e9rcoles","Jueves","Viernes","S\\u00e1bado","Domingo"];
+        var _calDay=new Date('{today.isoformat()}T12:00:00');
+
+        function _dayName(d){{return _DN[(d.getDay()+6)%7];}}
+        function _bigDay(d){{return _MN[d.getMonth()]+' '+d.getDate();}}
+        function _iso(d){{return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');}}
+
+        function updateHeader(view){{
+          if(!_big||!_hdr)return;
+          if(view==='day'){{_big.textContent=_bigDay(_calDay);_sub.textContent=_dayName(_calDay);}}
+          else if(view==='week'){{_big.textContent=_hdr.dataset.weekBig||'';_sub.textContent=_hdr.dataset.weekSub||'';}}
+          else{{_big.textContent=_hdr.dataset.monthBig||'';_sub.textContent='';}}
+        }}
+
+        function showMonthDay(ds){{
+          var det=document.getElementById('cal-month-detail');
+          var src=document.getElementById('cal-mday-'+ds);
+          if(!det)return;
+          det.innerHTML=src?src.innerHTML:'<div style="color:rgba(255,255,255,.4);font-size:13px;padding:8px 0;">Sin turnos.</div>';
+          document.querySelectorAll('.calMonthCell').forEach(function(c){{c.classList.remove('selected-cell');}});
+          var sel=document.querySelector('.calMonthCell[data-date="'+ds+'"]');
+          if(sel)sel.classList.add('selected-cell');
+        }}
+
+        function setView(view){{
+          _pills.forEach(function(p){{p.classList.remove('active');}});
+          _panels.forEach(function(p){{p.classList.remove('active');}});
+          var pill=document.querySelector('.calPill[data-view="'+view+'"]');
+          if(pill)pill.classList.add('active');
+          var panel=document.getElementById('cal-view-'+view);
+          if(panel)panel.classList.add('active');
+          updateHeader(view);
+          history.replaceState(null,'','#'+view);
+        }}
+
+        function navGo(dir){{
+          var view=(document.querySelector('.calPill.active')||{{}}).getAttribute('data-view')||'day';
+          if(view==='day'){{
+            _calDay.setDate(_calDay.getDate()+dir);
+            updateHeader('day');
+            var ds=_iso(_calDay);
+            var dp=document.getElementById('cal-view-day');
+            if(dp){{
+              var src=document.getElementById('cal-dayslots-'+ds);
+              dp.innerHTML=src?src.innerHTML:'<div class="calDaySlots"><div style="color:rgba(255,255,255,.35);padding:20px 16px;font-size:13px;">Sin turnos.</div></div>';
+            }}
+          }}else if(view==='week'){{
+            window.location.href=(dir<0?_hdr.dataset.prevWeek:_hdr.dataset.nextWeek)+'#week';
+          }}else{{
+            window.location.href=(dir<0?_hdr.dataset.prevMonth:_hdr.dataset.nextMonth)+'#month';
+          }}
+        }}
+
+        _pills.forEach(function(p){{p.addEventListener('click',function(){{setView(p.getAttribute('data-view'));}});}});
+        document.querySelectorAll('.calMonthCell[data-date]').forEach(function(c){{c.addEventListener('click',function(){{showMonthDay(c.getAttribute('data-date'));}});}});
+        if(_prev)_prev.addEventListener('click',function(){{navGo(-1);}});
+        if(_next)_next.addEventListener('click',function(){{navGo(1);}});
+
+        window.addEventListener('DOMContentLoaded',function(){{
+          var h=(location.hash||'').replace('#','');
+          setView(['day','week','month'].indexOf(h)>=0?h:'day');
+          showMonthDay('{today.isoformat()}');
+        }});
+      }})();
+    </script>""")
     html.append("</main></div>")
     return "\n".join(html)
 
@@ -3860,6 +4175,7 @@ def render_profesionales_page(profesionales: list[Profesional], user_email: str 
       thead th { font-size: 12px; color: #374151; background: #fff; position: sticky; top: 0; z-index: 5; box-shadow: 0 1px 0 rgba(0,0,0,.08); }
       td { font-size: 13px; }
       tr:hover td { background: #f3f4f6; }
+      @media (max-width: 768px) { .grid { grid-template-columns: 1fr; } .grid input, .grid select { width: 100%; box-sizing: border-box; } .main { padding: 60px 12px 0 !important; } }
     """
     css = _base_css(extra_css=table_css)
 
@@ -4124,7 +4440,7 @@ def render_lead_card(
 
     vehicle_badge = "Vehículo"
     if last_rev and last_rev.tipo_vehiculo:
-        vehicle_badge = last_rev.tipo_vehiculo.replace("_", " ").title()
+        vehicle_badge = _friendly_tipo_vehiculo(last_rev.tipo_vehiculo)
 
     base_cls = "card leadCard"
     if bool(_get(l, "necesita_humano")):
@@ -5261,6 +5577,10 @@ def render_revisions_table_page(
       .chips { display:flex; flex-wrap:wrap; gap:8px; margin:8px 0 12px; }
       .chip { display:inline-flex; align-items:center; gap:8px; padding:6px 10px; border-radius:999px; border:1px solid var(--border); background:#fff; font-size:12px; text-decoration:none; color:#111827; }
       .chip .x { opacity:.6; }
+      @media (max-width: 768px) {
+        .kanbanTopBar { display: flex !important; top: 52px; }
+        .kanbanTopBarTitle, .buildStamp { display: none !important; }
+      }
     """
     css = _base_css(extra_css=table_css)
     build_stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -5702,6 +6022,7 @@ def render_agencias_page(
       .agModalBody { padding:12px; overflow:auto; }
       .agModalFoot { padding:10px 12px; border-top:1px solid var(--border); display:flex; gap:8px; justify-content:flex-end; flex-wrap:wrap; }
       @media (max-width: 740px) { .agModal { width:100vw; height:100vh; max-height:none; border-radius:0; } }
+      @media (max-width: 768px) { .grid { grid-template-columns: 1fr; } .grid input, .grid select { width: 100%; box-sizing: border-box; } .main { padding: 60px 12px 0 !important; } }
     """
     css = _base_css(extra_css=table_css)
     build_stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
