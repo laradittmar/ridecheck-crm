@@ -200,11 +200,11 @@ class TestCalendarTypographyCSS(unittest.TestCase):
         )
 
     def test_desktop_breakpoint_present(self):
-        """Desktop font should be smaller via @media breakpoint."""
+        """Desktop date header must be resized via @media breakpoint."""
         html = self._css_html()
-        # M12 used 1.45rem; M12.1 refined to 1.1rem — both valid
+        # M12: 1.45rem, M12.1: 1.1rem, M12.2: 1.75rem — any explicit override is valid
         self.assertTrue(
-            "1.45rem" in html or "1.1rem" in html,
+            any(v in html for v in ("1.45rem", "1.1rem", "1.75rem")),
             "Desktop date breakpoint font must be present",
         )
         self.assertIn("min-width: 769px", html)

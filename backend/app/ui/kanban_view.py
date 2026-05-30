@@ -3578,9 +3578,9 @@ def render_calendar_page(
       .calWrap * { font-family: 'Bahnschrift','Segoe UI','Arial Narrow',Arial,sans-serif; }
       /* Fix: push content below fixed top nav on mobile */
       @media (max-width: 768px) { .main { padding-top: 56px !important; } }
-      /* Desktop: cap calendar width so cards do not stretch full-screen */
+      /* Desktop: center and cap at a comfortable wide width */
       @media (min-width: 769px) {
-        .calWrap { max-width: 800px; margin: 0 auto; }
+        .calWrap { max-width: min(94vw, 1360px); margin: 0 auto; }
       }
 
       /* ── View pills ── */
@@ -3618,7 +3618,7 @@ def render_calendar_page(
         letter-spacing: .01em; text-align: center;
       }
       @media (min-width: 769px) {
-        .calDateBig { font-size: 1.1rem; }
+        .calDateBig { font-size: 1.75rem; }
       }
       .calDateSub {
         font-size: .78rem; font-weight: 500; color: rgba(255,255,255,.6);
@@ -3772,6 +3772,38 @@ def render_calendar_page(
       .calMonthApptMeta ~ .calMonthApptMeta { color: #9ca3af; font-size: 10px; }
       .calMonthApptMeta { font-size: 10.5px; color: #6b7280; margin-top: 2px; line-height: 1.35; }
       .calMonthApptMeta a { color: #3b82f6; text-decoration: none; }
+
+      /* ── Desktop: spacious card typography and nav ── */
+      @media (min-width: 769px) {
+        .calNavArrow { width: 36px; height: 36px; font-size: 19px; }
+        .calDateHeadCenter { min-width: 220px; }
+        .calDateSub { font-size: .9rem; }
+        .calDaySlots { gap: 3px; padding: 8px 16px; }
+        .calDaySlotTime { flex: 0 0 56px; font-size: 12px; }
+        .calDaySlotCard.has-appt .calDaySlotTime { font-size: 12px; padding-top: 11px; }
+        .calDaySlotBody { padding: 11px 18px 10px 0; }
+        .calApptName { font-size: .95rem; }
+        .calApptName + .calApptMeta { font-size: 12px; }
+        .calApptMeta ~ .calApptMeta { font-size: 11.5px; }
+        .calApptStatus { font-size: 10.5px; padding: 2px 8px; }
+        .calWeekList { gap: 6px; padding: 8px 16px; }
+        .calWeekDayHead { padding: 8px 16px; }
+        .calWeekDayName { font-size: 12px; }
+        .calWeekDayDate { font-size: 12px; }
+        .calWeekApptRow { padding: 10px 16px; }
+        .calWeekApptName { font-size: .92rem; }
+        .calWeekApptName + .calWeekApptMeta { font-size: 12px; }
+        .calWeekApptMeta ~ .calWeekApptMeta { font-size: 11.5px; }
+        .calWeekApptMeta { font-size: 12px; }
+        .calWeekApptTime { font-size: 12px; flex: 0 0 46px; }
+        .calMonthWrap { padding: 8px 16px; }
+        .calMonthApptCard { padding: 9px 12px; }
+        .calMonthApptName { font-size: .9rem; }
+        .calMonthApptName + .calMonthApptMeta { font-size: 12px; }
+        .calMonthApptMeta ~ .calMonthApptMeta { font-size: 11px; }
+        .calMonthApptMeta { font-size: 12px; }
+        .calMonthDetailTitle { font-size: .9rem; }
+      }
 
       /* ── Highlight ── */
       .calAppt-highlight { outline: 3px solid #f59e0b; outline-offset: 2px;
