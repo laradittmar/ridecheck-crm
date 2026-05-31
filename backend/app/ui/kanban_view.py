@@ -3568,10 +3568,13 @@ def render_calendar_page(
     _MONTHS_ES_CAP = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"]
     week_label_str = f"{week_start.strftime('%d/%m')} – {week_end.strftime('%d/%m')}"
     month_label_str = f"{_MONTHS_ES_CAP[month_start.month - 1]} {month_start.year}"
+    # Pass the first of the target month as the week param so month_start = week_start.replace(day=1)
+    # resolves correctly regardless of what day of week the 1st falls on.
+    # Bug before fix: used Monday of the containing week, which could be in the wrong month.
     _prev_month_first = (month_start - timedelta(days=1)).replace(day=1)
-    prev_month_monday = _prev_month_first - timedelta(days=_prev_month_first.weekday())
+    prev_month_monday = _prev_month_first  # first of prev month
     _next_month_first = month_end_dt + timedelta(days=1)
-    next_month_monday = _next_month_first - timedelta(days=_next_month_first.weekday())
+    next_month_monday = _next_month_first  # first of next month
 
     calendar_css = """
       /* ── Calendar: shared font ── */
