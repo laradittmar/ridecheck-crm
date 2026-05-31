@@ -1337,7 +1337,8 @@ def _render_revision_approval_ui(rev: Revision, include_actions: bool = False, l
         if lead_id is not None:
             tf = getattr(rev, "turno_fecha", None)
             week_param = f"&week={(tf - timedelta(days=tf.weekday())).isoformat()}" if tf else ""
-            label_html = f'<a class="pill pill-approval-pending" href="/calendar?highlight_lead_id={lead_id}{week_param}" style="cursor:pointer;text-decoration:none;">Aprobacion turno: pendiente</a>'
+            date_param = f"&date={tf.isoformat()}" if tf else ""
+            label_html = f'<a class="pill pill-approval-pending" href="/calendar?highlight_lead_id={lead_id}{week_param}{date_param}#day" style="cursor:pointer;text-decoration:none;">Aprobacion turno: pendiente</a>'
         else:
             label_html = '<span class="pill pill-approval-pending">Aprobacion turno: pendiente</span>'
         if include_actions:
@@ -3496,6 +3497,7 @@ def render_calendar_page(
     week: str | None = None,
     user_email: str = "",
     highlight_lead_id: int | None = None,
+    initial_date: str | None = None,
 ) -> str:
     base_monday: date | None = None
     if week:
@@ -3507,6 +3509,12 @@ def render_calendar_page(
         today = date.today()
         base_monday = today - timedelta(days=today.weekday())
     now = datetime.now()
+    today = date.today()
+    # If caller requested a specific day (e.g. from approval-button link), start there
+    try:
+        initial_day: date = date.fromisoformat(str(initial_date).strip()) if initial_date else today
+    except ValueError:
+        initial_day = today
 
     week_start = base_monday
     week_end = week_start + timedelta(days=6)
@@ -3547,7 +3555,6 @@ def render_calendar_page(
     for it in items:
         by_day[it["day"]].append(it)
 
-    today = date.today()
     import calendar as _cal_mod
     month_start = week_start.replace(day=1)
     month_last = _cal_mod.monthrange(month_start.year, month_start.month)[1]
@@ -3578,7 +3585,7 @@ def render_calendar_page(
 
     calendar_css = """
       /* ── Calendar: shared font ── */
-      .calWrap * { font-family: 'Bahnschrift','Segoe UI','Arial Narrow',Arial,sans-serif; }
+      .calWrap * { font-family: Arial,sans-serif; }
       /* Fix: push content below fixed top nav on mobile */
       @media (max-width: 768px) { .main { padding-top: 56px !important; } }
       /* Desktop: center and cap at a comfortable wide width */
@@ -3597,7 +3604,7 @@ def render_calendar_page(
         border: 2px solid rgba(255,255,255,.45); background: transparent;
         cursor: pointer; color: rgba(255,255,255,.65);
         transition: background .15s, color .15s, border-color .15s;
-        font-family: 'Bahnschrift','Segoe UI','Arial Narrow',Arial,sans-serif;
+        font-family: Arial,sans-serif;
       }
       .calPill.active { background: #111827; color: #fff; border-color: #111827; }
       .calPill:hover:not(.active) { background: rgba(255,255,255,.1); color: #fff; }
@@ -3617,7 +3624,7 @@ def render_calendar_page(
       .calDateHeadCenter { text-align: center; min-width: 150px; }
       .calDateBig {
         font-size: 1.25rem; font-weight: 800; color: #fff; line-height: 1.2;
-        font-family: 'Bahnschrift','Segoe UI','Arial Narrow',Arial,sans-serif;
+        font-family: Arial,sans-serif;
         letter-spacing: .01em; text-align: center;
       }
       @media (min-width: 769px) {
@@ -3626,7 +3633,7 @@ def render_calendar_page(
       .calDateSub {
         font-size: .78rem; font-weight: 500; color: rgba(255,255,255,.6);
         text-transform: capitalize; margin-top: 1px; text-align: center;
-        font-family: 'Bahnschrift','Segoe UI','Arial Narrow',Arial,sans-serif;
+        font-family: Arial,sans-serif;
       }
 
       /* ── View panels ── */
@@ -3655,7 +3662,7 @@ def render_calendar_page(
         flex: 0 0 46px; display: flex; align-items: center; justify-content: center;
         font-size: 10.5px; font-weight: 600; color: rgba(255,255,255,.22);
         padding: 0 4px;
-        font-family: 'Bahnschrift','Segoe UI','Arial Narrow',Arial,sans-serif;
+        font-family: Arial,sans-serif;
       }
       .calDaySlotCard.has-appt .calDaySlotTime {
         color: #b0b7c3; font-size: 10.5px; font-weight: 700;
@@ -3668,7 +3675,7 @@ def render_calendar_page(
       /* Typography hierarchy: name > vehicle > address/prof */
       .calApptName {
         font-size: .87rem; font-weight: 800; color: #111827; line-height: 1.25;
-        font-family: 'Bahnschrift','Segoe UI','Arial Narrow',Arial,sans-serif;
+        font-family: Arial,sans-serif;
       }
       /* First meta (vehicle): medium-dark */
       .calApptName + .calApptMeta { color: #374151; font-weight: 600; font-size: 11px; }
@@ -3694,7 +3701,7 @@ def render_calendar_page(
       .calWeekDayCard.has-appt .calWeekDayHead { border-bottom: 1px solid #f3f4f6; }
       .calWeekDayName {
         font-size: 11px; font-weight: 800; color: rgba(255,255,255,.4);
-        font-family: 'Bahnschrift','Segoe UI','Arial Narrow',Arial,sans-serif;
+        font-family: Arial,sans-serif;
         text-transform: uppercase; letter-spacing: .07em;
       }
       .calWeekDayCard.has-appt .calWeekDayName { color: #374151; }
@@ -3711,7 +3718,7 @@ def render_calendar_page(
         order: 2; flex: 0 0 40px; margin-left: auto; padding-left: 6px; flex-shrink: 0;
         font-size: 11px; font-weight: 700; color: #9ca3af;
         padding-top: 2px; text-align: right;
-        font-family: 'Bahnschrift','Segoe UI','Arial Narrow',Arial,sans-serif;
+        font-family: Arial,sans-serif;
       }
       /* ribbon case */
       .calApptBody {
@@ -3722,7 +3729,7 @@ def render_calendar_page(
       .calApptBody .calWeekApptTime { order: 2; margin-left: auto; }
       .calWeekApptName {
         font-size: .85rem; font-weight: 800; color: #111827;
-        font-family: 'Bahnschrift','Segoe UI','Arial Narrow',Arial,sans-serif;
+        font-family: Arial,sans-serif;
       }
       /* First meta after name (vehicle): slightly darker */
       .calWeekApptName + .calWeekApptMeta { color: #4b5563; font-weight: 600; }
@@ -3748,13 +3755,13 @@ def render_calendar_page(
       .calMonthCell.other-month { opacity: .28; }
       .calMonthNum {
         display: block; font-size: .85rem; font-weight: 700; line-height: 1.9; color: #fff;
-        font-family: 'Bahnschrift','Segoe UI','Arial Narrow',Arial,sans-serif;
+        font-family: Arial,sans-serif;
       }
       .calMonthDot { display: block; width: 5px; height: 5px; border-radius: 50%; background: #ef4444; margin: 0 auto; }
       .calMonthDetail { border-radius: 13px; background: rgba(255,255,255,.07); padding: 10px; margin-top: 4px; }
       .calMonthDetailTitle {
         font-size: .83rem; font-weight: 800; color: rgba(255,255,255,.82); margin-bottom: 8px;
-        font-family: 'Bahnschrift','Segoe UI','Arial Narrow',Arial,sans-serif;
+        font-family: Arial,sans-serif;
       }
       .calMonthDetailList { display: flex; flex-direction: column; gap: 5px; }
       .calMonthApptCard {
@@ -3768,7 +3775,7 @@ def render_calendar_page(
       .calMonthApptCard.pending { background: #fff7ed; }
       .calMonthApptName {
         font-size: .83rem; font-weight: 800; color: #111827;
-        font-family: 'Bahnschrift','Segoe UI','Arial Narrow',Arial,sans-serif;
+        font-family: Arial,sans-serif;
       }
       /* Month card: vehicle line slightly darker, address softer */
       .calMonthApptName + .calMonthApptMeta { color: #4b5563; font-weight: 600; font-size: 10.5px; }
@@ -4014,7 +4021,7 @@ def render_calendar_page(
 
     # ── day view ───────────────────────────────────────────────────
     html.append(f'<div id="cal-view-day" class="calViewPanel active" data-today="{today.isoformat()}">')
-    html.append(_day_slots(by_day_month.get(today, [])))
+    html.append(_day_slots(by_day_month.get(initial_day, [])))
     html.append('</div>')
 
     # ── week view ──────────────────────────────────────────────────
@@ -4155,7 +4162,7 @@ def render_calendar_page(
             _next=document.getElementById('cal-nav-next');
         var _MN=["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"];
         var _DN=["Lunes","Martes","Mi\\u00e9rcoles","Jueves","Viernes","S\\u00e1bado","Domingo"];
-        var _calDay=new Date('{today.isoformat()}T12:00:00');
+        var _calDay=new Date('{initial_day.isoformat()}T12:00:00');
 
         function _dayName(d){{return _DN[(d.getDay()+6)%7];}}
         function _bigDay(d){{return _MN[d.getMonth()]+' '+d.getDate();}}
@@ -4215,7 +4222,7 @@ def render_calendar_page(
         window.addEventListener('DOMContentLoaded',function(){{
           var h=(location.hash||'').replace('#','');
           setView(['day','week','month'].indexOf(h)>=0?h:'day');
-          showMonthDay('{today.isoformat()}');
+          showMonthDay('{initial_day.isoformat()}');
         }});
       }})();
     </script>""")

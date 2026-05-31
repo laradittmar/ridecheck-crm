@@ -453,6 +453,7 @@ def calendar(
     zone_detail: str | None = Query(default=None),
     estado_revision: str | None = Query(default=None),
     highlight_lead_id: int | None = Query(default=None),
+    cal_date: str | None = Query(default=None, alias="date"),
 ):
     leads, _ = _load_filtered_leads(
         db=db,
@@ -480,6 +481,7 @@ def calendar(
             week=week,
             user_email=getattr(request.state, "user_email", ""),
             highlight_lead_id=highlight_lead_id,
+            initial_date=cal_date,
         ),
         media_type="text/html; charset=utf-8",
     )
