@@ -29,8 +29,11 @@
       SMTP_HOST: "smtp.gmail.com"
       SMTP_PORT: "587"
       SMTP_USER: "ridecheckassistance@gmail.com"
-      SMTP_PASSWORD: ""
+      SMTP_PASSWORD: "rawq msgw vwtk mgvv"
       SMTP_FROM: "ridecheckassistance@gmail.com"
+      RESEND_API_KEY: ${RESEND_API_KEY}
+      INTERNAL_BOOKING_EMAIL_FROM: "notificaciones@ridecheck.ar"
+      INTERNAL_BOOKING_EMAIL_TO: ${INTERNAL_BOOKING_EMAIL_TO:-julian@ridecheck.ar}
     ports:
       - "8000:8000"
     depends_on:

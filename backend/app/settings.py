@@ -18,6 +18,9 @@ class Settings:
     smtp_user: str = ""
     smtp_password: str = ""
     smtp_from: str = ""
+    resend_api_key: str = ""
+    internal_booking_email_from: str = ""
+    internal_booking_email_to: str = ""
 
     @property
     def whatsapp_enabled(self) -> bool:
@@ -56,4 +59,7 @@ def get_settings() -> Settings:
         smtp_user=_getenv("SMTP_USER"),
         smtp_password=_getenv("SMTP_PASSWORD"),
         smtp_from=_getenv("SMTP_FROM"),
+        resend_api_key=_getenv("RESEND_API_KEY"),
+        internal_booking_email_from=_getenv("INTERNAL_BOOKING_EMAIL_FROM", "notificaciones@ridecheck.ar"),
+        internal_booking_email_to=_getenv("INTERNAL_BOOKING_EMAIL_TO"),
     )

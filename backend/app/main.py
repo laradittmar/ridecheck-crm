@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
+from .api.internal_notify import router as internal_notify_router
 from .api.leads import router as leads_router
 from .api.excluded_phones import router as excluded_phones_router
 from .api.pricing import router as pricing_router
@@ -448,6 +449,17 @@ async def _start_followup_tasks() -> None:
 
 
 @app.on_event("startup")
+def _migrate_m15_8_notification_sent() -> None:
+    from sqlalchemy import text
+    with engine.connect() as conn:
+        conn.execute(text(
+            "ALTER TABLE thread_revisions "
+            "ADD COLUMN IF NOT EXISTS notification_sent_at TIMESTAMPTZ"
+        ))
+        conn.commit()
+
+
+@app.on_event("startup")
 def validate_whatsapp_settings() -> None:
     settings = get_settings()
     missing = settings.missing_whatsapp_required_vars()
@@ -459,6 +471,7 @@ def validate_whatsapp_settings() -> None:
         )
 
 # routers
+app.include_router(internal_notify_router)
 app.include_router(leads_router)
 app.include_router(excluded_phones_router)
 app.include_router(pricing_router)

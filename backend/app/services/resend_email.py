@@ -1,0 +1,210 @@
+"""M15.8 — Resend email notification service (HTTPS API, no SMTP)."""
+from __future__ import annotations
+
+import json
+import logging
+from urllib import error, request as urlrequest
+
+logger = logging.getLogger(__name__)
+
+_RESEND_API_URL = "https://api.resend.com/emails"
+
+
+def _fmt(value: object, fallback: str = "Sin dato") -> str:
+    s = str(value).strip() if value is not None else ""
+    return s if s else fallback
+
+
+def _fmt_money(value: str) -> str:
+    """Format a numeric string as Argentine currency: 140000 → $140.000"""
+    try:
+        return f"${int(value):,}".replace(",", ".")
+    except (ValueError, TypeError):
+        return value if value else "Sin dato"
+
+
+def _build_html(
+    lead_id: int | str,
+    revision_id: int | str,
+    buyer_name: str,
+    buyer_phone: str,
+    buyer_email: str,
+    source: str,
+    marca: str,
+    modelo: str,
+    anio: str,
+    tipo_vehiculo: str,
+    zone_group: str,
+    zone_detail: str,
+    address: str,
+    seller_type: str,
+    seller_name: str,
+    scheduled_date: str,
+    scheduled_time: str,
+    precio_base: str,
+    viaticos: str,
+    precio_total: str,
+) -> str:
+    # /calendar?highlight_lead_id=X&week=YYYY-MM-DD#day opens the calendar
+    # on the appointment week and highlights the lead's slot.
+    week_param = f"&week={scheduled_date}&date={scheduled_date}" if scheduled_date and scheduled_date != "Sin dato" else ""
+    crm_cal_url  = f"https://crm.ridecheck.ar/calendar?highlight_lead_id={lead_id}{week_param}#day"
+    crm_lead_url = f"https://crm.ridecheck.ar/kanban#lead-{lead_id}"
+    precio_base_fmt  = _fmt_money(precio_base)
+    viaticos_fmt     = _fmt_money(viaticos)
+    precio_total_fmt = _fmt_money(precio_total)
+    return f"""<!DOCTYPE html>
+<html lang="es">
+<body style="font-family:Arial,sans-serif;font-size:14px;color:#333;max-width:600px;margin:0 auto;padding:20px;">
+<h2 style="color:#1a1a2e;">🔔 Nueva solicitud de revisión</h2>
+<table style="width:100%;border-collapse:collapse;">
+<tr><td style="padding:4px 0;"><strong>Lead ID:</strong></td><td>{lead_id}</td></tr>
+<tr><td style="padding:4px 0;"><strong>Revisión ID:</strong></td><td>{revision_id}</td></tr>
+</table>
+
+<h3 style="color:#444;border-bottom:1px solid #ddd;padding-bottom:6px;">Cliente</h3>
+<table style="width:100%;border-collapse:collapse;">
+<tr><td style="padding:4px 0;width:140px;"><strong>Nombre:</strong></td><td>{buyer_name}</td></tr>
+<tr><td style="padding:4px 0;"><strong>Teléfono:</strong></td><td>{buyer_phone}</td></tr>
+<tr><td style="padding:4px 0;"><strong>Email:</strong></td><td>{buyer_email}</td></tr>
+<tr><td style="padding:4px 0;"><strong>Cómo llegó:</strong></td><td>{source}</td></tr>
+</table>
+
+<h3 style="color:#444;border-bottom:1px solid #ddd;padding-bottom:6px;">Vehículo</h3>
+<table style="width:100%;border-collapse:collapse;">
+<tr><td style="padding:4px 0;width:140px;"><strong>Vehículo:</strong></td><td>{marca} {modelo} {anio}</td></tr>
+<tr><td style="padding:4px 0;"><strong>Tipo:</strong></td><td>{tipo_vehiculo}</td></tr>
+</table>
+
+<h3 style="color:#444;border-bottom:1px solid #ddd;padding-bottom:6px;">Ubicación</h3>
+<table style="width:100%;border-collapse:collapse;">
+<tr><td style="padding:4px 0;width:140px;"><strong>Zona:</strong></td><td>{zone_group} / {zone_detail}</td></tr>
+<tr><td style="padding:4px 0;"><strong>Dirección:</strong></td><td>{address}</td></tr>
+</table>
+
+<h3 style="color:#444;border-bottom:1px solid #ddd;padding-bottom:6px;">Vendedor</h3>
+<table style="width:100%;border-collapse:collapse;">
+<tr><td style="padding:4px 0;width:140px;"><strong>Tipo:</strong></td><td>{seller_type}</td></tr>
+<tr><td style="padding:4px 0;"><strong>Nombre:</strong></td><td>{seller_name}</td></tr>
+</table>
+
+<h3 style="color:#444;border-bottom:1px solid #ddd;padding-bottom:6px;">Turno solicitado</h3>
+<table style="width:100%;border-collapse:collapse;">
+<tr><td style="padding:4px 0;width:140px;"><strong>Fecha:</strong></td><td>{scheduled_date}</td></tr>
+<tr><td style="padding:4px 0;"><strong>Hora:</strong></td><td>{scheduled_time}</td></tr>
+</table>
+
+<h3 style="color:#444;border-bottom:1px solid #ddd;padding-bottom:6px;">Presupuesto</h3>
+<table style="width:100%;border-collapse:collapse;">
+<tr><td style="padding:4px 0;width:140px;"><strong>Base:</strong></td><td>{precio_base_fmt}</td></tr>
+<tr><td style="padding:4px 0;"><strong>Viáticos:</strong></td><td>{viaticos_fmt}</td></tr>
+<tr><td style="padding:4px 0;"><strong>Total:</strong></td><td><strong>{precio_total_fmt}</strong></td></tr>
+</table>
+
+<h3 style="color:#444;border-bottom:1px solid #ddd;padding-bottom:6px;">CRM</h3>
+<table cellpadding="0" cellspacing="0" border="0" style="margin:12px 0 8px;">
+  <tr>
+    <td align="center" bgcolor="#0f766e" style="border-radius:6px;">
+      <a href="{crm_cal_url}"
+         style="display:inline-block;padding:12px 28px;color:#ffffff;text-decoration:none;font-weight:bold;font-family:Arial,sans-serif;font-size:15px;border-radius:6px;background-color:#0f766e;">
+        Abrir turno en CRM
+      </a>
+    </td>
+  </tr>
+</table>
+<p style="font-size:12px;color:#888;margin-top:4px;">{crm_lead_url}</p>
+</body>
+</html>"""
+
+
+def send_booking_notification(
+    *,
+    api_key: str,
+    from_email: str,
+    to_email: str,
+    lead_id: int | str,
+    revision_id: int | str,
+    buyer_name: str,
+    buyer_phone: str,
+    buyer_email: str,
+    source: str,
+    marca: str,
+    modelo: str,
+    anio: str,
+    tipo_vehiculo: str,
+    zone_group: str,
+    zone_detail: str,
+    address: str,
+    seller_type: str,
+    seller_name: str,
+    scheduled_date: str,
+    scheduled_time: str,
+    precio_base: str,
+    viaticos: str,
+    precio_total: str,
+) -> bool:
+    """Send booking notification via Resend HTTPS API. Returns True on success, False on failure."""
+    if not api_key:
+        logger.error("[M15.8] RESEND_API_KEY not set — email not sent for revision_id=%s", revision_id)
+        return False
+    if not to_email:
+        logger.error("[M15.8] INTERNAL_BOOKING_EMAIL_TO not set — email not sent for revision_id=%s", revision_id)
+        return False
+
+    subject = f"Nueva solicitud de revisión — Lead #{lead_id} / Revisión #{revision_id}"
+    html_body = _build_html(
+        lead_id=lead_id,
+        revision_id=revision_id,
+        buyer_name=_fmt(buyer_name),
+        buyer_phone=_fmt(buyer_phone),
+        buyer_email=_fmt(buyer_email),
+        source=_fmt(source),
+        marca=_fmt(marca),
+        modelo=_fmt(modelo),
+        anio=_fmt(anio),
+        tipo_vehiculo=_fmt(tipo_vehiculo),
+        zone_group=_fmt(zone_group),
+        zone_detail=_fmt(zone_detail),
+        address=_fmt(address),
+        seller_type=_fmt(seller_type),
+        seller_name=_fmt(seller_name),
+        scheduled_date=_fmt(scheduled_date),
+        scheduled_time=_fmt(scheduled_time),
+        precio_base=_fmt(precio_base),
+        viaticos=_fmt(viaticos),
+        precio_total=_fmt(precio_total),
+    )
+
+    payload = json.dumps({
+        "from": from_email,
+        "to": [to_email],
+        "subject": subject,
+        "html": html_body,
+    }).encode("utf-8")
+
+    req = urlrequest.Request(
+        _RESEND_API_URL,
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "RideCheck-CRM/1.0",
+        },
+    )
+
+    try:
+        with urlrequest.urlopen(req, timeout=15) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+        logger.info("[M15.8] Resend email sent OK for revision_id=%s lead_id=%s — %s", revision_id, lead_id, body)
+        return True
+    except error.HTTPError as exc:
+        err_body = exc.read().decode("utf-8", errors="replace")
+        logger.error("[M15.8] Resend HTTP error %s for revision_id=%s: %s", exc.code, revision_id, err_body)
+        return False
+    except error.URLError as exc:
+        logger.error("[M15.8] Resend URL error for revision_id=%s: %s", revision_id, exc.reason)
+        return False
+    except Exception as exc:  # noqa: BLE001
+        logger.error("[M15.8] Resend unexpected error for revision_id=%s: %s", revision_id, exc)
+        return False
