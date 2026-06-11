@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
+from .api.conversation import router as conversation_router
 from .api.internal_notify import router as internal_notify_router
 from .api.leads import router as leads_router
 from .api.excluded_phones import router as excluded_phones_router
@@ -471,6 +472,7 @@ def validate_whatsapp_settings() -> None:
         )
 
 # routers
+app.include_router(conversation_router)
 app.include_router(internal_notify_router)
 app.include_router(leads_router)
 app.include_router(excluded_phones_router)

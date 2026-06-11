@@ -21,6 +21,9 @@ class Settings:
     resend_api_key: str = ""
     internal_booking_email_from: str = ""
     internal_booking_email_to: str = ""
+    whatsapp_flow_id: str = ""
+    conversation_engine_direct_webhook_enabled: bool = False
+    openai_chat_model: str = "gpt-4o-mini"
 
     @property
     def whatsapp_enabled(self) -> bool:
@@ -62,4 +65,7 @@ def get_settings() -> Settings:
         resend_api_key=_getenv("RESEND_API_KEY"),
         internal_booking_email_from=_getenv("INTERNAL_BOOKING_EMAIL_FROM", "notificaciones@ridecheck.ar"),
         internal_booking_email_to=_getenv("INTERNAL_BOOKING_EMAIL_TO"),
+        whatsapp_flow_id=_getenv("WHATSAPP_FLOW_ID"),
+        conversation_engine_direct_webhook_enabled=_getenv("CONVERSATION_ENGINE_DIRECT_WEBHOOK_ENABLED", "false").lower() in ("1", "true", "yes"),
+        openai_chat_model=_getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
     )

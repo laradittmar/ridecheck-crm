@@ -7,13 +7,16 @@ import logging
 from datetime import datetime, timezone
 from urllib import request as urllib_request
 
+import threading
+
 from fastapi import APIRouter, Depends, Query, Request, Response
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from ..db import get_db
+from ..db import engine as db_engine, get_db
 from ..models import AiEvent, WhatsAppContact, WhatsAppMessage, WhatsAppThread
+from ..schemas.conversation import ConversationHandleIn
 from ..services.buscando_followup import reset_buscando_followup
 from ..services.quote_followup import reset_quote_followup
 from ..settings import get_settings
@@ -66,6 +69,35 @@ def _verify_signature(raw_body: bytes, signature_header: str | None, app_secret:
     else:
         logger.warning("Webhook signature invalid")
     return valid
+
+
+def _dispatch_to_engine(payload: dict[str, object]) -> None:
+    """Run the M18 conversation engine in a background thread with its own DB session."""
+    from sqlalchemy.orm import Session as _Session
+    from ..services.conversation_engine import ConversationEngine
+
+    handle_in = ConversationHandleIn(
+        thread_id=int(payload.get("thread_id") or 0),
+        wa_message_id=str(payload.get("wa_message_id") or ""),
+        wa_id=str(payload.get("wa_id") or ""),
+        text=payload.get("text"),  # type: ignore[arg-type]
+        message_type=str(payload.get("message_type") or "text"),
+        media_id=payload.get("media_id"),  # type: ignore[arg-type]
+        flow_response=payload.get("flow_response"),  # type: ignore[arg-type]
+        flow_token=payload.get("flow_token"),  # type: ignore[arg-type]
+    )
+
+    def _run() -> None:
+        try:
+            with _Session(db_engine) as db:
+                settings = get_settings()
+                engine = ConversationEngine(db=db, settings=settings)
+                engine.handle(handle_in)
+        except Exception:
+            logger.warning("M18 background dispatch failed wa_message_id=%s", handle_in.wa_message_id, exc_info=True)
+
+    t = threading.Thread(target=_run, daemon=True, name=f"m18-{handle_in.wa_message_id[:8]}")
+    t.start()
 
 
 def _post_n8n_event(webhook_url: str, payload: dict[str, object]) -> None:
@@ -165,7 +197,7 @@ async def inbound_webhook(request: Request, db: Session = Depends(get_db)):
                         continue
 
                     message_type = str(message.get("type") or "").strip().lower()
-                    if message_type not in {"text", "audio", "image"}:
+                    if message_type not in {"text", "audio", "image", "interactive"}:
                         continue
 
                     wa_message_id = str(message.get("id") or "").strip()
@@ -256,6 +288,39 @@ async def inbound_webhook(request: Request, db: Session = Depends(get_db)):
                                 "media_id": media_id,
                             }
                         )
+                    elif message_type == "interactive":
+                        interactive_block = message.get("interactive") or {}
+                        interactive_type = str(interactive_block.get("type") or "").strip().lower()
+                        if interactive_type != "nfm_reply":
+                            logger.info(
+                                "whatsapp inbound interactive non-nfm_reply wa_message_id=%s subtype=%s — skipped",
+                                wa_message_id,
+                                interactive_type,
+                            )
+                            continue
+                        nfm = interactive_block.get("nfm_reply") or {}
+                        raw_response_json = str(nfm.get("response_json") or "")
+                        try:
+                            flow_data: dict = json.loads(raw_response_json) if raw_response_json else {}
+                        except json.JSONDecodeError:
+                            flow_data = {}
+                        flow_token = str(flow_data.get("flow_token") or "").strip() or None
+                        stored_message_type = "flow_response"
+                        raw_payload_to_store = message
+                        n8n_payload.update(
+                            {
+                                "text": None,
+                                "message_type": "flow_response",
+                                "flow_response": flow_data,
+                                "flow_token": flow_token,
+                            }
+                        )
+                        logger.info(
+                            "WHATSAPP_FLOW_RESPONSE_RECEIVED wa_message_id=%s flow_token=%s keys=%s",
+                            wa_message_id,
+                            flow_token or "-",
+                            sorted(flow_data.keys()),
+                        )
 
                     try:
                         contact = db.execute(
@@ -335,33 +400,49 @@ async def inbound_webhook(request: Request, db: Session = Depends(get_db)):
                             )
                             ai_event = None
 
-                        if ai_event_created and ai_event is not None and settings.n8n_webhook_url:
-                            try:
-                                n8n_payload["thread_id"] = thread.id
-                                _post_n8n_event(
-                                    settings.n8n_webhook_url,
-                                    n8n_payload,
-                                )
-                                ai_event.status = "triggered"
-                                ai_event.last_error = None
-                                db.commit()
-                            except Exception as exc:
-                                db.rollback()
+                        if ai_event_created and ai_event is not None:
+                            n8n_payload["thread_id"] = thread.id
+                            if settings.conversation_engine_direct_webhook_enabled:
+                                # M18: dispatch to backend conversation engine
                                 try:
-                                    ai_event = db.execute(
-                                        select(AiEvent).where(AiEvent.wa_message_id == wa_message_id)
-                                    ).scalar_one_or_none()
-                                    if ai_event is not None:
-                                        ai_event.status = "failed"
-                                        ai_event.last_error = str(exc)
-                                        db.commit()
-                                except Exception:
+                                    _dispatch_to_engine(n8n_payload)
+                                    ai_event.status = "triggered"
+                                    ai_event.last_error = None
+                                    db.commit()
+                                except Exception as exc:
                                     db.rollback()
-                                logger.warning(
-                                    "whatsapp ai_event n8n trigger failed wa_message_id=%s",
-                                    wa_message_id,
-                                    exc_info=True,
-                                )
+                                    logger.warning(
+                                        "M18 engine dispatch failed wa_message_id=%s: %s",
+                                        wa_message_id,
+                                        exc,
+                                    )
+                            elif settings.n8n_webhook_url:
+                                # Legacy: forward to n8n
+                                try:
+                                    _post_n8n_event(
+                                        settings.n8n_webhook_url,
+                                        n8n_payload,
+                                    )
+                                    ai_event.status = "triggered"
+                                    ai_event.last_error = None
+                                    db.commit()
+                                except Exception as exc:
+                                    db.rollback()
+                                    try:
+                                        ai_event = db.execute(
+                                            select(AiEvent).where(AiEvent.wa_message_id == wa_message_id)
+                                        ).scalar_one_or_none()
+                                        if ai_event is not None:
+                                            ai_event.status = "failed"
+                                            ai_event.last_error = str(exc)
+                                            db.commit()
+                                    except Exception:
+                                        db.rollback()
+                                    logger.warning(
+                                        "whatsapp ai_event n8n trigger failed wa_message_id=%s",
+                                        wa_message_id,
+                                        exc_info=True,
+                                    )
                     except IntegrityError:
                         db.rollback()
                         dedup_after_race = db.execute(
@@ -435,6 +516,12 @@ async def inbound_webhook(request: Request, db: Session = Depends(get_db)):
 
                         existing_msg.status = incoming_status
                         db.commit()
+                        if incoming_status == "failed" and getattr(existing_msg, "direction", None) == "out":
+                            logger.error(
+                                "WHATSAPP_OUTBOUND_DELIVERY_FAILED wa_message_id=%s status=failed — "
+                                "Meta did not deliver outbound message (24h session window likely closed)",
+                                wa_message_id,
+                            )
                         logger.info(
                             "WHATSAPP_STATUS_PROCESSED status=%s wa_message_id=%s result=updated",
                             incoming_status,
