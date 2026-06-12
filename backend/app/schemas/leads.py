@@ -56,6 +56,7 @@ class LeadOut(BaseModel):
     telefono: str | None = None
     nombre: str | None = None
     apellido: str | None = None
+    email: str | None = None
 
     necesita_humano: bool
     motivo_perdida: str | None = None

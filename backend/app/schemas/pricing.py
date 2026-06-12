@@ -5,8 +5,8 @@ from pydantic import BaseModel, Field
 
 class PricingQuoteIn(BaseModel):
     tipo_vehiculo: str = Field(min_length=1, max_length=30)
-    zone_group: str = Field(min_length=1, max_length=50)
-    zone_detail: str = Field(min_length=1, max_length=80)
+    zone_group: str | None = Field(default=None, max_length=50)
+    zone_detail: str | None = Field(default=None, max_length=80)
 
 
 class PricingQuoteOut(BaseModel):

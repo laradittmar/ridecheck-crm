@@ -46,6 +46,26 @@ class FakePricingRepository:
         return None
 
 
+class FakePricingRepositoryNorte:
+    """Fake repository covering Norte zone cases for M13.3 Beccar alias tests."""
+
+    _BASE = {
+        "AUTO": FakePriceRow(tipo_vehiculo="AUTO", precio_base=130000),
+        "SUV_4X4_DEPORTIVO": FakePriceRow(tipo_vehiculo="SUV_4X4_DEPORTIVO", precio_base=140000),
+    }
+    _ZONES = {
+        "beccar":     FakeZone(zone_group="Norte", zone_detail="Beccar",    viaticos=0),
+        "san isidro": FakeZone(zone_group="Norte", zone_detail="San Isidro", viaticos=0),
+        "pilar":      FakeZone(zone_group="Norte", zone_detail="Pilar",      viaticos=50000),
+    }
+
+    def find_base_price(self, tipo_vehiculo: str):
+        return self._BASE.get(tipo_vehiculo)
+
+    def find_zone_by_group_and_detail(self, db, zone_group, zone_detail):
+        return self._ZONES.get((zone_detail or "").strip().lower())
+
+
 class FakeThreadRevisionRepository:
     def __init__(self):
         self.db = self
@@ -275,6 +295,56 @@ class BackendServiceTests(unittest.TestCase):
 
         self.assertEqual(result.business_hours, "09:00-18:00")
         self.assertGreater(len(result.slots), 0)
+
+
+class BeccarPricingTests(unittest.TestCase):
+    """M13.3 — Beccar must price with viaticos=0, same as San Isidro."""
+
+    def _service(self):
+        return PricingService(repository=FakePricingRepositoryNorte())
+
+    def test_beccar_suv_total_equals_base_no_viaticos(self):
+        quote = self._service().quote(
+            db=None,
+            tipo_vehiculo="SUV_4X4_DEPORTIVO",
+            zone_group="Norte",
+            zone_detail="Beccar",
+        )
+        self.assertEqual(quote.precio_base, 140000)
+        self.assertEqual(quote.viaticos, 0)
+        self.assertEqual(quote.precio_total, 140000)
+
+    def test_beccar_auto_total_equals_base_no_viaticos(self):
+        quote = self._service().quote(
+            db=None,
+            tipo_vehiculo="AUTO",
+            zone_group="Norte",
+            zone_detail="Beccar",
+        )
+        self.assertEqual(quote.precio_base, 130000)
+        self.assertEqual(quote.viaticos, 0)
+        self.assertEqual(quote.precio_total, 130000)
+
+    def test_san_isidro_suv_unchanged(self):
+        quote = self._service().quote(
+            db=None,
+            tipo_vehiculo="SUV_4X4_DEPORTIVO",
+            zone_group="Norte",
+            zone_detail="San Isidro",
+        )
+        self.assertEqual(quote.precio_base, 140000)
+        self.assertEqual(quote.viaticos, 0)
+        self.assertEqual(quote.precio_total, 140000)
+
+    def test_pilar_norte_viaticos_unchanged(self):
+        quote = self._service().quote(
+            db=None,
+            tipo_vehiculo="SUV_4X4_DEPORTIVO",
+            zone_group="Norte",
+            zone_detail="Pilar",
+        )
+        self.assertEqual(quote.viaticos, 50000)
+        self.assertEqual(quote.precio_total, 190000)
 
 
 if __name__ == "__main__":

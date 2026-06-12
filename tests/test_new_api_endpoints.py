@@ -15,12 +15,14 @@ BACKEND_DIR = ROOT_DIR / "backend"
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
+from app.api.leads import router as leads_router
 from app.api.pricing import get_pricing_service, router as pricing_router
 from app.api.routes.public_approval import router as public_approval_router
 from app.api.revision_items import api_router as revision_items_api_router
 from app.api.schedule import get_schedule_service, router as schedule_router
 from app.api.thread_revisions import get_thread_revision_service, router as thread_revisions_router
 from app.db import get_db
+from app.models import Lead
 
 
 @dataclass
@@ -308,6 +310,123 @@ class NewApiEndpointTests(unittest.TestCase):
 
         with TestClient(app) as client:
             response = client.patch("/api/revisions/999/appointment-approval", json={"status": "REJECTED"})
+
+        self.assertEqual(response.status_code, 404)
+
+
+# ---------------------------------------------------------------------------
+# M6 — Lead email / name persistence regression tests
+# ---------------------------------------------------------------------------
+
+class FakeLead:
+    def __init__(self, lead_id=1, email=None, nombre=None, apellido=None):
+        self.id = lead_id
+        self.estado = "CONSULTA_NUEVA"
+        self.flag = None
+        self.necesita_humano = False
+        self.motivo_perdida = None
+        self.telefono = "5491155550000"
+        self.nombre = nombre
+        self.apellido = apellido
+        self.email = email
+        self.canal = None
+        self.compro_el_auto = None
+        self.buscando_auto_set_at = None
+        self.feedback = None
+        self.created_at = datetime.now(timezone.utc)
+
+
+class FakeLeadDb:
+    def __init__(self, lead: FakeLead):
+        self._lead = lead
+        self.committed = False
+
+    def get(self, model, pk):
+        if model is Lead and pk == self._lead.id:
+            return self._lead
+        return None
+
+    def add(self, obj):
+        pass
+
+    def commit(self):
+        self.committed = True
+
+    def rollback(self):
+        pass
+
+    def refresh(self, obj):
+        pass
+
+
+class LeadPatchM6Tests(unittest.TestCase):
+    def _make_app(self, lead: FakeLead):
+        app = FastAPI()
+        app.include_router(leads_router)
+        db = FakeLeadDb(lead)
+        app.dependency_overrides[get_db] = lambda: db
+        return app, db
+
+    # TEST A — email is patched from full booking form
+    def test_lead_patch_email_from_booking_form(self):
+        lead = FakeLead(lead_id=10, email=None)
+        app, db = self._make_app(lead)
+
+        with TestClient(app) as client:
+            response = client.patch("/leads/10", json={"email": "agomelsky@gmail.com"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(lead.email, "agomelsky@gmail.com")
+        self.assertTrue(db.committed)
+
+    # TEST B — nombre and apellido are patched from full booking form
+    def test_lead_patch_nombre_apellido_from_booking_form(self):
+        lead = FakeLead(lead_id=11, nombre=None, apellido=None)
+        app, db = self._make_app(lead)
+
+        with TestClient(app) as client:
+            response = client.patch("/leads/11", json={"nombre": "Alejandro", "apellido": "Gomelsky"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(lead.nombre, "Alejandro")
+        self.assertEqual(lead.apellido, "Gomelsky")
+
+    # TEST C — full booking patch (nombre + apellido + email together)
+    def test_lead_patch_full_contact_fields(self):
+        lead = FakeLead(lead_id=12, nombre=None, apellido=None, email=None)
+        app, db = self._make_app(lead)
+
+        with TestClient(app) as client:
+            response = client.patch(
+                "/leads/12",
+                json={"nombre": "Alejandro", "apellido": "Gomelsky", "email": "agomelsky@gmail.com"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(lead.nombre, "Alejandro")
+        self.assertEqual(lead.apellido, "Gomelsky")
+        self.assertEqual(lead.email, "agomelsky@gmail.com")
+
+    # TEST D — do NOT overwrite existing email with null
+    def test_lead_patch_null_email_does_not_overwrite_existing(self):
+        lead = FakeLead(lead_id=13, email="existing@example.com")
+        app, db = self._make_app(lead)
+
+        with TestClient(app) as client:
+            # Sending null email — backend must leave existing value intact
+            response = client.patch("/leads/13", json={"nombre": "Alguien"})
+
+        self.assertEqual(response.status_code, 200)
+        # email was not in the payload, so it must remain unchanged
+        self.assertEqual(lead.email, "existing@example.com")
+
+    # TEST E — lead 404 still works (existing behavior preserved)
+    def test_lead_patch_returns_404_for_missing_lead(self):
+        lead = FakeLead(lead_id=99)
+        app, db = self._make_app(lead)
+
+        with TestClient(app) as client:
+            response = client.patch("/leads/999", json={"email": "x@y.com"})
 
         self.assertEqual(response.status_code, 404)
 

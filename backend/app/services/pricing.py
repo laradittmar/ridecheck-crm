@@ -29,7 +29,7 @@ class PricingService:
     def __init__(self, repository: PricingRepository):
         self.repository = repository
 
-    def quote(self, db: Session, tipo_vehiculo: str, zone_group: str, zone_detail: str) -> PricingQuote:
+    def quote(self, db: Session, tipo_vehiculo: str, zone_group: str | None, zone_detail: str | None) -> PricingQuote:
         canonical_tipo = self._canonical_vehicle_type(tipo_vehiculo)
         price_row = self.repository.find_base_price(canonical_tipo)
         if price_row is None:
