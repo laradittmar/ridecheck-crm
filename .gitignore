@@ -29,6 +29,7 @@ Thumbs.db
 
 # DB leftovers
 *.sqlite3
+*.sql
 
 # Temp
 tmp/
