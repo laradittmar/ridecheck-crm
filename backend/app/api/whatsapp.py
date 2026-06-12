@@ -22,6 +22,7 @@ from ..models import (
     WhatsAppThreadCandidate,
 )
 from ..schemas.whatsapp_api import (
+    InteractiveButton,
     LatestInboundMessageOut,
     LatestInboundOut,
     SetLatestInboundIn,
@@ -29,6 +30,12 @@ from ..schemas.whatsapp_api import (
     WhatsAppThreadCandidatePatch,
     WhatsAppThreadCandidateRead,
     WhatsAppThreadDisplayNamePatch,
+    WhatsAppSendFlowIn,
+    WhatsAppSendFlowOut,
+    WhatsAppSendInteractiveIn,
+    WhatsAppSendInteractiveOut,
+    WhatsAppSendListIn,
+    WhatsAppSendListOut,
     WhatsAppSendTextIn,
     WhatsAppSendTextOut,
     WhatsAppThreadStatePatch,
@@ -42,7 +49,7 @@ from ..services.db_errors import commit_or_400
 from ..services.unanswered_alert import reset_unanswered_alert
 from ..services.whatsapp_thread_state import build_thread_state_read, upsert_thread_state
 from ..services.whatsapp_threads import load_latest_inbound_message, load_recent_thread_messages, load_thread_payload
-from ..ui.whatsapp_ui import _send_whatsapp_cloud_text
+from ..ui.whatsapp_ui import _send_whatsapp_cloud_flow, _send_whatsapp_cloud_interactive, _send_whatsapp_cloud_list, _send_whatsapp_cloud_text
 
 router = APIRouter(prefix="/api/whatsapp", tags=["whatsapp"])
 thread_router = APIRouter(tags=["whatsapp"])
@@ -147,9 +154,16 @@ def _download_whatsapp_media_bytes(media_id: str) -> tuple[WhatsAppMediaInfoOut,
 
 
 def _guess_media_filename(media_id: str, mime_type: str | None) -> str:
-    extension = mimetypes.guess_extension(mime_type or "") or ".bin"
+    mime_base = (mime_type or "").split(";")[0].strip().lower()
+    extension = mimetypes.guess_extension(mime_base) or ".bin"
     if extension == ".oga":
         extension = ".ogg"
+    if mime_base in ("audio/ogg", "audio/opus"):
+        extension = ".ogg"
+    if mime_base == "audio/mpeg":
+        extension = ".mp3"
+    if mime_base == "audio/mp4":
+        extension = ".mp4"
     return f"{media_id}{extension}"
 
 
@@ -444,6 +458,156 @@ def send_thread_text(thread_id: int, payload: WhatsAppSendTextIn, db: Session = 
         raise HTTPException(status_code=502, detail=f"WhatsApp outbound send failed: {exc}") from exc
 
 
+def _store_outbound_and_send(
+    db: Session,
+    thread_id: int,
+    thread: WhatsAppThread,
+    to_wa_id: str,
+    body_text: str,
+    send_fn,
+) -> tuple[WhatsAppMessage, str]:
+    """Shared helper: persist outbound message then call send_fn(to_wa_id, ...) → wa_message_id."""
+    from zoneinfo import ZoneInfo
+    now_utc = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
+    outbound = WhatsAppMessage(
+        thread_id=thread_id,
+        wa_message_id=None,
+        direction="out",
+        status="pending",
+        timestamp=now_utc,
+        text=body_text,
+    )
+    db.add(outbound)
+    thread.last_message_at = now_utc
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        outbound.status = "sent"
+        db.add(outbound)
+        thread.last_message_at = now_utc
+        db.commit()
+    reset_unanswered_alert(db, thread_id)
+    db.commit()
+
+    try:
+        wa_message_id = send_fn(to_wa_id)
+        outbound.status = "sent"
+        outbound.wa_message_id = wa_message_id
+        db.add(outbound)
+        db.commit()
+        return outbound, wa_message_id
+    except Exception as exc:
+        db.rollback()
+        outbound.status = "failed"
+        db.add(outbound)
+        db.commit()
+        raise exc
+
+
+def _resolve_thread_wa_id(db: Session, thread_id: int) -> tuple[WhatsAppThread, str]:
+    thread_data = db.execute(
+        select(WhatsAppThread, WhatsAppContact.wa_id)
+        .join(WhatsAppContact, WhatsAppThread.contact_id == WhatsAppContact.id)
+        .where(WhatsAppThread.id == thread_id)
+    ).first()
+    if thread_data is None:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    to_wa_id = str(thread_data.wa_id or "").strip()
+    if not to_wa_id:
+        raise HTTPException(status_code=400, detail="Thread has no wa_id")
+    return thread_data[0], to_wa_id
+
+
+@router.post("/thread/{thread_id}/send-interactive", response_model=WhatsAppSendInteractiveOut)
+def send_thread_interactive(thread_id: int, payload: WhatsAppSendInteractiveIn, db: Session = Depends(get_db)):
+    """M16.3 — Send an interactive button message (max 3 buttons) to a WhatsApp thread."""
+    body_text = (payload.body or "").strip()
+    if not body_text:
+        raise HTTPException(status_code=400, detail="body is required")
+    if not payload.buttons:
+        raise HTTPException(status_code=400, detail="At least one button is required")
+
+    thread, to_wa_id = _resolve_thread_wa_id(db, thread_id)
+    buttons = [{"id": btn.id, "title": btn.title} for btn in payload.buttons]
+
+    try:
+        _, wa_message_id = _store_outbound_and_send(
+            db, thread_id, thread, to_wa_id, body_text,
+            lambda wa_id: _send_whatsapp_cloud_interactive(wa_id, body_text, buttons)[0],
+        )
+        return WhatsAppSendInteractiveOut(ok=True, thread_id=thread_id, wa_message_id=wa_message_id, body=body_text)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"WhatsApp interactive send failed: {exc}") from exc
+
+
+@router.post("/thread/{thread_id}/send-list", response_model=WhatsAppSendListOut)
+def send_thread_list(thread_id: int, payload: WhatsAppSendListIn, db: Session = Depends(get_db)):
+    """M16.4 — Send an interactive list message (up to 10 rows) to a WhatsApp thread."""
+    body_text = (payload.body or "").strip()
+    if not body_text:
+        raise HTTPException(status_code=400, detail="body is required")
+    if not payload.rows:
+        raise HTTPException(status_code=400, detail="At least one row is required")
+
+    thread, to_wa_id = _resolve_thread_wa_id(db, thread_id)
+    rows = [{"id": r.id, "title": r.title, "description": r.description} for r in payload.rows]
+
+    try:
+        _, wa_message_id = _store_outbound_and_send(
+            db, thread_id, thread, to_wa_id, body_text,
+            lambda wa_id: _send_whatsapp_cloud_list(
+                wa_id, body_text, payload.button_label, payload.section_title, rows
+            )[0],
+        )
+        return WhatsAppSendListOut(ok=True, thread_id=thread_id, wa_message_id=wa_message_id, body=body_text)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"WhatsApp list send failed: {exc}") from exc
+
+
+@router.post("/thread/{thread_id}/send-flow", response_model=WhatsAppSendFlowOut)
+def send_thread_flow(thread_id: int, payload: WhatsAppSendFlowIn, db: Session = Depends(get_db)):
+    """M17 — Send a WhatsApp Flow button to a thread. The Flow collects booking data
+    (name, email, address, seller type, etc.) natively within WhatsApp.
+    Requires WHATSAPP_FLOW_ID env var to be set."""
+    settings = get_settings()
+    flow_id = (settings.whatsapp_flow_id or "").strip()
+    if not flow_id:
+        raise HTTPException(status_code=503, detail="WHATSAPP_FLOW_ID not configured")
+
+    body_text = (payload.body or "").strip()
+    if not body_text:
+        raise HTTPException(status_code=400, detail="body is required")
+
+    thread, to_wa_id = _resolve_thread_wa_id(db, thread_id)
+
+    from zoneinfo import ZoneInfo
+    import time as _time
+    flow_token = (payload.flow_token or "").strip() or f"{thread_id}-{int(_time.time())}"
+    cta_label = (payload.cta_label or "Completar datos").strip()
+
+    try:
+        _, wa_message_id = _store_outbound_and_send(
+            db, thread_id, thread, to_wa_id, body_text,
+            lambda wa_id: _send_whatsapp_cloud_flow(
+                to_wa_id=wa_id,
+                flow_id=flow_id,
+                flow_token=flow_token,
+                body_text=body_text,
+                cta_label=cta_label,
+            )[0],
+        )
+        return WhatsAppSendFlowOut(
+            ok=True,
+            thread_id=thread_id,
+            wa_message_id=wa_message_id,
+            body=body_text,
+            flow_token=flow_token,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"WhatsApp Flow send failed: {exc}") from exc
+
+
 @router.post("/thread/{thread_id}/link", response_model=WhatsAppThreadOut)
 def link_thread(thread_id: int, payload: WhatsAppThreadLinkIn, db: Session = Depends(get_db)):
     thread = db.get(WhatsAppThread, thread_id)
@@ -486,6 +650,93 @@ def set_thread_latest_inbound(thread_id: int, payload: SetLatestInboundIn, db: S
 def get_thread_latest_inbound_ephemeral(thread_id: int, db: Session = Depends(get_db)):
     thread = _require_thread(db, thread_id)
     return LatestInboundOut(thread_id=thread_id, wa_message_id=thread.latest_inbound_wa_message_id)
+
+
+class SendToPhoneIn(BaseModel):
+    wa_id: str
+    text: str
+    reply_to_message_id: str | None = None
+
+
+class SendToPhoneOut(BaseModel):
+    ok: bool
+    wa_message_id: str | None = None
+    note: str | None = None
+
+
+@router.post("/send-to-phone", response_model=SendToPhoneOut)
+def send_to_phone(payload: SendToPhoneIn, db: Session = Depends(get_db)):
+    """Send a WhatsApp text message to an arbitrary wa_id (no thread required).
+    Used for internal notifications, e.g. Julián booking alerts.
+    ok=True means Meta accepted the request (WAMID issued). Actual delivery requires
+    the recipient to have messaged the business number within the last 24 hours.
+    Saves message to DB so Meta delivery status webhooks are tracked and failures
+    surface as ERROR-level logs (not silently discarded)."""
+    from zoneinfo import ZoneInfo
+    wa_id = (payload.wa_id or "").strip()
+    text = (payload.text or "").strip()
+    if not wa_id:
+        raise HTTPException(status_code=400, detail="wa_id is required")
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+
+    now_utc = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
+
+    # Find or create contact + thread so delivery status webhooks can update the record.
+    contact = db.execute(
+        select(WhatsAppContact).where(WhatsAppContact.wa_id == wa_id)
+    ).scalar_one_or_none()
+    if contact is None:
+        contact = WhatsAppContact(wa_id=wa_id, display_name=None, phone=None)
+        db.add(contact)
+        db.flush()
+
+    thread = db.execute(
+        select(WhatsAppThread)
+        .where(WhatsAppThread.contact_id == contact.id)
+        .order_by(WhatsAppThread.id.asc())
+    ).scalars().first()
+    if thread is None:
+        thread = WhatsAppThread(contact_id=contact.id, lead_id=None, unread_count=0)
+        db.add(thread)
+        db.flush()
+
+    db.commit()
+
+    # Send to Meta first, then persist the result for delivery tracking.
+    send_exc: Exception | None = None
+    wa_message_id: str | None = None
+    final_status = "failed"
+    try:
+        wa_message_id, _ = _send_whatsapp_cloud_text(to_wa_id=wa_id, text=text)
+        final_status = "sent"
+    except Exception as exc:
+        send_exc = exc
+
+    # Save the message record with the real status so the webhook handler can track delivery.
+    try:
+        outbound = WhatsAppMessage(
+            thread_id=thread.id,
+            wa_message_id=wa_message_id,
+            direction="out",
+            status=final_status,
+            timestamp=now_utc,
+            text=text,
+        )
+        db.add(outbound)
+        thread.last_message_at = now_utc
+        db.commit()
+    except Exception:
+        db.rollback()
+
+    if send_exc is not None:
+        raise HTTPException(status_code=502, detail=f"WhatsApp send failed: {send_exc}") from send_exc
+
+    return SendToPhoneOut(
+        ok=True,
+        wa_message_id=wa_message_id,
+        note="Meta accepted. If Julian has not messaged this number within 24h, delivery will fail.",
+    )
 
 
 @thread_router.post("/whatsapp/thread/{thread_id}/link-lead", response_model=WhatsAppThreadOut)

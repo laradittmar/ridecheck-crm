@@ -75,6 +75,9 @@ class WhatsAppThreadStateRead(BaseModel):
     customer_name: str | None = None
     home_zone_group: str | None = None
     home_zone_detail: str | None = None
+    preferred_day: str | None = None
+    preferred_time: str | None = None
+    flow_booking_token: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -91,6 +94,9 @@ class WhatsAppThreadStatePatch(BaseModel):
     customer_name: str | None = Field(default=None, max_length=120)
     home_zone_group: str | None = Field(default=None, max_length=50)
     home_zone_detail: str | None = Field(default=None, max_length=80)
+    preferred_day: str | None = Field(default=None, max_length=20)
+    preferred_time: str | None = Field(default=None, max_length=10)
+    flow_booking_token: str | None = Field(default=None, max_length=120)
 
 
 class WhatsAppThreadCandidateRead(BaseModel):
@@ -148,3 +154,58 @@ class WhatsAppThreadCandidatePatch(BaseModel):
     direccion_texto: str | None = None
     source_text: str | None = None
     status: str | None = Field(default=None, max_length=30)
+
+
+# ── M16.3 / M16.4 — Interactive messaging ──────────────────────────────────
+
+class InteractiveButton(BaseModel):
+    id: str = Field(max_length=256)
+    title: str = Field(max_length=20)
+
+
+class WhatsAppSendInteractiveIn(BaseModel):
+    body: str
+    buttons: list[InteractiveButton] = Field(min_length=1, max_length=3)
+
+
+class WhatsAppSendInteractiveOut(BaseModel):
+    ok: bool
+    thread_id: int
+    wa_message_id: str
+    body: str
+
+
+class WhatsAppListRow(BaseModel):
+    id: str = Field(max_length=200)
+    title: str = Field(max_length=24)
+    description: str | None = Field(default=None, max_length=72)
+
+
+class WhatsAppSendListIn(BaseModel):
+    body: str
+    button_label: str = Field(default="Ver opciones", max_length=20)
+    section_title: str = Field(default="Opciones", max_length=24)
+    rows: list[WhatsAppListRow] = Field(min_length=1, max_length=10)
+
+
+class WhatsAppSendListOut(BaseModel):
+    ok: bool
+    thread_id: int
+    wa_message_id: str
+    body: str
+
+
+# ── M17 — Flow messaging ────────────────────────────────────────────────────
+
+class WhatsAppSendFlowIn(BaseModel):
+    body: str
+    cta_label: str = "Completar datos"
+    flow_token: str | None = None
+
+
+class WhatsAppSendFlowOut(BaseModel):
+    ok: bool
+    thread_id: int
+    wa_message_id: str
+    body: str
+    flow_token: str | None = None

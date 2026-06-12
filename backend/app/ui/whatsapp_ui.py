@@ -127,8 +127,217 @@ def _send_whatsapp_cloud_text(to_wa_id: str, text: str) -> tuple[str, int]:
     if isinstance(messages, list) and messages and isinstance(messages[0], dict):
         wa_message_id = str(messages[0].get("id") or "").strip()
         if wa_message_id:
+            logger.info("WHATSAPP_OUTBOUND_WAMID to=%s wamid=%s", to_wa_id, wa_message_id)
             return wa_message_id, status_code
     raise RuntimeError(f"Unexpected response from WhatsApp Cloud API: {body}")
+
+
+def _send_whatsapp_cloud_interactive(
+    to_wa_id: str,
+    body_text: str,
+    buttons: list[dict[str, str]],
+) -> tuple[str, int]:
+    """Send a WhatsApp interactive button message (M16.3 — max 3 buttons)."""
+    settings = get_settings()
+    token = (settings.whatsapp_token or "").strip()
+    phone_number_id = (settings.whatsapp_phone_number_id or "").strip()
+    logger.info("WHATSAPP_OUTBOUND_INTERACTIVE_ATTEMPT to=%s", to_wa_id)
+
+    if not token or token.lower() == "dummy":
+        logger.info("WHATSAPP_OUTBOUND_INTERACTIVE_RESPONSE status=200 mode=dummy")
+        return _build_test_wa_message_id(datetime.now(timezone.utc)), 200
+
+    if not phone_number_id:
+        raise RuntimeError("WHATSAPP_PHONE_NUMBER_ID missing")
+
+    endpoint = f"https://graph.facebook.com/v19.0/{phone_number_id}/messages"
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_wa_id,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": body_text},
+            "action": {
+                "buttons": [
+                    {"type": "reply", "reply": {"id": btn["id"], "title": btn["title"]}}
+                    for btn in buttons
+                ]
+            },
+        },
+    }
+    req = urlrequest.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+    )
+    logger.info("WHATSAPP_OUTBOUND_INTERACTIVE_META endpoint=%s", endpoint)
+    try:
+        with urlrequest.urlopen(req, timeout=15) as resp:
+            status_code = int(getattr(resp, "status", 200))
+            body = resp.read().decode("utf-8", errors="replace")
+    except error.HTTPError as exc:
+        err_body = exc.read().decode("utf-8", errors="replace")
+        logger.error("WHATSAPP_OUTBOUND_INTERACTIVE_RESPONSE status=%s body=%s", exc.code, err_body)
+        raise RuntimeError(f"HTTP {exc.code}: {err_body}") from exc
+
+    logger.info("WHATSAPP_OUTBOUND_INTERACTIVE_RESPONSE status=%s", status_code)
+    response_data = json.loads(body) if body.strip() else {}
+    messages = response_data.get("messages") if isinstance(response_data, dict) else None
+    if isinstance(messages, list) and messages and isinstance(messages[0], dict):
+        wa_message_id = str(messages[0].get("id") or "").strip()
+        if wa_message_id:
+            logger.info("WHATSAPP_OUTBOUND_INTERACTIVE_WAMID to=%s wamid=%s", to_wa_id, wa_message_id)
+            return wa_message_id, status_code
+    raise RuntimeError(f"Unexpected interactive response from WhatsApp Cloud API: {body}")
+
+
+def _send_whatsapp_cloud_list(
+    to_wa_id: str,
+    body_text: str,
+    button_label: str,
+    section_title: str,
+    rows: list[dict],
+) -> tuple[str, int]:
+    """Send a WhatsApp interactive list message (M16.4 — up to 10 rows)."""
+    settings = get_settings()
+    token = (settings.whatsapp_token or "").strip()
+    phone_number_id = (settings.whatsapp_phone_number_id or "").strip()
+    logger.info("WHATSAPP_OUTBOUND_LIST_ATTEMPT to=%s rows=%d", to_wa_id, len(rows))
+
+    if not token or token.lower() == "dummy":
+        logger.info("WHATSAPP_OUTBOUND_LIST_RESPONSE status=200 mode=dummy")
+        return _build_test_wa_message_id(datetime.now(timezone.utc)), 200
+
+    if not phone_number_id:
+        raise RuntimeError("WHATSAPP_PHONE_NUMBER_ID missing")
+
+    endpoint = f"https://graph.facebook.com/v19.0/{phone_number_id}/messages"
+    section_rows = []
+    for r in rows:
+        row_entry: dict = {"id": r["id"], "title": r["title"]}
+        if r.get("description"):
+            row_entry["description"] = r["description"]
+        section_rows.append(row_entry)
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_wa_id,
+        "type": "interactive",
+        "interactive": {
+            "type": "list",
+            "body": {"text": body_text},
+            "action": {
+                "button": button_label,
+                "sections": [{"title": section_title, "rows": section_rows}],
+            },
+        },
+    }
+    req = urlrequest.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+    )
+    logger.info("WHATSAPP_OUTBOUND_LIST_META endpoint=%s", endpoint)
+    try:
+        with urlrequest.urlopen(req, timeout=15) as resp:
+            status_code = int(getattr(resp, "status", 200))
+            body = resp.read().decode("utf-8", errors="replace")
+    except error.HTTPError as exc:
+        err_body = exc.read().decode("utf-8", errors="replace")
+        logger.error("WHATSAPP_OUTBOUND_LIST_RESPONSE status=%s body=%s", exc.code, err_body)
+        raise RuntimeError(f"HTTP {exc.code}: {err_body}") from exc
+
+    logger.info("WHATSAPP_OUTBOUND_LIST_RESPONSE status=%s", status_code)
+    response_data = json.loads(body) if body.strip() else {}
+    messages = response_data.get("messages") if isinstance(response_data, dict) else None
+    if isinstance(messages, list) and messages and isinstance(messages[0], dict):
+        wa_message_id = str(messages[0].get("id") or "").strip()
+        if wa_message_id:
+            logger.info("WHATSAPP_OUTBOUND_LIST_WAMID to=%s wamid=%s", to_wa_id, wa_message_id)
+            return wa_message_id, status_code
+    raise RuntimeError(f"Unexpected list response from WhatsApp Cloud API: {body}")
+
+
+def _send_whatsapp_cloud_flow(
+    to_wa_id: str,
+    flow_id: str,
+    flow_token: str,
+    body_text: str,
+    cta_label: str = "Completar datos",
+) -> tuple[str, int]:
+    """M17 — Send a WhatsApp Flow button message (data-collection mode, no back-end)."""
+    settings = get_settings()
+    token = (settings.whatsapp_token or "").strip()
+    phone_number_id = (settings.whatsapp_phone_number_id or "").strip()
+    logger.info("WHATSAPP_OUTBOUND_FLOW_ATTEMPT to=%s flow_id=%s token=%s", to_wa_id, flow_id, flow_token)
+
+    if not token or token.lower() == "dummy":
+        logger.info("WHATSAPP_OUTBOUND_FLOW_RESPONSE status=200 mode=dummy")
+        return _build_test_wa_message_id(datetime.now(timezone.utc)), 200
+
+    if not phone_number_id:
+        raise RuntimeError("WHATSAPP_PHONE_NUMBER_ID missing")
+    if not flow_id:
+        raise RuntimeError("WHATSAPP_FLOW_ID missing")
+
+    endpoint = f"https://graph.facebook.com/v19.0/{phone_number_id}/messages"
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_wa_id,
+        "type": "interactive",
+        "interactive": {
+            "type": "flow",
+            "body": {"text": body_text},
+            "action": {
+                "name": "flow",
+                "parameters": {
+                    "flow_message_version": "3",
+                    "flow_token": flow_token,
+                    "flow_id": flow_id,
+                    "flow_cta": cta_label,
+                    "flow_action": "navigate",
+                    "flow_action_payload": {"screen": "MAIN"},
+                },
+            },
+        },
+    }
+    req = urlrequest.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+    )
+    logger.info("WHATSAPP_OUTBOUND_FLOW_META endpoint=%s", endpoint)
+    try:
+        with urlrequest.urlopen(req, timeout=15) as resp:
+            status_code = int(getattr(resp, "status", 200))
+            body = resp.read().decode("utf-8", errors="replace")
+    except error.HTTPError as exc:
+        err_body = exc.read().decode("utf-8", errors="replace")
+        logger.error("WHATSAPP_OUTBOUND_FLOW_RESPONSE status=%s body=%s", exc.code, err_body)
+        raise RuntimeError(f"HTTP {exc.code}: {err_body}") from exc
+
+    logger.info("WHATSAPP_OUTBOUND_FLOW_RESPONSE status=%s", status_code)
+    response_data = json.loads(body) if body.strip() else {}
+    messages = response_data.get("messages") if isinstance(response_data, dict) else None
+    if isinstance(messages, list) and messages and isinstance(messages[0], dict):
+        wa_message_id = str(messages[0].get("id") or "").strip()
+        if wa_message_id:
+            logger.info("WHATSAPP_OUTBOUND_FLOW_WAMID to=%s wamid=%s", to_wa_id, wa_message_id)
+            return wa_message_id, status_code
+    raise RuntimeError(f"Unexpected flow response from WhatsApp Cloud API: {body}")
 
 
 def _avatar_initials(display_name: str | None) -> str:

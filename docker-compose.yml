@@ -34,6 +34,7 @@
       RESEND_API_KEY: ${RESEND_API_KEY}
       INTERNAL_BOOKING_EMAIL_FROM: "notificaciones@ridecheck.ar"
       INTERNAL_BOOKING_EMAIL_TO: ${INTERNAL_BOOKING_EMAIL_TO:-julian@ridecheck.ar}
+      WHATSAPP_FLOW_ID: "1644218879979041"
     ports:
       - "8000:8000"
     depends_on:
