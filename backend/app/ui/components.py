@@ -44,7 +44,15 @@ def render_sidebar_nav(
         f'<a href="{html_lib.escape(href, quote=True)}"><span class="navIcon{extra_cls}">{icon}</span><span class="navLabel">{html_lib.escape(label)}</span></a>'
         for href, label, icon, extra_cls in items
     )
-    return f'<div class="nav">{links}</div>'
+    active_script = (
+        "<script>(function(){"
+        "var seg='/'+location.pathname.split('/')[1];"
+        "document.querySelectorAll('.nav a').forEach(function(a){"
+        "var h=(a.getAttribute('href')||'').split('?')[0];"
+        "if(seg.length>1&&h.startsWith(seg))a.classList.add('active');"
+        "});})();</script>"
+    )
+    return f'<div class="nav">{links}</div>{active_script}'
 
 
 def render_sidebar_ai_block() -> str:
