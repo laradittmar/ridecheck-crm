@@ -601,7 +601,8 @@ class ConversationEngine:
             flow_id = (self.settings.whatsapp_flow_id or "").strip()
             flow_token = f"{ctx.thread.id}-{int(_time.time())}"
             state.flow_booking_token = flow_token
-            state.last_stage = STAGE_FLOW_SENT
+            # last_stage stays SCHEDULING — flow_booking_token signals the form was sent.
+            # Stage only advances to BOOKED when the form response arrives.
             self.db.commit()
 
             if not flow_id:
