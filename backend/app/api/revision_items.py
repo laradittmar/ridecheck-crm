@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from ..db import get_db
-from ..models import Revision
+from ..models import Lead, Revision
 from ..schemas.revisions import RevisionAppointmentApprovalUpdate, RevisionOut, RevisionUpdate
 from ..services.db_errors import commit_or_400
 from .revisions import _apply_revision_update
@@ -40,6 +40,10 @@ def update_revision_appointment_approval(
     if payload.status == "APPROVED":
         revision.appointment_approval_status = "APPROVED"
         revision.appointment_approved_at = datetime.utcnow()
+        if revision.lead_id:
+            lead = db.get(Lead, revision.lead_id)
+            if lead and lead.estado == "COORDINAR_DISPONIBILIDAD":
+                lead.estado = "AGENDADO"
     else:
         revision.appointment_approval_status = "REJECTED"
 

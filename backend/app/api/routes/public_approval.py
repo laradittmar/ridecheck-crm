@@ -7,7 +7,7 @@ from fastapi.responses import HTMLResponse
 from sqlalchemy.orm import Session
 
 from ...db import get_db
-from ...models import ThreadRevision
+from ...models import Lead, ThreadRevision, WhatsAppThread
 
 
 router = APIRouter(prefix="/public", tags=["public-approval"])
@@ -37,6 +37,13 @@ def approve_revision_appointment(
     revision.appointment_approval_status = "APPROVED"
     revision.appointment_approved_at = datetime.utcnow()
     db.add(revision)
+
+    thread = db.get(WhatsAppThread, revision.thread_id)
+    if thread and thread.lead_id:
+        lead = db.get(Lead, thread.lead_id)
+        if lead and lead.estado == "COORDINAR_DISPONIBILIDAD":
+            lead.estado = "AGENDADO"
+
     db.commit()
 
     return HTMLResponse("<html><body><h2>✅ Turno confirmado. ¡Gracias!</h2></body></html>")

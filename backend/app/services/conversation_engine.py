@@ -38,6 +38,7 @@ from ..models import (
     Lead,
     Revision,
     ThreadRevision,
+    ViaticosZone,
     WhatsAppContact,
     WhatsAppMessage,
     WhatsAppThread,
@@ -51,7 +52,7 @@ from ..schemas.conversation import (
     ConversationHandleOut,
 )
 from ..schemas.schedule import ScheduleCheckIn
-from ..services.pricing import PricingNotFoundError, PricingService
+from ..services.pricing import PricingNotFoundError, PricingQuote, PricingService
 from ..services.schedule import ScheduleService
 from ..services.unanswered_alert import reset_unanswered_alert
 from ..services.vehicle_catalog import VehicleMatch, lookup_vehicle
@@ -350,6 +351,8 @@ class ConversationEngine:
             lead.apellido = buyer_last
         if canal and not lead.canal:
             lead.canal = canal
+        if buyer_email and not lead.email:
+            lead.email = buyer_email
 
         # Thread state
         state.current_revision_id = thread_rev.id
@@ -444,21 +447,42 @@ class ConversationEngine:
                     return result
 
         # ── Deterministic vehicle catalog lookup (pre-AI) ─────────────────
-        # Scan all user messages for a known vehicle alias. If found, we
-        # inject the result into the AI prompt AND enforce it after AI output
-        # so tipo_vehiculo is never guessed/hallucinated.
-        combined_user_text = " ".join(ai_input_messages)
-        pre_detected_vehicle = lookup_vehicle(combined_user_text)
+        # Search across all recent messages (not just current burst) so a
+        # vehicle name from a prior turn is still recognised.
+        all_recent_text = " ".join(
+            list(event.recent_user_messages or []) + list(ai_input_messages)
+        )
+        pre_detected_vehicle = lookup_vehicle(all_recent_text)
         if pre_detected_vehicle:
             logger.info(
                 "M18 vehicle catalog hit thread_id=%s alias=%r tipo=%s confidence=%s",
                 ctx.thread.id, pre_detected_vehicle.matched_alias,
                 pre_detected_vehicle.tipo_vehiculo, pre_detected_vehicle.confidence,
             )
+            # Proactively create a candidate when catalog fires but none exists yet.
+            if not ctx.candidates:
+                self._create_candidate_from_catalog(ctx, state, pre_detected_vehicle)
+
+        # ── Pre-AI zone detection ──────────────────────────────────────────
+        # Look up zone in DB from text so zone_group is deterministic (not
+        # guessed) before the AI runs. Also populates state.home_zone_group.
+        if not state.home_zone_detail:
+            zone_hit = self._extract_zone_from_text(all_recent_text)
+            if zone_hit:
+                state.home_zone_detail = zone_hit.zone_detail
+                if zone_hit.zone_group:
+                    state.home_zone_group = zone_hit.zone_group
+
+        # Normalise zone_group when detail is known but group is still blank.
+        self._normalize_zone_from_db(ctx, state)
+
+        # ── Pre-AI deterministic price quote ──────────────────────────────
+        real_price_quote = self._compute_price_quote(ctx, state)
 
         messages_for_ai = self._build_ai_messages(
             ctx, event, ai_input_messages,
             pre_detected_vehicle=pre_detected_vehicle,
+            real_price_quote=real_price_quote,
         )
 
         try:
@@ -479,6 +503,9 @@ class ConversationEngine:
         extracted = decision.get("extracted") or {}
         self._apply_extracted(ctx, state, extracted)
 
+        # Normalise zone_group again in case AI extracted a zone_detail.
+        self._normalize_zone_from_db(ctx, state)
+
         # Candidate updates
         self._apply_candidate(ctx, decision.get("candidate") or {})
 
@@ -489,9 +516,27 @@ class ConversationEngine:
         if pre_detected_vehicle:
             self._enforce_catalog_vehicle(ctx, pre_detected_vehicle)
 
+        # Sync state zone onto focus candidate when candidate fields are blank.
+        focus_after = self._focus_candidate(ctx)
+        if focus_after:
+            if state.home_zone_group and not focus_after.zone_group:
+                focus_after.zone_group = state.home_zone_group
+            if state.home_zone_detail and not focus_after.zone_detail:
+                focus_after.zone_detail = state.home_zone_detail
+
+        # Recompute price after all extractions have run.
+        real_price_quote = self._compute_price_quote(ctx, state)
+
         # Lead flag — only allowed values, engine validates
         new_flag = decision.get("lead_flag")
         flag_accepted = new_flag and new_flag in _ALLOWED_FLAGS
+        # Guard: never set PRESUPUESTO_ENVIADO without a deterministic price.
+        if flag_accepted and new_flag == "PRESUPUESTO_ENVIADO" and real_price_quote is None:
+            logger.warning(
+                "M18 blocking PRESUPUESTO_ENVIADO — no deterministic price thread_id=%s",
+                ctx.thread.id,
+            )
+            flag_accepted = False
         if flag_accepted and new_flag != lead.flag:
             lead.flag = new_flag
             if new_flag == "PRESUPUESTO_ENVIADO":
@@ -648,6 +693,7 @@ class ConversationEngine:
         event: ConversationHandleIn,
         ai_input_messages: list[str],
         pre_detected_vehicle: VehicleMatch | None = None,
+        real_price_quote: "PricingQuote | None" = None,
     ) -> list[dict]:
         lead = ctx.lead
         assert lead is not None
@@ -655,22 +701,14 @@ class ConversationEngine:
         assert state is not None
         focus = self._focus_candidate(ctx)
 
-        # Pre-calculated price (inject if available)
+        # Pre-calculated price (injected from caller — never computed inline)
         precio_info = ""
-        if focus and focus.tipo_vehiculo and (state.home_zone_group or state.home_zone_detail):
-            try:
-                q = self._pricing.quote(
-                    db=self.db,
-                    tipo_vehiculo=focus.tipo_vehiculo,
-                    zone_group=state.home_zone_group or "",
-                    zone_detail=state.home_zone_detail or "",
-                )
-                precio_info = (
-                    f"\n\nPRECIO CALCULADO (usalo si vas a cotizar): "
-                    f"${q.precio_total:,.0f} (base ${q.precio_base:,.0f} + viáticos ${q.viaticos:,.0f})"
-                ).replace(",", ".")
-            except PricingNotFoundError:
-                pass
+        if real_price_quote is not None:
+            q = real_price_quote
+            precio_info = (
+                f"\n\nPRECIO CALCULADO (usalo exactamente si vas a cotizar): "
+                f"${q.precio_total:,.0f} (base ${q.precio_base:,.0f} + viáticos ${q.viaticos:,.0f})"
+            ).replace(",", ".")
 
         # History: prefer n8n-provided arrays, fall back to DB messages
         history_lines: list[str] = []
@@ -715,6 +753,11 @@ class ConversationEngine:
                 f"  → Usar EXACTAMENTE este tipo_vehiculo en el campo candidate.tipo_vehiculo."
             )
 
+        # Candidate id for update actions (AI must reference it explicitly)
+        focus_id_block = ""
+        if focus and focus.id:
+            focus_id_block = f"\n- ID candidato en foco: {focus.id} (usalo en candidate.id cuando hagas action=update)"
+
         system_prompt = f"""Sos el asistente de Ridecheck, servicio de revisión pre-compra de autos en Argentina. Ayudás a coordinar inspecciones antes de que el cliente compre un vehículo usado.
 
 ESTADO ACTUAL:
@@ -722,19 +765,20 @@ ESTADO ACTUAL:
 - Flag del lead: {flag}
 - Nombre del cliente: {customer}
 - Zona: {zone}
-- Vehículo en foco: {vehicle_txt}{precio_info}{detected_vehicle_block}
+- Vehículo en foco: {vehicle_txt}{focus_id_block}{precio_info}{detected_vehicle_block}
 
 HISTORIAL RECIENTE:
 {history}
 
 REGLAS DE NEGOCIO:
 1. PRESUPUESTANDO → colectá tipo de vehículo, zona/ciudad y tipo de vendedor (agencia/particular). Podés pedir marca/modelo/año también.
-2. Cuando tenés tipo_vehiculo + zona → cotizá. Si hay precio arriba, incluilo y seteá lead_flag="PRESUPUESTO_ENVIADO".
+2. Cuando tenés tipo_vehiculo + zona → cotizá SÓLO si aparece "PRECIO CALCULADO" arriba. Incluí ese precio exacto y seteá lead_flag="PRESUPUESTO_ENVIADO". Si no hay PRECIO CALCULADO, pedí la info faltante, NO cotices.
 3. Aceptación ("sí", "dale", "ok", "me sirve", "avanzamos") → lead_flag="ACEPTADO".
 4. Etapa SCHEDULING → preguntá qué día y horario le viene mejor.
 5. Derivá a humano si hay queja, solicitud especial o no podés resolver → needs_human=true.
 6. NUNCA uses lead_flag="PERDIDO", "BUSCANDO_AUTO", ni "RECOMPRA".
 7. Respondé en español, registro informal argentino (voseo), conciso.
+8. NUNCA inventes ni calcules precios. El único precio válido es el que aparece en PRECIO CALCULADO.
 
 TIPOS DE VEHÍCULO VÁLIDOS: AUTO, SUV_4X4_DEPORTIVO, SUV/4x4, CLASICO, MOTO, ESCANEO_MOTOR
 
@@ -928,9 +972,15 @@ Respondé SOLO con JSON válido:
                 state.current_focus_candidate_id = candidate.id
             ctx.candidates.insert(0, candidate)
 
-        elif action == "update" and candidate_data.get("id"):
-            target_id = int(candidate_data["id"])
-            target = next((c for c in ctx.candidates if c.id == target_id), None)
+        elif action == "update":
+            raw_id = candidate_data.get("id")
+            if raw_id:
+                target_id = int(raw_id)
+                target = next((c for c in ctx.candidates if c.id == target_id), None)
+            else:
+                # AI omitted id — fall back to the current focus candidate.
+                target = self._focus_candidate(ctx)
+                target_id = target.id if target else None
             if target is None:
                 return
             for k in ("marca", "modelo", "version_text", "anio", "tipo_vehiculo",
@@ -955,6 +1005,8 @@ Respondé SOLO con JSON válido:
         """
         focus = self._focus_candidate(ctx)
         if focus is None:
+            # AI returned action=none but catalog hit — create the candidate now.
+            self._create_candidate_from_catalog(ctx, ctx.state, match)
             return
         if focus.tipo_vehiculo != match.tipo_vehiculo:
             logger.info(
@@ -966,6 +1018,80 @@ Respondé SOLO con JSON válido:
             focus.marca = match.marca
         if not focus.modelo:
             focus.modelo = match.modelo
+
+    # ── Deterministic helper methods ──────────────────────────────────────
+
+    def _create_candidate_from_catalog(
+        self, ctx: _Context, state: "WhatsAppThreadState | None", match: VehicleMatch
+    ) -> None:
+        candidate = WhatsAppThreadCandidate(
+            thread_id=ctx.thread.id,
+            marca=match.marca,
+            modelo=match.modelo,
+            tipo_vehiculo=match.tipo_vehiculo,
+            zone_group=state.home_zone_group if state else None,
+            zone_detail=state.home_zone_detail if state else None,
+            status="current_focus",
+        )
+        self.db.add(candidate)
+        self.db.flush()
+        if state:
+            state.current_focus_candidate_id = candidate.id
+        ctx.candidates.insert(0, candidate)
+        logger.info(
+            "M18 proactive candidate created thread_id=%s candidate=%s tipo=%s",
+            ctx.thread.id, candidate.id, match.tipo_vehiculo,
+        )
+
+    def _extract_zone_from_text(self, text: str) -> "ViaticosZone | None":
+        from sqlalchemy import select as _select
+        normalized_text = " ".join(text.lower().split())
+        zones = list(self.db.execute(_select(ViaticosZone)).scalars().all())
+        # Longer detail strings first to avoid partial matches shadowing full names.
+        zones_sorted = sorted(zones, key=lambda z: len(z.zone_detail or ""), reverse=True)
+        for zone in zones_sorted:
+            if not zone.zone_detail:
+                continue
+            zone_norm = " ".join(zone.zone_detail.lower().split())
+            if zone_norm in normalized_text:
+                return zone
+        return None
+
+    def _normalize_zone_from_db(self, ctx: _Context, state: "WhatsAppThreadState | None") -> None:
+        if not state:
+            return
+        if state.home_zone_detail and not state.home_zone_group:
+            zone = self._pricing.repository.find_zone_by_group_and_detail(
+                db=self.db,
+                zone_group=None,
+                zone_detail=state.home_zone_detail,
+            )
+            if zone and zone.zone_group:
+                state.home_zone_group = zone.zone_group
+
+    def _compute_price_quote(
+        self, ctx: _Context, state: "WhatsAppThreadState | None"
+    ) -> "PricingQuote | None":
+        if not state:
+            return None
+        focus = self._focus_candidate(ctx)
+        if not focus or not focus.tipo_vehiculo:
+            return None
+        if not (state.home_zone_group or state.home_zone_detail):
+            return None
+        try:
+            q = self._pricing.quote(
+                db=self.db,
+                tipo_vehiculo=focus.tipo_vehiculo,
+                zone_group=state.home_zone_group or "",
+                zone_detail=state.home_zone_detail or "",
+            )
+            # Back-fill zone_group on state if the pricing lookup resolved it.
+            if not state.home_zone_group and q.zone_group:
+                state.home_zone_group = q.zone_group
+            return q
+        except PricingNotFoundError:
+            return None
 
     # ── WhatsApp sends ────────────────────────────────────────────────────
 
