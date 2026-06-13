@@ -24,10 +24,11 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import secrets
 import time as _time
 from dataclasses import dataclass
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from urllib import error as urlerror, request as urlrequest
 
 from sqlalchemy import select
@@ -80,6 +81,80 @@ def _is_acceptance(texts: list[str]) -> bool:
     combined = " ".join(texts).strip()
     normalized = combined.lower().strip("!.¡ ").strip()
     return normalized in _ACCEPTANCE_KEYWORDS
+
+
+# Maps lowercased Spanish day names (accented + unaccented) to Python weekday numbers.
+_SPANISH_DAY_TO_WEEKDAY: dict[str, int] = {
+    "lunes": 0,
+    "martes": 1,
+    "miercoles": 2,
+    "miércoles": 2,
+    "jueves": 3,
+    "viernes": 4,
+    "sabado": 5,
+    "sábado": 5,
+    "domingo": 6,
+}
+
+
+def _parse_scheduling_text(texts: list[str], today: date) -> tuple[str | None, str | None]:
+    """Parse a Spanish day+time expression from SCHEDULING-stage user messages.
+
+    Returns (iso_date_str, "HH:MM").  Either value may be None if not found.
+    The result is always DB-safe: iso_date_str fits VARCHAR(20) and "HH:MM"
+    fits VARCHAR(10).
+    """
+    combined = " ".join(texts).lower()
+
+    # ── Day extraction ────────────────────────────────────────────────────
+    # Specific day names take priority over relative words so that
+    # "viernes por la mañana" is resolved as "viernes", not "tomorrow".
+    day_name_found = any(name in combined for name in _SPANISH_DAY_TO_WEEKDAY)
+    day_iso: str | None = None
+
+    if "pasado mañana" in combined or "pasado manana" in combined:
+        day_iso = (today + timedelta(days=2)).isoformat()
+    elif ("mañana" in combined or "manana" in combined) and not day_name_found:
+        day_iso = (today + timedelta(days=1)).isoformat()
+    elif "hoy" in combined and not day_name_found:
+        day_iso = today.isoformat()
+
+    if day_iso is None:
+        for day_name, weekday in _SPANISH_DAY_TO_WEEKDAY.items():
+            if day_name in combined:
+                days_ahead = weekday - today.weekday()
+                if days_ahead <= 0:  # today or past → next week
+                    days_ahead += 7
+                day_iso = (today + timedelta(days=days_ahead)).isoformat()
+                break
+
+    # ── Time extraction ───────────────────────────────────────────────────
+    time_str: str | None = None
+
+    # "12hs", "12h", "9:30hs", "9:30h"  (most common Argentine pattern)
+    m = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*h(?:s|oras?)?\b", combined)
+    if m:
+        h, mi = int(m.group(1)), int(m.group(2) or 0)
+        if 0 <= h <= 23 and 0 <= mi <= 59:
+            time_str = f"{h:02d}:{mi:02d}"
+
+    if not time_str:
+        # "las 12", "la 1", "a las 9:30"
+        m = re.search(r"\bla[s]?\s+(\d{1,2})(?::(\d{2}))?\b", combined)
+        if m:
+            h, mi = int(m.group(1)), int(m.group(2) or 0)
+            if 0 <= h <= 23 and 0 <= mi <= 59:
+                time_str = f"{h:02d}:{mi:02d}"
+
+    if not time_str:
+        # Standalone "9:30" or "12:00"
+        m = re.search(r"\b(\d{1,2}):(\d{2})\b", combined)
+        if m:
+            h, mi = int(m.group(1)), int(m.group(2))
+            if 0 <= h <= 23 and 0 <= mi <= 59:
+                time_str = f"{h:02d}:{mi:02d}"
+
+    return day_iso, time_str
 
 
 def _out(action: str, **kwargs) -> ConversationHandleOut:
@@ -348,6 +423,25 @@ class ConversationEngine:
         # for day/time only.  No revision, no Flow, no re-quoting.
         if state.last_stage == STAGE_QUOTED and _is_acceptance(ai_input_messages):
             return self._handle_quoted_acceptance(ctx, state)
+
+        # ── Deterministic SCHEDULING day/time parse (pre-AI) ─────────────
+        # Parse Spanish day names and time expressions without calling the AI.
+        # The AI historically misformats preferred_time_str (e.g. "Viernes 12hs"
+        # instead of "12:00"), overflowing the VARCHAR(10) column.
+        if (
+            state.last_stage == STAGE_SCHEDULING
+            and not state.needs_human
+            and not state.flow_booking_token
+        ):
+            sched_day_iso, sched_time_str = _parse_scheduling_text(ai_input_messages, date.today())
+            if sched_day_iso:
+                logger.info(
+                    "M18 scheduling deterministic parse thread_id=%s day=%s time=%s",
+                    ctx.thread.id, sched_day_iso, sched_time_str,
+                )
+                result = self._try_schedule_and_flow(ctx, state, sched_day_iso, sched_time_str, "")
+                if result is not None:
+                    return result
 
         # ── Deterministic vehicle catalog lookup (pre-AI) ─────────────────
         # Scan all user messages for a known vehicle alias. If found, we
@@ -790,9 +884,24 @@ Respondé SOLO con JSON válido:
         if extracted.get("zone_detail"):
             state.home_zone_detail = extracted["zone_detail"]
         if extracted.get("preferred_day_iso"):
-            state.preferred_day = extracted["preferred_day_iso"]
+            raw_day = str(extracted["preferred_day_iso"]).strip()
+            try:
+                date.fromisoformat(raw_day)  # validate before storing
+                state.preferred_day = raw_day
+            except (ValueError, TypeError):
+                logger.warning(
+                    "M18 ignoring malformed preferred_day_iso=%r thread_id=%s",
+                    raw_day, ctx.thread.id,
+                )
         if extracted.get("preferred_time_str"):
-            state.preferred_time = extracted["preferred_time_str"]
+            raw_time = str(extracted["preferred_time_str"]).strip()
+            if re.match(r"^\d{1,2}:\d{2}$", raw_time):  # must be "HH:MM", max 5 chars
+                state.preferred_time = raw_time
+            else:
+                logger.warning(
+                    "M18 ignoring malformed preferred_time_str=%r thread_id=%s",
+                    raw_time, ctx.thread.id,
+                )
 
     def _apply_candidate(self, ctx: _Context, candidate_data: dict) -> None:
         action = candidate_data.get("action", "none")
