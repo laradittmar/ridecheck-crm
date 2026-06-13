@@ -68,6 +68,19 @@ STAGE_FLOW_SENT = "FLOW_SENT"
 STAGE_BOOKED = "BOOKED"
 STAGE_HUMAN = "HUMAN_REQUIRED"
 
+_ACCEPTANCE_KEYWORDS = frozenset({
+    "sí", "si", "yes", "ok", "dale", "perfecto", "avancemos",
+    "listo", "buenísimo", "me sirve", "bueno", "claro",
+    "de acuerdo", "por supuesto", "quiero avanzar",
+})
+
+
+def _is_acceptance(texts: list[str]) -> bool:
+    """Return True when all user messages together express unambiguous acceptance."""
+    combined = " ".join(texts).strip()
+    normalized = combined.lower().strip("!.¡ ").strip()
+    return normalized in _ACCEPTANCE_KEYWORDS
+
 
 def _out(action: str, **kwargs) -> ConversationHandleOut:
     return ConversationHandleOut(
@@ -105,6 +118,10 @@ class ConversationEngine:
                 "M18 engine unhandled error thread_id=%s wa=%s",
                 event.thread_id, event.wa_message_id,
             )
+            try:
+                self.db.rollback()
+            except Exception:
+                pass
             return _out("error", detail="internal_error")
 
     # ── Core dispatch ─────────────────────────────────────────────────────
@@ -120,19 +137,21 @@ class ConversationEngine:
             logger.info("M18 dedup thread_id=%s wa=%s", event.thread_id, event.wa_message_id)
             return _out("skipped_dedup")
 
-        # Mark as processing immediately to prevent concurrent re-entry
+        # Mark as processing — committed atomically with the final successful action,
+        # so a failure mid-flight does not leave the message appearing processed.
         state = self._get_or_create_state(ctx)
         state.last_processed_inbound_wa_message_id = event.wa_message_id
-        self.db.commit()
 
-        # No lead linked — cannot make business decisions
+        # No lead linked — cannot make business decisions; commit dedup marker now
         if ctx.lead is None:
             logger.info("M18 thread_id=%s no linked lead", event.thread_id)
+            self.db.commit()
             return _out("no_lead")
 
-        # Human takeover active: AI is suppressed
+        # Human takeover active: AI is suppressed; commit dedup marker now
         if state.needs_human:
             logger.info("M18 thread_id=%s needs_human — AI suppressed", event.thread_id)
+            self.db.commit()
             return _out("skipped_human")
 
         # Route by message type
@@ -323,6 +342,13 @@ class ConversationEngine:
             logger.info("M18 no text content thread_id=%s — ignored", ctx.thread.id)
             return _out("skipped_dedup", detail="no_text")
 
+        # ── Deterministic QUOTED acceptance (pre-AI) ─────────────────────
+        # When the client is in QUOTED stage and sends a clear acceptance word,
+        # skip the AI entirely: set flag=ACEPTADO, stage=SCHEDULING, and ask
+        # for day/time only.  No revision, no Flow, no re-quoting.
+        if state.last_stage == STAGE_QUOTED and _is_acceptance(ai_input_messages):
+            return self._handle_quoted_acceptance(ctx, state)
+
         # ── Deterministic vehicle catalog lookup (pre-AI) ─────────────────
         # Scan all user messages for a known vehicle alias. If found, we
         # inject the result into the AI prompt AND enforce it after AI output
@@ -384,7 +410,6 @@ class ConversationEngine:
             lead.necesita_humano = True
             state.needs_human = True
             state.last_stage = STAGE_HUMAN
-            self.db.commit()
 
         # Schedule check + flow when in SCHEDULING stage
         stage = state.last_stage
@@ -401,13 +426,40 @@ class ConversationEngine:
             self.db.commit()
             return _out("replied", detail="no_reply_text")
 
-        # For PRESUPUESTO_ENVIADO: send FIRST, commit flag AFTER (rule B)
-        if flag_accepted and new_flag == "PRESUPUESTO_ENVIADO":
-            sent_id = self._send_text_to_wa(ctx, reply)
-            self.db.commit()
-            return _out("replied", wa_message_id=sent_id)
+        # All paths: _send_text_to_wa commits everything atomically after the send.
+        # For PRESUPUESTO_ENVIADO (rule B), this means the flag is only committed
+        # after the WhatsApp send succeeds — which is the correct ordering.
+        sent_id = self._send_text_to_wa(ctx, reply)
+        return _out("replied", wa_message_id=sent_id)
 
-        self.db.commit()
+    # ── Deterministic QUOTED acceptance ───────────────────────────────────
+
+    def _handle_quoted_acceptance(
+        self, ctx: _Context, state: WhatsAppThreadState,
+    ) -> ConversationHandleOut:
+        """Client said yes after receiving a quote.
+
+        Transitions: flag → ACEPTADO, stage → SCHEDULING.
+        Does not create a revision, does not send the Flow, does not ask for
+        buyer/seller/address.  Just asks for preferred day and time.
+        All DB writes are committed inside _send_text_to_wa so that
+        last_processed_inbound_wa_message_id is only persisted once the
+        outbound message is durably stored.
+        """
+        lead = ctx.lead
+        assert lead is not None
+
+        lead.flag = "ACEPTADO"
+        state.last_stage = STAGE_SCHEDULING
+        # lead.estado stays CONSULTA_NUEVA
+        # state.current_revision_id stays null
+        # state.needs_human stays false
+
+        customer = (state.customer_name or "").strip() or (lead.nombre or "").strip() or "cliente"
+        reply = (
+            f"Genial, {customer}! "
+            "¿Qué día y horario te viene mejor para la revisión?"
+        )
         sent_id = self._send_text_to_wa(ctx, reply)
         return _out("replied", wa_message_id=sent_id)
 
@@ -812,11 +864,22 @@ Respondé SOLO con JSON válido:
         now_utc = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
         wa_id = ctx.contact.wa_id
 
+        # Call the WhatsApp API BEFORE writing to the DB so that all session
+        # state (including last_processed_inbound_wa_message_id) is only
+        # committed after we know whether the send succeeded or failed.
+        wa_message_id = None
+        final_status = "failed"
+        try:
+            wa_message_id, _ = _send_whatsapp_cloud_text(to_wa_id=wa_id, text=text)
+            final_status = "sent"
+        except Exception as exc:
+            logger.error("M18 send_text failed thread_id=%s: %s", ctx.thread.id, exc)
+
         outbound = WhatsAppMessage(
             thread_id=ctx.thread.id,
-            wa_message_id=None,
+            wa_message_id=wa_message_id,
             direction="out",
-            status="pending",
+            status=final_status,
             timestamp=now_utc,
             text=text,
         )
@@ -825,18 +888,7 @@ Respondé SOLO con JSON válido:
         self.db.commit()
         reset_unanswered_alert(self.db, ctx.thread.id)
         self.db.commit()
-
-        try:
-            wa_message_id, _ = _send_whatsapp_cloud_text(to_wa_id=wa_id, text=text)
-            outbound.status = "sent"
-            outbound.wa_message_id = wa_message_id
-            self.db.commit()
-            return wa_message_id
-        except Exception as exc:
-            logger.error("M18 send_text failed thread_id=%s: %s", ctx.thread.id, exc)
-            outbound.status = "failed"
-            self.db.commit()
-            return None
+        return wa_message_id
 
     def _send_flow_button(self, ctx: _Context, body_text: str, flow_token: str) -> str:
         flow_id = (self.settings.whatsapp_flow_id or "").strip()
@@ -847,11 +899,20 @@ Respondé SOLO con JSON válido:
         now_utc = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
         wa_id = ctx.contact.wa_id
 
+        # Send first; raises on failure so the caller can revert state.
+        wa_message_id, _ = _send_whatsapp_cloud_flow(
+            to_wa_id=wa_id,
+            flow_id=flow_id,
+            flow_token=flow_token,
+            body_text=body_text,
+            cta_label="Completar datos",
+        )
+
         outbound = WhatsAppMessage(
             thread_id=ctx.thread.id,
-            wa_message_id=None,
+            wa_message_id=wa_message_id,
             direction="out",
-            status="pending",
+            status="sent",
             timestamp=now_utc,
             text=body_text,
         )
@@ -860,23 +921,7 @@ Respondé SOLO con JSON válido:
         self.db.commit()
         reset_unanswered_alert(self.db, ctx.thread.id)
         self.db.commit()
-
-        try:
-            wa_message_id, _ = _send_whatsapp_cloud_flow(
-                to_wa_id=wa_id,
-                flow_id=flow_id,
-                flow_token=flow_token,
-                body_text=body_text,
-                cta_label="Completar datos",
-            )
-            outbound.status = "sent"
-            outbound.wa_message_id = wa_message_id
-            self.db.commit()
-            return wa_message_id
-        except Exception as exc:
-            outbound.status = "failed"
-            self.db.commit()
-            raise exc
+        return wa_message_id
 
     # ── Booking notification ──────────────────────────────────────────────
 
