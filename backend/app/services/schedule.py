@@ -78,6 +78,25 @@ class ScheduleService:
             is_holiday=payload.is_holiday,
         )
         rules_applied.append(f"Horario operativo del dia: {self._format_hours(hours.start, hours.end)}")
+        if hours.closed:
+            reasons.append("Domingo: sin operaciones. Por favor elegí un día de lunes a sábado")
+            return ScheduleCheckOut(
+                valid=False,
+                suggested_slots=[],
+                approval_tag=APPROVAL_TAG,
+                requested_slot=ScheduleSlotOut(
+                    start=requested_start.isoformat(timespec="minutes"),
+                    end=requested_end.isoformat(timespec="minutes"),
+                ),
+                business_hours="cerrado",
+                service_minutes=SERVICE_MINUTES,
+                buffer_minutes=BUFFER_MINUTES,
+                travel_minutes=travel_minutes,
+                total_slot_minutes=total_slot_minutes,
+                conflicts=[],
+                reasons=reasons,
+                rules_applied=rules_applied,
+            )
         if payload.is_holiday:
             rules_applied.append("Feriado: se usa horario reducido 09:00 a 15:00")
         if hours.extended_for_zone:
@@ -164,6 +183,14 @@ class ScheduleService:
             f"Tiempo total reservado: {total_slot_minutes} minutos",
             f"Horario operativo del dia: {self._format_hours(hours.start, hours.end)}",
         ]
+        if hours.closed:
+            rules_applied.append("Domingo: sin operaciones")
+            return ScheduleSlotsOut(
+                preferred_day=payload.preferred_day,
+                business_hours="cerrado",
+                slots=[],
+                rules_applied=rules_applied,
+            )
         if payload.is_holiday:
             rules_applied.append("Feriado: se usa horario reducido 09:00 a 15:00")
         if hours.extended_for_zone:
@@ -362,7 +389,8 @@ class ScheduleService:
             )
         if weekday == 5:
             return _BusinessHours(start=time(9, 0), end=time(15, 0))
-        return _BusinessHours(start=time(9, 0), end=time(15, 0))
+        # weekday == 6: Sunday — no operations
+        return _BusinessHours(start=time(9, 0), end=time(9, 0), closed=True)
 
     def _has_special_extension(self, normalized_context: str) -> bool:
         return any(zone in normalized_context for zone in SPECIAL_EXTENSION_ZONES)
@@ -385,3 +413,4 @@ class _BusinessHours:
     end: time
     extended_for_zone: bool = False
     alternating_note: str | None = None
+    closed: bool = False

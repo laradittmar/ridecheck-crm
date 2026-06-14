@@ -84,6 +84,15 @@ def _is_acceptance(texts: list[str]) -> bool:
     return normalized in _ACCEPTANCE_KEYWORDS
 
 
+# Matches a vehicle model year: 1980–2029
+_VEHICLE_YEAR_RE = re.compile(r"\b(19[89]\d|20[012]\d)\b")
+
+
+def _extract_year_from_text(text: str) -> int | None:
+    m = _VEHICLE_YEAR_RE.search(text)
+    return int(m.group(1)) if m else None
+
+
 # Maps lowercased Spanish day names (accented + unaccented) to Python weekday numbers.
 _SPANISH_DAY_TO_WEEKDAY: dict[str, int] = {
     "lunes": 0,
@@ -461,7 +470,9 @@ class ConversationEngine:
             )
             # Proactively create a candidate when catalog fires but none exists yet.
             if not ctx.candidates:
-                self._create_candidate_from_catalog(ctx, state, pre_detected_vehicle)
+                self._create_candidate_from_catalog(
+                    ctx, state, pre_detected_vehicle, source_text=all_recent_text
+                )
 
         # ── Pre-AI zone detection ──────────────────────────────────────────
         # Look up zone in DB from text so zone_group is deterministic (not
@@ -524,6 +535,12 @@ class ConversationEngine:
             if state.home_zone_detail and not focus_after.zone_detail:
                 focus_after.zone_detail = state.home_zone_detail
 
+        # Sync year onto focus candidate deterministically if AI missed it.
+        if focus_after and focus_after.anio is None:
+            year_hit = _extract_year_from_text(all_recent_text)
+            if year_hit:
+                focus_after.anio = year_hit
+
         # Recompute price after all extractions have run.
         real_price_quote = self._compute_price_quote(ctx, state)
 
@@ -581,8 +598,12 @@ class ConversationEngine:
         # Schedule check + flow when in SCHEDULING stage
         stage = state.last_stage
         if stage == STAGE_SCHEDULING and not state.needs_human and not state.flow_booking_token:
-            pday = extracted.get("preferred_day_iso") or state.preferred_day
-            ptime = extracted.get("preferred_time_str") or state.preferred_time
+            # Deterministic parser runs first to prevent AI hallucinating dates.
+            # This handles the ráfaga case where "si" + "mañana 12hs" arrive together
+            # and the AI transitions from QUOTED→SCHEDULING in the same turn.
+            det_day, det_time = _parse_scheduling_text(ai_input_messages, date.today())
+            pday = det_day or state.preferred_day
+            ptime = det_time or extracted.get("preferred_time_str") or state.preferred_time
             if pday:
                 result = self._try_schedule_and_flow(ctx, state, pday, ptime, decision.get("reply") or "")
                 if result is not None:
@@ -821,7 +842,6 @@ Respondé SOLO con JSON válido:
   "extracted": {{
     "customer_name": null,
     "zone_detail": null,
-    "preferred_day_iso": null,
     "preferred_time_str": null,
     "tipo_vehiculo": null,
     "vendedor_tipo": null
@@ -1051,13 +1071,19 @@ Respondé SOLO con JSON válido:
     # ── Deterministic helper methods ──────────────────────────────────────
 
     def _create_candidate_from_catalog(
-        self, ctx: _Context, state: "WhatsAppThreadState | None", match: VehicleMatch
+        self,
+        ctx: _Context,
+        state: "WhatsAppThreadState | None",
+        match: VehicleMatch,
+        source_text: str = "",
     ) -> None:
+        anio = _extract_year_from_text(source_text) if source_text else None
         candidate = WhatsAppThreadCandidate(
             thread_id=ctx.thread.id,
             marca=match.marca,
             modelo=match.modelo,
             tipo_vehiculo=match.tipo_vehiculo,
+            anio=anio,
             zone_group=state.home_zone_group if state else None,
             zone_detail=state.home_zone_detail if state else None,
             status="current_focus",
@@ -1068,8 +1094,8 @@ Respondé SOLO con JSON válido:
             state.current_focus_candidate_id = candidate.id
         ctx.candidates.insert(0, candidate)
         logger.info(
-            "M18 proactive candidate created thread_id=%s candidate=%s tipo=%s",
-            ctx.thread.id, candidate.id, match.tipo_vehiculo,
+            "M18 proactive candidate created thread_id=%s candidate=%s tipo=%s anio=%s",
+            ctx.thread.id, candidate.id, match.tipo_vehiculo, anio,
         )
 
     def _extract_zone_from_text(self, text: str) -> "ViaticosZone | None":

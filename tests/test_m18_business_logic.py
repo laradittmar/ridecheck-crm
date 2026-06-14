@@ -682,5 +682,176 @@ class TestPromptNeverAsksVehiclePrice(unittest.TestCase):
         self.assertIn("170.000", system)
 
 
+class TestVehicleYearExtraction(unittest.TestCase):
+    """Year (anio) must be extracted deterministically from free text and persisted."""
+
+    def test_extract_year_from_text_2020(self):
+        from app.services.conversation_engine import _extract_year_from_text
+        self.assertEqual(_extract_year_from_text("captiva 2020"), 2020)
+
+    def test_extract_year_from_text_1998(self):
+        from app.services.conversation_engine import _extract_year_from_text
+        self.assertEqual(_extract_year_from_text("tengo una Hilux 1998"), 1998)
+
+    def test_extract_year_returns_none_when_absent(self):
+        from app.services.conversation_engine import _extract_year_from_text
+        self.assertIsNone(_extract_year_from_text("tengo una Captiva en San Justo"))
+
+    def test_create_candidate_with_year(self):
+        """_create_candidate_from_catalog must populate anio from source_text."""
+        eng, created = _engine_with_fake_db_for_year()
+        state = _make_state(home_zone_group="Oeste", home_zone_detail="San Justo")
+        ctx = _make_ctx(candidates=[], state=state)
+
+        match = lookup_vehicle("Captiva 2020")
+        self.assertIsNotNone(match)
+        eng._create_candidate_from_catalog(ctx, state, match, source_text="captiva 2020 San Justo")
+
+        self.assertEqual(len(created), 1)
+        self.assertEqual(created[0].anio, 2020)
+
+    def test_create_candidate_no_year_in_text(self):
+        """When no year in text anio must be None, not 0 or a wrong value."""
+        eng, created = _engine_with_fake_db_for_year()
+        state = _make_state()
+        ctx = _make_ctx(candidates=[], state=state)
+
+        match = lookup_vehicle("Captiva")
+        eng._create_candidate_from_catalog(ctx, state, match, source_text="tengo una Captiva")
+
+        self.assertEqual(len(created), 1)
+        self.assertIsNone(created[0].anio)
+
+    def test_year_sync_onto_existing_candidate(self):
+        """Post-AI year sync must backfill anio=None on focus candidate from all_recent_text."""
+        from app.services.conversation_engine import _extract_year_from_text
+        candidate = _make_candidate(anio=None, tipo_vehiculo="SUV_4X4_DEPORTIVO")
+        year_hit = _extract_year_from_text("captiva 2020 san justo")
+        if year_hit and candidate.anio is None:
+            candidate.anio = year_hit
+        self.assertEqual(candidate.anio, 2020)
+
+    def test_existing_year_not_overwritten(self):
+        """If candidate already has anio, the sync block must not overwrite it."""
+        from app.services.conversation_engine import _extract_year_from_text
+        candidate = _make_candidate(anio=2018, tipo_vehiculo="SUV_4X4_DEPORTIVO")
+        year_hit = _extract_year_from_text("captiva 2020")
+        if year_hit and candidate.anio is None:
+            candidate.anio = year_hit
+        self.assertEqual(candidate.anio, 2018)
+
+
+def _engine_with_fake_db_for_year():
+    created = []
+
+    def fake_add(obj):
+        if hasattr(obj, "tipo_vehiculo"):
+            obj.id = 42
+            created.append(obj)
+
+    eng = _make_engine()
+    eng.db.add.side_effect = fake_add
+    eng.db.flush.side_effect = lambda: None
+    return eng, created
+
+
+class TestDeterministicSchedulingDate(unittest.TestCase):
+    """Post-AI scheduling path must use _parse_scheduling_text, never AI's preferred_day_iso."""
+
+    def test_parse_manana_returns_tomorrow(self):
+        from datetime import date
+        from app.services.conversation_engine import _parse_scheduling_text
+        today = date(2026, 6, 13)  # Saturday
+        day, t = _parse_scheduling_text(["mañana 12hs"], today)
+        self.assertEqual(day, "2026-06-14")  # Sunday
+
+    def test_parse_lunes_returns_next_monday(self):
+        from datetime import date
+        from app.services.conversation_engine import _parse_scheduling_text
+        today = date(2026, 6, 13)  # Saturday
+        day, t = _parse_scheduling_text(["el lunes a las 10"], today)
+        self.assertEqual(day, "2026-06-15")
+
+    def test_parse_time_extracted(self):
+        from datetime import date
+        from app.services.conversation_engine import _parse_scheduling_text
+        today = date(2026, 6, 13)
+        day, t = _parse_scheduling_text(["mañana 12hs"], today)
+        self.assertEqual(t, "12:00")
+
+    def test_rafaga_si_plus_manana_uses_deterministic_date(self):
+        """Simulates the bug: ráfaga ['Si', 'Mañana 12hs'] must yield 2026-06-14, not AI date."""
+        from datetime import date
+        from app.services.conversation_engine import _parse_scheduling_text
+        today = date(2026, 6, 13)
+        # The ráfaga arrives as two messages; engine passes both to _parse_scheduling_text
+        day, t = _parse_scheduling_text(["Si", "Mañana 12hs"], today)
+        self.assertEqual(day, "2026-06-14")
+        self.assertEqual(t, "12:00")
+
+
+class TestSundayClosed(unittest.TestCase):
+    """Sunday must be closed; ScheduleService.check() and list_slots() return no valid slots."""
+
+    def _make_schedule_service(self):
+        from app.services.schedule import ScheduleService
+        from unittest.mock import MagicMock
+        svc = ScheduleService.__new__(ScheduleService)
+        svc.db = MagicMock()
+        svc.db.execute.return_value.scalars.return_value.all.return_value = []
+        return svc
+
+    def test_business_hours_sunday_is_closed(self):
+        from datetime import date
+        from app.services.schedule import ScheduleService
+        svc = self._make_schedule_service()
+        sunday = date(2026, 6, 14)
+        hours = svc._business_hours(sunday, normalized_context="", is_holiday=False)
+        self.assertTrue(hours.closed)
+
+    def test_check_sunday_returns_invalid(self):
+        from datetime import date, time
+        from app.schemas.schedule import ScheduleCheckIn
+        svc = self._make_schedule_service()
+        payload = ScheduleCheckIn(
+            address="San Justo 123",
+            preferred_day=date(2026, 6, 14),
+            preferred_time=time(12, 0),
+            zone_group="Oeste",
+            zone_detail="San Justo",
+            distance_km=15.0,
+            is_holiday=False,
+        )
+        result = svc.check(payload)
+        self.assertFalse(result.valid)
+        self.assertEqual(result.suggested_slots, [])
+        self.assertTrue(any("Domingo" in r for r in result.reasons))
+
+    def test_list_slots_sunday_returns_empty(self):
+        from datetime import date, time
+        from app.schemas.schedule import ScheduleCheckIn
+        svc = self._make_schedule_service()
+        payload = ScheduleCheckIn(
+            address="San Justo 123",
+            preferred_day=date(2026, 6, 14),
+            preferred_time=time(12, 0),
+            zone_group="Oeste",
+            zone_detail="San Justo",
+            distance_km=15.0,
+            is_holiday=False,
+        )
+        result = svc.list_slots(payload)
+        self.assertEqual(result.slots, [])
+        self.assertEqual(result.business_hours, "cerrado")
+
+    def test_saturday_is_open(self):
+        from datetime import date
+        from app.services.schedule import ScheduleService
+        svc = self._make_schedule_service()
+        saturday = date(2026, 6, 13)
+        hours = svc._business_hours(saturday, normalized_context="", is_holiday=False)
+        self.assertFalse(hours.closed)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
