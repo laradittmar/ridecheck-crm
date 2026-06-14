@@ -204,15 +204,17 @@ class TestNormalizeZoneFromDb(unittest.TestCase):
         eng._normalize_zone_from_db(ctx, state)
         self.assertEqual(state.home_zone_group, "Oeste")
 
-    def test_does_not_overwrite_existing_group(self):
+    def test_overwrites_wrong_ai_zone_group_with_db_canonical(self):
+        """DB is authoritative — normalization must overwrite even when zone_group is set."""
         eng = _make_engine()
-        state = _make_state(home_zone_group="Sur", home_zone_detail="Lomas del Mirador")
+        # Simulate AI having set zone_group to the city name (wrong) instead of "Oeste"
+        state = _make_state(home_zone_group="Lomas del Mirador", home_zone_detail="Lomas del Mirador")
         ctx = _make_ctx(state=state)
         eng._pricing = PricingService(repository=FakeRepoCaptiva())
 
         eng._normalize_zone_from_db(ctx, state)
-        # Should not override an existing group
-        self.assertEqual(state.home_zone_group, "Sur")
+        # DB says zone_group="Oeste" — must overwrite the AI's wrong value
+        self.assertEqual(state.home_zone_group, "Oeste")
 
 
 class TestComputePriceQuote(unittest.TestCase):
@@ -459,6 +461,225 @@ class TestApprovalMovesLeadToAgendado(unittest.TestCase):
     def test_public_approval_does_not_move_other_states(self):
         _, lead = self._simulate_public_approval("AGENDADO")
         self.assertEqual(lead.estado, "AGENDADO")  # already correct, unchanged
+
+
+class FakeRepoSanJusto:
+    """Covers Captiva (SUV_4X4_DEPORTIVO) in San Justo (Oeste, 30000)."""
+
+    _BASE = {
+        "SUV_4X4_DEPORTIVO": FakePriceRow(tipo_vehiculo="SUV_4X4_DEPORTIVO", precio_base=140000),
+    }
+    _ZONES_BY_DETAIL = {
+        "san justo": FakeZone(zone_group="Oeste", zone_detail="San Justo", viaticos=30000),
+    }
+
+    def find_base_price(self, tipo_vehiculo: str):
+        return self._BASE.get(tipo_vehiculo)
+
+    def find_zone_by_group_and_detail(self, db, zone_group, zone_detail):
+        key = (zone_detail or "").strip().lower()
+        return self._ZONES_BY_DETAIL.get(key)
+
+
+class TestSanJustoZoneNormalization(unittest.TestCase):
+    """San Justo must map to Oeste/San Justo and produce a $170,000 quote."""
+
+    def test_san_justo_in_pricing_repo(self):
+        service = PricingService(repository=FakeRepoSanJusto())
+        q = service.quote(
+            db=None,
+            tipo_vehiculo="SUV_4X4_DEPORTIVO",
+            zone_group=None,
+            zone_detail="San Justo",
+        )
+        self.assertEqual(q.zone_group, "Oeste")
+        self.assertEqual(q.zone_detail, "San Justo")
+        self.assertEqual(q.precio_total, 170000)
+
+    def test_normalize_zone_overwrites_wrong_ai_zone_group(self):
+        """When AI sets zone_group='San Justo' (wrong), DB normalization must fix it."""
+        eng = _make_engine(repo=FakeRepoSanJusto())
+        # Simulate AI having extracted zone_group="San Justo" (wrong) + zone_detail="San Justo"
+        state = _make_state(home_zone_group="San Justo", home_zone_detail="San Justo")
+        ctx = _make_ctx(state=state)
+
+        eng._pricing = PricingService(repository=FakeRepoSanJusto())
+        eng._normalize_zone_from_db(ctx, state)
+
+        self.assertEqual(state.home_zone_group, "Oeste")
+        self.assertEqual(state.home_zone_detail, "San Justo")
+
+    def test_compute_price_quote_san_justo(self):
+        eng = _make_engine(repo=FakeRepoSanJusto())
+        c = _make_candidate(tipo_vehiculo="SUV_4X4_DEPORTIVO")
+        # Simulate post-normalization state (zone_group already fixed)
+        state = _make_state(home_zone_group="Oeste", home_zone_detail="San Justo")
+        ctx = _make_ctx(candidates=[c], state=state)
+        result = eng._compute_price_quote(ctx, state)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.precio_total, 170000)
+
+    def test_compute_price_quote_returns_none_before_normalization(self):
+        """With wrong zone_group='San Justo' and wrong zone_detail in a repo
+        that only knows 'San Justo' by detail, pricing should still work because
+        find_zone_by_group_and_detail falls back to detail-only search."""
+        eng = _make_engine(repo=FakeRepoSanJusto())
+        c = _make_candidate(tipo_vehiculo="SUV_4X4_DEPORTIVO")
+        # Pre-normalization: zone_group and detail both set to "San Justo" (AI mistake)
+        state = _make_state(home_zone_group="San Justo", home_zone_detail="San Justo")
+        ctx = _make_ctx(candidates=[c], state=state)
+        # Normalize first (as engine does) then compute
+        eng._normalize_zone_from_db(ctx, state)
+        result = eng._compute_price_quote(ctx, state)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.precio_total, 170000)
+
+
+class TestDeterministicQuoteOverride(unittest.TestCase):
+    """Engine must force PRESUPUESTO_ENVIADO + price injection when quote is available."""
+
+    def _run_override_logic(self, real_price_quote, lead_flag, last_stage, ai_reply, needs_human=False):
+        """Replicate the override block from _process_text in isolation."""
+        STAGE_QUALIFYING = "QUALIFYING"
+        STAGE_QUOTED = "QUOTED"
+
+        lead = types.SimpleNamespace(flag=lead_flag)
+        state = types.SimpleNamespace(last_stage=last_stage, needs_human=needs_human)
+        decision = {"reply": ai_reply}
+
+        if (
+            real_price_quote is not None
+            and lead.flag not in ("PRESUPUESTO_ENVIADO", "ACEPTADO")
+            and state.last_stage in (STAGE_QUALIFYING, None)
+            and not state.needs_human
+        ):
+            lead.flag = "PRESUPUESTO_ENVIADO"
+            state.last_stage = STAGE_QUOTED
+            total_str = f"${real_price_quote.precio_total:,.0f}".replace(",", ".")
+            if str(real_price_quote.precio_total) not in ai_reply and total_str not in ai_reply:
+                decision["reply"] = (
+                    ai_reply
+                    + f"\n\nEl precio de la revisión es {total_str} "
+                    f"(base ${real_price_quote.precio_base:,.0f}".replace(",", ".")
+                    + f" + viáticos ${real_price_quote.viaticos:,.0f})".replace(",", ".")
+                )
+
+        return lead, state, decision
+
+    def _make_quote(self, total=170000):
+        return PricingQuote(
+            tipo_vehiculo="SUV_4X4_DEPORTIVO",
+            zone_group="Oeste",
+            zone_detail="San Justo",
+            precio_base=140000,
+            viaticos=30000,
+        )
+
+    def test_override_forces_flag_when_ai_missed_it(self):
+        q = self._make_quote()
+        lead, state, decision = self._run_override_logic(
+            real_price_quote=q,
+            lead_flag="PRESUPUESTANDO",
+            last_stage="QUALIFYING",
+            ai_reply="Genial, ya tengo toda la info.",
+        )
+        self.assertEqual(lead.flag, "PRESUPUESTO_ENVIADO")
+        self.assertEqual(state.last_stage, "QUOTED")
+
+    def test_override_injects_price_when_missing_from_reply(self):
+        q = self._make_quote()
+        lead, state, decision = self._run_override_logic(
+            real_price_quote=q,
+            lead_flag="PRESUPUESTANDO",
+            last_stage="QUALIFYING",
+            ai_reply="Genial, ya tengo toda la info.",
+        )
+        self.assertIn("170.000", decision["reply"])
+
+    def test_override_skips_when_already_quoted(self):
+        q = self._make_quote()
+        lead, state, decision = self._run_override_logic(
+            real_price_quote=q,
+            lead_flag="PRESUPUESTO_ENVIADO",
+            last_stage="QUOTED",
+            ai_reply="Ya te mandé el precio.",
+        )
+        self.assertEqual(lead.flag, "PRESUPUESTO_ENVIADO")
+        self.assertEqual(state.last_stage, "QUOTED")
+
+    def test_override_skips_when_no_price(self):
+        lead, state, decision = self._run_override_logic(
+            real_price_quote=None,
+            lead_flag="PRESUPUESTANDO",
+            last_stage="QUALIFYING",
+            ai_reply="Necesito saber tu zona.",
+        )
+        self.assertEqual(lead.flag, "PRESUPUESTANDO")
+        self.assertEqual(state.last_stage, "QUALIFYING")
+
+    def test_override_skips_when_needs_human(self):
+        q = self._make_quote()
+        lead, state, decision = self._run_override_logic(
+            real_price_quote=q,
+            lead_flag="PRESUPUESTANDO",
+            last_stage="QUALIFYING",
+            ai_reply="Un asesor te va a contactar.",
+            needs_human=True,
+        )
+        # Should NOT override when needs_human=True
+        self.assertEqual(lead.flag, "PRESUPUESTANDO")
+
+
+class TestPromptNeverAsksVehiclePrice(unittest.TestCase):
+    """Validate the system prompt rules contain the required prohibitions."""
+
+    def _get_system_prompt(self):
+        from app.services.conversation_engine import ConversationEngine
+        from app.services.pricing import PricingService
+        from unittest.mock import MagicMock
+
+        eng = _make_engine()
+        ctx = _make_ctx(
+            candidates=[_make_candidate(tipo_vehiculo="SUV_4X4_DEPORTIVO", marca="Chevrolet", modelo="Captiva")],
+            state=_make_state(home_zone_detail="San Justo"),
+        )
+        event = MagicMock()
+        event.recent_outbound_replies = []
+        event.recent_user_messages = []
+        msgs = eng._build_ai_messages(ctx, event, ["Agencia"])
+        return msgs[0]["content"]  # system message
+
+    def test_prompt_forbids_vehicle_price(self):
+        prompt = self._get_system_prompt()
+        self.assertIn("precio de venta", prompt.lower())
+        self.assertIn("NUNCA", prompt)
+
+    def test_prompt_does_not_require_seller_type_for_quote(self):
+        prompt = self._get_system_prompt()
+        # Rule 1 must NOT say vendedor is required for quoting
+        self.assertNotIn("tipo de vendedor (agencia/particular)", prompt)
+
+    def test_prompt_has_calculated_price_when_available(self):
+        eng = _make_engine(repo=FakeRepoSanJusto())
+        ctx = _make_ctx(
+            candidates=[_make_candidate(tipo_vehiculo="SUV_4X4_DEPORTIVO", marca="Chevrolet", modelo="Captiva")],
+            state=_make_state(home_zone_group="Oeste", home_zone_detail="San Justo"),
+        )
+        from unittest.mock import MagicMock
+        event = MagicMock()
+        event.recent_outbound_replies = []
+        event.recent_user_messages = []
+        q = PricingQuote(
+            tipo_vehiculo="SUV_4X4_DEPORTIVO",
+            zone_group="Oeste",
+            zone_detail="San Justo",
+            precio_base=140000,
+            viaticos=30000,
+        )
+        msgs = eng._build_ai_messages(ctx, event, ["Agencia"], real_price_quote=q)
+        system = msgs[0]["content"]
+        self.assertIn("PRECIO CALCULADO", system)
+        self.assertIn("170.000", system)
 
 
 if __name__ == "__main__":

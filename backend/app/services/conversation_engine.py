@@ -550,6 +550,34 @@ class ConversationEngine:
             state.needs_human = True
             state.last_stage = STAGE_HUMAN
 
+        # ── Deterministic quote override ───────────────────────────────────
+        # If pricing succeeded and the conversation is still in qualifying
+        # stage, force the quote regardless of what the AI decided to do.
+        # This guarantees the price is never blocked or replaced by invented
+        # requirements (e.g. "necesito el precio del vehículo").
+        if (
+            real_price_quote is not None
+            and lead.flag not in ("PRESUPUESTO_ENVIADO", "ACEPTADO")
+            and state.last_stage in (STAGE_QUALIFYING, None)
+            and not state.needs_human
+        ):
+            logger.info(
+                "M18 deterministic quote force thread_id=%s total=%s",
+                ctx.thread.id, real_price_quote.precio_total,
+            )
+            lead.flag = "PRESUPUESTO_ENVIADO"
+            state.last_stage = STAGE_QUOTED
+            ai_reply = str(decision.get("reply") or "")
+            total_str = f"${real_price_quote.precio_total:,.0f}".replace(",", ".")
+            # Inject price into reply when AI omitted it.
+            if str(real_price_quote.precio_total) not in ai_reply and total_str not in ai_reply:
+                decision["reply"] = (
+                    ai_reply
+                    + f"\n\nEl precio de la revisión es {total_str} "
+                    f"(base ${real_price_quote.precio_base:,.0f}".replace(",", ".")
+                    + f" + viáticos ${real_price_quote.viaticos:,.0f})".replace(",", ".")
+                )
+
         # Schedule check + flow when in SCHEDULING stage
         stage = state.last_stage
         if stage == STAGE_SCHEDULING and not state.needs_human and not state.flow_booking_token:
@@ -771,14 +799,16 @@ HISTORIAL RECIENTE:
 {history}
 
 REGLAS DE NEGOCIO:
-1. PRESUPUESTANDO → colectá tipo de vehículo, zona/ciudad y tipo de vendedor (agencia/particular). Podés pedir marca/modelo/año también.
-2. Cuando tenés tipo_vehiculo + zona → cotizá SÓLO si aparece "PRECIO CALCULADO" arriba. Incluí ese precio exacto y seteá lead_flag="PRESUPUESTO_ENVIADO". Si no hay PRECIO CALCULADO, pedí la info faltante, NO cotices.
+1. PRESUPUESTANDO → colectá tipo de vehículo y zona/ciudad. Eso es todo lo que necesitás para cotizar. Tipo de vendedor (agencia/particular) es útil pero NO bloquea la cotización; si el cliente lo ofrece, registralo, pero no lo pidas como requisito.
+2. Cuando tenés tipo_vehiculo + zona Y aparece "PRECIO CALCULADO" arriba → enviá la cotización YA con ese precio exacto y seteá lead_flag="PRESUPUESTO_ENVIADO". No preguntes nada más. Si no hay PRECIO CALCULADO, preguntá solo qué dato falta (tipo de vehículo o zona).
 3. Aceptación ("sí", "dale", "ok", "me sirve", "avanzamos") → lead_flag="ACEPTADO".
 4. Etapa SCHEDULING → preguntá qué día y horario le viene mejor.
 5. Derivá a humano si hay queja, solicitud especial o no podés resolver → needs_human=true.
 6. NUNCA uses lead_flag="PERDIDO", "BUSCANDO_AUTO", ni "RECOMPRA".
 7. Respondé en español, registro informal argentino (voseo), conciso.
 8. NUNCA inventes ni calcules precios. El único precio válido es el que aparece en PRECIO CALCULADO.
+9. NUNCA preguntes el precio de venta, valor o tasación del vehículo. Ridecheck NO necesita eso para cotizar la inspección.
+10. Si la zona no está disponible en tu sistema, pedí confirmación de una zona/barrio cercano. NUNCA pidas precio del vehículo ni datos de la venta.
 
 TIPOS DE VEHÍCULO VÁLIDOS: AUTO, SUV_4X4_DEPORTIVO, SUV/4x4, CLASICO, MOTO, ESCANEO_MOTOR
 
@@ -790,7 +820,6 @@ Respondé SOLO con JSON válido:
   "needs_human": false,
   "extracted": {{
     "customer_name": null,
-    "zone_group": null,
     "zone_detail": null,
     "preferred_day_iso": null,
     "preferred_time_str": null,
@@ -805,7 +834,7 @@ Respondé SOLO con JSON válido:
     "version_text": null,
     "anio": null,
     "tipo_vehiculo": null,
-    "status": "mentioned"
+    "status": "current_focus"
   }}
 }}"""
 
@@ -924,10 +953,10 @@ Respondé SOLO con JSON válido:
             state.customer_name = extracted["customer_name"]
             if ctx.lead and not ctx.lead.nombre:
                 ctx.lead.nombre = extracted["customer_name"].split()[0]
-        if extracted.get("zone_group"):
-            state.home_zone_group = extracted["zone_group"]
         if extracted.get("zone_detail"):
             state.home_zone_detail = extracted["zone_detail"]
+        # zone_group is intentionally NOT read from AI — DB normalization always
+        # sets the canonical value in _normalize_zone_from_db.
         if extracted.get("preferred_day_iso"):
             raw_day = str(extracted["preferred_day_iso"]).strip()
             try:
@@ -1058,16 +1087,18 @@ Respondé SOLO con JSON válido:
         return None
 
     def _normalize_zone_from_db(self, ctx: _Context, state: "WhatsAppThreadState | None") -> None:
-        if not state:
+        if not state or not state.home_zone_detail:
             return
-        if state.home_zone_detail and not state.home_zone_group:
-            zone = self._pricing.repository.find_zone_by_group_and_detail(
-                db=self.db,
-                zone_group=None,
-                zone_detail=state.home_zone_detail,
-            )
-            if zone and zone.zone_group:
-                state.home_zone_group = zone.zone_group
+        # DB is always authoritative for zone_group.  Overwrite whatever the AI
+        # extracted (AI often puts the city name as zone_group instead of the
+        # correct CABA/Norte/Oeste/Sur canonical value).
+        zone = self._pricing.repository.find_zone_by_group_and_detail(
+            db=self.db,
+            zone_group=None,
+            zone_detail=state.home_zone_detail,
+        )
+        if zone and zone.zone_group:
+            state.home_zone_group = zone.zone_group
 
     def _compute_price_quote(
         self, ctx: _Context, state: "WhatsAppThreadState | None"
