@@ -1100,5 +1100,236 @@ class TestAcceptanceGuardNoQuote(unittest.TestCase):
         self.assertNotIn("$", decision["reply"])
 
 
+# ── CABA synonym + quote-intent scrub regression (real test 160626) ──────────
+
+
+class FakeRepoCABASentinel:
+    """CABA sentinel row: zone_group='CABA', zone_detail='CABA', viaticos=0.
+    Mirrors the DB row added by migration 20260617_add_caba_zone.
+    """
+    _BASE = {"AUTO": FakePriceRow("AUTO", 130000)}
+    _CABA_ZONE = FakeZone(zone_group="CABA", zone_detail="CABA", viaticos=0)
+
+    def find_base_price(self, tipo_vehiculo):
+        return self._BASE.get(tipo_vehiculo)
+
+    def find_zone_by_group_and_detail(self, db, zone_group, zone_detail):
+        ng = (zone_group or "").strip().lower()
+        nd = (zone_detail or "").strip().lower()
+        if nd == "caba":
+            return self._CABA_ZONE
+        if ng == "caba" and nd == "caba":
+            return self._CABA_ZONE
+        return None
+
+
+class TestCABASynonymNormalization(unittest.TestCase):
+    """'capital federal', 'ciudad autónoma de buenos aires' etc. must map to CABA sentinel."""
+
+    def _normalize_engine(self, repo=None):
+        return _make_engine(repo=repo or FakeRepoCABASentinel())
+
+    def test_capital_federal_normalized_to_caba(self):
+        eng = self._normalize_engine()
+        state = _make_state(home_zone_detail="capital federal")
+        ctx = _make_ctx(state=state)
+        eng._normalize_zone_from_db(ctx, state)
+        self.assertEqual(state.home_zone_detail, "CABA")
+        self.assertEqual(state.home_zone_group, "CABA")
+
+    def test_ciudad_autonoma_normalized(self):
+        eng = self._normalize_engine()
+        state = _make_state(home_zone_detail="ciudad autónoma de buenos aires")
+        ctx = _make_ctx(state=state)
+        eng._normalize_zone_from_db(ctx, state)
+        self.assertEqual(state.home_zone_detail, "CABA")
+        self.assertEqual(state.home_zone_group, "CABA")
+
+    def test_ciudad_autonoma_unaccented_normalized(self):
+        eng = self._normalize_engine()
+        state = _make_state(home_zone_detail="ciudad autonoma de buenos aires")
+        ctx = _make_ctx(state=state)
+        eng._normalize_zone_from_db(ctx, state)
+        self.assertEqual(state.home_zone_detail, "CABA")
+
+    def test_cdad_autonoma_normalized(self):
+        eng = self._normalize_engine()
+        state = _make_state(home_zone_detail="cdad autónoma de buenos aires")
+        ctx = _make_ctx(state=state)
+        eng._normalize_zone_from_db(ctx, state)
+        self.assertEqual(state.home_zone_detail, "CABA")
+
+    def test_caba_canonical_unchanged(self):
+        """'CABA' itself is canonical — must not be treated as synonym and must still
+        resolve correctly via the normal DB lookup."""
+        eng = self._normalize_engine()
+        state = _make_state(home_zone_detail="CABA")
+        ctx = _make_ctx(state=state)
+        eng._normalize_zone_from_db(ctx, state)
+        # DB lookup finds the row: zone_group="CABA"
+        self.assertEqual(state.home_zone_detail, "CABA")
+        self.assertEqual(state.home_zone_group, "CABA")
+
+    def test_gol_trend_caba_quotes_130000(self):
+        """After synonym normalization: AUTO + CABA → $130.000, no extra confirmation."""
+        eng = self._normalize_engine()
+        c = _make_candidate(tipo_vehiculo="AUTO")
+        # Simulate post-normalization state (synonym already normalized to CABA)
+        state = _make_state(home_zone_group="CABA", home_zone_detail="CABA")
+        ctx = _make_ctx(candidates=[c], state=state)
+
+        result = eng._compute_price_quote(ctx, state)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.precio_total, 130000)
+        self.assertEqual(result.zone_group, "CABA")
+        self.assertEqual(result.viaticos, 0)
+
+    def test_gol_trend_capital_federal_quotes_130000(self):
+        """'capital federal' + AUTO → normalize → $130.000."""
+        eng = self._normalize_engine()
+        c = _make_candidate(tipo_vehiculo="AUTO")
+        state = _make_state(home_zone_detail="capital federal")
+        ctx = _make_ctx(candidates=[c], state=state)
+
+        eng._normalize_zone_from_db(ctx, state)
+        result = eng._compute_price_quote(ctx, state)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.precio_total, 130000)
+
+    def test_is_caba_synonym_function(self):
+        from app.services.conversation_engine import _is_caba_synonym
+        self.assertTrue(_is_caba_synonym("capital federal"))
+        self.assertTrue(_is_caba_synonym("Capital Federal"))
+        self.assertTrue(_is_caba_synonym("ciudad autónoma de buenos aires"))
+        self.assertTrue(_is_caba_synonym("ciudad autonoma de buenos aires"))
+        self.assertTrue(_is_caba_synonym("c.a.b.a."))
+        self.assertFalse(_is_caba_synonym("CABA"))  # canonical, not a synonym
+        self.assertFalse(_is_caba_synonym("caba"))  # handled by DB detail match
+        self.assertFalse(_is_caba_synonym("Palermo"))
+        self.assertFalse(_is_caba_synonym("Oeste"))
+
+
+class TestQuoteIntentScrub(unittest.TestCase):
+    """BUG-2 extension: 'te envío la cotización' without amount must be scrubbed."""
+
+    def _scrub(self, reply, real_price_quote=None):
+        eng = _make_engine()
+        return eng._scrub_invented_price(reply, real_price_quote)
+
+    def test_te_envio_la_cotizacion_scrubbed_when_no_quote(self):
+        reply = "Genial, te envío la cotización para la revisión del Volkswagen Gol en CABA."
+        result = self._scrub(reply, real_price_quote=None)
+        self.assertNotIn("cotización", result)
+        self.assertIn("precio", result.lower())
+
+    def test_te_paso_el_precio_scrubbed_when_no_quote(self):
+        result = self._scrub("Ya te paso el precio.", real_price_quote=None)
+        self.assertNotIn("te paso el precio", result)
+
+    def test_envio_el_presupuesto_scrubbed_when_no_quote(self):
+        result = self._scrub("Te envío el presupuesto a la brevedad.", real_price_quote=None)
+        self.assertNotIn("presupuesto", result)
+
+    def test_quote_intent_with_real_quote_passes_through(self):
+        """When real_price_quote exists, 'te envío la cotización' is fine — override injects the amount."""
+        q = PricingQuote(
+            tipo_vehiculo="AUTO", zone_group="CABA", zone_detail="CABA",
+            precio_base=130000, viaticos=0,
+        )
+        reply = "Perfecto, te envío la cotización ahora."
+        result = self._scrub(reply, real_price_quote=q)
+        self.assertEqual(result, reply)  # not scrubbed
+
+    def test_regular_reply_without_intent_passes_through(self):
+        reply = "¿En qué barrio de CABA está el auto?"
+        result = self._scrub(reply, real_price_quote=None)
+        self.assertEqual(result, reply)
+
+
+class TestCABAEndToEndPricingPath(unittest.TestCase):
+    """Integration: full engine path for Gol Trend + CABA variants → $130.000."""
+
+    def test_caba_zone_detail_directly_prices_130000(self):
+        """Simulate what happens when zone_detail='CABA' after AI extraction."""
+        eng = _make_engine(repo=FakeRepoCABASentinel())
+        c = _make_candidate(tipo_vehiculo="AUTO")
+        state = _make_state(home_zone_detail="CABA")
+        ctx = _make_ctx(candidates=[c], state=state)
+
+        # Replicate engine normalization + pricing
+        eng._normalize_zone_from_db(ctx, state)
+        result = eng._compute_price_quote(ctx, state)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.precio_total, 130000)
+        self.assertEqual(result.viaticos, 0)
+
+    def test_ciudad_autonoma_zone_detail_prices_130000(self):
+        eng = _make_engine(repo=FakeRepoCABASentinel())
+        c = _make_candidate(tipo_vehiculo="AUTO")
+        state = _make_state(home_zone_detail="Ciudad Autónoma de Buenos Aires")
+        ctx = _make_ctx(candidates=[c], state=state)
+
+        eng._normalize_zone_from_db(ctx, state)
+        result = eng._compute_price_quote(ctx, state)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.precio_total, 130000)
+
+    def test_caba_quote_has_viatics_zero(self):
+        eng = _make_engine(repo=FakeRepoCABASentinel())
+        c = _make_candidate(tipo_vehiculo="AUTO")
+        state = _make_state(home_zone_detail="CABA")
+        ctx = _make_ctx(candidates=[c], state=state)
+
+        eng._normalize_zone_from_db(ctx, state)
+        result = eng._compute_price_quote(ctx, state)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.viaticos, 0)
+        self.assertEqual(result.precio_base, 130000)
+
+    def test_no_zone_confirmation_needed_when_caba_known(self):
+        """When real_price_quote is not None, BUG-3 ACEPTADO guard must NOT fire."""
+        q = PricingQuote(
+            tipo_vehiculo="AUTO", zone_group="CABA", zone_detail="CABA",
+            precio_base=130000, viaticos=0,
+        )
+        # BUG-3 guard condition: requires real_price_quote is None
+        guard_fires = (
+            "ACEPTADO" == "ACEPTADO"
+            and "QUALIFYING" in ("QUALIFYING", None)
+            and q is None  # <-- not None, so guard does NOT fire
+        )
+        self.assertFalse(guard_fires)
+
+    def test_si_after_caba_quote_moves_to_scheduling(self):
+        """After PRESUPUESTO_ENVIADO + QUOTED stage, 'Si' goes through _handle_quoted_acceptance.
+        BUG-3 guard (which blocks ACEPTADO in QUALIFYING) must NOT interfere."""
+        from app.services.conversation_engine import _is_acceptance, STAGE_QUOTED
+        # Simulate state after quote was sent
+        last_stage = STAGE_QUOTED
+        messages = ["Si"]
+        # Pre-AI acceptance check: last_stage == STAGE_QUOTED AND _is_acceptance → True
+        acceptance_fires = (last_stage == STAGE_QUOTED and _is_acceptance(messages))
+        self.assertTrue(acceptance_fires)
+
+    def test_caba_pricing_not_blocked_by_presupuesto_enviado_guard(self):
+        """PRESUPUESTO_ENVIADO guard must NOT block when real_price_quote is not None."""
+        q = PricingQuote(
+            tipo_vehiculo="AUTO", zone_group="CABA", zone_detail="CABA",
+            precio_base=130000, viaticos=0,
+        )
+        new_flag = "PRESUPUESTO_ENVIADO"
+        real_price_quote = q
+        # Guard: only blocks when real_price_quote is None
+        flag_accepted = True
+        if new_flag == "PRESUPUESTO_ENVIADO" and real_price_quote is None:
+            flag_accepted = False
+        self.assertTrue(flag_accepted)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

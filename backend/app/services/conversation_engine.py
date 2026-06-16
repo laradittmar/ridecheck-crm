@@ -91,6 +91,34 @@ _VEHICLE_YEAR_RE = re.compile(r"\b(19[89]\d|20[012]\d)\b")
 # Used to detect AI-hallucinated prices when real_price_quote is None.
 _PRICE_RE = re.compile(r'\$\s*\d[\d.,]*|\b\d[\d.,]+\s*pesos\b', re.IGNORECASE)
 
+# Matches "te envío la cotización / te paso el precio" patterns — quote-promise
+# without an actual amount.  Scrubbed when real_price_quote is None.
+_QUOTE_INTENT_RE = re.compile(
+    r'(?:te\s+(?:envío|paso|mando|alcanzo)|envíamos|les\s+enviamos|ya\s+te\s+(?:envío|paso|mando))'
+    r'\s+(?:el\s+precio|la\s+cotizaci[oó]n|el\s+presupuesto)',
+    re.IGNORECASE,
+)
+
+# CABA synonyms: all strings that mean "Ciudad Autónoma de Buenos Aires".
+# Stored as lowercase/normalized for direct substring matching.
+# Does NOT include "caba" itself — that's handled by the zone_detail="CABA" DB row.
+_CABA_SYNONYMS: frozenset[str] = frozenset({
+    "capital federal",
+    "ciudad autonoma de buenos aires",
+    "ciudad autónoma de buenos aires",
+    "cdad autonoma de buenos aires",
+    "cdad autónoma de buenos aires",
+    "c.a.b.a.",
+    "ciudad de buenos aires",
+})
+_CABA_CANONICAL_DETAIL = "CABA"
+_CABA_CANONICAL_GROUP = "CABA"
+
+
+def _is_caba_synonym(value: str) -> bool:
+    """Return True if value (case-insensitive) is a known CABA synonym."""
+    return " ".join((value or "").lower().split()) in _CABA_SYNONYMS
+
 
 def _extract_year_from_text(text: str) -> int | None:
     m = _VEHICLE_YEAR_RE.search(text)
@@ -1145,7 +1173,31 @@ Respondé SOLO con JSON válido:
         from sqlalchemy import select as _select
         normalized_text = " ".join(text.lower().split())
         zones = list(self.db.execute(_select(ViaticosZone)).scalars().all())
+
+        # CABA synonym fast-path: "capital federal", "ciudad autónoma de buenos aires" etc.
+        # Checked before the zone_detail loop because these strings don't appear
+        # as zone_detail values in the DB.  "caba" / "CABA" are NOT in this set —
+        # they're handled by the zone_detail="CABA" sentinel row in the loop below.
+        for synonym in _CABA_SYNONYMS:
+            if synonym in normalized_text:
+                # Return the CABA sentinel row from the already-loaded zones list.
+                for z in zones:
+                    if (
+                        " ".join((z.zone_group or "").lower().split()) == "caba"
+                        and " ".join((z.zone_detail or "").lower().split()) == "caba"
+                    ):
+                        return z
+                # Defensive sentinel if migration hasn't run yet.
+                from types import SimpleNamespace
+                return SimpleNamespace(  # type: ignore[return-value]
+                    zone_group=_CABA_CANONICAL_GROUP,
+                    zone_detail=_CABA_CANONICAL_DETAIL,
+                    viaticos=0,
+                )
+
         # Longer detail strings first to avoid partial matches shadowing full names.
+        # The zone_detail="CABA" sentinel row (len=4) is checked here too, matching
+        # "caba" as a substring in any user message that mentions CABA explicitly.
         zones_sorted = sorted(zones, key=lambda z: len(z.zone_detail or ""), reverse=True)
         for zone in zones_sorted:
             if not zone.zone_detail:
@@ -1153,9 +1205,10 @@ Respondé SOLO con JSON válido:
             zone_norm = " ".join(zone.zone_detail.lower().split())
             if zone_norm in normalized_text:
                 return zone
-        # BUG-1 pre-AI: also check if text contains a bare zone_group name (e.g. "caba").
-        # Return the group-level zone (zone_detail=None) so _compute_price_quote can
-        # attempt the group fallback, and so we know to ask for a specific neighborhood.
+
+        # Pre-AI group detection: if text mentions a bare zone_group name (e.g. "Oeste")
+        # that has no matching zone_detail, return a sentinel so the caller can set
+        # home_zone_group and the ACEPTADO guard can ask for the specific barrio.
         seen_groups: set[str] = set()
         for zone in zones:
             if zone.zone_group:
@@ -1164,12 +1217,9 @@ Respondé SOLO con JSON válido:
                     continue
                 seen_groups.add(g_norm)
                 if g_norm in normalized_text:
-                    # Return a synthetic group-level zone (zone_detail stays None)
                     group_zones = [z for z in zones if z.zone_group == zone.zone_group and z.zone_detail is None]
                     if group_zones:
                         return group_zones[0]
-                    # No explicit group-level row — return a sentinel with zone_detail=None
-                    # so the caller can set home_zone_group and clear home_zone_detail.
                     from types import SimpleNamespace
                     return SimpleNamespace(zone_group=zone.zone_group, zone_detail=None, viaticos=None)  # type: ignore[return-value]
         return None
@@ -1177,6 +1227,21 @@ Respondé SOLO con JSON válido:
     def _normalize_zone_from_db(self, ctx: _Context, state: "WhatsAppThreadState | None") -> None:
         if not state or not state.home_zone_detail:
             return
+
+        # Normalize CABA synonyms BEFORE the DB lookup so that all city-level
+        # CABA inputs map to the canonical sentinel row (zone_detail="CABA").
+        # "CABA" itself is NOT a synonym — it's the canonical value and resolves
+        # via the normal DB lookup below.
+        if _is_caba_synonym(state.home_zone_detail):
+            logger.info(
+                "M18 CABA synonym normalized: %r → %r thread_id=%s",
+                state.home_zone_detail, _CABA_CANONICAL_DETAIL,
+                ctx.thread.id if ctx else "?",
+            )
+            state.home_zone_detail = _CABA_CANONICAL_DETAIL
+            state.home_zone_group = _CABA_CANONICAL_GROUP
+            return  # No DB lookup needed; canonical values are hardwired
+
         # DB is always authoritative for zone_group.  Overwrite whatever the AI
         # extracted (AI often puts the city name as zone_group instead of the
         # correct CABA/Norte/Oeste/Sur canonical value).
@@ -1189,14 +1254,13 @@ Respondé SOLO con JSON válido:
             if zone.zone_group:
                 state.home_zone_group = zone.zone_group
         else:
-            # BUG-1: zone_detail might actually be a city/group name (e.g. "CABA").
+            # BUG-1: zone_detail might actually be a group name (e.g. "Oeste").
             # If it matches a known zone_group, promote it and clear zone_detail so
-            # _compute_price_quote can attempt the group-level fallback, and so the
-            # engine knows to ask for a specific neighborhood if no fallback exists.
+            # the engine knows to ask for a specific barrio.
             group_name = self._find_zone_group(state.home_zone_detail)
             if group_name:
                 logger.info(
-                    "M18 city-level zone detected: %r promoted to zone_group=%r thread_id=%s",
+                    "M18 group-level zone detected: %r promoted to zone_group=%r thread_id=%s",
                     state.home_zone_detail, group_name, ctx.thread.id if ctx else "?",
                 )
                 state.home_zone_group = group_name
@@ -1217,7 +1281,8 @@ Respondé SOLO con JSON válido:
         return None
 
     def _scrub_invented_price(self, reply: str, real_price_quote: "PricingQuote | None") -> str:
-        """BUG-2: If AI reply contains a price but we have no deterministic quote, replace it.
+        """BUG-2: Replace AI reply when no deterministic quote is available but the reply
+        either contains an invented price OR promises to send a quote without the amount.
 
         This is a hard backend guard — prompt instructions alone are not reliable.
         """
@@ -1225,6 +1290,12 @@ Respondé SOLO con JSON válido:
             return reply
         if _PRICE_RE.search(reply):
             logger.warning("M18 scrubbing AI-invented price from reply — no deterministic quote")
+            return (
+                "Necesito confirmar algunos datos antes de darte el precio exacto. "
+                "¿Me podés indicar en qué barrio o zona de la ciudad está el auto?"
+            )
+        if _QUOTE_INTENT_RE.search(reply):
+            logger.warning("M18 scrubbing AI quote-promise without amount — no deterministic quote")
             return (
                 "Necesito confirmar algunos datos antes de darte el precio exacto. "
                 "¿Me podés indicar en qué barrio o zona de la ciudad está el auto?"
