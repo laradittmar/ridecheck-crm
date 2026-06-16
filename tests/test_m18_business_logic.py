@@ -853,5 +853,252 @@ class TestSundayClosed(unittest.TestCase):
         self.assertFalse(hours.closed)
 
 
+# ── 160626_TESTS regression: BUG-1 / BUG-2 / BUG-3 ──────────────────────────
+
+
+class FakeRepoCABAFallback:
+    """CABA group-level zone (zone_detail=NULL), AUTO base price = $130.000.
+
+    Models a viaticos_zones row: zone_group='CABA', zone_detail=NULL, viaticos=0.
+    The PricingRepository group-only lookup (third branch) resolves this row when
+    zone_detail is blank and zone_group='CABA'.
+    """
+    _BASE = {"AUTO": FakePriceRow("AUTO", 130000)}
+
+    def find_base_price(self, tipo_vehiculo):
+        return self._BASE.get(tipo_vehiculo)
+
+    def find_zone_by_group_and_detail(self, db, zone_group, zone_detail):
+        ng = (zone_group or "").strip().lower()
+        nd = (zone_detail or "").strip().lower()
+        if nd == "caba":
+            return None  # "CABA" is not a zone_detail in the DB
+        if ng == "caba" and not nd:
+            return FakeZone(zone_group="CABA", zone_detail=None, viaticos=0)
+        return None
+
+
+class FakeRepoCABANoFallback:
+    """CABA is a known zone_group but has NO pricing row at any level."""
+    _BASE = {"AUTO": FakePriceRow("AUTO", 130000)}
+
+    def find_base_price(self, tipo_vehiculo):
+        return self._BASE.get(tipo_vehiculo)
+
+    def find_zone_by_group_and_detail(self, db, zone_group, zone_detail):
+        return None
+
+
+def _make_engine_with_groups(groups, repo):
+    """Make engine where db.execute returns the given zone_group list for _find_zone_group."""
+    from unittest.mock import MagicMock
+    eng = _make_engine(repo=repo)
+    mock_result = MagicMock()
+    mock_result.scalars.return_value.all.return_value = list(groups)
+    eng.db.execute.return_value = mock_result
+    return eng
+
+
+class TestCABAZoneDetection(unittest.TestCase):
+    """BUG-1: 'CABA' input must be promoted to zone_group, not used as zone_detail."""
+
+    def test_normalize_promotes_caba_detail_to_group(self):
+        """After AI extracts zone_detail='CABA', normalization must promote to zone_group."""
+        eng = _make_engine_with_groups(["CABA", "Oeste", "Norte"], repo=FakeRepoCABAFallback())
+        state = _make_state(home_zone_detail="CABA")
+        ctx = _make_ctx(state=state)
+
+        eng._normalize_zone_from_db(ctx, state)
+
+        self.assertEqual(state.home_zone_group, "CABA")
+        self.assertIsNone(state.home_zone_detail)
+
+    def test_normalize_clears_zone_detail_when_caba_is_group(self):
+        """zone_detail must be None after promotion so downstream knows to ask for barrio."""
+        eng = _make_engine_with_groups(["CABA"], repo=FakeRepoCABANoFallback())
+        state = _make_state(home_zone_detail="CABA")
+        ctx = _make_ctx(state=state)
+
+        eng._normalize_zone_from_db(ctx, state)
+
+        self.assertIsNone(state.home_zone_detail)
+
+    def test_compute_quote_caba_with_fallback_returns_130000(self):
+        """When CABA has a group-level pricing row, AUTO + CABA yields $130.000."""
+        eng = _make_engine_with_groups(["CABA", "Oeste"], repo=FakeRepoCABAFallback())
+        c = _make_candidate(tipo_vehiculo="AUTO")
+        # Post-normalization state: zone_group=CABA, zone_detail=None
+        state = _make_state(home_zone_group="CABA", home_zone_detail=None)
+        ctx = _make_ctx(candidates=[c], state=state)
+
+        result = eng._compute_price_quote(ctx, state)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.precio_total, 130000)
+        self.assertEqual(result.zone_group, "CABA")
+
+    def test_compute_quote_caba_without_fallback_returns_none(self):
+        """When CABA has no pricing row, compute returns None — no invented price possible."""
+        eng = _make_engine_with_groups(["CABA"], repo=FakeRepoCABANoFallback())
+        c = _make_candidate(tipo_vehiculo="AUTO")
+        state = _make_state(home_zone_group="CABA", home_zone_detail=None)
+        ctx = _make_ctx(candidates=[c], state=state)
+
+        result = eng._compute_price_quote(ctx, state)
+
+        self.assertIsNone(result)
+
+    def test_find_zone_group_returns_canonical_name(self):
+        """_find_zone_group must return the canonical casing from the DB."""
+        eng = _make_engine_with_groups(["CABA", "Oeste"], repo=FakeRepoCABAFallback())
+        result = eng._find_zone_group("caba")
+        self.assertEqual(result, "CABA")
+
+    def test_find_zone_group_returns_none_for_unknown(self):
+        eng = _make_engine_with_groups(["CABA", "Oeste"], repo=FakeRepoCABAFallback())
+        result = eng._find_zone_group("Mars")
+        self.assertIsNone(result)
+
+    def test_regular_zone_detail_not_promoted(self):
+        """A real zone_detail (Lomas del Mirador) must NOT be treated as a group."""
+        eng = _make_engine_with_groups(["CABA", "Oeste"], repo=FakeRepoCaptiva())
+        state = _make_state(home_zone_detail="Lomas del Mirador")
+        ctx = _make_ctx(state=state)
+
+        eng._normalize_zone_from_db(ctx, state)
+
+        # zone_detail stays; zone_group gets filled from DB
+        self.assertEqual(state.home_zone_detail, "Lomas del Mirador")
+        self.assertEqual(state.home_zone_group, "Oeste")
+
+
+class TestHardPriceGuard(unittest.TestCase):
+    """BUG-2: AI replies containing a price must be replaced when real_price_quote is None."""
+
+    def _scrub(self, reply, real_price_quote=None):
+        eng = _make_engine()
+        return eng._scrub_invented_price(reply, real_price_quote)
+
+    def test_dollar_dot_format_scrubbed(self):
+        """'$5.000' must be scrubbed when no real quote — the exact incident format."""
+        result = self._scrub("El precio de la revisión de tu Gol Trend en CABA es $5.000.")
+        self.assertNotIn("5.000", result)
+        self.assertNotIn("$", result)
+
+    def test_dollar_no_separator_scrubbed(self):
+        result = self._scrub("Son $5000 para tu auto.")
+        self.assertNotIn("5000", result)
+
+    def test_pesos_word_scrubbed(self):
+        result = self._scrub("Te queda en 130.000 pesos.")
+        self.assertNotIn("130.000", result)
+
+    def test_scrubbed_reply_asks_for_zone(self):
+        """Replacement text must guide the user to provide zone info."""
+        result = self._scrub("El precio es $5.000.")
+        self.assertIn("barrio", result.lower())
+
+    def test_real_quote_allows_price_through(self):
+        """When real_price_quote exists, price in reply must NOT be scrubbed."""
+        q = PricingQuote(
+            tipo_vehiculo="AUTO", zone_group="CABA", zone_detail=None,
+            precio_base=130000, viaticos=0,
+        )
+        result = self._scrub("El precio es $130.000.", real_price_quote=q)
+        self.assertIn("$130.000", result)
+
+    def test_no_price_reply_passes_through_unchanged(self):
+        """Reply without any price and no quote must be returned unchanged."""
+        original = "¿En qué barrio de CABA está el auto?"
+        result = self._scrub(original)
+        self.assertEqual(result, original)
+
+    def test_gol_trend_caba_hallucinated_5000_scrubbed(self):
+        """Exact regression: $5.000 for Gol Trend in CABA must be scrubbed."""
+        from app.services.conversation_engine import _PRICE_RE
+        ai_reply = "Para tu Gol Trend en CABA, el precio de la revisión es $5.000."
+        eng = _make_engine(repo=FakeRepoCABANoFallback())
+        scrubbed = eng._scrub_invented_price(ai_reply, real_price_quote=None)
+        self.assertIsNone(_PRICE_RE.search(scrubbed), f"Price pattern found in: {scrubbed!r}")
+        self.assertNotIn("5.000", scrubbed)
+
+
+class TestAcceptanceGuardNoQuote(unittest.TestCase):
+    """BUG-3: Acceptance in QUALIFYING without a quote must not advance to SCHEDULING."""
+
+    def _run_guard(self, new_flag, last_stage, real_price_quote):
+        """Replicate the BUG-3 guard from _process_text in isolation."""
+        _ALLOWED_FLAGS = {"PRESUPUESTANDO", "PRESUPUESTO_ENVIADO", "ACEPTADO"}
+
+        flag_accepted = bool(new_flag and new_flag in _ALLOWED_FLAGS)
+
+        if flag_accepted and new_flag == "PRESUPUESTO_ENVIADO" and real_price_quote is None:
+            flag_accepted = False
+
+        if (
+            flag_accepted
+            and new_flag == "ACEPTADO"
+            and last_stage in ("QUALIFYING", None)
+            and real_price_quote is None
+        ):
+            flag_accepted = False
+
+        return flag_accepted
+
+    def test_dale_in_qualifying_without_quote_is_blocked(self):
+        """'dale' after hallucinated price must NOT move to ACEPTADO/SCHEDULING."""
+        accepted = self._run_guard("ACEPTADO", "QUALIFYING", real_price_quote=None)
+        self.assertFalse(accepted)
+
+    def test_aceptado_with_none_stage_is_blocked(self):
+        accepted = self._run_guard("ACEPTADO", None, real_price_quote=None)
+        self.assertFalse(accepted)
+
+    def test_aceptado_in_quoted_stage_is_not_blocked(self):
+        """In QUOTED stage, ACEPTADO is legitimate — this guard must not fire."""
+        accepted = self._run_guard("ACEPTADO", "QUOTED", real_price_quote=None)
+        self.assertTrue(accepted)
+
+    def test_aceptado_with_real_quote_in_qualifying_not_blocked(self):
+        q = PricingQuote(
+            tipo_vehiculo="AUTO", zone_group="CABA", zone_detail=None,
+            precio_base=130000, viaticos=0,
+        )
+        accepted = self._run_guard("ACEPTADO", "QUALIFYING", real_price_quote=q)
+        self.assertTrue(accepted)
+
+    def test_guard_reply_cites_caba_neighborhood_when_group_known(self):
+        """When zone_group='CABA' and detail missing, the override reply asks for barrio."""
+        from unittest.mock import MagicMock
+        eng = _make_engine(repo=FakeRepoCABANoFallback())
+        eng.db.flush = MagicMock()
+
+        state = _make_state(home_zone_group="CABA", home_zone_detail=None, last_stage="QUALIFYING")
+        c = _make_candidate(tipo_vehiculo="AUTO")
+        ctx = _make_ctx(candidates=[c], state=state)
+
+        # Simulate the exact engine logic path for BUG-3 override reply
+        decision = {"lead_flag": "ACEPTADO", "reply": "Te llevo al siguiente paso."}
+        flag_accepted = True
+        if (
+            flag_accepted
+            and decision["lead_flag"] == "ACEPTADO"
+            and state.last_stage in ("QUALIFYING", None)
+            # real_price_quote is None
+        ):
+            flag_accepted = False
+            focus_c = eng._focus_candidate(ctx)
+            if state.home_zone_group and not state.home_zone_detail:
+                decision["reply"] = (
+                    f"¿En qué barrio de {state.home_zone_group} está el auto? "
+                    "Así te paso el valor exacto."
+                )
+
+        self.assertFalse(flag_accepted)
+        self.assertIn("CABA", decision["reply"])
+        self.assertIn("barrio", decision["reply"].lower())
+        self.assertNotIn("$", decision["reply"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

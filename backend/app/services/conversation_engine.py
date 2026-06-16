@@ -87,6 +87,10 @@ def _is_acceptance(texts: list[str]) -> bool:
 # Matches a vehicle model year: 1980–2029
 _VEHICLE_YEAR_RE = re.compile(r"\b(19[89]\d|20[012]\d)\b")
 
+# Matches any price-like token: "$5.000", "$5000", "5000 pesos", etc.
+# Used to detect AI-hallucinated prices when real_price_quote is None.
+_PRICE_RE = re.compile(r'\$\s*\d[\d.,]*|\b\d[\d.,]+\s*pesos\b', re.IGNORECASE)
+
 
 def _extract_year_from_text(text: str) -> int | None:
     m = _VEHICLE_YEAR_RE.search(text)
@@ -554,6 +558,43 @@ class ConversationEngine:
                 ctx.thread.id,
             )
             flag_accepted = False
+
+        # BUG-3 guard: never advance QUALIFYING → ACEPTADO without a deterministic quote.
+        # Acceptance words ("dale", "sí") in QUALIFYING stage must not move to SCHEDULING
+        # when we have no confirmed price — they could be accepting a hallucinated amount.
+        if (
+            flag_accepted
+            and new_flag == "ACEPTADO"
+            and state.last_stage in (STAGE_QUALIFYING, None)
+            and real_price_quote is None
+        ):
+            logger.warning(
+                "M18 blocking ACEPTADO in QUALIFYING — no deterministic quote thread_id=%s",
+                ctx.thread.id,
+            )
+            flag_accepted = False
+            focus_c = self._focus_candidate(ctx)
+            if state.home_zone_group and not state.home_zone_detail:
+                decision["reply"] = (
+                    f"¿En qué barrio de {state.home_zone_group} está el auto? "
+                    "Así te paso el valor exacto."
+                )
+            elif not (focus_c and focus_c.tipo_vehiculo):
+                decision["reply"] = (
+                    "Para avanzar necesito saber qué tipo de vehículo es. "
+                    "¿Es un auto, SUV u otro tipo?"
+                )
+            elif not (state.home_zone_group or state.home_zone_detail):
+                decision["reply"] = (
+                    "Para avanzar necesito saber en qué zona está el auto. "
+                    "¿Me podés indicar el barrio?"
+                )
+            else:
+                decision["reply"] = (
+                    "Antes de avanzar necesito confirmar el precio. "
+                    "Falta información de la zona o el vehículo."
+                )
+
         if flag_accepted and new_flag != lead.flag:
             lead.flag = new_flag
             if new_flag == "PRESUPUESTO_ENVIADO":
@@ -610,6 +651,8 @@ class ConversationEngine:
                     return result
 
         reply = str(decision.get("reply") or "")
+        # BUG-2 guard: if AI invented a price and we have no deterministic quote, scrub it.
+        reply = self._scrub_invented_price(reply, real_price_quote)
         if not reply:
             self.db.commit()
             return _out("replied", detail="no_reply_text")
@@ -1110,6 +1153,25 @@ Respondé SOLO con JSON válido:
             zone_norm = " ".join(zone.zone_detail.lower().split())
             if zone_norm in normalized_text:
                 return zone
+        # BUG-1 pre-AI: also check if text contains a bare zone_group name (e.g. "caba").
+        # Return the group-level zone (zone_detail=None) so _compute_price_quote can
+        # attempt the group fallback, and so we know to ask for a specific neighborhood.
+        seen_groups: set[str] = set()
+        for zone in zones:
+            if zone.zone_group:
+                g_norm = " ".join(zone.zone_group.lower().split())
+                if g_norm in seen_groups:
+                    continue
+                seen_groups.add(g_norm)
+                if g_norm in normalized_text:
+                    # Return a synthetic group-level zone (zone_detail stays None)
+                    group_zones = [z for z in zones if z.zone_group == zone.zone_group and z.zone_detail is None]
+                    if group_zones:
+                        return group_zones[0]
+                    # No explicit group-level row — return a sentinel with zone_detail=None
+                    # so the caller can set home_zone_group and clear home_zone_detail.
+                    from types import SimpleNamespace
+                    return SimpleNamespace(zone_group=zone.zone_group, zone_detail=None, viaticos=None)  # type: ignore[return-value]
         return None
 
     def _normalize_zone_from_db(self, ctx: _Context, state: "WhatsAppThreadState | None") -> None:
@@ -1123,8 +1185,51 @@ Respondé SOLO con JSON válido:
             zone_group=None,
             zone_detail=state.home_zone_detail,
         )
-        if zone and zone.zone_group:
-            state.home_zone_group = zone.zone_group
+        if zone is not None:
+            if zone.zone_group:
+                state.home_zone_group = zone.zone_group
+        else:
+            # BUG-1: zone_detail might actually be a city/group name (e.g. "CABA").
+            # If it matches a known zone_group, promote it and clear zone_detail so
+            # _compute_price_quote can attempt the group-level fallback, and so the
+            # engine knows to ask for a specific neighborhood if no fallback exists.
+            group_name = self._find_zone_group(state.home_zone_detail)
+            if group_name:
+                logger.info(
+                    "M18 city-level zone detected: %r promoted to zone_group=%r thread_id=%s",
+                    state.home_zone_detail, group_name, ctx.thread.id if ctx else "?",
+                )
+                state.home_zone_group = group_name
+                state.home_zone_detail = None  # need a specific neighborhood
+
+    def _find_zone_group(self, value: str) -> str | None:
+        """Return canonical zone_group name if value matches one in the DB; else None."""
+        from sqlalchemy import select as _select
+        normalized = " ".join((value or "").lower().split())
+        if not normalized:
+            return None
+        rows = self.db.execute(
+            _select(ViaticosZone.zone_group).distinct()
+        ).scalars().all()
+        for g in rows:
+            if g and " ".join(g.lower().split()) == normalized:
+                return g
+        return None
+
+    def _scrub_invented_price(self, reply: str, real_price_quote: "PricingQuote | None") -> str:
+        """BUG-2: If AI reply contains a price but we have no deterministic quote, replace it.
+
+        This is a hard backend guard — prompt instructions alone are not reliable.
+        """
+        if real_price_quote is not None:
+            return reply
+        if _PRICE_RE.search(reply):
+            logger.warning("M18 scrubbing AI-invented price from reply — no deterministic quote")
+            return (
+                "Necesito confirmar algunos datos antes de darte el precio exacto. "
+                "¿Me podés indicar en qué barrio o zona de la ciudad está el auto?"
+            )
+        return reply
 
     def _compute_price_quote(
         self, ctx: _Context, state: "WhatsAppThreadState | None"
