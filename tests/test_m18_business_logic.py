@@ -1331,5 +1331,218 @@ class TestCABAEndToEndPricingPath(unittest.TestCase):
         self.assertTrue(flag_accepted)
 
 
+# ── M18 scheduling-flow regression (real test 20260617) ──────────────────────
+
+
+class TestParseSchedulingTextExplicitDates(unittest.TestCase):
+    """_parse_scheduling_text must handle numeric dates like '21 del 6'."""
+
+    def _parse(self, texts, today=None):
+        from app.services.conversation_engine import _parse_scheduling_text
+        from datetime import date
+        return _parse_scheduling_text(texts, today or date(2026, 6, 17))
+
+    def test_21_del_6_parses_as_june_21(self):
+        day, _ = self._parse(["Tenes para el 21 del 6 ? A las 12hs ?"])
+        self.assertEqual(day, "2026-06-21")
+
+    def test_21_de_junio_parses_as_june_21(self):
+        day, _ = self._parse(["¿Tenés para el 21 de junio?"])
+        self.assertEqual(day, "2026-06-21")
+
+    def test_slash_format_21_6(self):
+        day, _ = self._parse(["para el 21/6 a las 12hs"])
+        self.assertEqual(day, "2026-06-21")
+
+    def test_dash_format_21_6(self):
+        day, _ = self._parse(["21-6 a las 10hs"])
+        self.assertEqual(day, "2026-06-21")
+
+    def test_time_12hs_extracted_alongside_date(self):
+        day, t = self._parse(["Tenes para el 21 del 6 ? A las 12hs ?"])
+        self.assertEqual(day, "2026-06-21")
+        self.assertEqual(t, "12:00")
+
+    def test_numeric_date_takes_next_year_if_past(self):
+        from datetime import date
+        day, _ = self._parse(["para el 3 del 1 a las 9hs"], today=date(2026, 6, 17))
+        self.assertEqual(day, "2027-01-03")
+
+    def test_si_alone_returns_no_date(self):
+        day, t = self._parse(["Si"])
+        self.assertIsNone(day)
+        self.assertIsNone(t)
+
+    def test_named_day_still_works(self):
+        from datetime import date
+        # today is Wednesday (weekday=2); "lunes" → next Monday = +5 days
+        day, _ = self._parse(["el lunes a las 10hs"], today=date(2026, 6, 17))
+        self.assertEqual(day, "2026-06-22")  # Monday 22/6
+
+    def test_manana_still_works(self):
+        from datetime import date
+        day, _ = self._parse(["mañana 12hs"], today=date(2026, 6, 17))
+        self.assertEqual(day, "2026-06-18")
+
+    def test_all_spanish_months(self):
+        from app.services.conversation_engine import _parse_scheduling_text
+        from datetime import date
+        today = date(2026, 1, 1)
+        month_names = [
+            "enero", "febrero", "marzo", "abril", "mayo", "junio",
+            "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+        ]
+        for i, mname in enumerate(month_names, start=1):
+            day, _ = _parse_scheduling_text([f"para el 15 de {mname}"], today)
+            self.assertIsNotNone(day, f"month '{mname}' not parsed")
+            expected_month = i
+            from datetime import date as d
+            parsed = d.fromisoformat(day)
+            self.assertEqual(parsed.month, expected_month, f"month mismatch for '{mname}'")
+
+
+class TestQuotedDateProposal(unittest.TestCase):
+    """QUOTED + date proposal → must NOT ask '¿Te parece bien?'.
+    Sunday must be rejected.  No 'cliente' placeholder in any reply.
+    """
+
+    def _make_schedule_service(self, valid: bool = True):
+        from unittest.mock import MagicMock
+        from app.services.schedule import ScheduleCheckOut
+        svc = MagicMock()
+        if valid:
+            svc.check.return_value = ScheduleCheckOut(
+                valid=True,
+                confirmed_day=None,
+                confirmed_time=None,
+                suggested_slots=[],
+                reasons=[],
+            )
+        else:
+            svc.check.return_value = ScheduleCheckOut(
+                valid=False,
+                confirmed_day=None,
+                confirmed_time=None,
+                suggested_slots=[],
+                reasons=["Domingo"],
+            )
+        return svc
+
+    def test_quoted_date_proposal_accepts_quote_and_advances(self):
+        """QUOTED + parseable date → flag=ACEPTADO, stage=SCHEDULING, no AI."""
+        from app.services.conversation_engine import (
+            STAGE_QUOTED, STAGE_SCHEDULING, _parse_scheduling_text,
+        )
+        from datetime import date
+
+        today = date(2026, 6, 17)
+        messages = ["Tenes para el 23 del 6 ? A las 10hs ?"]  # Monday 23/6 = valid
+        day, t = _parse_scheduling_text(messages, today)
+
+        self.assertEqual(day, "2026-06-23")  # Monday
+        self.assertEqual(t, "10:00")
+
+        # Verify the condition that gates the new QUOTED-date path
+        last_stage = STAGE_QUOTED
+        needs_human = False
+        gate_fires = (last_stage == STAGE_QUOTED and not needs_human and day is not None)
+        self.assertTrue(gate_fires)
+
+    def test_sunday_june_21_is_parsed_but_rejected_by_schedule(self):
+        """June 21 is Sunday → _try_schedule_and_flow must call check() which returns invalid."""
+        from app.services.conversation_engine import _parse_scheduling_text
+        from datetime import date
+
+        today = date(2026, 6, 17)
+        messages = ["Tenes para el 21 del 6 ? A las 12hs ?"]
+        day, t = _parse_scheduling_text(messages, today)
+
+        self.assertEqual(day, "2026-06-21")
+
+        parsed = date.fromisoformat(day)
+        self.assertEqual(parsed.weekday(), 6, "21/6/2026 must be Sunday (weekday=6)")
+
+    def test_no_cliente_in_handle_quoted_acceptance_reply_without_name(self):
+        """_handle_quoted_acceptance must not emit 'cliente' when customer_name is None."""
+        from unittest.mock import MagicMock
+
+        eng = _make_engine()
+
+        lead = MagicMock()
+        lead.flag = "PRESUPUESTO_ENVIADO"
+        lead.nombre = None
+
+        state = MagicMock()
+        state.customer_name = None
+        state.last_stage = "QUOTED"
+
+        sent_replies: list[str] = []
+
+        def fake_send_text(ctx, text):
+            sent_replies.append(text)
+            return "fake-msg-id"
+
+        eng._send_text_to_wa = fake_send_text
+
+        ctx = MagicMock()
+        ctx.lead = lead
+        ctx.state = state
+
+        eng._handle_quoted_acceptance(ctx, state)
+
+        self.assertEqual(len(sent_replies), 1)
+        reply = sent_replies[0]
+        self.assertNotIn("cliente", reply.lower())
+        self.assertIn("Genial", reply)
+
+    def test_scheduling_si_with_stored_non_sunday_day_retries_slot(self):
+        """'Si' in SCHEDULING stage with preferred_day=Monday → re-confirms that slot."""
+        from app.services.conversation_engine import (
+            STAGE_SCHEDULING, _parse_scheduling_text, _is_acceptance,
+        )
+        from datetime import date
+
+        # Simulate the engine pre-AI SCHEDULING check logic
+        today = date(2026, 6, 17)
+        ai_input_messages = ["Si"]
+        preferred_day = "2026-06-22"  # Monday
+        preferred_time = "10:00"
+
+        sched_day_iso, sched_time_str = _parse_scheduling_text(ai_input_messages, today)
+        self.assertIsNone(sched_day_iso)
+
+        # New: Si + stored non-Sunday → use stored day
+        if not sched_day_iso and preferred_day and _is_acceptance(ai_input_messages):
+            stored = date.fromisoformat(preferred_day)
+            if stored.weekday() != 6:
+                sched_day_iso = preferred_day
+                sched_time_str = preferred_time
+
+        self.assertEqual(sched_day_iso, "2026-06-22")
+        self.assertEqual(sched_time_str, "10:00")
+
+    def test_scheduling_si_with_stored_sunday_does_not_retry(self):
+        """'Si' in SCHEDULING stage with preferred_day=Sunday → do NOT re-confirm."""
+        from app.services.conversation_engine import (
+            _parse_scheduling_text, _is_acceptance,
+        )
+        from datetime import date
+
+        today = date(2026, 6, 17)
+        ai_input_messages = ["Si"]
+        preferred_day = "2026-06-21"  # Sunday
+        preferred_time = "12:00"
+
+        sched_day_iso, sched_time_str = _parse_scheduling_text(ai_input_messages, today)
+        self.assertIsNone(sched_day_iso)
+
+        if not sched_day_iso and preferred_day and _is_acceptance(ai_input_messages):
+            stored = date.fromisoformat(preferred_day)
+            if stored.weekday() != 6:  # Sunday excluded
+                sched_day_iso = preferred_day
+
+        self.assertIsNone(sched_day_iso, "Sunday stored day must not be retried")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

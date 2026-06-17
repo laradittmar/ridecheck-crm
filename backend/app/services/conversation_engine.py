@@ -138,6 +138,13 @@ _SPANISH_DAY_TO_WEEKDAY: dict[str, int] = {
     "domingo": 6,
 }
 
+_SPANISH_MONTHS: dict[str, int] = {
+    "enero": 1, "febrero": 2, "marzo": 3, "abril": 4,
+    "mayo": 5, "junio": 6, "julio": 7, "agosto": 8,
+    "septiembre": 9, "setiembre": 9, "octubre": 10,
+    "noviembre": 11, "diciembre": 12,
+}
+
 
 def _parse_scheduling_text(texts: list[str], today: date) -> tuple[str | None, str | None]:
     """Parse a Spanish day+time expression from SCHEDULING-stage user messages.
@@ -169,6 +176,50 @@ def _parse_scheduling_text(texts: list[str], today: date) -> tuple[str | None, s
                     days_ahead += 7
                 day_iso = (today + timedelta(days=days_ahead)).isoformat()
                 break
+
+    # Explicit numeric date: "21 del 6", "21 de 6" (Argentine DD del/de MM)
+    if day_iso is None:
+        m = re.search(r"\b(\d{1,2})\s+del?\s+(\d{1,2})\b", combined)
+        if m:
+            d, mo = int(m.group(1)), int(m.group(2))
+            if 1 <= d <= 31 and 1 <= mo <= 12:
+                try:
+                    candidate = date(today.year, mo, d)
+                    if candidate < today:
+                        candidate = date(today.year + 1, mo, d)
+                    day_iso = candidate.isoformat()
+                except ValueError:
+                    pass
+
+    # Spanish month name: "21 de junio", "3 de marzo"
+    if day_iso is None:
+        for mname, mnum in _SPANISH_MONTHS.items():
+            m = re.search(rf"\b(\d{{1,2}})\s+de\s+{mname}\b", combined)
+            if m:
+                d = int(m.group(1))
+                if 1 <= d <= 31:
+                    try:
+                        candidate = date(today.year, mnum, d)
+                        if candidate < today:
+                            candidate = date(today.year + 1, mnum, d)
+                        day_iso = candidate.isoformat()
+                    except ValueError:
+                        pass
+                break
+
+    # Slash/dash date: "21/6" or "21-6" (Argentine: day first)
+    if day_iso is None:
+        m = re.search(r"\b(\d{1,2})[/-](\d{1,2})\b", combined)
+        if m:
+            d, mo = int(m.group(1)), int(m.group(2))
+            if 1 <= d <= 31 and 1 <= mo <= 12:
+                try:
+                    candidate = date(today.year, mo, d)
+                    if candidate < today:
+                        candidate = date(today.year + 1, mo, d)
+                    day_iso = candidate.isoformat()
+                except ValueError:
+                    pass
 
     # ── Time extraction ───────────────────────────────────────────────────
     time_str: str | None = None
@@ -427,9 +478,9 @@ class ConversationEngine:
             scheduled_time=sched_time.strftime("%H:%M") if sched_time else None,
         )
 
-        buyer_display = buyer_first or state.customer_name or "cliente"
+        buyer_display = buyer_first or state.customer_name or ""
         confirm_text = (
-            f"¡Perfecto, {buyer_display}! Tu solicitud de turno quedó registrada 🎉\n\n"
+            f"¡Perfecto{', ' + buyer_display if buyer_display else ''}! Tu solicitud de turno quedó registrada 🎉\n\n"
             "Un asesor va a revisar la disponibilidad y te confirma el turno a la brevedad. "
             "Cualquier consulta respondé por acá."
         )
@@ -468,6 +519,24 @@ class ConversationEngine:
         if state.last_stage == STAGE_QUOTED and _is_acceptance(ai_input_messages):
             return self._handle_quoted_acceptance(ctx, state)
 
+        # ── Deterministic QUOTED + date/time proposal (pre-AI) ───────────
+        # User proposes a specific slot while still in QUOTED stage.
+        # Treat as implicit quote acceptance + scheduling request; skip AI,
+        # advance flag to ACEPTADO and immediately check availability.
+        # Sunday / closed days → rejection message with alternatives.
+        if state.last_stage == STAGE_QUOTED and not state.needs_human:
+            sched_day_iso, sched_time_str = _parse_scheduling_text(ai_input_messages, date.today())
+            if sched_day_iso:
+                lead.flag = "ACEPTADO"
+                state.last_stage = STAGE_SCHEDULING
+                logger.info(
+                    "M18 QUOTED scheduling proposal thread_id=%s day=%s time=%s",
+                    ctx.thread.id, sched_day_iso, sched_time_str,
+                )
+                result = self._try_schedule_and_flow(ctx, state, sched_day_iso, sched_time_str, "")
+                if result is not None:
+                    return result
+
         # ── Deterministic SCHEDULING day/time parse (pre-AI) ─────────────
         # Parse Spanish day names and time expressions without calling the AI.
         # The AI historically misformats preferred_time_str (e.g. "Viernes 12hs"
@@ -478,6 +547,17 @@ class ConversationEngine:
             and not state.flow_booking_token
         ):
             sched_day_iso, sched_time_str = _parse_scheduling_text(ai_input_messages, date.today())
+            # If user confirmed ("si") without a date, re-confirm the stored slot
+            # (e.g. they accepted an alternative the bot proposed).  Skip Sundays
+            # since those are always closed and re-trying would just loop.
+            if not sched_day_iso and state.preferred_day and _is_acceptance(ai_input_messages):
+                try:
+                    stored = date.fromisoformat(str(state.preferred_day))
+                    if stored.weekday() != 6:
+                        sched_day_iso = str(state.preferred_day)
+                        sched_time_str = str(state.preferred_time) if state.preferred_time else None
+                except (ValueError, TypeError):
+                    pass
             if sched_day_iso:
                 logger.info(
                     "M18 scheduling deterministic parse thread_id=%s day=%s time=%s",
@@ -714,11 +794,9 @@ class ConversationEngine:
         # state.current_revision_id stays null
         # state.needs_human stays false
 
-        customer = (state.customer_name or "").strip() or (lead.nombre or "").strip() or "cliente"
-        reply = (
-            f"Genial, {customer}! "
-            "¿Qué día y horario te viene mejor para la revisión?"
-        )
+        customer = (state.customer_name or "").strip() or (lead.nombre or "").strip()
+        greeting = f"Genial, {customer}!" if customer else "Genial!"
+        reply = f"{greeting} ¿Qué día y horario te viene mejor para la revisión?"
         sent_id = self._send_text_to_wa(ctx, reply)
         return _out("replied", wa_message_id=sent_id)
 
@@ -901,6 +979,7 @@ REGLAS DE NEGOCIO:
 8. NUNCA inventes ni calcules precios. El único precio válido es el que aparece en PRECIO CALCULADO.
 9. NUNCA preguntes el precio de venta, valor o tasación del vehículo. Ridecheck NO necesita eso para cotizar la inspección.
 10. Si la zona no está disponible en tu sistema, pedí confirmación de una zona/barrio cercano. NUNCA pidas precio del vehículo ni datos de la venta.
+11. NUNCA uses "cliente" como nombre de persona. Si no sabés el nombre, salteá el nombre por completo — decí "Genial!" en lugar de "Genial, cliente!".
 
 TIPOS DE VEHÍCULO VÁLIDOS: AUTO, SUV_4X4_DEPORTIVO, SUV/4x4, CLASICO, MOTO, ESCANEO_MOTOR
 
