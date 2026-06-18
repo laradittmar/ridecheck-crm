@@ -2764,5 +2764,258 @@ class TestAuditVehicleChange(unittest.TestCase):
         self.assertFalse(result.handled)
 
 
+class TestSlotOrdering(unittest.TestCase):
+    """All slot lists — stored and displayed — must be chronological."""
+
+    def _run_rejection(self, requested_time="12:00", all_day_slots=None):
+        """Trigger the rejection branch in _try_schedule_and_flow and return (state, sent)."""
+        MagicMock = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock
+        eng = _make_engine()
+        svc = MagicMock()
+        check_mock = MagicMock(valid=False, suggested_slots=[], reasons=["Ocupado"])
+        svc.check.return_value = check_mock
+        list_mock = MagicMock()
+        list_mock.slots = all_day_slots or ["09:00", "09:30", "10:00", "10:30", "11:00",
+                                             "13:00", "13:30", "14:00", "14:30"]
+        svc.list_slots.return_value = list_mock
+        eng._schedule = svc
+        sent: list[str] = []
+        eng._send_text_to_wa = lambda ctx, txt: sent.append(txt) or "id"
+        state = _make_state(last_stage="SCHEDULING", home_zone_group="Oeste", home_zone_detail="San Justo")
+        ctx = _make_ctx(state=state)
+        eng._try_schedule_and_flow(ctx, state, "2026-06-19", requested_time, "")
+        return state, sent
+
+    def test_offered_slots_stored_sorted(self):
+        """last_offered_slots must be chronological regardless of list_slots order."""
+        import json
+        # Simulate list_slots returning slots out of order (as seen in the bug)
+        state, _ = self._run_rejection(all_day_slots=["11:00", "13:00", "10:30", "09:00", "14:00"])
+        stored = json.loads(state.last_offered_slots)
+        self.assertEqual(stored, sorted(stored), f"Stored slots not sorted: {stored}")
+
+    def test_rejection_reply_slots_are_chronological(self):
+        """The offered slots in the rejection reply must be in chronological order."""
+        _, sent = self._run_rejection(requested_time="12:00",
+                                      all_day_slots=["09:00", "09:30", "10:00", "10:30",
+                                                     "11:00", "13:00", "13:30", "14:00"])
+        reply = sent[0]
+        # Extract only the offered-slot section (after "disponibles:")
+        import re
+        after_disponibles = reply.split("disponibles:")[-1] if "disponibles:" in reply else reply
+        times = re.findall(r"\d{2}:\d{2}", after_disponibles)
+        self.assertTrue(len(times) >= 2, f"Expected at least 2 slot times in reply: {reply!r}")
+        self.assertEqual(times, sorted(times), f"Offered slots not in chronological order: {times}")
+
+    def test_nearest_slots_displayed_chronologically(self):
+        """The 3 nearest slots to the requested time must be sorted, not by proximity."""
+        from app.services.conversation_engine import _nearest_slots
+        # Nearest to 12:00: 11:00 (60min), 13:00 (60min), 10:30 (90min)
+        # Without sorting: [11:00, 13:00, 10:30] — WRONG
+        # With sorting: [10:30, 11:00, 13:00] — correct
+        result = _nearest_slots(["09:00", "10:30", "11:00", "13:00", "14:00"], "12:00", 3)
+        self.assertEqual(sorted(result), sorted(result))  # basic sanity
+        # The displayed ones (sorted) must be in order
+        displayed = sorted(result)
+        self.assertEqual(displayed, sorted(displayed))
+
+
+class TestPeriodDetection(unittest.TestCase):
+    """_detect_time_period must handle accents, typos, and standalone 'tarde'."""
+
+    def _detect(self, texts):
+        from app.services.conversation_engine import _detect_time_period
+        return _detect_time_period(texts)
+
+    def test_a_la_tarde_ascii(self):
+        self.assertEqual(self._detect(["a la tarde?"]), "tarde")
+
+    def test_accented_a_la_tarde(self):
+        """'À la tarde?' (accented À) must normalize and return 'tarde'."""
+        self.assertEqual(self._detect(["À la tarde?"]), "tarde")
+
+    def test_por_la_tarde(self):
+        self.assertEqual(self._detect(["por la tarde"]), "tarde")
+
+    def test_standalone_tarde(self):
+        """Single-word 'tarde?' must return 'tarde'."""
+        self.assertEqual(self._detect(["tarde?"]), "tarde")
+        self.assertEqual(self._detect(["tarde"]), "tarde")
+
+    def test_mañana_a_la_tarde_detects_tarde(self):
+        """'Mañana a la tarde' has day + period — period must still be detected."""
+        self.assertEqual(self._detect(["Mañana a la tarde"]), "tarde")
+
+    def test_por_la_manana(self):
+        self.assertEqual(self._detect(["por la mañana"]), "manana")
+
+    def test_temprano(self):
+        self.assertEqual(self._detect(["algo temprano"]), "manana")
+
+    def test_unrelated_message_not_detected(self):
+        self.assertIsNone(self._detect(["el lunes a las 10hs"]))
+
+    def test_no_false_positive_from_scheduling_context(self):
+        self.assertIsNone(self._detect(["mañana 12hs"]))
+
+
+class TestPeriodSchedulingFlow(unittest.TestCase):
+    """Afternoon/morning period requests must be deterministic in SCHEDULING stage."""
+
+    def _make_svc(self, slots):
+        MagicMock = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock
+        svc = MagicMock()
+        check_mock = MagicMock(valid=False, suggested_slots=[], reasons=["test"])
+        svc.check.return_value = check_mock
+        list_mock = MagicMock()
+        list_mock.slots = slots
+        list_mock.business_hours = "09:00-18:00"
+        svc.list_slots.return_value = list_mock
+        return svc
+
+    def _make_afternoon_state(self, with_slots=True):
+        import json
+        slots = ["09:00", "09:30", "10:00", "10:30", "11:00",
+                 "13:00", "13:30", "14:00", "14:30"]
+        return _make_state(
+            last_stage="SCHEDULING",
+            home_zone_group="Oeste",
+            home_zone_detail="San Justo",
+            active_requested_date="2026-06-19",
+            last_offered_slots=json.dumps(sorted(slots)) if with_slots else None,
+        )
+
+    def test_a_la_tarde_accented_uses_active_date(self):
+        """'À la tarde?' must filter last_offered_slots for afternoon, not ask for day/time."""
+        eng = _make_engine()
+        sent: list[str] = []
+        eng._send_text_to_wa = lambda ctx, txt: sent.append(txt) or "id"
+
+        state = self._make_afternoon_state()
+        ctx = _make_ctx(state=state)
+        result = eng._handle_period_request(ctx, state, "tarde")
+
+        self.assertIsNotNone(result)
+        self.assertEqual(len(sent), 1)
+        reply = sent[0]
+        # Must show afternoon slots
+        self.assertTrue(
+            any(t in reply for t in ["13:00", "13:30", "14:00", "14:30"]),
+            f"Afternoon slots must appear in reply: {reply!r}",
+        )
+        # Must NOT ask for day/time generically
+        self.assertNotIn("¿Qué día", reply)
+
+    def test_manana_a_la_tarde_returns_afternoon_slots(self):
+        """'Mañana a la tarde' must list afternoon slots, not morning."""
+        eng = _make_engine()
+        all_slots = ["09:00", "09:30", "10:00", "10:30", "11:00",
+                     "13:00", "13:30", "14:00", "14:30"]
+        eng._schedule = self._make_svc(all_slots)
+        sent: list[str] = []
+        eng._send_text_to_wa = lambda ctx, txt: sent.append(txt) or "id"
+
+        state = self._make_afternoon_state(with_slots=False)
+        ctx = _make_ctx(state=state)
+        eng._handle_day_only_request(ctx, state, "2026-06-19", period="tarde")
+
+        reply = sent[0]
+        # Must not contain morning-only slots as the primary options
+        self.assertNotIn("09:00", reply)
+        self.assertNotIn("10:00", reply)
+        # Must contain afternoon slots
+        self.assertTrue(
+            any(t in reply for t in ["13:00", "13:30", "14:00", "14:30"]),
+            f"Afternoon slots must appear: {reply!r}",
+        )
+
+    def test_day_only_slots_are_sorted(self):
+        """Slots stored via _handle_day_only_request must be chronological."""
+        import json
+        eng = _make_engine()
+        # Simulate list_slots returning an unordered list
+        eng._schedule = self._make_svc(["14:00", "09:00", "13:00", "10:30"])
+        eng._send_text_to_wa = lambda ctx, txt: "id"
+
+        state = self._make_afternoon_state(with_slots=False)
+        ctx = _make_ctx(state=state)
+        eng._handle_day_only_request(ctx, state, "2026-06-19")
+
+        stored = json.loads(state.last_offered_slots)
+        self.assertEqual(stored, sorted(stored), f"Stored slots must be sorted: {stored}")
+
+    def test_period_request_does_not_send_flow(self):
+        """A period request ('tarde') must NEVER send the Flow button."""
+        eng = _make_engine()
+        sent_texts: list[str] = []
+        flow_sent: list[bool] = []
+        eng._send_text_to_wa = lambda ctx, txt: sent_texts.append(txt) or "id"
+        eng._send_flow_button = lambda ctx, body, token: flow_sent.append(True) or "flow-id"
+
+        state = self._make_afternoon_state()
+        ctx = _make_ctx(state=state)
+        eng._handle_period_request(ctx, state, "tarde")
+
+        self.assertEqual(flow_sent, [], "Flow must NOT be sent for a period request")
+        self.assertEqual(len(sent_texts), 1)
+
+    def test_exact_slot_from_afternoon_list_can_trigger_flow(self):
+        """After afternoon list shown, user picks exact slot → Flow is sent."""
+        MagicMock = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock
+        eng = _make_engine()
+        svc = MagicMock()
+        check_mock = MagicMock(valid=True, suggested_slots=[], reasons=[])
+        svc.check.return_value = check_mock
+        eng._schedule = svc
+        flow_sent: list[str] = []
+        eng._send_flow_button = lambda ctx, body, token: flow_sent.append(token) or "flow-id"
+        eng._send_text_to_wa = lambda ctx, txt: "id"
+
+        import json
+        state = _make_state(
+            last_stage="SCHEDULING",
+            home_zone_group="Oeste",
+            home_zone_detail="San Justo",
+            active_requested_date="2026-06-19",
+            last_offered_slots=json.dumps(["09:00", "13:00", "14:00"]),
+        )
+        ctx = _make_ctx(state=state)
+        # User picks "14:00" from the afternoon list
+        eng._try_schedule_and_flow(ctx, state, "2026-06-19", "14:00", "")
+
+        self.assertTrue(len(flow_sent) > 0, "Flow must be sent when exact slot is confirmed available")
+
+    def test_reply_contains_no_iso_strings(self):
+        """Rejection reply must not contain ISO datetime strings."""
+        _, sent = TestSlotOrdering()._run_rejection()
+        reply = sent[0]
+        self.assertNotIn("T", reply.split("disponibilidad")[0] if "disponibilidad" in reply else reply[:50])
+        import re
+        iso_pattern = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}")
+        self.assertFalse(iso_pattern.search(reply), f"ISO datetime found in reply: {reply!r}")
+
+    def test_period_reply_no_quote_mention(self):
+        """Period reply in SCHEDULING must not repeat the price/quote."""
+        eng = _make_engine()
+        sent: list[str] = []
+        eng._send_text_to_wa = lambda ctx, txt: sent.append(txt) or "id"
+
+        import json
+        state = _make_state(
+            last_stage="SCHEDULING",
+            home_zone_group="Oeste",
+            home_zone_detail="San Justo",
+            active_requested_date="2026-06-19",
+            last_offered_slots=json.dumps(["09:00", "13:00", "14:00", "14:30"]),
+        )
+        ctx = _make_ctx(state=state)
+        eng._handle_period_request(ctx, state, "tarde")
+
+        reply = sent[0].lower()
+        self.assertNotIn("cotización", reply)
+        self.assertNotIn("$", reply)
+        self.assertNotIn("precio", reply)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

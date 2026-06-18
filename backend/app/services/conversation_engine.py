@@ -27,6 +27,7 @@ import logging
 import re
 import secrets
 import time as _time
+import unicodedata
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from urllib import error as urlerror, request as urlrequest
@@ -209,12 +210,27 @@ def _time_hour(time_str: str) -> int:
         return 0
 
 
+def _strip_accents(text: str) -> str:
+    """Decompose text and drop combining diacritical marks → ASCII-safe lowercase."""
+    nfkd = unicodedata.normalize("NFKD", text)
+    return "".join(c for c in nfkd if not unicodedata.combining(c)).lower()
+
+
 def _detect_time_period(texts: list[str]) -> str | None:
-    """Return 'tarde' or 'manana' if the message requests a broad time period."""
-    combined = " ".join(texts).lower()
+    """Return 'tarde' or 'manana' if the message requests a broad time period.
+
+    Normalizes accents first so 'À la tarde', 'a la tarde', 'tarde?' all match.
+    Also handles standalone 'tarde' (one-word reply).
+    """
+    combined = _strip_accents(" ".join(texts))
+    # "a la tarde" / "por la tarde" / "a la tarde?" / "à la tarde" (after normalization)
     if re.search(r"\b(?:por|a)\s+la\s+tarde\b", combined):
         return "tarde"
-    if re.search(r"\b(?:por|a)\s+la\s+(?:mañana|manana)\b|\btemprano\b", combined):
+    # Standalone "tarde" or "tarde?" as a very short reply
+    if re.match(r"^\s*[¿¡]*tarde[?!.]*\s*$", combined.strip()):
+        return "tarde"
+    # "por la mañana" / "a la mañana" / "temprano"
+    if re.search(r"\b(?:por|a)\s+la\s+manana\b|\btemprano\b", combined):
         return "manana"
     return None
 
@@ -721,14 +737,22 @@ class ConversationEngine:
                 )
 
             sched_day_iso, sched_time_str = _parse_scheduling_text(ai_input_messages, date.today())
+            # Detect period once — used by both the period-only and day+period branches.
+            period = _detect_time_period(ai_input_messages)
 
-            # 2. Period request ("por la tarde") → filter active date's alternatives
-            if not sched_day_iso and not sched_time_str:
-                period = _detect_time_period(ai_input_messages)
-                if period and state.active_requested_date and state.last_offered_slots:
+            # 2. Period request: no explicit day/time in the message.
+            #    Use active_requested_date (set by prior rejection) as the target date.
+            if not sched_day_iso and not sched_time_str and period:
+                if state.active_requested_date and state.last_offered_slots:
+                    # Fast path: filter the already-stored full-day slots by period.
                     result = self._handle_period_request(ctx, state, period)
                     if result is not None:
                         return result
+                elif state.active_requested_date:
+                    # No cached slots — fetch fresh slots and filter by period.
+                    return self._handle_day_only_request(
+                        ctx, state, str(state.active_requested_date), period=period
+                    )
 
             # 3. Time-only reply on active date: user picks "14:30" from alternatives
             if not sched_day_iso and sched_time_str and state.active_requested_date:
@@ -756,7 +780,8 @@ class ConversationEngine:
                 if result is not None:
                     return result
             elif sched_day_iso and _pure_sched:
-                return self._handle_day_only_request(ctx, state, sched_day_iso)
+                # Day only (or day + period like "mañana a la tarde") — list available slots.
+                return self._handle_day_only_request(ctx, state, sched_day_iso, period=period)
 
         # ── Deterministic vehicle catalog lookup (pre-AI) ─────────────────
         # Search across all recent messages (not just current burst) so a
@@ -1112,6 +1137,7 @@ class ConversationEngine:
                 )
             if not all_slots:
                 all_slots = [s for s in sched_out.suggested_slots if isinstance(s, str)]
+            all_slots = sorted(all_slots)  # always store chronologically
 
             state.preferred_day = None
             state.preferred_time = None
@@ -1121,7 +1147,8 @@ class ConversationEngine:
 
             date_human = _format_date_human(preferred_day_iso, date.today())
             if all_slots:
-                near = _nearest_slots(all_slots, preferred_time_obj.strftime("%H:%M"))
+                # Sort nearest slots chronologically so reply is always in time order.
+                near = sorted(_nearest_slots(all_slots, preferred_time_obj.strftime("%H:%M")))
                 slot_list = ", ".join(near)
                 msg = (
                     f"Para {date_human} a las {preferred_time_obj.strftime('%H:%M')} "
@@ -1181,8 +1208,11 @@ class ConversationEngine:
         ctx: _Context,
         state: WhatsAppThreadState,
         day_iso: str,
+        period: str | None = None,
     ) -> ConversationHandleOut:
-        """User named a day but no specific time. List available slots for that day."""
+        """User named a day (with optional time period) but no exact slot.
+        Fetches full-day availability, stores sorted slots, and replies with options
+        filtered by period ('tarde'/'manana') when specified."""
         from ..schemas.schedule import ScheduleCheckIn
         assert ctx.lead is not None
         zone_parts = [state.home_zone_detail, state.home_zone_group, "Buenos Aires, Argentina"]
@@ -1199,23 +1229,46 @@ class ConversationEngine:
         is_closed = False
         try:
             slots_out = self._schedule.list_slots(sched_in)
-            all_slots = [s for s in (slots_out.slots or []) if isinstance(s, str)]
+            all_slots = sorted([s for s in (slots_out.slots or []) if isinstance(s, str)])
             is_closed = slots_out.business_hours == "cerrado"
         except Exception as exc:
             logger.warning("M18 list_slots failed in day_only thread_id=%s: %s", ctx.thread.id, exc)
             all_slots = []
 
         state.active_requested_date = day_iso
-        state.last_offered_slots = json.dumps(all_slots)
+        state.last_offered_slots = json.dumps(all_slots)  # full-day, sorted
 
         date_human = _format_date_human(day_iso, date.today())
-        if all_slots:
-            shown = all_slots[:4]
-            if len(shown) >= 2:
-                slot_list = ", ".join(shown[:-1]) + f" o {shown[-1]}"
+
+        # Filter by time period when the user requested morning or afternoon.
+        if period == "tarde":
+            display_slots = [s for s in all_slots if _time_hour(s) >= _AFTERNOON_HOUR]
+            period_label: str | None = "tarde"
+            alt_label: str | None = "mañana"
+        elif period == "manana":
+            display_slots = [s for s in all_slots if _time_hour(s) < _AFTERNOON_HOUR]
+            period_label = "mañana"
+            alt_label = "tarde"
+        else:
+            display_slots = all_slots
+            period_label = None
+            alt_label = None
+
+        if display_slots:
+            shown = display_slots[:4]
+            slot_list = ", ".join(shown[:-1]) + f" o {shown[-1]}" if len(shown) >= 2 else shown[0]
+            if period_label:
+                msg = f"Para {date_human} por la {period_label} tengo: {slot_list}. ¿A qué hora te viene bien?"
             else:
-                slot_list = shown[0]
-            msg = f"Para {date_human} tengo disponible: {slot_list}. ¿A qué hora te viene bien?"
+                msg = f"Para {date_human} tengo disponible: {slot_list}. ¿A qué hora te viene bien?"
+        elif period_label and all_slots:
+            # Requested period has no slots — offer the other period.
+            shown_all = all_slots[:4]
+            sl = ", ".join(shown_all[:-1]) + f" o {shown_all[-1]}" if len(shown_all) >= 2 else shown_all[0]
+            msg = (
+                f"Para {date_human} no hay horarios por la {period_label}. "
+                f"Tengo disponible: {sl}. ¿Alguno te sirve?"
+            )
         elif is_closed:
             msg = (
                 f"El {date_human} no tenemos operaciones. "
@@ -1227,8 +1280,8 @@ class ConversationEngine:
                 "¿Tenés otro día preferido?"
             )
         logger.info(
-            "M18 day_only_request thread_id=%s day=%s slots=%d",
-            ctx.thread.id, day_iso, len(all_slots),
+            "M18 day_only_request thread_id=%s day=%s period=%s display_slots=%d",
+            ctx.thread.id, day_iso, period, len(display_slots),
         )
         sent_id = self._send_text_to_wa(ctx, msg)
         return _out("replied", wa_message_id=sent_id)
