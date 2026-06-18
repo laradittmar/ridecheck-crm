@@ -329,6 +329,7 @@ class WhatsAppThreadState(Base):
     last_requested_time: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
     last_offered_slots: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     last_visible_slots: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    is_website_lead: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     flow_booking_token: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
     unanswered_alert_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     quote_followup_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)

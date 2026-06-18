@@ -103,6 +103,7 @@ def _make_state(**kwargs):
         last_requested_time=None,
         last_offered_slots=None,
         last_visible_slots=None,
+        is_website_lead=False,
         last_stage="QUALIFYING",
         needs_human=False,
         flow_booking_token=None,
@@ -1583,7 +1584,7 @@ class TestRejectedSlotNotStored(unittest.TestCase):
 
         sent: list[str] = []
         eng._send_text_to_wa = lambda ctx, txt: sent.append(txt) or "msg-id"
-        eng._send_flow_button = lambda ctx, body, token: "flow-id"
+        eng._send_flow_button = lambda ctx, body, token, flow_id="": "flow-id"
 
         ctx = _make_ctx(state=state)
         result = eng._try_schedule_and_flow(ctx, state, day_iso, time_str, "")
@@ -1909,7 +1910,7 @@ class TestRejectionStoresContext(unittest.TestCase):
         result_mock.reasons = []
         svc.check.return_value = result_mock
         eng._schedule = svc
-        eng._send_flow_button = lambda ctx, body, token: "flow-id"
+        eng._send_flow_button = lambda ctx, body, token, flow_id="": "flow-id"
 
         state = _make_state(
             home_zone_group="Oeste",
@@ -2357,7 +2358,7 @@ class TestDayOnlyRequest(unittest.TestCase):
         sent_texts: list[str] = []
         flow_sent: list[str] = []
         eng._send_text_to_wa = lambda ctx, txt: sent_texts.append(txt) or "id"
-        eng._send_flow_button = lambda ctx, body, token: flow_sent.append(token) or "flow-id"
+        eng._send_flow_button = lambda ctx, body, token, flow_id="": flow_sent.append(token) or "flow-id"
 
         state = _make_state(
             last_stage="SCHEDULING",
@@ -2951,7 +2952,7 @@ class TestPeriodSchedulingFlow(unittest.TestCase):
         sent_texts: list[str] = []
         flow_sent: list[bool] = []
         eng._send_text_to_wa = lambda ctx, txt: sent_texts.append(txt) or "id"
-        eng._send_flow_button = lambda ctx, body, token: flow_sent.append(True) or "flow-id"
+        eng._send_flow_button = lambda ctx, body, token, flow_id="": flow_sent.append(True) or "flow-id"
 
         state = self._make_afternoon_state()
         ctx = _make_ctx(state=state)
@@ -2969,7 +2970,7 @@ class TestPeriodSchedulingFlow(unittest.TestCase):
         svc.check.return_value = check_mock
         eng._schedule = svc
         flow_sent: list[str] = []
-        eng._send_flow_button = lambda ctx, body, token: flow_sent.append(token) or "flow-id"
+        eng._send_flow_button = lambda ctx, body, token, flow_id="": flow_sent.append(token) or "flow-id"
         eng._send_text_to_wa = lambda ctx, txt: "id"
 
         import json
@@ -3116,7 +3117,7 @@ class TestOrdinalSlotConfirmation(unittest.TestCase):
         eng = _make_engine()
         eng._schedule = self._make_svc(valid=True)
         flow_sent: list[str] = []
-        eng._send_flow_button = lambda ctx, body, token: flow_sent.append(token) or "flow-id"
+        eng._send_flow_button = lambda ctx, body, token, flow_id="": flow_sent.append(token) or "flow-id"
         eng._send_text_to_wa = lambda ctx, txt: "id"
 
         state = self._make_scheduling_state()
@@ -3138,7 +3139,7 @@ class TestOrdinalSlotConfirmation(unittest.TestCase):
         eng = _make_engine()
         eng._schedule = self._make_svc(valid=True)
         flow_sent: list[str] = []
-        eng._send_flow_button = lambda ctx, body, token: flow_sent.append(token) or "flow-id"
+        eng._send_flow_button = lambda ctx, body, token, flow_id="": flow_sent.append(token) or "flow-id"
         eng._send_text_to_wa = lambda ctx, txt: "id"
 
         state = self._make_scheduling_state()
@@ -3179,7 +3180,7 @@ class TestOrdinalSlotConfirmation(unittest.TestCase):
         svc = self._make_svc(valid=True)
         eng._schedule = svc
         flow_sent: list[str] = []
-        eng._send_flow_button = lambda ctx, body, token: flow_sent.append(token) or "flow-id"
+        eng._send_flow_button = lambda ctx, body, token, flow_id="": flow_sent.append(token) or "flow-id"
         eng._send_text_to_wa = lambda ctx, txt: "id"
 
         state = self._make_scheduling_state()
@@ -3200,7 +3201,7 @@ class TestOrdinalSlotConfirmation(unittest.TestCase):
 
         eng = _make_engine()
         eng._schedule = self._make_svc(valid=True)
-        eng._send_flow_button = lambda ctx, body, token: "flow-id"
+        eng._send_flow_button = lambda ctx, body, token, flow_id="": "flow-id"
         eng._send_text_to_wa = lambda ctx, txt: "id"
 
         state = self._make_scheduling_state()
@@ -3301,7 +3302,7 @@ class TestOrdinalSlotConfirmation(unittest.TestCase):
         eng = _make_engine()
         eng._schedule = self._make_svc(valid=True)
         flow_sent: list[str] = []
-        eng._send_flow_button = lambda ctx, body, token: flow_sent.append(token) or "flow-id"
+        eng._send_flow_button = lambda ctx, body, token, flow_id="": flow_sent.append(token) or "flow-id"
         eng._send_text_to_wa = lambda ctx, txt: "id"
 
         # State after "a la tarde?": last_offered_slots has 17 full-day slots,
@@ -3369,7 +3370,7 @@ class TestOrdinalSlotConfirmation(unittest.TestCase):
         eng = _make_engine()
         eng._schedule = self._make_svc(valid=True)
         flow_sent: list[str] = []
-        eng._send_flow_button = lambda ctx, body, token: flow_sent.append(token) or "flow-id"
+        eng._send_flow_button = lambda ctx, body, token, flow_id="": flow_sent.append(token) or "flow-id"
         eng._send_text_to_wa = lambda ctx, txt: "id"
 
         # State: AI extracted preferred_time="14:30" in previous turn;
@@ -3834,6 +3835,351 @@ class TestWebsiteFormHandler(unittest.TestCase):
 
         # home_zone_detail was already set — should not be overwritten
         self.assertEqual(state.home_zone_detail, "Palermo")
+
+
+class TestWebsiteFlowSelection(unittest.TestCase):
+    """Website leads must use WHATSAPP_WEBSITE_FLOW_ID, not the generic Flow."""
+
+    def _make_svc(self, valid=True):
+        from unittest.mock import MagicMock
+        svc = MagicMock()
+        svc.check.return_value = MagicMock(valid=valid, suggested_slots=[], reasons=["no disp"])
+        ls_mock = MagicMock()
+        ls_mock.slots = []
+        svc.list_slots.return_value = ls_mock
+        return svc
+
+    def _make_scheduling_website_state(self):
+        return _make_state(
+            last_stage="SCHEDULING",
+            home_zone_group="CABA",
+            home_zone_detail="Palermo",
+            is_website_lead=True,
+        )
+
+    def test_website_lead_sends_website_flow(self):
+        """When is_website_lead=True and WEBSITE_FLOW_ID is set, website Flow is sent."""
+        from unittest.mock import MagicMock
+        eng = _make_engine()
+        eng._schedule = self._make_svc(valid=True)
+
+        # Track which flow_id was used
+        flows_sent: list[str] = []
+        def fake_send_flow(ctx, body, token, flow_id=""):
+            flows_sent.append(flow_id)
+            return "flow-msg-id"
+
+        eng._send_flow_button = fake_send_flow
+        eng.settings = MagicMock()
+        eng.settings.whatsapp_flow_id = "generic-flow-123"
+        eng.settings.whatsapp_website_flow_id = "website-flow-456"
+
+        state = self._make_scheduling_website_state()
+        ctx = _make_ctx(state=state)
+        eng.db.commit = lambda: None
+
+        result = eng._try_schedule_and_flow(ctx, state, "2026-06-23", "10:00", "")
+
+        self.assertEqual(result.action, "flow_button_sent")
+        self.assertEqual(len(flows_sent), 1)
+        self.assertEqual(flows_sent[0], "website-flow-456",
+                         "Website lead must use WHATSAPP_WEBSITE_FLOW_ID, not generic")
+
+    def test_normal_lead_sends_generic_flow(self):
+        """When is_website_lead=False, generic WHATSAPP_FLOW_ID is sent."""
+        from unittest.mock import MagicMock
+        eng = _make_engine()
+        eng._schedule = self._make_svc(valid=True)
+
+        flows_sent: list[str] = []
+        def fake_send_flow(ctx, body, token, flow_id=""):
+            flows_sent.append(flow_id)
+            return "flow-msg-id"
+
+        eng._send_flow_button = fake_send_flow
+        eng.settings = MagicMock()
+        eng.settings.whatsapp_flow_id = "generic-flow-123"
+        eng.settings.whatsapp_website_flow_id = "website-flow-456"
+
+        state = _make_state(last_stage="SCHEDULING", home_zone_group="CABA", is_website_lead=False)
+        ctx = _make_ctx(state=state)
+        eng.db.commit = lambda: None
+
+        result = eng._try_schedule_and_flow(ctx, state, "2026-06-23", "10:00", "")
+
+        self.assertEqual(result.action, "flow_button_sent")
+        self.assertEqual(flows_sent[0], "generic-flow-123")
+
+    def test_website_lead_missing_flow_id_falls_back_to_chat(self):
+        """When WHATSAPP_WEBSITE_FLOW_ID is not set, ask for email+address via chat.
+        Must NOT send the generic Flow (it would re-ask name/vehicle/etc.)."""
+        from unittest.mock import MagicMock
+        eng = _make_engine()
+        eng._schedule = self._make_svc(valid=True)
+
+        flows_sent: list[str] = []
+        eng._send_flow_button = lambda ctx, body, token, flow_id="": flows_sent.append(flow_id) or "id"
+        texts_sent: list[str] = []
+        eng._send_text_to_wa = lambda ctx, txt: texts_sent.append(txt) or "id"
+        eng.settings = MagicMock()
+        eng.settings.whatsapp_flow_id = "generic-flow-123"
+        eng.settings.whatsapp_website_flow_id = ""  # not configured
+
+        state = self._make_scheduling_website_state()
+        ctx = _make_ctx(state=state)
+        eng.db.commit = lambda: None
+
+        result = eng._try_schedule_and_flow(ctx, state, "2026-06-23", "10:00", "")
+
+        # Must send text, not a flow
+        self.assertEqual(result.action, "replied")
+        self.assertEqual(len(flows_sent), 0, "Must NOT send generic Flow when website flow ID missing")
+        self.assertEqual(len(texts_sent), 1)
+        # Text must ask for email and address
+        txt = texts_sent[0].lower()
+        self.assertIn("email", txt)
+        self.assertIn("direcci", txt)
+
+    def test_generic_lead_missing_flow_id_falls_back_to_text(self):
+        """When WHATSAPP_FLOW_ID is not set for a normal lead, send text fallback."""
+        from unittest.mock import MagicMock
+        eng = _make_engine()
+        eng._schedule = self._make_svc(valid=True)
+
+        flows_sent: list[str] = []
+        eng._send_flow_button = lambda ctx, body, token, flow_id="": flows_sent.append(flow_id) or "id"
+        texts_sent: list[str] = []
+        eng._send_text_to_wa = lambda ctx, txt: texts_sent.append(txt) or "id"
+        eng.settings = MagicMock()
+        eng.settings.whatsapp_flow_id = ""  # not configured
+        eng.settings.whatsapp_website_flow_id = ""
+
+        state = _make_state(last_stage="SCHEDULING", home_zone_group="CABA", is_website_lead=False)
+        ctx = _make_ctx(state=state)
+        eng.db.commit = lambda: None
+
+        result = eng._try_schedule_and_flow(ctx, state, "2026-06-23", "10:00", "")
+
+        self.assertEqual(result.action, "replied")
+        self.assertEqual(len(flows_sent), 0)
+        self.assertEqual(len(texts_sent), 1)
+
+    def test_website_form_handler_sets_is_website_lead(self):
+        """_handle_website_form must set state.is_website_lead = True."""
+        eng = _make_engine()
+        from unittest.mock import MagicMock
+        eng._schedule = MagicMock()
+        eng._send_text_to_wa = lambda ctx, txt: "id"
+        eng._apply_candidate = lambda ctx, d: None
+        eng._normalize_zone_from_db = lambda ctx, state: None
+
+        state = _make_state(last_stage="QUALIFYING")
+        ctx = _make_ctx(state=state)
+
+        eng._handle_website_form(ctx, state, {
+            "vehicle_text": "Toyota Corolla",
+            "zone_detail": "Palermo",
+        })
+
+        self.assertTrue(state.is_website_lead,
+                        "is_website_lead must be True after website form handling")
+
+
+class TestWebsiteFlowResponse(unittest.TestCase):
+    """_process_flow_response for website leads fills context fields automatically."""
+
+    def _make_ctx_with_lead(self, website_lead=True, customer_name="María García",
+                             lead_phone="1155443322"):
+        candidate = _make_candidate(
+            tipo_vehiculo="AUTO", marca="Toyota", modelo="Corolla", anio=2020,
+        )
+        state = _make_state(
+            last_stage="SCHEDULING",
+            is_website_lead=website_lead,
+            customer_name=customer_name,
+            home_zone_group="CABA",
+            home_zone_detail="Palermo",
+            preferred_day="2026-06-23",
+            preferred_time="10:00",
+            flow_booking_token="tok-123",
+            current_focus_candidate_id=candidate.id,
+        )
+        ctx = _make_ctx(state=state, candidates=[candidate])
+        ctx.lead.nombre = "María"
+        ctx.lead.apellido = "García"
+        ctx.lead.telefono = lead_phone
+        ctx.contact.wa_id = "549" + lead_phone
+        return ctx, state
+
+    def _make_engine_for_flow_response(self):
+        from unittest.mock import MagicMock
+        eng = _make_engine()
+        eng.db = MagicMock()
+        eng.db.flush = lambda: None
+        eng.db.add = lambda obj: None
+        eng.db.commit = lambda: None
+        eng._send_text_to_wa = lambda ctx, txt: "id"
+        eng._send_booking_notification = lambda **kwargs: None
+        eng._pricing = MagicMock()
+        eng._pricing.recalculate_revision_if_possible = lambda **kwargs: None
+        return eng
+
+    def test_website_flow_response_fills_name_from_context(self):
+        """When nombre_apellido is absent from website Flow payload, fill from state."""
+        eng = self._make_engine_for_flow_response()
+        ctx, state = self._make_ctx_with_lead()
+
+        revisions_created: list = []
+        original_add = eng.db.add
+        def capture_add(obj):
+            revisions_created.append(obj)
+        eng.db.add = capture_add
+
+        eng._process_flow_response(
+            ctx,
+            flow_data={
+                "email": "maria@example.com",
+                "direccion": "Av. Santa Fe 1234",
+                "tipo_vendedor": "particular",
+                "nombre_vendedor": "Juan Comprador",
+                # nombre_apellido intentionally absent
+            },
+            flow_token="tok-123",
+        )
+
+        # ThreadRevision and CrmRevision are created; buyer_name must come from context
+        thread_revs = [r for r in revisions_created
+                       if type(r).__name__ == "ThreadRevision" or hasattr(r, "buyer_name")]
+        if thread_revs:
+            self.assertIn("María", thread_revs[0].buyer_name or "")
+
+    def test_website_flow_response_fills_phone_from_lead(self):
+        """buyer_phone comes from lead.telefono for website leads, not flow payload."""
+        eng = self._make_engine_for_flow_response()
+        ctx, state = self._make_ctx_with_lead(lead_phone="1155443322")
+
+        phones_used: list[str] = []
+        original_process = eng._process_flow_response
+
+        # Patch _send_booking_notification to capture buyer_phone
+        captured: dict = {}
+        eng._send_booking_notification = lambda **kwargs: captured.update(kwargs)
+
+        eng._process_flow_response(
+            ctx,
+            flow_data={
+                "email": "maria@example.com",
+                "direccion": "Av. Santa Fe 1234",
+                "tipo_vendedor": "particular",
+                "nombre_vendedor": "",
+            },
+            flow_token="tok-123",
+        )
+
+        # buyer_phone must come from lead, not be empty
+        self.assertIsNotNone(captured.get("buyer_phone"))
+        self.assertIn("1155443322", str(captured.get("buyer_phone") or ""))
+
+    def test_website_flow_canal_is_formulario_web(self):
+        """canal must be 'Formulario web' for website leads (como_llego not in payload)."""
+        eng = self._make_engine_for_flow_response()
+        ctx, state = self._make_ctx_with_lead()
+        ctx.lead.canal = None
+
+        eng._process_flow_response(
+            ctx,
+            flow_data={
+                "email": "maria@example.com",
+                "direccion": "Av. Santa Fe 1234",
+                "tipo_vendedor": "particular",
+                "nombre_vendedor": "",
+            },
+            flow_token="tok-123",
+        )
+
+        self.assertEqual(ctx.lead.canal, "Formulario web")
+
+    def test_generic_flow_response_still_reads_nombre_apellido(self):
+        """For non-website leads, nombre_apellido must be read from Flow payload."""
+        eng = self._make_engine_for_flow_response()
+        ctx, state = self._make_ctx_with_lead(website_lead=False, customer_name="")
+        ctx.lead.nombre = None
+        ctx.lead.apellido = None
+
+        eng._process_flow_response(
+            ctx,
+            flow_data={
+                "nombre_apellido": "Carlos Martínez",
+                "email": "carlos@example.com",
+                "telefono": "1166778899",
+                "direccion": "Florida 350",
+                "tipo_vendedor": "concesionaria",
+                "nombre_vendedor": "AutoMax",
+                "como_llego": "Instagram",
+            },
+            flow_token="tok-123",
+        )
+
+        self.assertEqual(ctx.lead.nombre, "Carlos")
+        self.assertEqual(ctx.lead.apellido, "Martínez")
+        self.assertEqual(ctx.lead.canal, "Instagram")
+
+    def test_website_flow_creates_booking_action(self):
+        """_process_flow_response must return booking_created action."""
+        eng = self._make_engine_for_flow_response()
+        ctx, state = self._make_ctx_with_lead()
+
+        result = eng._process_flow_response(
+            ctx,
+            flow_data={
+                "email": "maria@example.com",
+                "direccion": "Av. Santa Fe 1234",
+                "tipo_vendedor": "particular",
+                "nombre_vendedor": "",
+            },
+            flow_token="tok-123",
+        )
+
+        self.assertEqual(result.action, "booking_created")
+
+    def test_website_flow_does_not_overwrite_existing_canal(self):
+        """If lead.canal is already set (e.g., from form ref), don't overwrite with 'Formulario web'."""
+        eng = self._make_engine_for_flow_response()
+        ctx, state = self._make_ctx_with_lead()
+        ctx.lead.canal = "Google Ads"
+
+        eng._process_flow_response(
+            ctx,
+            flow_data={
+                "email": "maria@example.com",
+                "direccion": "Av. Santa Fe 1234",
+                "tipo_vendedor": "particular",
+                "nombre_vendedor": "",
+            },
+            flow_token="tok-123",
+        )
+
+        # canal was already set — must not be overwritten
+        self.assertEqual(ctx.lead.canal, "Google Ads")
+
+    def test_website_flow_response_advances_stage_to_booked(self):
+        eng = self._make_engine_for_flow_response()
+        ctx, state = self._make_ctx_with_lead()
+
+        eng._process_flow_response(
+            ctx,
+            flow_data={
+                "email": "maria@example.com",
+                "direccion": "Av. Santa Fe 1234",
+                "tipo_vendedor": "particular",
+                "nombre_vendedor": "",
+            },
+            flow_token="tok-123",
+        )
+
+        self.assertEqual(state.last_stage, "BOOKED")
+        self.assertTrue(state.needs_human)
+        self.assertIsNone(state.flow_booking_token)
 
 
 if __name__ == "__main__":

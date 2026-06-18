@@ -684,13 +684,11 @@ class ConversationEngine:
                 ctx.thread.id, expected, flow_token,
             )
 
-        # Parse flow fields
-        full_name = (flow_data.get("nombre_apellido") or "").strip()
-        name_parts = full_name.split() if full_name else []
-        buyer_first = name_parts[0] if name_parts else ""
-        buyer_last = " ".join(name_parts[1:]) if len(name_parts) > 1 else ""
+        # Determine lead source so we can fill missing fields from context.
+        is_website = getattr(state, "is_website_lead", False)
+
+        # Parse flow fields — website Flow only sends email/direccion/tipo_vendedor/nombre_vendedor.
         buyer_email = (flow_data.get("email") or "").strip() or None
-        buyer_phone = (flow_data.get("telefono") or lead.telefono or "").strip() or None
         direccion = (
             flow_data.get("direccion")
             or flow_data.get("direccion_texto")
@@ -699,7 +697,26 @@ class ConversationEngine:
         seller_type = (flow_data.get("tipo_vendedor") or "").strip() or None
         seller_name = (flow_data.get("nombre_vendedor") or "").strip() or None
         publication_url = (flow_data.get("link_publicacion") or "").strip() or None
-        canal = (flow_data.get("como_llego") or "").strip() or None
+
+        if is_website:
+            # Website Flow: nombre_apellido / telefono / como_llego are NOT collected
+            # by the form — fill them from the context set during form processing.
+            ctx_name = (state.customer_name or "").strip()
+            if not ctx_name:
+                parts = [lead.nombre or "", lead.apellido or ""]
+                ctx_name = " ".join(p for p in parts if p).strip()
+            full_name = ctx_name
+            buyer_phone = (lead.telefono or ctx.contact.wa_id or "").strip() or None
+            canal = "Formulario web"
+        else:
+            # Generic Flow: all fields are collected by the form.
+            full_name = (flow_data.get("nombre_apellido") or "").strip()
+            buyer_phone = (flow_data.get("telefono") or lead.telefono or "").strip() or None
+            canal = (flow_data.get("como_llego") or "").strip() or None
+
+        name_parts = full_name.split() if full_name else []
+        buyer_first = name_parts[0] if name_parts else ""
+        buyer_last = " ".join(name_parts[1:]) if len(name_parts) > 1 else ""
 
         # Date/time from thread state (set during scheduling stage)
         sched_date: date | None = None
@@ -1350,6 +1367,7 @@ class ConversationEngine:
         # ── Advance state ─────────────────────────────────────────────────
         lead.flag = "PRESUPUESTO_ENVIADO"
         state.last_stage = STAGE_SCHEDULING
+        state.is_website_lead = True  # route to short website Flow at booking time
 
         # ── Build reply ───────────────────────────────────────────────────
         customer = (state.customer_name or "").split()[0] if state.customer_name else (lead.nombre or "")
@@ -1417,25 +1435,46 @@ class ConversationEngine:
             state.last_requested_time = None
             state.last_offered_slots = None
             state.last_visible_slots = None
-            flow_id = (self.settings.whatsapp_flow_id or "").strip()
             flow_token = f"{ctx.thread.id}-{int(_time.time())}"
             state.flow_booking_token = flow_token
             # last_stage stays SCHEDULING — flow_booking_token signals the form was sent.
             # Stage only advances to BOOKED when the form response arrives.
             self.db.commit()
 
-            if not flow_id:
-                logger.error("M18 WHATSAPP_FLOW_ID not set — sending text fallback")
-                fallback = ai_reply or "Perfecto, tenemos disponibilidad. ¡Ya te confirmo!"
-                sent_id = self._send_text_to_wa(ctx, fallback)
-                return _out("replied", wa_message_id=sent_id)
+            # Choose Flow based on lead source: website leads use the short
+            # website-specific Flow; all others use the generic full-data Flow.
+            is_website = getattr(state, "is_website_lead", False)
+            if is_website:
+                flow_id = (self.settings.whatsapp_website_flow_id or "").strip()
+                if not flow_id:
+                    logger.error(
+                        "M18 WHATSAPP_WEBSITE_FLOW_ID not set — "
+                        "website lead thread_id=%s, falling back to chat collection",
+                        ctx.thread.id,
+                    )
+                    # Don't send the generic Flow (it would re-ask data already collected).
+                    # Ask for the two remaining missing pieces via chat.
+                    fallback = (
+                        "Perfecto, ese horario está disponible 🎉 "
+                        "Para confirmar el turno necesito dos datos más: "
+                        "¿Me podés dar tu email y la dirección exacta donde está el vehículo?"
+                    )
+                    sent_id = self._send_text_to_wa(ctx, fallback)
+                    return _out("replied", wa_message_id=sent_id)
+            else:
+                flow_id = (self.settings.whatsapp_flow_id or "").strip()
+                if not flow_id:
+                    logger.error("M18 WHATSAPP_FLOW_ID not set — sending text fallback")
+                    fallback = ai_reply or "Perfecto, tenemos disponibilidad. ¡Ya te confirmo!"
+                    sent_id = self._send_text_to_wa(ctx, fallback)
+                    return _out("replied", wa_message_id=sent_id)
 
             body = (
                 "Perfecto, ese horario está disponible 🎉 "
                 "Para confirmar el turno, completá el formulario con tus datos."
             )
             try:
-                sent_id = self._send_flow_button(ctx, body, flow_token)
+                sent_id = self._send_flow_button(ctx, body, flow_token, flow_id=flow_id)
                 return _out("flow_button_sent", wa_message_id=sent_id)
             except Exception as exc:
                 logger.error("M18 flow button send failed thread_id=%s: %s", ctx.thread.id, exc)
@@ -2367,8 +2406,11 @@ Respondé SOLO con JSON válido:
         self.db.commit()
         return wa_message_id
 
-    def _send_flow_button(self, ctx: _Context, body_text: str, flow_token: str) -> str:
-        flow_id = (self.settings.whatsapp_flow_id or "").strip()
+    def _send_flow_button(
+        self, ctx: _Context, body_text: str, flow_token: str, flow_id: str = ""
+    ) -> str:
+        if not flow_id:
+            flow_id = (self.settings.whatsapp_flow_id or "").strip()
         if not flow_id:
             raise RuntimeError("WHATSAPP_FLOW_ID not configured")
 
