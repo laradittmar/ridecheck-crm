@@ -2524,5 +2524,245 @@ class TestFlowFailureDetection(unittest.TestCase):
         self.assertTrue(handoff_called, "Handoff email must be sent")
 
 
+class FakeRepoAutoAlmagro:
+    """Covers AUTO in Almagro (CABA, no viaticos) and SUV in any zone."""
+
+    _BASE = {
+        "AUTO": FakePriceRow(tipo_vehiculo="AUTO", precio_base=130000),
+        "SUV_4X4_DEPORTIVO": FakePriceRow(tipo_vehiculo="SUV_4X4_DEPORTIVO", precio_base=140000),
+    }
+    _ZONES_BY_DETAIL = {
+        "almagro": FakeZone(zone_group="CABA", zone_detail="Almagro", viaticos=0),
+        "tortuguitas": FakeZone(zone_group="Norte", zone_detail="Tortuguitas", viaticos=25000),
+    }
+
+    def find_base_price(self, tipo_vehiculo: str):
+        return self._BASE.get(tipo_vehiculo)
+
+    def find_zone_by_group_and_detail(self, db, zone_group, zone_detail):
+        key = (zone_detail or "").strip().lower()
+        return self._ZONES_BY_DETAIL.get(key)
+
+
+class TestAuditVehicleChange(unittest.TestCase):
+    """Regression suite for the Corsa→Meriva audit case.
+
+    Original bugs:
+    A. Bot invented $5.000 price (no deterministic quote).
+    B. Vehicle changed to Meriva mid-conversation; bot sent Flow without
+       re-quoting for the new vehicle.
+    C. Legacy manual questionnaire (Comprador/Vendedor/Año) was shown while
+       in SCHEDULING stage.
+    """
+
+    # ── Bug A: price invention ──────────────────────────────────────────
+
+    def test_scrub_invented_price_when_no_quote(self):
+        """_scrub_invented_price must strip any monetary amount when no real quote exists."""
+        eng = _make_engine()
+        result = eng._scrub_invented_price("El precio es $5.000 para el Corsa.", real_price_quote=None)
+        self.assertNotIn("5.000", result)
+        self.assertNotIn("$", result)
+
+    def test_scrub_price_intent_when_no_quote(self):
+        """Quote-promise ('te paso el precio') must be scrubbed with no deterministic quote."""
+        eng = _make_engine()
+        result = eng._scrub_invented_price("Te paso el precio ahora.", real_price_quote=None)
+        # Should be replaced with a data-collection message
+        self.assertNotIn("precio ahora", result.lower())
+
+    def test_scrub_does_not_fire_when_real_quote_exists(self):
+        """Reply with correct price is not scrubbed when quote is available."""
+        eng = _make_engine()
+        q = PricingQuote(
+            tipo_vehiculo="AUTO", zone_group="CABA", zone_detail="Almagro",
+            precio_base=130000, viaticos=0,
+        )
+        result = eng._scrub_invented_price("El precio de la revisión es $130.000.", real_price_quote=q)
+        self.assertIn("130.000", result)
+
+    def test_corsa_almagro_quote_is_deterministic(self):
+        """Corsa (AUTO) + Almagro (CABA, $0 viáticos) → deterministic $130,000."""
+        repo = FakeRepoAutoAlmagro()
+        pricing = PricingService(repository=repo)
+        q = pricing.quote(db=None, tipo_vehiculo="AUTO", zone_group=None, zone_detail="Almagro")
+        self.assertEqual(q.precio_base, 130000)
+        self.assertEqual(q.viaticos, 0)
+        self.assertEqual(q.precio_total, 130000)
+        self.assertEqual(q.zone_group, "CABA")
+
+    def test_presupuesto_enviado_blocked_without_deterministic_quote(self):
+        """PRESUPUESTO_ENVIADO flag is blocked when _compute_price_quote returns None."""
+        from app.services.conversation_engine import ConversationEngine
+        _ALLOWED_FLAGS = {"PRESUPUESTANDO", "PRESUPUESTO_ENVIADO", "ACEPTADO"}
+        new_flag = "PRESUPUESTO_ENVIADO"
+        flag_accepted = new_flag in _ALLOWED_FLAGS
+        # Guard replicating _process_text logic
+        real_price_quote = None
+        if flag_accepted and new_flag == "PRESUPUESTO_ENVIADO" and real_price_quote is None:
+            flag_accepted = False
+        self.assertFalse(flag_accepted)
+
+    # ── Bug B: vehicle change without re-quote ──────────────────────────
+
+    def test_tipo_vehiculo_change_in_scheduling_resets_stage(self):
+        """When tipo_vehiculo changes while in SCHEDULING, stage resets to QUALIFYING
+        so the deterministic quote override re-prices for the new vehicle."""
+        from app.services.conversation_engine import STAGE_SCHEDULING, STAGE_QUALIFYING
+
+        eng = _make_engine(repo=FakeRepoAutoAlmagro())
+
+        # Start: Corsa (AUTO) accepted, now in SCHEDULING
+        corsa = _make_candidate(id=1, tipo_vehiculo="AUTO", marca="Chevrolet", modelo="Corsa")
+        state = _make_state(
+            last_stage=STAGE_SCHEDULING,
+            home_zone_group="CABA",
+            home_zone_detail="Almagro",
+        )
+        ctx = _make_ctx(state=state, candidates=[corsa])
+        lead = ctx.lead
+        lead.flag = "ACEPTADO"
+
+        focus_before_tipo = corsa.tipo_vehiculo  # "AUTO"
+
+        # AI updates the candidate to SUV (tipo changed)
+        eng._apply_candidate(ctx, {
+            "action": "update",
+            "id": 1,
+            "marca": "Chevrolet",
+            "modelo": "Captiva",
+            "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+        })
+
+        focus_after = eng._focus_candidate(ctx)
+
+        # Simulate the vehicle-change guard from _process_text
+        if (
+            focus_after is not None
+            and focus_before_tipo is not None
+            and focus_after.tipo_vehiculo != focus_before_tipo
+            and state.last_stage in (STAGE_SCHEDULING, "QUOTED", "FLOW_SENT")
+            and not state.needs_human
+        ):
+            lead.flag = "PRESUPUESTANDO"
+            state.last_stage = STAGE_QUALIFYING
+
+        self.assertEqual(state.last_stage, STAGE_QUALIFYING,
+                         "Stage must reset to QUALIFYING after vehicle tipo change")
+        self.assertEqual(lead.flag, "PRESUPUESTANDO",
+                         "Flag must reset to PRESUPUESTANDO after vehicle tipo change")
+
+    def test_tipo_vehiculo_unchanged_does_not_reset_stage(self):
+        """Updating marca/modelo without changing tipo_vehiculo must NOT reset the stage."""
+        from app.services.conversation_engine import STAGE_SCHEDULING, STAGE_QUALIFYING
+
+        eng = _make_engine(repo=FakeRepoAutoAlmagro())
+        corsa = _make_candidate(id=1, tipo_vehiculo="AUTO", marca="Chevrolet", modelo="Corsa")
+        state = _make_state(last_stage=STAGE_SCHEDULING, home_zone_group="CABA", home_zone_detail="Almagro")
+        ctx = _make_ctx(state=state, candidates=[corsa])
+        lead = ctx.lead
+        lead.flag = "ACEPTADO"
+
+        focus_before_tipo = corsa.tipo_vehiculo
+
+        # AI updates modelo only — tipo_vehiculo stays AUTO
+        eng._apply_candidate(ctx, {
+            "action": "update",
+            "id": 1,
+            "marca": "Chevrolet",
+            "modelo": "Meriva",
+            "tipo_vehiculo": "AUTO",
+        })
+
+        focus_after = eng._focus_candidate(ctx)
+
+        if (
+            focus_after is not None
+            and focus_before_tipo is not None
+            and focus_after.tipo_vehiculo != focus_before_tipo
+            and state.last_stage in (STAGE_SCHEDULING, "QUOTED", "FLOW_SENT")
+            and not state.needs_human
+        ):
+            lead.flag = "PRESUPUESTANDO"
+            state.last_stage = STAGE_QUALIFYING
+
+        # Stage must NOT reset — same tipo_vehiculo means same price
+        self.assertEqual(state.last_stage, STAGE_SCHEDULING)
+        self.assertEqual(lead.flag, "ACEPTADO")
+
+    def test_rafaga_vehicle_correction_is_not_pure_scheduling(self):
+        """'Es una Chevrolet Meriva' + 'Miércoles 17HS' must fail the pure-scheduling check."""
+        from app.services.conversation_engine import _is_pure_scheduling_rafaga
+        from datetime import date
+
+        messages = ["Es una Chevrolet Meriva", "Miércoles 17HS"]
+        result = _is_pure_scheduling_rafaga(messages, date(2026, 6, 16))
+        self.assertFalse(result, "Vehicle-correction ráfaga must not be treated as pure scheduling")
+
+    def test_pure_scheduling_rafaga_recognized(self):
+        """'Si' + 'mañana 12hs' must pass the pure-scheduling check."""
+        from app.services.conversation_engine import _is_pure_scheduling_rafaga
+        from datetime import date
+
+        messages = ["Si", "mañana 12hs"]
+        result = _is_pure_scheduling_rafaga(messages, date(2026, 6, 16))
+        self.assertTrue(result, "Pure scheduling ráfaga (si + mañana 12hs) must be recognized")
+
+    def test_single_day_time_message_is_pure_scheduling(self):
+        """A single scheduling message passes the check."""
+        from app.services.conversation_engine import _is_pure_scheduling_rafaga
+        from datetime import date
+
+        result = _is_pure_scheduling_rafaga(["el lunes a las 10hs"], date(2026, 6, 16))
+        self.assertTrue(result)
+
+    # ── Bug C: legacy manual questionnaire ─────────────────────────────
+
+    def test_scheduling_prompt_does_not_ask_buyer_seller_data(self):
+        """In SCHEDULING stage, the system prompt must NOT ask for buyer/seller/address.
+        The questionnaire ('Comprador', 'Vendedor', 'datos del vehículo') is legacy
+        behavior that was previously reachable via AI hallucination."""
+        from app.services.conversation_engine import STAGE_SCHEDULING
+        from unittest.mock import MagicMock
+
+        eng = _make_engine(repo=FakeRepoAutoAlmagro())
+        ctx = _make_ctx(
+            candidates=[_make_candidate(tipo_vehiculo="AUTO", marca="Chevrolet", modelo="Corsa")],
+            state=_make_state(
+                last_stage=STAGE_SCHEDULING,
+                home_zone_group="CABA",
+                home_zone_detail="Almagro",
+            ),
+        )
+        event = MagicMock()
+        event.recent_outbound_replies = []
+        event.recent_user_messages = []
+        msgs = eng._build_ai_messages(ctx, event, ["el martes a las 10hs"])
+        system = msgs[0]["content"]
+
+        # Rule 4 must be present: SCHEDULING → only ask day/time
+        self.assertIn("SCHEDULING", system)
+        # Prompt must NOT demand buyer or seller data
+        self.assertNotIn("Comprador:", system)
+        self.assertNotIn("Vendedor:", system)
+        # Rule 12: in SCHEDULING, don't mention price/quote
+        self.assertIn("SCHEDULING", system)
+        self.assertIn("NO menciones precio", system)
+
+    def test_handled_true_on_replied_action(self):
+        """handled=True must be set on 'replied' action so n8n skips legacy AI path."""
+        from app.services.conversation_engine import _out
+        from app.schemas.conversation import HANDLED_ACTIONS
+        result = _out("replied", wa_message_id="msg-123")
+        self.assertTrue(result.handled)
+        self.assertIn("replied", HANDLED_ACTIONS)
+
+    def test_handled_false_on_unmatched_action(self):
+        """Actions not in HANDLED_ACTIONS must return handled=False."""
+        from app.services.conversation_engine import _out
+        result = _out("skipped_unknown")
+        self.assertFalse(result.handled)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

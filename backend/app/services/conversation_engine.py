@@ -255,6 +255,20 @@ def _is_flow_failure(texts: list[str]) -> bool:
     return any(kw in combined for kw in _FLOW_FAILURE_KEYWORDS)
 
 
+def _is_pure_scheduling_rafaga(messages: list[str], today: "date") -> bool:
+    """Return True when every message in the burst contributes only to scheduling
+    (parses to a day or time, or is a short acceptance).  A message with
+    substantive non-scheduling text (> 2 words, no day/time component) signals
+    a vehicle correction or other content that the AI must process first."""
+    for msg in messages:
+        if _is_acceptance([msg]):
+            continue
+        d, t = _parse_scheduling_text([msg], today)
+        if d is None and t is None and len(msg.split()) > 2:
+            return False
+    return True
+
+
 def _nearest_slots(slots: list[str], requested_time_str: str, n: int = 3) -> list[str]:
     """Return up to n slots from slots[], ordered by proximity to requested_time_str (HH:MM)."""
     try:
@@ -730,7 +744,10 @@ class ConversationEngine:
                 except (ValueError, TypeError):
                     pass
 
-            if sched_day_iso and sched_time_str:
+            # Skip deterministic scheduling when the burst contains non-scheduling
+            # content (vehicle correction, zone update, etc.) — let the AI process it.
+            _pure_sched = _is_pure_scheduling_rafaga(ai_input_messages, date.today())
+            if sched_day_iso and sched_time_str and _pure_sched:
                 logger.info(
                     "M18 scheduling deterministic parse thread_id=%s day=%s time=%s",
                     ctx.thread.id, sched_day_iso, sched_time_str,
@@ -738,7 +755,7 @@ class ConversationEngine:
                 result = self._try_schedule_and_flow(ctx, state, sched_day_iso, sched_time_str, "")
                 if result is not None:
                     return result
-            elif sched_day_iso:
+            elif sched_day_iso and _pure_sched:
                 return self._handle_day_only_request(ctx, state, sched_day_iso)
 
         # ── Deterministic vehicle catalog lookup (pre-AI) ─────────────────
@@ -804,6 +821,8 @@ class ConversationEngine:
         self._normalize_zone_from_db(ctx, state)
 
         # Candidate updates
+        _focus_before = self._focus_candidate(ctx)
+        _focus_before_tipo = _focus_before.tipo_vehiculo if _focus_before else None
         self._apply_candidate(ctx, decision.get("candidate") or {})
 
         # ── Catalog enforcement (post-AI) ─────────────────────────────────
@@ -815,6 +834,24 @@ class ConversationEngine:
 
         # Sync state zone onto focus candidate when candidate fields are blank.
         focus_after = self._focus_candidate(ctx)
+
+        # ── Vehicle-change re-quote guard ─────────────────────────────────
+        # When the user corrects the vehicle in SCHEDULING/QUOTED stage, the
+        # previously-sent quote is now stale.  Reset to QUALIFYING so the
+        # deterministic quote override below re-prices and sends the new quote.
+        if (
+            focus_after is not None
+            and _focus_before_tipo is not None
+            and focus_after.tipo_vehiculo != _focus_before_tipo
+            and state.last_stage in (STAGE_SCHEDULING, STAGE_QUOTED, STAGE_FLOW_SENT)
+            and not state.needs_human
+        ):
+            logger.info(
+                "M18 vehicle change %r→%r in %s — resetting to QUALIFYING for re-quote thread_id=%s",
+                _focus_before_tipo, focus_after.tipo_vehiculo, state.last_stage, ctx.thread.id,
+            )
+            lead.flag = "PRESUPUESTANDO"
+            state.last_stage = STAGE_QUALIFYING
         if focus_after:
             if state.home_zone_group and not focus_after.zone_group:
                 focus_after.zone_group = state.home_zone_group
