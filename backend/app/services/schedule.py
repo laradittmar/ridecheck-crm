@@ -305,7 +305,7 @@ class ScheduleService:
         hard_end = datetime.combine(preferred_day, hours.end)
         while candidate + timedelta(minutes=total_slot_minutes) <= hard_end and len(suggestions) < max_results:
             if self._is_candidate_usable(candidate, total_slot_minutes, occupied_slots, payload):
-                suggestions.append(candidate.isoformat(timespec="minutes"))
+                suggestions.append(candidate.strftime("%H:%M"))
             candidate += timedelta(minutes=30)
         return suggestions
 

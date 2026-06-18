@@ -1830,14 +1830,26 @@ class TestEscalationKeywords(unittest.TestCase):
 class TestRejectionStoresContext(unittest.TestCase):
     """After slot rejection, active_requested_date and last_offered_slots must be set."""
 
-    def _run_rejection(self, day_iso="2026-06-19", time_str="12:00", slots=None):
+    def _run_rejection(self, day_iso="2026-06-19", time_str="12:00", slots=None,
+                        list_slots_result=None):
+        MagicMock = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock
         eng = _make_engine()
-        svc = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock()
-        result_mock = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock()
-        result_mock.valid = False
-        result_mock.suggested_slots = slots if slots is not None else ["10:00", "14:30", "16:00"]
-        result_mock.reasons = ["Ocupado"]
-        svc.check.return_value = result_mock
+        svc = MagicMock()
+
+        check_mock = MagicMock()
+        check_mock.valid = False
+        check_mock.suggested_slots = slots if slots is not None else ["10:00", "14:30", "16:00"]
+        check_mock.reasons = ["Ocupado"]
+        svc.check.return_value = check_mock
+
+        # list_slots returns full-day availability; default matches check slots
+        list_mock = MagicMock()
+        list_mock.slots = (
+            list_slots_result if list_slots_result is not None
+            else (slots if slots is not None else ["10:00", "14:30", "16:00"])
+        )
+        svc.list_slots.return_value = list_mock
+
         eng._schedule = svc
 
         sent: list[str] = []
@@ -2098,6 +2110,209 @@ class TestHandleSchedulingEscalation(unittest.TestCase):
     def test_handoff_reply_no_iso_date(self):
         _, _, _, _, sent = self._run_escalation()
         self.assertNotIn("2026-06-", sent[0])
+
+
+class TestSlotFormatting(unittest.TestCase):
+    """Slots must be formatted as HH:MM, never as ISO datetime."""
+
+    def test_time_hour_hhmm(self):
+        from app.services.conversation_engine import _time_hour
+        self.assertEqual(_time_hour("09:00"), 9)
+        self.assertEqual(_time_hour("14:30"), 14)
+        self.assertEqual(_time_hour("17:00"), 17)
+
+    def test_time_hour_iso_fallback(self):
+        """_time_hour must handle legacy ISO datetime strings gracefully."""
+        from app.services.conversation_engine import _time_hour
+        self.assertEqual(_time_hour("2026-06-19T09:00"), 9)
+        self.assertEqual(_time_hour("2026-06-19T14:30"), 14)
+
+    def test_rejection_reply_no_iso_strings(self):
+        """Rejection message must never contain raw ISO datetime tokens."""
+        state, sent = TestRejectionStoresContext()._run_rejection(
+            day_iso="2026-06-19",
+            slots=["09:00", "09:30", "10:00"],
+            list_slots_result=["09:00", "09:30", "10:00"],
+        )
+        self.assertEqual(len(sent), 1)
+        self.assertNotIn("2026-06-19T", sent[0])
+        self.assertNotIn("T09", sent[0])
+
+    def test_rejection_stores_hhmm_not_iso(self):
+        """last_offered_slots must store HH:MM strings, not ISO datetimes."""
+        import json
+        state, _ = TestRejectionStoresContext()._run_rejection(
+            slots=["09:00", "14:00"],
+            list_slots_result=["09:00", "14:00"],
+        )
+        stored = json.loads(state.last_offered_slots)
+        for s in stored:
+            self.assertNotIn("T", s, f"ISO datetime leaked into last_offered_slots: {s!r}")
+            self.assertRegex(s, r"^\d{2}:\d{2}$", f"Expected HH:MM, got: {s!r}")
+
+    def test_full_day_slots_stored_after_rejection(self):
+        """Rejection stores list_slots results (full day) not just check() first-5."""
+        import json
+        full_day = ["09:00", "09:30", "10:00", "10:30", "11:00",
+                    "13:00", "13:30", "14:00", "14:30", "15:00"]
+        state, _ = TestRejectionStoresContext()._run_rejection(
+            slots=["09:00", "09:30", "10:00"],  # check() only returned 3 morning
+            list_slots_result=full_day,          # list_slots has full day
+        )
+        stored = json.loads(state.last_offered_slots)
+        self.assertEqual(stored, full_day)
+        self.assertIn("14:00", stored, "Afternoon slot must be stored for period filtering")
+
+    def test_period_filter_uses_full_day_stored_slots(self):
+        """_handle_period_request must return afternoon slots from the stored full-day list."""
+        MagicMock = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock
+        import json
+
+        eng = _make_engine()
+        eng._send_text_to_wa = MagicMock(return_value="id")
+
+        full_day = ["09:00", "09:30", "10:00", "10:30", "11:00",
+                    "13:00", "13:30", "14:00", "14:30", "15:00"]
+        state = _make_state(
+            last_stage="SCHEDULING",
+            active_requested_date="2026-06-19",
+            last_requested_time="12:00",
+            last_offered_slots=json.dumps(full_day),
+        )
+        ctx = _make_ctx(state=state)
+
+        result = eng._handle_period_request(ctx, state, "tarde")
+
+        self.assertIsNotNone(result)
+        call_args = eng._send_text_to_wa.call_args
+        reply = call_args[0][1] if call_args[0] else call_args[1].get("txt", "")
+        self.assertIn("13:00", reply)
+        self.assertNotIn("09:00", reply, "Morning slot must not appear in tarde reply")
+
+    def test_morning_filter_uses_stored_morning_slots(self):
+        """'por la mañana' returns only morning slots from the full-day list."""
+        MagicMock = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock
+        import json
+
+        eng = _make_engine()
+        eng._send_text_to_wa = MagicMock(return_value="id")
+
+        full_day = ["09:00", "09:30", "10:00", "13:00", "14:00"]
+        state = _make_state(
+            last_stage="SCHEDULING",
+            active_requested_date="2026-06-19",
+            last_requested_time="14:00",
+            last_offered_slots=json.dumps(full_day),
+        )
+        ctx = _make_ctx(state=state)
+
+        result = eng._handle_period_request(ctx, state, "manana")
+
+        self.assertIsNotNone(result)
+        call_args = eng._send_text_to_wa.call_args
+        reply = call_args[0][1] if call_args[0] else call_args[1].get("txt", "")
+        self.assertIn("09:00", reply)
+        self.assertNotIn("14:00", reply, "Afternoon slot must not appear in mañana reply")
+
+    def test_period_reply_no_iso_strings(self):
+        """Period reply must never contain ISO datetime tokens."""
+        MagicMock = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock
+        import json
+
+        eng = _make_engine()
+        eng._send_text_to_wa = MagicMock(return_value="id")
+
+        state = _make_state(
+            last_stage="SCHEDULING",
+            active_requested_date="2026-06-19",
+            last_requested_time="12:00",
+            last_offered_slots=json.dumps(["13:00", "13:30", "14:00"]),
+        )
+        ctx = _make_ctx(state=state)
+        eng._handle_period_request(ctx, state, "tarde")
+
+        call_args = eng._send_text_to_wa.call_args
+        reply = call_args[0][1] if call_args[0] else call_args[1].get("txt", "")
+        self.assertNotIn("2026-06-19T", reply)
+
+    def test_12h_booking_does_not_block_afternoon(self):
+        """A 12:00 booking (ends 13:00) must not block 13:00+ afternoon slots."""
+        from app.services.schedule import ScheduleService, SERVICE_MINUTES, BUFFER_MINUTES
+        from app.schemas.schedule import ScheduleCheckIn
+        from datetime import date, time
+        MagicMock = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock
+
+        db = MagicMock()
+        # Simulate one revision at 12:00 on 2026-06-19 (Friday long)
+        rev = MagicMock()
+        rev.id = 18
+        rev.turno_fecha = date(2026, 6, 19)
+        rev.turno_hora = time(12, 0)
+        db.execute.return_value.scalars.return_value.all.return_value = [rev]
+
+        svc = ScheduleService(db=db)
+        payload = ScheduleCheckIn(
+            address="San Justo, Buenos Aires",
+            preferred_day=date(2026, 6, 19),
+            preferred_time=time(12, 0),
+            zone_group="Oeste",
+            zone_detail="San Justo",
+        )
+
+        # Manually check afternoon slots using _suggest_slots with the occupied slot
+        from datetime import datetime, timedelta
+        from app.services.schedule import OccupiedSlot
+        rev_start = datetime(2026, 6, 19, 12, 0)
+        rev_end = rev_start + timedelta(minutes=SERVICE_MINUTES + BUFFER_MINUTES)
+        occupied = [OccupiedSlot("revision", 18, rev_start, rev_end, "Rev #18")]
+
+        from app.services.schedule import _BusinessHours
+        hours = _BusinessHours(start=time(9, 0), end=time(18, 0))
+        all_slots = svc._suggest_slots(
+            preferred_day=date(2026, 6, 19),
+            occupied_slots=occupied,
+            hours=hours,
+            total_slot_minutes=SERVICE_MINUTES + BUFFER_MINUTES,
+            payload=payload,
+            max_results=24,
+        )
+
+        afternoon_slots = [s for s in all_slots if int(s.split(":")[0]) >= 13]
+        self.assertGreater(len(afternoon_slots), 0, "Afternoon must be available after 12-13 block")
+        self.assertIn("13:00", afternoon_slots)
+        self.assertIn("14:00", afternoon_slots)
+
+    def test_suggest_slots_returns_hhmm_not_iso(self):
+        """_suggest_slots must return HH:MM strings, not ISO datetimes."""
+        from app.services.schedule import ScheduleService, _BusinessHours, OccupiedSlot
+        from app.schemas.schedule import ScheduleCheckIn
+        from datetime import date, time
+        MagicMock = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock
+
+        db = MagicMock()
+        db.execute.return_value.scalars.return_value.all.return_value = []
+        svc = ScheduleService(db=db)
+
+        payload = ScheduleCheckIn(
+            address="San Justo, Buenos Aires",
+            preferred_day=date(2026, 6, 19),
+            preferred_time=time(9, 0),
+            zone_group="Oeste",
+            zone_detail="San Justo",
+        )
+        hours = _BusinessHours(start=time(9, 0), end=time(18, 0))
+        slots = svc._suggest_slots(
+            preferred_day=date(2026, 6, 19),
+            occupied_slots=[],
+            hours=hours,
+            total_slot_minutes=60,
+            payload=payload,
+            max_results=3,
+        )
+        for s in slots:
+            self.assertRegex(s, r"^\d{2}:\d{2}$", f"Expected HH:MM, got ISO: {s!r}")
+            self.assertNotIn("T", s)
+            self.assertNotIn("2026", s)
 
 
 if __name__ == "__main__":

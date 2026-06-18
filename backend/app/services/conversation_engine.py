@@ -181,9 +181,12 @@ def _format_date_human(date_iso: str, today: date | None = None) -> str:
 
 
 def _time_hour(time_str: str) -> int:
-    """Extract the hour component from an HH:MM string."""
+    """Extract the hour component from an HH:MM or YYYY-MM-DDTHH:MM string."""
     try:
-        return int(time_str.split(":")[0])
+        s = str(time_str)
+        if "T" in s:
+            s = s.split("T")[1]  # handle ISO datetime like "2026-06-19T14:00"
+        return int(s.split(":")[0])
     except (ValueError, IndexError, AttributeError):
         return 0
 
@@ -1007,17 +1010,32 @@ class ConversationEngine:
                 self.db.commit()
                 return None
         else:
-            # Slot rejected — keep the date for "por la tarde" follow-ups,
-            # but clear the confirmed slot and store alternatives offered.
+            # Slot rejected — fetch the full day's availability via list_slots so
+            # "por la tarde" follow-ups can find afternoon options.
+            # sched_out.suggested_slots is capped at 5 and starts from the beginning
+            # of business hours (morning only); list_slots uses max_results=24 and
+            # returns every usable slot across the whole day.
+            all_slots: list[str] = []
+            try:
+                all_day = self._schedule.list_slots(sched_in)
+                all_slots = [s for s in (all_day.slots or []) if isinstance(s, str)]
+            except Exception as exc:
+                logger.warning(
+                    "M18 list_slots failed for full-day alternatives thread_id=%s: %s",
+                    ctx.thread.id, exc,
+                )
+            if not all_slots:
+                all_slots = [s for s in sched_out.suggested_slots if isinstance(s, str)]
+
             state.preferred_day = None
             state.preferred_time = None
             state.active_requested_date = preferred_day_iso
             state.last_requested_time = preferred_time_obj.strftime("%H:%M")
-            offered = sched_out.suggested_slots[:5]
-            state.last_offered_slots = json.dumps(offered)
+            state.last_offered_slots = json.dumps(all_slots)
+
             date_human = _format_date_human(preferred_day_iso, date.today())
-            if offered:
-                slot_list = ", ".join(offered[:3])
+            if all_slots:
+                slot_list = ", ".join(all_slots[:3])
                 msg = (
                     f"Para {date_human} a las {preferred_time_obj.strftime('%H:%M')} "
                     f"no tenemos disponibilidad. "
@@ -1055,8 +1073,12 @@ class ConversationEngine:
 
         date_human = _format_date_human(str(state.active_requested_date), date.today())
         if filtered:
-            slot_list = ", ".join(filtered[:3])
-            msg = f"Para {date_human} por la {period_label} tenemos: {slot_list}. ¿Cuál te viene mejor?"
+            shown = filtered[:4]
+            if len(shown) >= 2:
+                slot_list = ", ".join(shown[:-1]) + f" o {shown[-1]}"
+            else:
+                slot_list = shown[0]
+            msg = f"Sí, para {date_human} por la {period_label} tengo: {slot_list}. ¿Cuál te sirve?"
         else:
             msg = (
                 f"Para {date_human} no hay horarios disponibles por la {period_label}. "
