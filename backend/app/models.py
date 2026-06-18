@@ -325,6 +325,9 @@ class WhatsAppThreadState(Base):
     home_zone_detail: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
     preferred_day: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     preferred_time: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    active_requested_date: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    last_requested_time: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    last_offered_slots: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     flow_booking_token: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
     unanswered_alert_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     quote_followup_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -379,7 +382,7 @@ class ThreadRevision(Base):
     __tablename__ = "thread_revisions"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('draft', 'collecting_data', 'booked', 'completed')",
+            "status IN ('draft', 'collecting_data', 'booked', 'completed', 'provisional')",
             name="ck_thread_revisions_status",
         ),
     )

@@ -208,3 +208,154 @@ def send_booking_notification(
     except Exception as exc:  # noqa: BLE001
         logger.error("[M15.8] Resend unexpected error for revision_id=%s: %s", revision_id, exc)
         return False
+
+
+def _build_handoff_html(
+    lead_id: int | str,
+    thread_id: int | str,
+    revision_id: int | str,
+    buyer_name: str,
+    buyer_phone: str,
+    vehicle: str,
+    tipo_vehiculo: str,
+    zone_group: str,
+    zone_detail: str,
+    precio_total: str,
+    requested_slot: str,
+    offered_slots: str,
+    last_message: str,
+) -> str:
+    crm_lead_url = f"https://crm.ridecheck.ar/kanban#lead-{lead_id}"
+    precio_fmt = _fmt_money(precio_total) if precio_total not in ("Sin dato", "") else "Sin dato"
+    return f"""<!DOCTYPE html>
+<html lang="es">
+<body style="font-family:Arial,sans-serif;font-size:14px;color:#333;max-width:600px;margin:0 auto;padding:20px;">
+<h2 style="color:#b45309;">⚠️ Cliente solicita horario no disponible — coordinación manual</h2>
+<table style="width:100%;border-collapse:collapse;">
+<tr><td style="padding:4px 0;"><strong>Lead ID:</strong></td><td>{lead_id}</td></tr>
+<tr><td style="padding:4px 0;"><strong>Thread ID:</strong></td><td>{thread_id}</td></tr>
+<tr><td style="padding:4px 0;"><strong>Revisión provisional ID:</strong></td><td>{revision_id}</td></tr>
+</table>
+
+<h3 style="color:#444;border-bottom:1px solid #ddd;padding-bottom:6px;">Cliente</h3>
+<table style="width:100%;border-collapse:collapse;">
+<tr><td style="padding:4px 0;width:160px;"><strong>Nombre:</strong></td><td>{buyer_name}</td></tr>
+<tr><td style="padding:4px 0;"><strong>WhatsApp:</strong></td><td>{buyer_phone}</td></tr>
+</table>
+
+<h3 style="color:#444;border-bottom:1px solid #ddd;padding-bottom:6px;">Vehículo</h3>
+<table style="width:100%;border-collapse:collapse;">
+<tr><td style="padding:4px 0;width:160px;"><strong>Vehículo:</strong></td><td>{vehicle}</td></tr>
+<tr><td style="padding:4px 0;"><strong>Tipo:</strong></td><td>{tipo_vehiculo}</td></tr>
+<tr><td style="padding:4px 0;"><strong>Zona:</strong></td><td>{zone_group} / {zone_detail}</td></tr>
+<tr><td style="padding:4px 0;"><strong>Presupuesto total:</strong></td><td><strong>{precio_fmt}</strong></td></tr>
+</table>
+
+<h3 style="color:#444;border-bottom:1px solid #ddd;padding-bottom:6px;">Turno solicitado (no disponible)</h3>
+<table style="width:100%;border-collapse:collapse;">
+<tr><td style="padding:4px 0;width:160px;"><strong>Horario pedido:</strong></td><td>{requested_slot}</td></tr>
+<tr><td style="padding:4px 0;"><strong>Alternativas ofrecidas:</strong></td><td>{offered_slots}</td></tr>
+</table>
+
+<h3 style="color:#444;border-bottom:1px solid #ddd;padding-bottom:6px;">Último mensaje del cliente</h3>
+<p style="background:#f5f5f5;padding:10px;border-radius:4px;font-style:italic;">"{last_message}"</p>
+
+<p style="color:#b45309;font-weight:bold;">
+  ⚠️ No se creó turno confirmado. Cliente aceptó presupuesto y está intentando coordinar.
+  La revisión provisional está en estado PENDIENTE en el CRM.
+</p>
+
+<table cellpadding="0" cellspacing="0" border="0" style="margin:12px 0 8px;">
+  <tr>
+    <td align="center" bgcolor="#b45309" style="border-radius:6px;">
+      <a href="{crm_lead_url}"
+         style="display:inline-block;padding:12px 28px;color:#ffffff;text-decoration:none;font-weight:bold;font-family:Arial,sans-serif;font-size:15px;border-radius:6px;background-color:#b45309;">
+        Ver lead en CRM
+      </a>
+    </td>
+  </tr>
+</table>
+</body>
+</html>"""
+
+
+def send_scheduling_handoff_notification(
+    *,
+    api_key: str,
+    from_email: str,
+    to_email: str,
+    lead_id: int | str,
+    thread_id: int | str,
+    revision_id: int | str,
+    buyer_name: str,
+    buyer_phone: str,
+    vehicle: str,
+    tipo_vehiculo: str,
+    zone_group: str,
+    zone_detail: str,
+    precio_total: str,
+    requested_slot: str,
+    offered_slots: str,
+    last_message: str,
+) -> bool:
+    """Send a scheduling handoff alert to Julián via Resend. Returns True on success."""
+    if not api_key:
+        logger.error("[M15.8] RESEND_API_KEY not set — handoff email not sent lead_id=%s", lead_id)
+        return False
+    if not to_email:
+        logger.error("[M15.8] INTERNAL_BOOKING_EMAIL_TO not set — handoff email not sent lead_id=%s", lead_id)
+        return False
+
+    vehicle_short = vehicle or "Vehículo sin dato"
+    zone_short = zone_detail or zone_group or "zona sin dato"
+    subject = f"Cliente pide revisar disponibilidad manual — {vehicle_short} en {zone_short}"
+
+    html_body = _build_handoff_html(
+        lead_id=_fmt(lead_id),
+        thread_id=_fmt(thread_id),
+        revision_id=_fmt(revision_id),
+        buyer_name=_fmt(buyer_name),
+        buyer_phone=_fmt(buyer_phone),
+        vehicle=_fmt(vehicle),
+        tipo_vehiculo=_fmt(tipo_vehiculo),
+        zone_group=_fmt(zone_group),
+        zone_detail=_fmt(zone_detail),
+        precio_total=_fmt(precio_total),
+        requested_slot=_fmt(requested_slot),
+        offered_slots=_fmt(offered_slots),
+        last_message=_fmt(last_message),
+    )
+
+    payload = json.dumps({
+        "from": from_email,
+        "to": [to_email],
+        "subject": subject,
+        "html": html_body,
+    }).encode("utf-8")
+
+    req = urlrequest.Request(
+        _RESEND_API_URL,
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "RideCheck-CRM/1.0",
+        },
+    )
+
+    try:
+        with urlrequest.urlopen(req, timeout=15) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+        logger.info("[M15.8] Handoff email sent OK lead_id=%s — %s", lead_id, body)
+        return True
+    except error.HTTPError as exc:
+        err_body = exc.read().decode("utf-8", errors="replace")
+        logger.error("[M15.8] Handoff email HTTP error %s lead_id=%s: %s", exc.code, lead_id, err_body)
+        return False
+    except error.URLError as exc:
+        logger.error("[M15.8] Handoff email URL error lead_id=%s: %s", lead_id, exc.reason)
+        return False
+    except Exception as exc:  # noqa: BLE001
+        logger.error("[M15.8] Handoff email unexpected error lead_id=%s: %s", lead_id, exc)
+        return False

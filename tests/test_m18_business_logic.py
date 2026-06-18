@@ -97,6 +97,9 @@ def _make_state(**kwargs):
         current_focus_candidate_id=None,
         preferred_day=None,
         preferred_time=None,
+        active_requested_date=None,
+        last_requested_time=None,
+        last_offered_slots=None,
         last_stage="QUALIFYING",
         needs_human=False,
         flow_booking_token=None,
@@ -1563,16 +1566,13 @@ class TestRejectedSlotNotStored(unittest.TestCase):
 
     def _make_state_obj(self, preferred_day=None, preferred_time=None, zone_group="Oeste",
                         zone_detail="San Justo"):
-        from unittest.mock import MagicMock
-        state = MagicMock()
-        state.preferred_day = preferred_day
-        state.preferred_time = preferred_time
-        state.home_zone_group = zone_group
-        state.home_zone_detail = zone_detail
-        state.flow_booking_token = None
-        state.last_stage = "SCHEDULING"
-        state.needs_human = False
-        return state
+        return _make_state(
+            preferred_day=preferred_day,
+            preferred_time=preferred_time,
+            home_zone_group=zone_group,
+            home_zone_detail=zone_detail,
+            last_stage="SCHEDULING",
+        )
 
     def _run_try_schedule(self, state, day_iso, time_str, valid=True, reasons=None):
         eng = _make_engine()
@@ -1685,6 +1685,341 @@ class TestSchedulingStageRegression(unittest.TestCase):
         ):
             flag_accepted = False
         self.assertTrue(flag_accepted, "PRESUPUESTO_ENVIADO allowed from QUALIFYING")
+
+
+# ── Scheduling escalation regression (real test 20260618) ────────────────────
+
+
+class TestEscalationKeywords(unittest.TestCase):
+    """_should_escalate_scheduling_to_human must fire on insistence phrases."""
+
+    def _check(self, texts, last_requested_time=None, last_offered_slots=None):
+        from app.services.conversation_engine import _should_escalate_scheduling_to_human
+        state = _make_state(
+            last_requested_time=last_requested_time,
+            last_offered_slots=last_offered_slots,
+        )
+        return _should_escalate_scheduling_to_human(texts, state)
+
+    def test_solo_puedo_escalates(self):
+        self.assertTrue(self._check(["solo puedo a las 12"]))
+
+    def test_no_me_sirve_escalates(self):
+        self.assertTrue(self._check(["no me sirve ninguno"]))
+
+    def test_si_o_si_escalates(self):
+        self.assertTrue(self._check(["mañana sí o sí"]))
+
+    def test_excepcion_escalates(self):
+        self.assertTrue(self._check(["podés hacer una excepción?"]))
+
+    def test_ninguno_me_viene_escalates(self):
+        self.assertTrue(self._check(["ninguno me viene bien"]))
+
+    def test_normal_time_proposal_does_not_escalate(self):
+        self.assertFalse(self._check(["14:30 me viene bien"]))
+
+    def test_okay_alone_does_not_escalate(self):
+        self.assertFalse(self._check(["Okay"]))
+
+    def test_re_insistence_on_same_rejected_time_escalates(self):
+        """Asking for the exact same rejected time after alternatives were offered."""
+        import json
+        self.assertTrue(self._check(
+            ["a las 12hs sí o sí"],
+            last_requested_time="12:00",
+            last_offered_slots=json.dumps(["10:00", "14:30"]),
+        ))
+
+    def test_different_time_from_rejected_does_not_escalate(self):
+        """Picking a different time (from alternatives) must not escalate."""
+        import json
+        self.assertFalse(self._check(
+            ["a las 14:30"],
+            last_requested_time="12:00",
+            last_offered_slots=json.dumps(["10:00", "14:30"]),
+        ))
+
+    def test_no_offered_slots_means_no_re_insistence_check(self):
+        """Re-insistence check requires last_offered_slots to be set."""
+        self.assertFalse(self._check(
+            ["a las 12hs"],
+            last_requested_time="12:00",
+            last_offered_slots=None,
+        ))
+
+
+class TestRejectionStoresContext(unittest.TestCase):
+    """After slot rejection, active_requested_date and last_offered_slots must be set."""
+
+    def _run_rejection(self, day_iso="2026-06-19", time_str="12:00", slots=None):
+        eng = _make_engine()
+        svc = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock()
+        result_mock = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock()
+        result_mock.valid = False
+        result_mock.suggested_slots = slots if slots is not None else ["10:00", "14:30", "16:00"]
+        result_mock.reasons = ["Ocupado"]
+        svc.check.return_value = result_mock
+        eng._schedule = svc
+
+        sent: list[str] = []
+        eng._send_text_to_wa = lambda ctx, txt: sent.append(txt) or "id"
+
+        state = _make_state(
+            home_zone_group="Oeste",
+            home_zone_detail="San Justo",
+            last_stage="SCHEDULING",
+        )
+        ctx = _make_ctx(state=state)
+        eng._try_schedule_and_flow(ctx, state, day_iso, time_str, "")
+        return state, sent
+
+    def test_active_requested_date_set_on_rejection(self):
+        state, _ = self._run_rejection()
+        self.assertEqual(str(state.active_requested_date), "2026-06-19")
+
+    def test_last_requested_time_set_on_rejection(self):
+        state, _ = self._run_rejection()
+        self.assertEqual(str(state.last_requested_time), "12:00")
+
+    def test_last_offered_slots_set_on_rejection(self):
+        import json
+        state, _ = self._run_rejection(slots=["10:00", "14:30"])
+        slots = json.loads(state.last_offered_slots)
+        self.assertIn("10:00", slots)
+        self.assertIn("14:30", slots)
+
+    def test_preferred_day_cleared_on_rejection(self):
+        state, _ = self._run_rejection()
+        self.assertIsNone(state.preferred_day)
+
+    def test_reply_uses_human_readable_date(self):
+        """No raw ISO datetime strings in the rejection reply."""
+        from datetime import date
+        state, sent = self._run_rejection(day_iso="2026-06-19")
+        self.assertEqual(len(sent), 1)
+        reply = sent[0]
+        self.assertNotIn("2026-06-19", reply)
+        self.assertNotIn("T", reply)  # no ISO "T" separator
+
+    def test_reply_includes_offered_slots(self):
+        state, sent = self._run_rejection(slots=["10:00", "14:30"])
+        self.assertIn("10:00", sent[0])
+
+    def test_active_date_cleared_on_valid_slot(self):
+        """When slot is available, active_requested_date and last_offered_slots are cleared."""
+        eng = _make_engine()
+        svc = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock()
+        result_mock = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock()
+        result_mock.valid = True
+        result_mock.suggested_slots = []
+        result_mock.reasons = []
+        svc.check.return_value = result_mock
+        eng._schedule = svc
+        eng._send_flow_button = lambda ctx, body, token: "flow-id"
+
+        state = _make_state(
+            home_zone_group="Oeste",
+            home_zone_detail="San Justo",
+            last_stage="SCHEDULING",
+            active_requested_date="2026-06-19",
+            last_requested_time="12:00",
+            last_offered_slots='["10:00"]',
+        )
+        ctx = _make_ctx(state=state)
+        eng._try_schedule_and_flow(ctx, state, "2026-06-25", "10:00", "")
+        self.assertIsNone(state.active_requested_date)
+        self.assertIsNone(state.last_offered_slots)
+
+
+class TestDetectTimePeriod(unittest.TestCase):
+    """_detect_time_period must recognise afternoon / morning requests."""
+
+    def _detect(self, texts):
+        from app.services.conversation_engine import _detect_time_period
+        return _detect_time_period(texts)
+
+    def test_por_la_tarde_detected(self):
+        self.assertEqual(self._detect(["por la tarde no tenés?"]), "tarde")
+
+    def test_a_la_tarde_detected(self):
+        self.assertEqual(self._detect(["a la tarde, alguno?"]), "tarde")
+
+    def test_por_la_manana_detected(self):
+        self.assertEqual(self._detect(["por la mañana preferiblemente"]), "manana")
+
+    def test_temprano_detected_as_manana(self):
+        self.assertEqual(self._detect(["algo temprano?"]), "manana")
+
+    def test_plain_time_returns_none(self):
+        self.assertIsNone(self._detect(["14:30 me viene bien"]))
+
+    def test_manana_alone_returns_none(self):
+        """'mañana' alone means 'tomorrow', not 'morning period'."""
+        self.assertIsNone(self._detect(["mañana a las 10hs"]))
+
+
+class TestFormatDateHuman(unittest.TestCase):
+    """_format_date_human must produce readable Argentine format."""
+
+    def _fmt(self, iso, today_iso):
+        from app.services.conversation_engine import _format_date_human
+        from datetime import date
+        return _format_date_human(iso, date.fromisoformat(today_iso))
+
+    def test_tomorrow(self):
+        result = self._fmt("2026-06-19", "2026-06-18")
+        self.assertIn("mañana", result)
+        self.assertIn("viernes", result)
+        self.assertIn("19/06", result)
+
+    def test_today(self):
+        result = self._fmt("2026-06-18", "2026-06-18")
+        self.assertIn("hoy", result)
+
+    def test_future_day(self):
+        result = self._fmt("2026-06-22", "2026-06-18")
+        self.assertIn("lunes", result)
+        self.assertIn("22/06", result)
+        self.assertNotIn("mañana", result)
+
+    def test_no_iso_in_output(self):
+        result = self._fmt("2026-06-22", "2026-06-18")
+        self.assertNotIn("2026", result)
+        self.assertNotIn("-06-", result)
+
+
+class TestHandleSchedulingEscalation(unittest.TestCase):
+    """_handle_scheduling_escalation must create provisional revision, not Flow."""
+
+    def _run_escalation(self, with_focus=True, existing_revision_id=None):
+        from unittest.mock import MagicMock, patch
+        eng = _make_engine()
+
+        # Mock pricing
+        from app.services.pricing import PricingQuote
+        eng._compute_price_quote = lambda ctx, state: PricingQuote(
+            tipo_vehiculo="AUTO", zone_group="Oeste", zone_detail="San Justo",
+            precio_base=140000, viaticos=30000,
+        )
+        eng._pricing.recalculate_revision_if_possible = lambda db, revision: None
+
+        # Fake DB — assign sequential ids on add so current_revision_id is non-None
+        added: list = []
+        _id_counter = [0]
+
+        def _mock_add(obj):
+            added.append(obj)
+            _id_counter[0] += 1
+            obj.id = _id_counter[0]
+
+        eng.db.add = _mock_add
+        eng.db.flush = lambda: None
+        eng.db.commit = lambda: None
+
+        sent: list[str] = []
+        eng._send_text_to_wa = lambda ctx, txt: sent.append(txt) or "msg-id"
+        eng._send_scheduling_handoff_email = lambda **kw: None
+
+        focus = _make_candidate(
+            id=1, tipo_vehiculo="AUTO", marca="Chevrolet", modelo="Captiva", anio=2020,
+        ) if with_focus else None
+        eng._focus_candidate = lambda ctx: focus
+
+        state = _make_state(
+            last_stage="SCHEDULING",
+            home_zone_group="Oeste",
+            home_zone_detail="San Justo",
+            active_requested_date="2026-06-19",
+            last_requested_time="12:00",
+            last_offered_slots='["10:00", "14:30"]',
+            current_revision_id=existing_revision_id,
+        )
+
+        lead = MagicMock()
+        lead.id = 10
+        lead.flag = "ACEPTADO"
+        lead.estado = "CONSULTA_NUEVA"
+        lead.nombre = None
+        lead.email = None
+        lead.necesita_humano = False
+
+        contact = MagicMock()
+        contact.wa_id = "5491100000000"
+
+        ctx = _make_ctx(state=state)
+        ctx.lead = lead
+        ctx.state = state
+        ctx.contact = contact
+
+        result = eng._handle_scheduling_escalation(ctx, state, "solo puedo a las 12")
+        return result, state, lead, added, sent
+
+    def test_needs_human_set_on_state(self):
+        _, state, _, _, _ = self._run_escalation()
+        self.assertTrue(state.needs_human)
+
+    def test_lead_necesita_humano_set(self):
+        _, _, lead, _, _ = self._run_escalation()
+        self.assertTrue(lead.necesita_humano)
+
+    def test_lead_estado_set_to_atencion_humana(self):
+        _, _, lead, _, _ = self._run_escalation()
+        self.assertEqual(lead.estado, "ATENCION_HUMANA")
+
+    def test_lead_flag_remains_aceptado(self):
+        _, _, lead, _, _ = self._run_escalation()
+        self.assertEqual(lead.flag, "ACEPTADO")
+
+    def test_provisional_revision_created(self):
+        from app.models import ThreadRevision
+        _, _, _, added, _ = self._run_escalation()
+        rev_objs = [o for o in added if isinstance(o, ThreadRevision)]
+        self.assertEqual(len(rev_objs), 1)
+        self.assertEqual(rev_objs[0].status, "provisional")
+
+    def test_provisional_revision_has_vehicle_data(self):
+        from app.models import ThreadRevision
+        _, _, _, added, _ = self._run_escalation()
+        rev = next(o for o in added if isinstance(o, ThreadRevision))
+        self.assertEqual(rev.marca, "Chevrolet")
+        self.assertEqual(rev.modelo, "Captiva")
+        self.assertEqual(rev.anio, 2020)
+
+    def test_provisional_revision_has_requested_slot(self):
+        from app.models import ThreadRevision
+        from datetime import date, time
+        _, _, _, added, _ = self._run_escalation()
+        rev = next(o for o in added if isinstance(o, ThreadRevision))
+        self.assertEqual(rev.scheduled_date, date(2026, 6, 19))
+        self.assertEqual(rev.scheduled_time, time(12, 0))
+
+    def test_no_flow_sent(self):
+        result, _, _, _, _ = self._run_escalation()
+        self.assertNotEqual(result.action, "flow_button_sent")
+
+    def test_lead_estado_not_agendado(self):
+        _, _, lead, _, _ = self._run_escalation()
+        self.assertNotEqual(lead.estado, "AGENDADO")
+
+    def test_no_duplicate_revision_when_current_revision_id_set(self):
+        from app.models import ThreadRevision
+        _, _, _, added, _ = self._run_escalation(existing_revision_id=99)
+        rev_objs = [o for o in added if isinstance(o, ThreadRevision)]
+        self.assertEqual(len(rev_objs), 0, "No new revision if current_revision_id already set")
+
+    def test_current_revision_id_stored_in_state(self):
+        _, state, _, added, _ = self._run_escalation()
+        self.assertIsNotNone(state.current_revision_id)
+
+    def test_handoff_whatsapp_message_contains_julian(self):
+        _, _, _, _, sent = self._run_escalation()
+        self.assertEqual(len(sent), 1)
+        self.assertIn("Julián", sent[0])
+
+    def test_handoff_reply_no_iso_date(self):
+        _, _, _, _, sent = self._run_escalation()
+        self.assertNotIn("2026-06-", sent[0])
 
 
 if __name__ == "__main__":

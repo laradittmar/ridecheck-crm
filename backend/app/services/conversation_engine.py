@@ -125,6 +125,97 @@ def _extract_year_from_text(text: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+# ── Scheduling escalation ─────────────────────────────────────────────────────
+
+# Phrases that indicate the customer is insisting on an unavailable slot or
+# rejecting all alternatives — triggers human handoff.
+_ESCALATION_KEYWORDS: frozenset[str] = frozenset({
+    "solo puedo",
+    "necesito a las",
+    "no me sirve",
+    "no puedo por la tarde",
+    "no puedo por la mañana",
+    "no puedo por la manana",
+    "sí o sí",
+    "si o si",
+    "no tenés a las",
+    "no tenes a las",
+    "podés hacer una excepción",
+    "podes hacer una excepcion",
+    "hablá con julián",
+    "habla con julian",
+    "quería ese horario",
+    "queria ese horario",
+    "no, quería",
+    "no, queria",
+    "me lo podés ver",
+    "me lo podes ver",
+    "excepción",
+    "excepcion",
+    "ninguno me viene",
+    "ninguno me sirve",
+    "no me viene ninguno",
+    "no tengo otro horario",
+    "no puedo otro día",
+    "no puedo otro dia",
+})
+
+_AFTERNOON_HOUR: int = 13  # slots at HH >= 13 are classified as "tarde"
+
+_SPANISH_WEEKDAY_NAMES: list[str] = [
+    "lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo",
+]
+
+
+def _format_date_human(date_iso: str, today: date | None = None) -> str:
+    """Human-readable date: 'mañana viernes 19/06' or 'lunes 22/06'."""
+    try:
+        d = date.fromisoformat(date_iso)
+    except (ValueError, TypeError):
+        return date_iso
+    today = today or date.today()
+    delta = (d - today).days
+    prefix = "hoy " if delta == 0 else ("mañana " if delta == 1 else "")
+    day_name = _SPANISH_WEEKDAY_NAMES[d.weekday()]
+    return f"{prefix}{day_name} {d.strftime('%d/%m')}"
+
+
+def _time_hour(time_str: str) -> int:
+    """Extract the hour component from an HH:MM string."""
+    try:
+        return int(time_str.split(":")[0])
+    except (ValueError, IndexError, AttributeError):
+        return 0
+
+
+def _detect_time_period(texts: list[str]) -> str | None:
+    """Return 'tarde' or 'manana' if the message requests a broad time period."""
+    combined = " ".join(texts).lower()
+    if re.search(r"\b(?:por|a)\s+la\s+tarde\b", combined):
+        return "tarde"
+    if re.search(r"\b(?:por|a)\s+la\s+(?:mañana|manana)\b|\btemprano\b", combined):
+        return "manana"
+    return None
+
+
+def _should_escalate_scheduling_to_human(
+    texts: list[str],
+    state: "WhatsAppThreadState",
+) -> bool:
+    """Return True when the user is insisting on an unavailable slot or
+    explicitly rejecting the offered alternatives."""
+    combined = " ".join(texts).lower()
+    if any(kw in combined for kw in _ESCALATION_KEYWORDS):
+        return True
+    # Re-requesting the exact same time that was already rejected, after
+    # alternatives were offered.
+    if state.last_requested_time and state.last_offered_slots:
+        _, parsed_time = _parse_scheduling_text(texts, date.today())
+        if parsed_time and parsed_time == str(state.last_requested_time):
+            return True
+    return False
+
+
 # Maps lowercased Spanish day names (accented + unaccented) to Python weekday numbers.
 _SPANISH_DAY_TO_WEEKDAY: dict[str, int] = {
     "lunes": 0,
@@ -541,19 +632,33 @@ class ConversationEngine:
                 if result is not None:
                     return result
 
-        # ── Deterministic SCHEDULING day/time parse (pre-AI) ─────────────
-        # Parse Spanish day names and time expressions without calling the AI.
-        # The AI historically misformats preferred_time_str (e.g. "Viernes 12hs"
-        # instead of "12:00"), overflowing the VARCHAR(10) column.
+        # ── Deterministic SCHEDULING day/time parse + escalation (pre-AI) ──
         if (
             state.last_stage == STAGE_SCHEDULING
             and not state.needs_human
             and not state.flow_booking_token
         ):
+            # 1. Escalation: insistence on unavailable slot → human handoff
+            if _should_escalate_scheduling_to_human(ai_input_messages, state):
+                return self._handle_scheduling_escalation(
+                    ctx, state, " ".join(ai_input_messages)
+                )
+
             sched_day_iso, sched_time_str = _parse_scheduling_text(ai_input_messages, date.today())
-            # If user confirmed ("si") without a date, re-confirm the stored slot
-            # (e.g. they accepted an alternative the bot proposed).  Skip Sundays
-            # since those are always closed and re-trying would just loop.
+
+            # 2. Period request ("por la tarde") → filter active date's alternatives
+            if not sched_day_iso and not sched_time_str:
+                period = _detect_time_period(ai_input_messages)
+                if period and state.active_requested_date and state.last_offered_slots:
+                    result = self._handle_period_request(ctx, state, period)
+                    if result is not None:
+                        return result
+
+            # 3. Time-only reply on active date: user picks "14:30" from alternatives
+            if not sched_day_iso and sched_time_str and state.active_requested_date:
+                sched_day_iso = str(state.active_requested_date)
+
+            # 4. "Si" re-confirmation of a stored valid preferred_day
             if not sched_day_iso and state.preferred_day and _is_acceptance(ai_input_messages):
                 try:
                     stored = date.fromisoformat(str(state.preferred_day))
@@ -562,6 +667,7 @@ class ConversationEngine:
                         sched_time_str = str(state.preferred_time) if state.preferred_time else None
                 except (ValueError, TypeError):
                     pass
+
             if sched_day_iso:
                 logger.info(
                     "M18 scheduling deterministic parse thread_id=%s day=%s time=%s",
@@ -856,9 +962,12 @@ class ConversationEngine:
             return None
 
         if sched_out.valid:
-            # Slot is available — store it and send the Flow button.
+            # Slot is available — store it, clear scheduling context, send Flow.
             state.preferred_day = preferred_day_iso
             state.preferred_time = preferred_time_obj.strftime("%H:%M")
+            state.active_requested_date = None
+            state.last_requested_time = None
+            state.last_offered_slots = None
             flow_id = (self.settings.whatsapp_flow_id or "").strip()
             flow_token = f"{ctx.thread.id}-{int(_time.time())}"
             state.flow_booking_token = flow_token
@@ -886,22 +995,219 @@ class ConversationEngine:
                 self.db.commit()
                 return None
         else:
-            # Slot rejected — clear any stored slot so a later "Okay" or
-            # post-AI check cannot accidentally reconfirm this invalid day.
+            # Slot rejected — keep the date for "por la tarde" follow-ups,
+            # but clear the confirmed slot and store alternatives offered.
             state.preferred_day = None
             state.preferred_time = None
-            slots = sched_out.suggested_slots[:3]
-            if slots:
+            state.active_requested_date = preferred_day_iso
+            state.last_requested_time = preferred_time_obj.strftime("%H:%M")
+            offered = sched_out.suggested_slots[:5]
+            state.last_offered_slots = json.dumps(offered)
+            date_human = _format_date_human(preferred_day_iso, date.today())
+            if offered:
+                slot_list = ", ".join(offered[:3])
                 msg = (
-                    f"Para ese horario no hay disponibilidad. "
-                    f"Horarios disponibles el {preferred_day.strftime('%d/%m')}: "
-                    + ", ".join(slots)
+                    f"Para {date_human} a las {preferred_time_obj.strftime('%H:%M')} "
+                    f"no tenemos disponibilidad. "
+                    f"Horarios disponibles: {slot_list}. ¿Alguno te viene bien?"
                 )
             else:
                 reasons = "; ".join(sched_out.reasons[:2]) if sched_out.reasons else "sin disponibilidad"
-                msg = f"Para ese día no tenemos horarios disponibles ({reasons}). ¿Tenés otro día preferido?"
+                msg = (
+                    f"Para {date_human} no hay horarios disponibles "
+                    f"({reasons}). ¿Tenés otro día preferido?"
+                )
             sent_id = self._send_text_to_wa(ctx, msg)
             return _out("replied", wa_message_id=sent_id)
+
+    # ── Period-based scheduling: "por la tarde" ───────────────────────────
+
+    def _handle_period_request(
+        self,
+        ctx: _Context,
+        state: WhatsAppThreadState,
+        period: str,
+    ) -> ConversationHandleOut | None:
+        """Filter last_offered_slots by time period and reply with available options."""
+        try:
+            offered = json.loads(state.last_offered_slots or "[]")
+        except (json.JSONDecodeError, TypeError):
+            return None
+
+        if period == "tarde":
+            filtered = [s for s in offered if _time_hour(s) >= _AFTERNOON_HOUR]
+            period_label, alt_label = "tarde", "mañana"
+        else:
+            filtered = [s for s in offered if _time_hour(s) < _AFTERNOON_HOUR]
+            period_label, alt_label = "mañana", "tarde"
+
+        date_human = _format_date_human(str(state.active_requested_date), date.today())
+        if filtered:
+            slot_list = ", ".join(filtered[:3])
+            msg = f"Para {date_human} por la {period_label} tenemos: {slot_list}. ¿Cuál te viene mejor?"
+        else:
+            msg = (
+                f"Para {date_human} no hay horarios disponibles por la {period_label}. "
+                f"¿Podría ser por la {alt_label}?"
+            )
+        sent_id = self._send_text_to_wa(ctx, msg)
+        return _out("replied", wa_message_id=sent_id)
+
+    # ── Scheduling escalation to human ────────────────────────────────────
+
+    def _handle_scheduling_escalation(
+        self,
+        ctx: _Context,
+        state: WhatsAppThreadState,
+        last_message: str,
+    ) -> ConversationHandleOut:
+        """Customer insists on an unavailable slot — create a provisional revision
+        and hand off to Julián.  Does NOT send Flow, does NOT set AGENDADO."""
+        lead = ctx.lead
+        assert lead is not None
+
+        lead.necesita_humano = True
+        lead.flag = "ACEPTADO"
+        lead.estado = "ATENCION_HUMANA"
+        state.needs_human = True
+        state.last_stage = STAGE_HUMAN
+
+        thread_rev_id: int | None = state.current_revision_id
+
+        if thread_rev_id is None:
+            # Create provisional ThreadRevision and CRM Revision with all known data.
+            focus = self._focus_candidate(ctx)
+            real_price_quote = self._compute_price_quote(ctx, state)
+
+            prov_date: date | None = None
+            prov_time: time | None = None
+            act_date_str = str(state.active_requested_date or "")
+            if act_date_str:
+                try:
+                    prov_date = date.fromisoformat(act_date_str)
+                except ValueError:
+                    pass
+            last_t_str = str(state.last_requested_time or "")
+            if last_t_str:
+                try:
+                    prov_time = time.fromisoformat(last_t_str)
+                except ValueError:
+                    pass
+
+            buyer_name = (
+                (state.customer_name or "").strip()
+                or (lead.nombre or "").strip()
+                or None
+            )
+            thread_rev = ThreadRevision(
+                thread_id=ctx.thread.id,
+                candidate_id=focus.id if focus else None,
+                status="provisional",
+                buyer_name=buyer_name,
+                buyer_phone=ctx.contact.wa_id or None,
+                buyer_email=lead.email or None,
+                scheduled_date=prov_date,
+                scheduled_time=prov_time,
+                tipo_vehiculo=focus.tipo_vehiculo if focus else None,
+                marca=focus.marca if focus else None,
+                modelo=focus.modelo if focus else None,
+                anio=focus.anio if focus else None,
+            )
+            self.db.add(thread_rev)
+
+            crm_rev = Revision(
+                lead_id=lead.id,
+                tipo_vehiculo=focus.tipo_vehiculo if focus else None,
+                marca=focus.marca if focus else None,
+                modelo=focus.modelo if focus else None,
+                anio=focus.anio if focus else None,
+                zone_group=state.home_zone_group,
+                zone_detail=state.home_zone_detail,
+                turno_fecha=prov_date,
+                turno_hora=prov_time,
+                turno_notas="Pendiente coordinación manual — cliente insiste con horario no disponible",
+            )
+            self.db.add(crm_rev)
+            self.db.flush()
+            self._pricing.recalculate_revision_if_possible(db=self.db, revision=crm_rev)
+
+            state.current_revision_id = thread_rev.id
+            thread_rev_id = thread_rev.id
+            logger.info(
+                "M18 provisional revision created thread_id=%s thread_rev=%s",
+                ctx.thread.id, thread_rev_id,
+            )
+
+        self._send_scheduling_handoff_email(
+            ctx=ctx, state=state, thread_rev_id=thread_rev_id, last_message=last_message,
+        )
+
+        msg = (
+            "Entiendo, querés ese horario puntual. "
+            "Lo paso con Julián para ver si puede acomodarlo manualmente "
+            "y te respondemos por acá apenas lo revise. 🙌"
+        )
+        sent_id = self._send_text_to_wa(ctx, msg)
+        return _out("replied", wa_message_id=sent_id)
+
+    def _send_scheduling_handoff_email(
+        self,
+        ctx: _Context,
+        state: WhatsAppThreadState,
+        thread_rev_id: int | None,
+        last_message: str,
+    ) -> None:
+        from ..services.resend_email import send_scheduling_handoff_notification
+        settings = self.settings
+        if not settings.resend_api_key:
+            logger.warning("M18 RESEND_API_KEY missing — handoff email skipped")
+            return
+
+        lead = ctx.lead
+        assert lead is not None
+        focus = self._focus_candidate(ctx)
+        real_price_quote = self._compute_price_quote(ctx, state)
+
+        offered_str = "Sin dato"
+        if state.last_offered_slots:
+            try:
+                offered_str = ", ".join(json.loads(state.last_offered_slots)) or "Sin dato"
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        act_date = str(state.active_requested_date or "")
+        last_t = str(state.last_requested_time or "")
+        requested_str = (
+            f"{_format_date_human(act_date, date.today())} a las {last_t}"
+            if act_date and last_t
+            else (act_date or "Sin dato")
+        )
+
+        vehicle_parts = [
+            focus.marca if focus else None,
+            focus.modelo if focus else None,
+            str(focus.anio) if focus and focus.anio else None,
+        ]
+        vehicle_str = " ".join(p for p in vehicle_parts if p) or "Sin dato"
+
+        send_scheduling_handoff_notification(
+            api_key=settings.resend_api_key,
+            from_email=settings.internal_booking_email_from,
+            to_email=settings.internal_booking_email_to,
+            lead_id=lead.id,
+            thread_id=ctx.thread.id,
+            revision_id=thread_rev_id or "—",
+            buyer_name=state.customer_name or lead.nombre or "Sin dato",
+            buyer_phone=ctx.contact.wa_id or "Sin dato",
+            vehicle=vehicle_str,
+            tipo_vehiculo=focus.tipo_vehiculo if focus else "Sin dato",
+            zone_group=state.home_zone_group or "Sin dato",
+            zone_detail=state.home_zone_detail or "Sin dato",
+            precio_total=str(real_price_quote.precio_total) if real_price_quote else "Sin dato",
+            requested_slot=requested_str,
+            offered_slots=offered_str,
+            last_message=last_message or "Sin dato",
+        )
 
     # ── AI prompt ─────────────────────────────────────────────────────────
 
