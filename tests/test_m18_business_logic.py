@@ -3017,5 +3017,281 @@ class TestPeriodSchedulingFlow(unittest.TestCase):
         self.assertNotIn("precio", reply)
 
 
+class TestSelectSlotFromOffered(unittest.TestCase):
+    """Unit tests for _select_slot_from_offered — ordinal/positional slot detection."""
+
+    def setUp(self):
+        from app.services.conversation_engine import _select_slot_from_offered
+        import json
+        self._fn = _select_slot_from_offered
+        self._slots = json.dumps(["09:00", "09:30", "10:00", "13:00", "13:30", "14:00", "14:30"])
+
+    def test_ultimo_picks_last(self):
+        self.assertEqual(self._fn(["el último horario"], self._slots), "14:30")
+
+    def test_ultimo_no_accent(self):
+        self.assertEqual(self._fn(["el ultimo horario"], self._slots), "14:30")
+
+    def test_ultomp_typo_picks_last(self):
+        """'el ultomp horario' is a real WhatsApp typo for 'el último horario'."""
+        self.assertEqual(self._fn(["el ultomp horario"], self._slots), "14:30")
+
+    def test_ultom_typo_picks_last(self):
+        self.assertEqual(self._fn(["el ultom"], self._slots), "14:30")
+
+    def test_ultiom_typo_picks_last(self):
+        self.assertEqual(self._fn(["ultiom"], self._slots), "14:30")
+
+    def test_primero_picks_first(self):
+        self.assertEqual(self._fn(["el primero"], self._slots), "09:00")
+
+    def test_primer_picks_first(self):
+        self.assertEqual(self._fn(["el primer horario"], self._slots), "09:00")
+
+    def test_segundo_picks_second(self):
+        import json
+        self.assertEqual(self._fn(["el segundo"], self._slots), "09:30")
+
+    def test_tercero_picks_third(self):
+        import json
+        self.assertEqual(self._fn(["el tercero"], self._slots), "10:00")
+
+    def test_no_ordinal_returns_none(self):
+        self.assertIsNone(self._fn(["si"], self._slots))
+
+    def test_empty_slots_returns_none(self):
+        import json
+        self.assertIsNone(self._fn(["el último"], json.dumps([])))
+
+    def test_none_slots_returns_none(self):
+        self.assertIsNone(self._fn(["el último"], None))
+
+    def test_multi_message_burst(self):
+        self.assertEqual(self._fn(["horario", "el último"], self._slots), "14:30")
+
+    def test_segunda_picks_second(self):
+        import json
+        # feminine form
+        self.assertEqual(self._fn(["la segunda opción"], self._slots), "09:30")
+
+
+class TestOrdinalSlotConfirmation(unittest.TestCase):
+    """Step 2b + step 4b: ordinal selection and pending-slot si-confirmation."""
+
+    def _make_svc(self, valid=True, all_slots=None):
+        MagicMock = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock
+        svc = MagicMock()
+        svc.check.return_value = MagicMock(
+            valid=valid, suggested_slots=[], reasons=["no disp"]
+        )
+        ls_mock = MagicMock()
+        ls_mock.slots = all_slots or []
+        svc.list_slots.return_value = ls_mock
+        return svc
+
+    def _make_scheduling_state(self, preferred_day=None, preferred_time=None):
+        import json
+        return _make_state(
+            last_stage="SCHEDULING",
+            home_zone_group="Oeste",
+            home_zone_detail="San Justo",
+            active_requested_date="2026-06-19",
+            last_offered_slots=json.dumps(["09:00", "09:30", "13:00", "13:30", "14:00", "14:30"]),
+            preferred_day=preferred_day,
+            preferred_time=preferred_time,
+        )
+
+    # ── Step 2b: ordinal selection → _try_schedule_and_flow ────────────────
+
+    def test_ultimo_horario_sends_flow(self):
+        """'el último horario': ordinal picks 14:30, _try_schedule_and_flow sends Flow."""
+        from app.services.conversation_engine import _select_slot_from_offered
+        import json
+
+        eng = _make_engine()
+        eng._schedule = self._make_svc(valid=True)
+        flow_sent: list[str] = []
+        eng._send_flow_button = lambda ctx, body, token: flow_sent.append(token) or "flow-id"
+        eng._send_text_to_wa = lambda ctx, txt: "id"
+
+        state = self._make_scheduling_state()
+        ctx = _make_ctx(state=state)
+
+        # Simulate step 2b
+        chosen = _select_slot_from_offered(["el último horario"], str(state.last_offered_slots))
+        self.assertEqual(chosen, "14:30")
+        result = eng._try_schedule_and_flow(ctx, state, str(state.active_requested_date), chosen, "")
+
+        self.assertEqual(result.action, "flow_button_sent")
+        self.assertEqual(len(flow_sent), 1)
+
+    def test_ultomp_typo_sends_flow(self):
+        """'el ultomp horario' (WhatsApp typo) selects last slot and sends Flow."""
+        from app.services.conversation_engine import _select_slot_from_offered
+        import json
+
+        eng = _make_engine()
+        eng._schedule = self._make_svc(valid=True)
+        flow_sent: list[str] = []
+        eng._send_flow_button = lambda ctx, body, token: flow_sent.append(token) or "flow-id"
+        eng._send_text_to_wa = lambda ctx, txt: "id"
+
+        state = self._make_scheduling_state()
+        ctx = _make_ctx(state=state)
+
+        chosen = _select_slot_from_offered(["el ultomp horario"], str(state.last_offered_slots))
+        self.assertEqual(chosen, "14:30", "Typo 'ultomp' must resolve to last slot")
+        result = eng._try_schedule_and_flow(ctx, state, str(state.active_requested_date), chosen, "")
+
+        self.assertEqual(result.action, "flow_button_sent")
+        self.assertEqual(len(flow_sent), 1)
+
+    def test_ultimo_unavailable_offers_alternatives(self):
+        """'el último horario' for an unavailable slot must offer alternatives, not Flow."""
+        from app.services.conversation_engine import _select_slot_from_offered
+
+        eng = _make_engine()
+        eng._schedule = self._make_svc(valid=False, all_slots=["09:00", "09:30", "10:00"])
+        sent: list[str] = []
+        eng._send_text_to_wa = lambda ctx, txt: sent.append(txt) or "id"
+
+        state = self._make_scheduling_state()
+        ctx = _make_ctx(state=state)
+
+        chosen = _select_slot_from_offered(["el último horario"], str(state.last_offered_slots))
+        self.assertEqual(chosen, "14:30")
+        result = eng._try_schedule_and_flow(ctx, state, str(state.active_requested_date), chosen, "")
+
+        self.assertEqual(result.action, "replied")
+        self.assertEqual(len(sent), 1)
+        self.assertIn("disponib", sent[0].lower())
+
+    def test_primero_sends_flow_for_first_slot(self):
+        """'el primero' selects 09:00 and sends Flow."""
+        from app.services.conversation_engine import _select_slot_from_offered
+
+        eng = _make_engine()
+        svc = self._make_svc(valid=True)
+        eng._schedule = svc
+        flow_sent: list[str] = []
+        eng._send_flow_button = lambda ctx, body, token: flow_sent.append(token) or "flow-id"
+        eng._send_text_to_wa = lambda ctx, txt: "id"
+
+        state = self._make_scheduling_state()
+        ctx = _make_ctx(state=state)
+
+        chosen = _select_slot_from_offered(["el primero"], str(state.last_offered_slots))
+        self.assertEqual(chosen, "09:00")
+        result = eng._try_schedule_and_flow(ctx, state, str(state.active_requested_date), chosen, "")
+
+        self.assertEqual(result.action, "flow_button_sent")
+        call_args = svc.check.call_args
+        checkin = call_args[0][0]
+        self.assertEqual(checkin.preferred_time.strftime("%H:%M"), "09:00")
+
+    def test_current_revision_id_null_after_ordinal_flow(self):
+        """current_revision_id must remain None after ordinal-triggered Flow button."""
+        from app.services.conversation_engine import _select_slot_from_offered
+
+        eng = _make_engine()
+        eng._schedule = self._make_svc(valid=True)
+        eng._send_flow_button = lambda ctx, body, token: "flow-id"
+        eng._send_text_to_wa = lambda ctx, txt: "id"
+
+        state = self._make_scheduling_state()
+        ctx = _make_ctx(state=state)
+
+        chosen = _select_slot_from_offered(["el último horario"], str(state.last_offered_slots))
+        eng._try_schedule_and_flow(ctx, state, str(state.active_requested_date), chosen, "")
+
+        self.assertIsNone(state.current_revision_id, "current_revision_id must stay None until Flow submit")
+
+    def test_step_2b_simulation_ordinal_resolves_to_try_schedule(self):
+        """Simulate full step 2b path: ordinal → chosen slot → _try_schedule_and_flow."""
+        from app.services.conversation_engine import (
+            _select_slot_from_offered, _parse_scheduling_text, _detect_time_period,
+        )
+        import json
+        from datetime import date as dt_date
+
+        today = dt_date(2026, 6, 18)
+        last_offered = json.dumps(["09:00", "09:30", "13:00", "14:00", "14:30"])
+        active_date = "2026-06-19"
+        messages = ["el ultomp horario"]
+
+        sched_day_iso, sched_time_str = _parse_scheduling_text(messages, today)
+        period = _detect_time_period(messages)
+
+        # Step 2b guard: no day, no time, no period → check ordinal
+        self.assertIsNone(sched_day_iso)
+        self.assertIsNone(sched_time_str)
+        self.assertIsNone(period)
+
+        chosen = _select_slot_from_offered(messages, last_offered)
+        self.assertEqual(chosen, "14:30", "Ordinal 'ultomp' must resolve to last slot")
+
+        # The resolved day+time
+        resolved_day = active_date
+        resolved_time = chosen
+        self.assertEqual(resolved_day, "2026-06-19")
+        self.assertEqual(resolved_time, "14:30")
+
+    # ── Step 4b: "si" + preferred_time + active_date → Flow ─────────────────
+
+    def test_si_confirms_pending_ai_proposed_time(self):
+        """'si' with preferred_time set and preferred_day=None uses active_requested_date."""
+        from app.services.conversation_engine import (
+            _is_acceptance, _parse_scheduling_text, _detect_time_period,
+            _is_pure_scheduling_rafaga,
+        )
+        from datetime import date as dt_date
+
+        today = dt_date(2026, 6, 18)
+        messages = ["si"]
+        preferred_time = "14:30"
+        preferred_day = None
+        active_requested_date = "2026-06-19"
+
+        sched_day_iso, sched_time_str = _parse_scheduling_text(messages, today)
+        self.assertIsNone(sched_day_iso)
+        self.assertIsNone(sched_time_str)
+
+        # Step 4b: si + preferred_time + active_requested_date
+        if (
+            not sched_day_iso
+            and preferred_time
+            and active_requested_date
+            and _is_acceptance(messages)
+        ):
+            from datetime import date as dt_date2
+            active_date = dt_date2.fromisoformat(active_requested_date)
+            if active_date.weekday() != 6:
+                sched_day_iso = active_requested_date
+                sched_time_str = preferred_time
+
+        self.assertEqual(sched_day_iso, "2026-06-19", "Step 4b must set day from active_requested_date")
+        self.assertEqual(sched_time_str, "14:30", "Step 4b must set time from preferred_time")
+
+    def test_si_with_pending_time_sends_flow(self):
+        """'si' after AI confirms slot (preferred_time set) must trigger Flow, not generic question."""
+        eng = _make_engine()
+        eng._schedule = self._make_svc(valid=True)
+        flow_sent: list[str] = []
+        eng._send_flow_button = lambda ctx, body, token: flow_sent.append(token) or "flow-id"
+        eng._send_text_to_wa = lambda ctx, txt: "id"
+
+        # State: AI extracted preferred_time="14:30" in previous turn;
+        # preferred_day was cleared by rejection; active_requested_date is still set.
+        state = self._make_scheduling_state(preferred_day=None, preferred_time="14:30")
+        ctx = _make_ctx(state=state)
+
+        # Simulate step 4b: si + preferred_time + active_requested_date → _try_schedule_and_flow
+        result = eng._try_schedule_and_flow(ctx, state, str(state.active_requested_date), "14:30", "")
+
+        self.assertEqual(result.action, "flow_button_sent",
+                         "Step 4b path must trigger Flow for 'si' when pending time exists")
+        self.assertEqual(len(flow_sent), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

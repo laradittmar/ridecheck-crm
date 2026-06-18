@@ -304,6 +304,33 @@ def _nearest_slots(slots: list[str], requested_time_str: str, n: int = 3) -> lis
     return sorted(slots, key=distance)[:n]
 
 
+def _select_slot_from_offered(texts: list[str], last_offered_slots: str | None) -> str | None:
+    """Detect ordinal/positional slot selection and return the matching HH:MM string.
+
+    Handles 'el último horario', 'el ultomp horario' (typo), 'el primero',
+    'el segundo', 'el tercero'.  Uses _strip_accents so 'último' normalises to
+    'ultimo' before matching.  last_offered_slots is a sorted JSON list of HH:MM.
+    """
+    try:
+        offered = json.loads(last_offered_slots or "[]")
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not offered:
+        return None
+    combined = _strip_accents(" ".join(texts))
+    # "último"/"ultima" → "ultimo"/"ultima" after accent stripping.
+    # Also matches common typos: ultomp (ult+omp), ultom (ult+om), ultiom (ult+iom).
+    if re.search(r"\bult(?:im[ao]?|om[ap]?|iom)\b", combined):
+        return offered[-1]
+    if re.search(r"\bprim(?:er[ao]?)?\b", combined):
+        return offered[0]
+    if re.search(r"\bsegund[oa]?\b", combined) and len(offered) >= 2:
+        return offered[1]
+    if re.search(r"\btercer[oa]?\b", combined) and len(offered) >= 3:
+        return offered[2]
+    return None
+
+
 # Maps lowercased Spanish day names (accented + unaccented) to Python weekday numbers.
 _SPANISH_DAY_TO_WEEKDAY: dict[str, int] = {
     "lunes": 0,
@@ -754,6 +781,26 @@ class ConversationEngine:
                         ctx, state, str(state.active_requested_date), period=period
                     )
 
+            # 2b. Ordinal slot selection from offered alternatives: "el último horario",
+            #     "el ultomp horario" (typo), "el primero", "el segundo", etc.
+            #     Bypasses the _pure_sched gate because ordinal phrases (3+ words,
+            #     no parseable date/time) would otherwise fall to the AI.
+            if not sched_day_iso and not sched_time_str and not period:
+                if state.active_requested_date and state.last_offered_slots:
+                    _chosen = _select_slot_from_offered(
+                        ai_input_messages, str(state.last_offered_slots)
+                    )
+                    if _chosen:
+                        logger.info(
+                            "M18 ordinal slot selected thread_id=%s day=%s time=%s",
+                            ctx.thread.id, str(state.active_requested_date), _chosen,
+                        )
+                        result = self._try_schedule_and_flow(
+                            ctx, state, str(state.active_requested_date), _chosen, ""
+                        )
+                        if result is not None:
+                            return result
+
             # 3. Time-only reply on active date: user picks "14:30" from alternatives
             if not sched_day_iso and sched_time_str and state.active_requested_date:
                 sched_day_iso = str(state.active_requested_date)
@@ -765,6 +812,23 @@ class ConversationEngine:
                     if stored.weekday() != 6:
                         sched_day_iso = str(state.preferred_day)
                         sched_time_str = str(state.preferred_time) if state.preferred_time else None
+                except (ValueError, TypeError):
+                    pass
+
+            # 4b. "Si" when the AI proposed a time from the offered list but
+            #     preferred_day was cleared by a prior rejection.  Handles the
+            #     pattern: AI asked "¿Te sirve ese horario a las X?" → user says "si".
+            if (
+                not sched_day_iso
+                and state.preferred_time
+                and state.active_requested_date
+                and _is_acceptance(ai_input_messages)
+            ):
+                try:
+                    active_date = date.fromisoformat(str(state.active_requested_date))
+                    if active_date.weekday() != 6:
+                        sched_day_iso = str(state.active_requested_date)
+                        sched_time_str = str(state.preferred_time)
                 except (ValueError, TypeError):
                     pass
 
