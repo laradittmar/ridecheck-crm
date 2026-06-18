@@ -208,11 +208,23 @@ def _should_escalate_scheduling_to_human(
     if any(kw in combined for kw in _ESCALATION_KEYWORDS):
         return True
     # Re-requesting the exact same time that was already rejected, after
-    # alternatives were offered.
+    # *real* alternatives were offered for that same date.
+    # Guards:
+    #   1. Offered slots must be non-empty — a closed/Sunday rejection stores "[]"
+    #      and must NOT count as insistence (no alternatives were ever shown).
+    #   2. The user must not have switched to a different date — changing date is a
+    #      fresh attempt, not re-insisting on the previous rejected slot.
     if state.last_requested_time and state.last_offered_slots:
-        _, parsed_time = _parse_scheduling_text(texts, date.today())
-        if parsed_time and parsed_time == str(state.last_requested_time):
-            return True
+        try:
+            offered = json.loads(str(state.last_offered_slots))
+        except (json.JSONDecodeError, TypeError):
+            offered = []
+        if offered:  # real alternatives were actually offered
+            parsed_day, parsed_time = _parse_scheduling_text(texts, date.today())
+            if parsed_time and parsed_time == str(state.last_requested_time):
+                # Only escalate when the user hasn't switched to a new date
+                if parsed_day is None or parsed_day == str(state.active_requested_date):
+                    return True
     return False
 
 

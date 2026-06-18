@@ -1748,6 +1748,84 @@ class TestEscalationKeywords(unittest.TestCase):
             last_offered_slots=None,
         ))
 
+    def test_empty_offered_slots_json_does_not_escalate(self):
+        """Closed-day (e.g. Sunday) rejection stores '[]' — must NOT trigger escalation."""
+        import json
+        self.assertFalse(self._check(
+            ["a las 12hs"],
+            last_requested_time="12:00",
+            last_offered_slots=json.dumps([]),  # "[]" — Sunday/closed day
+        ))
+
+    def test_mn_12hs_after_sunday_rejection_does_not_escalate(self):
+        """'mñ 12hs' after a Sunday rejection must NOT escalate — it's a new valid date."""
+        import json
+        from app.services.conversation_engine import _should_escalate_scheduling_to_human
+        state = _make_state(
+            last_stage="SCHEDULING",
+            active_requested_date="2026-06-21",   # Sunday
+            last_requested_time="12:00",
+            last_offered_slots=json.dumps([]),    # no slots for Sunday
+        )
+        result = _should_escalate_scheduling_to_human(["mñ 12hs"], state)
+        self.assertFalse(result)
+
+    def test_same_time_different_date_does_not_escalate(self):
+        """Proposing the same time on a different (new) date must NOT escalate."""
+        import json
+        from app.services.conversation_engine import _should_escalate_scheduling_to_human
+        # State: Friday 12hs was rejected, alternatives were offered
+        state = _make_state(
+            last_stage="SCHEDULING",
+            active_requested_date="2026-06-19",   # Friday
+            last_requested_time="12:00",
+            last_offered_slots=json.dumps(["09:00", "09:30", "14:00"]),
+        )
+        # User changes to Saturday with the same time — fresh attempt, not insistence
+        result = _should_escalate_scheduling_to_human(["el sábado a las 12hs"], state)
+        self.assertFalse(result)
+
+    def test_same_time_same_date_with_real_slots_escalates(self):
+        """Re-requesting the same time on the same date after alternatives escalates."""
+        import json
+        from app.services.conversation_engine import _should_escalate_scheduling_to_human
+        state = _make_state(
+            last_stage="SCHEDULING",
+            active_requested_date="2026-06-19",   # Friday
+            last_requested_time="12:00",
+            last_offered_slots=json.dumps(["09:00", "09:30", "14:00"]),
+        )
+        # User insists on 12hs for the same Friday
+        result = _should_escalate_scheduling_to_human(["12hs"], state)
+        self.assertTrue(result)
+
+    def test_accepting_offered_slot_different_time_does_not_escalate(self):
+        """Picking a time from the offered alternatives must not escalate."""
+        import json
+        from app.services.conversation_engine import _should_escalate_scheduling_to_human
+        state = _make_state(
+            last_stage="SCHEDULING",
+            active_requested_date="2026-06-19",
+            last_requested_time="12:00",
+            last_offered_slots=json.dumps(["09:00", "14:00"]),
+        )
+        # User accepts "14:00" from alternatives
+        result = _should_escalate_scheduling_to_human(["14:00"], state)
+        self.assertFalse(result)
+
+    def test_insistence_keyword_still_escalates_even_with_empty_slots(self):
+        """Explicit insistence keywords escalate regardless of offered-slots state."""
+        import json
+        from app.services.conversation_engine import _should_escalate_scheduling_to_human
+        state = _make_state(
+            last_stage="SCHEDULING",
+            active_requested_date="2026-06-21",   # Sunday
+            last_requested_time="12:00",
+            last_offered_slots=json.dumps([]),
+        )
+        result = _should_escalate_scheduling_to_human(["solo puedo a las 12"], state)
+        self.assertTrue(result)
+
 
 class TestRejectionStoresContext(unittest.TestCase):
     """After slot rejection, active_requested_date and last_offered_slots must be set."""
