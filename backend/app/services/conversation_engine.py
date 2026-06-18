@@ -783,12 +783,14 @@ class ConversationEngine:
 
             # 2b. Ordinal slot selection from offered alternatives: "el último horario",
             #     "el ultomp horario" (typo), "el primero", "el segundo", etc.
+            #     Uses last_visible_slots — the exact slots displayed to the user —
+            #     so "el último" refers to the last SEEN option, not the full-day list.
             #     Bypasses the _pure_sched gate because ordinal phrases (3+ words,
             #     no parseable date/time) would otherwise fall to the AI.
             if not sched_day_iso and not sched_time_str and not period:
-                if state.active_requested_date and state.last_offered_slots:
+                if state.active_requested_date and state.last_visible_slots:
                     _chosen = _select_slot_from_offered(
-                        ai_input_messages, str(state.last_offered_slots)
+                        ai_input_messages, state.last_visible_slots
                     )
                     if _chosen:
                         logger.info(
@@ -1158,6 +1160,7 @@ class ConversationEngine:
             state.active_requested_date = None
             state.last_requested_time = None
             state.last_offered_slots = None
+            state.last_visible_slots = None
             flow_id = (self.settings.whatsapp_flow_id or "").strip()
             flow_token = f"{ctx.thread.id}-{int(_time.time())}"
             state.flow_booking_token = flow_token
@@ -1213,6 +1216,7 @@ class ConversationEngine:
             if all_slots:
                 # Sort nearest slots chronologically so reply is always in time order.
                 near = sorted(_nearest_slots(all_slots, preferred_time_obj.strftime("%H:%M")))
+                state.last_visible_slots = json.dumps(near)  # only what was shown
                 slot_list = ", ".join(near)
                 msg = (
                     f"Para {date_human} a las {preferred_time_obj.strftime('%H:%M')} "
@@ -1220,6 +1224,7 @@ class ConversationEngine:
                     f"Horarios disponibles: {slot_list}. ¿Alguno te viene bien?"
                 )
             else:
+                state.last_visible_slots = None
                 reasons = "; ".join(sched_out.reasons[:2]) if sched_out.reasons else "sin disponibilidad"
                 msg = (
                     f"Para {date_human} no hay horarios disponibles "
@@ -1251,13 +1256,17 @@ class ConversationEngine:
 
         date_human = _format_date_human(str(state.active_requested_date), date.today())
         if filtered:
-            shown = filtered[:4]
+            # Show all available slots for the period (not capped) so "el último" and
+            # "el primero" refer to what the user actually sees, not a hidden subset.
+            shown = filtered
+            state.last_visible_slots = json.dumps(shown)
             if len(shown) >= 2:
                 slot_list = ", ".join(shown[:-1]) + f" o {shown[-1]}"
             else:
                 slot_list = shown[0]
             msg = f"Sí, para {date_human} por la {period_label} tengo: {slot_list}. ¿Cuál te sirve?"
         else:
+            state.last_visible_slots = None
             msg = (
                 f"Para {date_human} no hay horarios disponibles por la {period_label}. "
                 f"¿Podría ser por la {alt_label}?"
@@ -1300,7 +1309,7 @@ class ConversationEngine:
             all_slots = []
 
         state.active_requested_date = day_iso
-        state.last_offered_slots = json.dumps(all_slots)  # full-day, sorted
+        state.last_offered_slots = json.dumps(all_slots)  # full-day, sorted — for period filtering
 
         date_human = _format_date_human(day_iso, date.today())
 
@@ -1314,12 +1323,13 @@ class ConversationEngine:
             period_label = "mañana"
             alt_label = "tarde"
         else:
-            display_slots = all_slots
+            display_slots = all_slots[:4]  # no period — cap at 4 for readability
             period_label = None
             alt_label = None
 
         if display_slots:
-            shown = display_slots[:4]
+            shown = display_slots  # show all filtered; period filter already limits scope
+            state.last_visible_slots = json.dumps(shown)
             slot_list = ", ".join(shown[:-1]) + f" o {shown[-1]}" if len(shown) >= 2 else shown[0]
             if period_label:
                 msg = f"Para {date_human} por la {period_label} tengo: {slot_list}. ¿A qué hora te viene bien?"
@@ -1328,17 +1338,20 @@ class ConversationEngine:
         elif period_label and all_slots:
             # Requested period has no slots — offer the other period.
             shown_all = all_slots[:4]
+            state.last_visible_slots = json.dumps(shown_all)
             sl = ", ".join(shown_all[:-1]) + f" o {shown_all[-1]}" if len(shown_all) >= 2 else shown_all[0]
             msg = (
                 f"Para {date_human} no hay horarios por la {period_label}. "
                 f"Tengo disponible: {sl}. ¿Alguno te sirve?"
             )
         elif is_closed:
+            state.last_visible_slots = None
             msg = (
                 f"El {date_human} no tenemos operaciones. "
                 "¿Qué otro día te funciona? De lunes a sábado estamos disponibles."
             )
         else:
+            state.last_visible_slots = None
             msg = (
                 f"Para {date_human} no hay horarios libres en este momento. "
                 "¿Tenés otro día preferido?"

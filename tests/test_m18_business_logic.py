@@ -102,6 +102,7 @@ def _make_state(**kwargs):
         active_requested_date=None,
         last_requested_time=None,
         last_offered_slots=None,
+        last_visible_slots=None,
         last_stage="QUALIFYING",
         needs_human=False,
         flow_booking_token=None,
@@ -3089,14 +3090,18 @@ class TestOrdinalSlotConfirmation(unittest.TestCase):
         svc.list_slots.return_value = ls_mock
         return svc
 
-    def _make_scheduling_state(self, preferred_day=None, preferred_time=None):
+    def _make_scheduling_state(self, preferred_day=None, preferred_time=None,
+                               visible_slots=None, all_slots=None):
         import json
+        _all = all_slots or ["09:00", "09:30", "13:00", "13:30", "14:00", "14:30"]
+        _visible = visible_slots or ["09:00", "09:30", "13:00", "13:30", "14:00", "14:30"]
         return _make_state(
             last_stage="SCHEDULING",
             home_zone_group="Oeste",
             home_zone_detail="San Justo",
             active_requested_date="2026-06-19",
-            last_offered_slots=json.dumps(["09:00", "09:30", "13:00", "13:30", "14:00", "14:30"]),
+            last_offered_slots=json.dumps(_all),
+            last_visible_slots=json.dumps(_visible),
             preferred_day=preferred_day,
             preferred_time=preferred_time,
         )
@@ -3215,7 +3220,8 @@ class TestOrdinalSlotConfirmation(unittest.TestCase):
         from datetime import date as dt_date
 
         today = dt_date(2026, 6, 18)
-        last_offered = json.dumps(["09:00", "09:30", "13:00", "14:00", "14:30"])
+        # last_visible_slots = what user actually saw (NOT the full 17-slot day list)
+        visible_slots = json.dumps(["09:00", "09:30", "13:00", "14:00", "14:30"])
         active_date = "2026-06-19"
         messages = ["el ultomp horario"]
 
@@ -3227,14 +3233,100 @@ class TestOrdinalSlotConfirmation(unittest.TestCase):
         self.assertIsNone(sched_time_str)
         self.assertIsNone(period)
 
-        chosen = _select_slot_from_offered(messages, last_offered)
-        self.assertEqual(chosen, "14:30", "Ordinal 'ultomp' must resolve to last slot")
+        # Engine passes last_visible_slots to _select_slot_from_offered
+        chosen = _select_slot_from_offered(messages, visible_slots)
+        self.assertEqual(chosen, "14:30", "Ordinal 'ultomp' must resolve to last VISIBLE slot")
 
-        # The resolved day+time
         resolved_day = active_date
         resolved_time = chosen
         self.assertEqual(resolved_day, "2026-06-19")
         self.assertEqual(resolved_time, "14:30")
+
+    def test_ultimo_uses_visible_not_full_day(self):
+        """Regression: 'el último' must pick from last_visible_slots (14:30), NOT from
+        last_offered_slots (17:00) when bot only displayed afternoon[:4]."""
+        from app.services.conversation_engine import _select_slot_from_offered
+        import json
+
+        # Simulate Friday long 19/06: 17 full-day slots, but bot only showed afternoon[:4]
+        full_day = json.dumps([
+            "09:00", "09:30", "10:00", "10:30", "11:00", "11:30",
+            "12:00", "12:30", "13:00", "13:30", "14:00", "14:30",
+            "15:00", "15:30", "16:00", "16:30", "17:00",
+        ])
+        visible = json.dumps(["13:00", "13:30", "14:00", "14:30"])
+
+        # The old (buggy) behavior: reading from full-day → picks 17:00
+        wrong_result = _select_slot_from_offered(["el último horario"], full_day)
+        self.assertEqual(wrong_result, "17:00", "Full-day list ends at 17:00 (confirms bug)")
+
+        # The correct behavior: reading from visible → picks 14:30
+        correct_result = _select_slot_from_offered(["el último horario"], visible)
+        self.assertEqual(correct_result, "14:30", "Must pick last VISIBLE slot (14:30), not 17:00")
+
+    def test_period_request_sets_last_visible_slots(self):
+        """_handle_period_request must update last_visible_slots to the displayed afternoon subset."""
+        import json
+        eng = _make_engine()
+        sent: list[str] = []
+        eng._send_text_to_wa = lambda ctx, txt: sent.append(txt) or "id"
+
+        # Full-day slots including afternoon until 17:00
+        all_slots = [
+            "09:00", "09:30", "10:00", "10:30", "11:00",
+            "13:00", "13:30", "14:00", "14:30", "15:00", "15:30", "16:00", "17:00",
+        ]
+        state = _make_state(
+            last_stage="SCHEDULING",
+            active_requested_date="2026-06-19",
+            last_offered_slots=json.dumps(sorted(all_slots)),
+        )
+        ctx = _make_ctx(state=state)
+        eng._handle_period_request(ctx, state, "tarde")
+
+        visible = json.loads(state.last_visible_slots or "[]")
+        # All afternoon slots must be in visible (not capped at 4)
+        self.assertTrue(len(visible) > 4, f"Visible must exceed 4 when more afternoon slots exist: {visible}")
+        # None of the morning slots should be in visible
+        self.assertTrue(all(int(s.split(":")[0]) >= 13 for s in visible),
+                        f"Visible must only contain afternoon slots: {visible}")
+        # Visible must end at the last afternoon slot, not 17:00 from a different period
+        self.assertEqual(visible[-1], "17:00")  # last afternoon is 17:00 here
+
+    def test_flow_sent_for_visible_last_not_full_day_last(self):
+        """Integration: bot shows afternoon [13:00-14:30], user says 'ultimo horario' → Flow for 14:30 not 17:00."""
+        from app.services.conversation_engine import _select_slot_from_offered
+        import json
+
+        eng = _make_engine()
+        eng._schedule = self._make_svc(valid=True)
+        flow_sent: list[str] = []
+        eng._send_flow_button = lambda ctx, body, token: flow_sent.append(token) or "flow-id"
+        eng._send_text_to_wa = lambda ctx, txt: "id"
+
+        # State after "a la tarde?": last_offered_slots has 17 full-day slots,
+        # last_visible_slots has only the 4 afternoon slots the bot displayed.
+        state = self._make_scheduling_state(
+            all_slots=[
+                "09:00", "09:30", "10:00", "10:30", "11:00", "11:30",
+                "12:00", "12:30", "13:00", "13:30", "14:00", "14:30",
+                "15:00", "15:30", "16:00", "16:30", "17:00",
+            ],
+            visible_slots=["13:00", "13:30", "14:00", "14:30"],
+        )
+        ctx = _make_ctx(state=state)
+
+        # "el último horario" must pick 14:30 (last visible), not 17:00 (last full-day)
+        chosen = _select_slot_from_offered(["el último horario"], state.last_visible_slots)
+        self.assertEqual(chosen, "14:30", "Must select last VISIBLE slot")
+
+        result = eng._try_schedule_and_flow(ctx, state, str(state.active_requested_date), chosen, "")
+        self.assertEqual(result.action, "flow_button_sent")
+
+        # Verify the scheduled time stored in state is 14:30, not 17:00
+        self.assertEqual(state.preferred_time, "14:30",
+                         "preferred_time must be 14:30 (visible last), not 17:00 (full-day last)")
+        self.assertIsNone(state.last_visible_slots, "last_visible_slots must be cleared after successful booking")
 
     # ── Step 4b: "si" + preferred_time + active_date → Flow ─────────────────
 
