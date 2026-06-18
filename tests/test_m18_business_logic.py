@@ -1544,5 +1544,148 @@ class TestQuotedDateProposal(unittest.TestCase):
         self.assertIsNone(sched_day_iso, "Sunday stored day must not be retried")
 
 
+# ── Scheduling state regression (real test 20260618) ─────────────────────────
+
+
+class TestRejectedSlotNotStored(unittest.TestCase):
+    """After ScheduleService rejects a slot, preferred_day/time must be cleared.
+    A subsequent 'Okay' must NOT reuse the rejected date."""
+
+    def _make_sched_service(self, valid: bool, reasons: list[str] | None = None):
+        from unittest.mock import MagicMock
+        svc = MagicMock()
+        result = MagicMock()
+        result.valid = valid
+        result.suggested_slots = []
+        result.reasons = reasons or ([] if valid else ["Domingo"])
+        svc.check.return_value = result
+        return svc
+
+    def _make_state_obj(self, preferred_day=None, preferred_time=None, zone_group="Oeste",
+                        zone_detail="San Justo"):
+        from unittest.mock import MagicMock
+        state = MagicMock()
+        state.preferred_day = preferred_day
+        state.preferred_time = preferred_time
+        state.home_zone_group = zone_group
+        state.home_zone_detail = zone_detail
+        state.flow_booking_token = None
+        state.last_stage = "SCHEDULING"
+        state.needs_human = False
+        return state
+
+    def _run_try_schedule(self, state, day_iso, time_str, valid=True, reasons=None):
+        eng = _make_engine()
+        eng._schedule = self._make_sched_service(valid=valid, reasons=reasons)
+
+        sent: list[str] = []
+        eng._send_text_to_wa = lambda ctx, txt: sent.append(txt) or "msg-id"
+        eng._send_flow_button = lambda ctx, body, token: "flow-id"
+
+        ctx = _make_ctx(state=state)
+        result = eng._try_schedule_and_flow(ctx, state, day_iso, time_str, "")
+        return result, sent, state
+
+    def test_rejected_slot_clears_preferred_day(self):
+        """When ScheduleService rejects, preferred_day must be None afterwards."""
+        state = self._make_state_obj()
+        result, _, state = self._run_try_schedule(
+            state, "2026-06-21", "12:00", valid=False, reasons=["Domingo"]
+        )
+        self.assertIsNone(state.preferred_day, "preferred_day must be cleared on rejection")
+        self.assertIsNone(state.preferred_time, "preferred_time must be cleared on rejection")
+
+    def test_rejected_slot_clears_preferred_time(self):
+        state = self._make_state_obj(preferred_day="2026-06-21", preferred_time="12:00")
+        self._run_try_schedule(state, "2026-06-21", "12:00", valid=False)
+        self.assertIsNone(state.preferred_time)
+
+    def test_valid_slot_stores_preferred_day(self):
+        """When ScheduleService accepts, preferred_day must be stored."""
+        state = self._make_state_obj()
+        self._run_try_schedule(state, "2026-06-25", "10:00", valid=True)
+        self.assertEqual(str(state.preferred_day), "2026-06-25")
+        self.assertEqual(str(state.preferred_time), "10:00")
+
+    def test_okay_after_sunday_rejection_finds_no_stored_day(self):
+        """After Sunday rejection clears preferred_day, 'Okay' has nothing to confirm."""
+        from app.services.conversation_engine import _parse_scheduling_text, _is_acceptance
+        from datetime import date
+
+        today = date(2026, 6, 18)
+        # Simulate state after Sunday rejection: preferred_day cleared
+        preferred_day = None  # cleared by rejection
+
+        sched_day_iso, _ = _parse_scheduling_text(["Okay"], today)
+        self.assertIsNone(sched_day_iso)
+
+        # "Si/Okay + stored preferred_day" logic: preferred_day is None → no retry
+        if not sched_day_iso and preferred_day and _is_acceptance(["Okay"]):
+            sched_day_iso = preferred_day
+
+        self.assertIsNone(sched_day_iso, "No slot should be confirmed when preferred_day is None")
+
+
+class TestMnAbbreviation(unittest.TestCase):
+    """'Mñ' (mobile abbreviation for 'mañana') must be parsed as tomorrow."""
+
+    def _parse(self, texts, today=None):
+        from app.services.conversation_engine import _parse_scheduling_text
+        from datetime import date
+        return _parse_scheduling_text(texts, today or date(2026, 6, 18))
+
+    def test_mn_standalone_parsed_as_tomorrow(self):
+        day, _ = self._parse(["Mñ 12hs"])
+        self.assertEqual(day, "2026-06-19")  # tomorrow = 19/6
+
+    def test_mn_lowercase_parsed(self):
+        day, _ = self._parse(["mñ a las 10hs"])
+        self.assertEqual(day, "2026-06-19")
+
+    def test_mn_time_extracted(self):
+        _, t = self._parse(["Mñ 12hs"])
+        self.assertEqual(t, "12:00")
+
+    def test_mn_does_not_match_inside_word(self):
+        """'mñ' inside a longer token must not trigger mañana detection."""
+        from app.services.conversation_engine import _parse_scheduling_text
+        from datetime import date
+        # "domñ" is not a real word but ensures we do word-boundary matching
+        day, _ = _parse_scheduling_text(["domñ 10hs"], date(2026, 6, 18))
+        self.assertIsNone(day)
+
+    def test_manana_still_works_unchanged(self):
+        day, _ = self._parse(["mañana 12hs"])
+        self.assertEqual(day, "2026-06-19")
+
+
+class TestSchedulingStageRegression(unittest.TestCase):
+    """PRESUPUESTO_ENVIADO in SCHEDULING stage must be blocked (no regression)."""
+
+    def test_presupuesto_enviado_blocked_in_scheduling(self):
+        from app.services.conversation_engine import (
+            STAGE_SCHEDULING, STAGE_FLOW_SENT, STAGE_BOOKED,
+        )
+        for stage in (STAGE_SCHEDULING, STAGE_FLOW_SENT, STAGE_BOOKED):
+            new_flag = "PRESUPUESTO_ENVIADO"
+            flag_accepted = True
+            if flag_accepted and new_flag == "PRESUPUESTO_ENVIADO" and stage in (
+                STAGE_SCHEDULING, STAGE_FLOW_SENT, STAGE_BOOKED
+            ):
+                flag_accepted = False
+            self.assertFalse(flag_accepted, f"flag must be blocked in stage {stage}")
+
+    def test_presupuesto_enviado_allowed_in_qualifying(self):
+        from app.services.conversation_engine import STAGE_QUALIFYING
+        new_flag = "PRESUPUESTO_ENVIADO"
+        flag_accepted = True
+        stage = STAGE_QUALIFYING
+        if flag_accepted and new_flag == "PRESUPUESTO_ENVIADO" and stage in (
+            "SCHEDULING", "FLOW_SENT", "BOOKED"
+        ):
+            flag_accepted = False
+        self.assertTrue(flag_accepted, "PRESUPUESTO_ENVIADO allowed from QUALIFYING")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

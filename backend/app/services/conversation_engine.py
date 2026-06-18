@@ -163,7 +163,11 @@ def _parse_scheduling_text(texts: list[str], today: date) -> tuple[str | None, s
 
     if "pasado mañana" in combined or "pasado manana" in combined:
         day_iso = (today + timedelta(days=2)).isoformat()
-    elif ("mañana" in combined or "manana" in combined) and not day_name_found:
+    elif (
+        "mañana" in combined
+        or "manana" in combined
+        or re.search(r"\bmñ\b", combined)  # mobile abbreviation for "mañana"
+    ) and not day_name_found:
         day_iso = (today + timedelta(days=1)).isoformat()
     elif "hoy" in combined and not day_name_found:
         day_iso = today.isoformat()
@@ -667,6 +671,20 @@ class ConversationEngine:
             )
             flag_accepted = False
 
+        # Prevent stage regression: once in SCHEDULING/later, the quote has already
+        # been sent — block the AI from moving back to QUOTED (e.g. re-quoting while
+        # user is proposing a day/time).
+        if (
+            flag_accepted
+            and new_flag == "PRESUPUESTO_ENVIADO"
+            and state.last_stage in (STAGE_SCHEDULING, STAGE_FLOW_SENT, STAGE_BOOKED)
+        ):
+            logger.warning(
+                "M18 blocking PRESUPUESTO_ENVIADO regression from %s thread_id=%s",
+                state.last_stage, ctx.thread.id,
+            )
+            flag_accepted = False
+
         # BUG-3 guard: never advance QUALIFYING → ACEPTADO without a deterministic quote.
         # Acceptance words ("dale", "sí") in QUALIFYING stage must not move to SCHEDULING
         # when we have no confirmed price — they could be accepting a hallucinated amount.
@@ -837,10 +855,10 @@ class ConversationEngine:
             logger.warning("M18 schedule check failed thread_id=%s: %s", ctx.thread.id, exc)
             return None
 
-        state.preferred_day = preferred_day_iso
-        state.preferred_time = preferred_time_obj.strftime("%H:%M")
-
         if sched_out.valid:
+            # Slot is available — store it and send the Flow button.
+            state.preferred_day = preferred_day_iso
+            state.preferred_time = preferred_time_obj.strftime("%H:%M")
             flow_id = (self.settings.whatsapp_flow_id or "").strip()
             flow_token = f"{ctx.thread.id}-{int(_time.time())}"
             state.flow_booking_token = flow_token
@@ -850,7 +868,6 @@ class ConversationEngine:
 
             if not flow_id:
                 logger.error("M18 WHATSAPP_FLOW_ID not set — sending text fallback")
-                self.db.commit()
                 fallback = ai_reply or "Perfecto, tenemos disponibilidad. ¡Ya te confirmo!"
                 sent_id = self._send_text_to_wa(ctx, fallback)
                 return _out("replied", wa_message_id=sent_id)
@@ -869,7 +886,10 @@ class ConversationEngine:
                 self.db.commit()
                 return None
         else:
-            self.db.commit()
+            # Slot rejected — clear any stored slot so a later "Okay" or
+            # post-AI check cannot accidentally reconfirm this invalid day.
+            state.preferred_day = None
+            state.preferred_time = None
             slots = sched_out.suggested_slots[:3]
             if slots:
                 msg = (
@@ -980,6 +1000,7 @@ REGLAS DE NEGOCIO:
 9. NUNCA preguntes el precio de venta, valor o tasación del vehículo. Ridecheck NO necesita eso para cotizar la inspección.
 10. Si la zona no está disponible en tu sistema, pedí confirmación de una zona/barrio cercano. NUNCA pidas precio del vehículo ni datos de la venta.
 11. NUNCA uses "cliente" como nombre de persona. Si no sabés el nombre, salteá el nombre por completo — decí "Genial!" en lugar de "Genial, cliente!".
+12. En etapa SCHEDULING, NO menciones precio ni cotización. El cliente ya recibió la cotización. Solo pedí día y horario disponible.
 
 TIPOS DE VEHÍCULO VÁLIDOS: AUTO, SUV_4X4_DEPORTIVO, SUV/4x4, CLASICO, MOTO, ESCANEO_MOTOR
 
