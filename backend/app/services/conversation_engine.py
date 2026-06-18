@@ -72,7 +72,7 @@ STAGE_BOOKED = "BOOKED"
 STAGE_HUMAN = "HUMAN_REQUIRED"
 
 _ACCEPTANCE_KEYWORDS = frozenset({
-    "sí", "si", "yes", "ok", "dale", "perfecto", "avancemos",
+    "sí", "si", "yes", "ok", "okay", "dale", "perfecto", "avancemos",
     "listo", "buenísimo", "me sirve", "bueno", "claro",
     "de acuerdo", "por supuesto", "quiero avanzar",
 })
@@ -329,6 +329,130 @@ def _select_slot_from_offered(texts: list[str], last_offered_slots: str | None) 
     if re.search(r"\btercer[oa]?\b", combined) and len(offered) >= 3:
         return offered[2]
     return None
+
+
+# Phrases that must never appear in an AI reply during SCHEDULING or QUOTED stages.
+# The engine has not yet created a booking; any confirmation language is a hallucination.
+_SCHEDULING_FORBIDDEN_PHRASES: tuple[str, ...] = (
+    "confirmamos la revisión",
+    "turno confirmado",
+    "queda confirmado",
+    "quedó confirmado",
+    "reserva confirmada",
+    "te enviaré un recordatorio",
+    "te enviaremos un recordatorio",
+    "recordatorio el día anterior",
+    "queda reservado",
+)
+
+
+def _scrub_scheduling_confirmation(reply: str, stage: str) -> str:
+    """Replace AI-hallucinated booking confirmations in SCHEDULING/QUOTED stages.
+
+    The flow button has not been sent yet at this point, so any language that
+    implies the turn is booked is incorrect.  We substitute a safe redirect
+    so the client keeps interacting instead of believing they have a confirmed slot.
+    """
+    if stage not in (STAGE_SCHEDULING, STAGE_QUOTED):
+        return reply
+    lower = reply.lower()
+    for phrase in _SCHEDULING_FORBIDDEN_PHRASES:
+        if phrase in lower:
+            logger.warning(
+                "M18 scheduling_scrub removed %r from AI reply (stage=%s)", phrase, stage
+            )
+            return (
+                "Perfecto, recibí tu preferencia. "
+                "Para confirmar el turno necesitamos que completes el formulario con tus datos. "
+                "¿Hay algo más que quieras ajustar?"
+            )
+    return reply
+
+
+# ── Website form (wa.me prefilled link) detection ────────────────────────────
+
+_WEBSITE_FORM_HEADER = "hola, quiero solicitar una revision pre-compra"
+
+# Maps form-submitted "tipo" values to internal tipo_vehiculo codes.
+_SUBMITTED_TIPO_MAP: dict[str, str] = {
+    "auto pequeño o mediano": "AUTO",
+    "auto pequeño": "AUTO",
+    "auto mediano": "AUTO",
+    "auto grande": "AUTO",
+    "auto": "AUTO",
+    "suv": "SUV/4x4",
+    "pickup": "SUV/4x4",
+    "4x4": "SUV/4x4",
+    "suv/4x4": "SUV/4x4",
+    "suv 4x4": "SUV/4x4",
+    "moto": "MOTO",
+    "clasico": "CLASICO",
+    "clásico": "CLASICO",
+    "deportivo": "SUV_4X4_DEPORTIVO",
+}
+
+
+def _normalize_submitted_tipo(submitted: str) -> str:
+    """Map a website-form-submitted tipo string to internal tipo_vehiculo."""
+    normalized = _strip_accents((submitted or "").lower().strip())
+    for key, val in _SUBMITTED_TIPO_MAP.items():
+        if key in normalized:
+            return val
+    return "AUTO"
+
+
+def _parse_website_form(texts: list[str]) -> dict | None:
+    """Parse a wa.me prefilled form message.  Returns field dict or None.
+
+    Expected format:
+        Hola, quiero solicitar una revisión pre-compra.
+        * Nombre: Juan Pérez
+        * Teléfono: 1112345678
+        * Auto a revisar: Toyota Corolla 2020
+        * Tipo: Auto pequeño o mediano
+        * Localidad: Palermo
+        * Total estimado: $130.000
+        ref: abc123
+    """
+    combined = "\n".join(texts)
+    # Fast reject: must contain the characteristic form opener.
+    if _WEBSITE_FORM_HEADER not in _strip_accents(combined).lower():
+        return None
+
+    fields: dict = {}
+    for raw_line in combined.splitlines():
+        line = raw_line.strip().lstrip("*-• ").strip()
+        if ":" not in line:
+            continue
+        key_raw, _, val_raw = line.partition(":")
+        key = _strip_accents(key_raw.strip().lower())
+        val = val_raw.strip()
+        if not val:
+            continue
+        if key == "nombre":
+            fields["customer_name"] = val
+        elif key in ("telefono", "teléfono", "celular", "cel"):
+            fields["phone"] = re.sub(r"[^\d+]", "", val)
+        elif key in ("auto a revisar", "auto", "vehiculo", "vehículo"):
+            fields["vehicle_text"] = val
+        elif key == "tipo":
+            fields["submitted_tipo"] = val
+        elif key in ("localidad", "zona", "barrio", "ciudad"):
+            fields["zone_detail"] = val
+        elif key in ("total estimado", "total", "precio estimado"):
+            nums = re.sub(r"[^\d]", "", val)
+            fields["submitted_total"] = int(nums) if nums else None
+
+    # Extract optional ref= from the raw text.
+    ref_m = re.search(r"\bref:\s*(\w+)", combined, re.IGNORECASE)
+    if ref_m:
+        fields["ref"] = ref_m.group(1)
+
+    # Require at least vehicle or zone to proceed.
+    if not fields.get("vehicle_text") and not fields.get("zone_detail"):
+        return None
+
+    return fields
 
 
 # Maps lowercased Spanish day names (accented + unaccented) to Python weekday numbers.
@@ -722,6 +846,14 @@ class ConversationEngine:
             logger.info("M18 no text content thread_id=%s — ignored", ctx.thread.id)
             return _out("skipped_dedup", detail="no_text")
 
+        # ── Website form from wa.me prefilled link (pre-AI) ─────────────
+        # Detect the structured form message before any other state-based checks.
+        # The form contains vehicle, zone, and submitted price from the website.
+        if state.last_stage in (STAGE_QUALIFYING, None) and not state.needs_human:
+            _form_data = _parse_website_form(ai_input_messages)
+            if _form_data:
+                return self._handle_website_form(ctx, state, _form_data)
+
         # ── Deterministic QUOTED acceptance (pre-AI) ─────────────────────
         # When the client is in QUOTED stage and sends a clear acceptance word,
         # skip the AI entirely: set flag=ACEPTADO, stage=SCHEDULING, and ask
@@ -729,13 +861,14 @@ class ConversationEngine:
         if state.last_stage == STAGE_QUOTED and _is_acceptance(ai_input_messages):
             return self._handle_quoted_acceptance(ctx, state)
 
-        # ── Deterministic QUOTED + date/time proposal (pre-AI) ───────────
-        # User proposes a specific slot while still in QUOTED stage.
-        # Treat as implicit quote acceptance + scheduling request; skip AI,
+        # ── Deterministic QUOTED + date proposal (pre-AI) ────────────────
+        # User proposes a day (with or without exact time) while still in QUOTED
+        # stage.  Treat as implicit quote acceptance + scheduling request; skip AI,
         # advance flag to ACEPTADO and immediately check availability.
         # Sunday / closed days → rejection message with alternatives.
         if state.last_stage == STAGE_QUOTED and not state.needs_human:
             sched_day_iso, sched_time_str = _parse_scheduling_text(ai_input_messages, date.today())
+            period = _detect_time_period(ai_input_messages)
             if sched_day_iso and sched_time_str:
                 lead.flag = "ACEPTADO"
                 state.last_stage = STAGE_SCHEDULING
@@ -746,6 +879,15 @@ class ConversationEngine:
                 result = self._try_schedule_and_flow(ctx, state, sched_day_iso, sched_time_str, "")
                 if result is not None:
                     return result
+            elif sched_day_iso:
+                # Day only (e.g. "okay, puede ser sábado?") — list available slots.
+                lead.flag = "ACEPTADO"
+                state.last_stage = STAGE_SCHEDULING
+                logger.info(
+                    "M18 QUOTED day-only proposal thread_id=%s day=%s",
+                    ctx.thread.id, sched_day_iso,
+                )
+                return self._handle_day_only_request(ctx, state, sched_day_iso, period=period)
 
         # ── Flow-failure: user can't open the WhatsApp Flow form ────────────
         if state.flow_booking_token and _is_flow_failure(ai_input_messages):
@@ -1073,10 +1215,19 @@ class ConversationEngine:
                 result = self._try_schedule_and_flow(ctx, state, pday, ptime, decision.get("reply") or "")
                 if result is not None:
                     return result
+            elif pday and not ptime:
+                # Day only in SCHEDULING — list available slots for that day.
+                logger.info(
+                    "M18 post-AI day-only in SCHEDULING thread_id=%s day=%s",
+                    ctx.thread.id, pday,
+                )
+                return self._handle_day_only_request(ctx, state, pday)
 
         reply = str(decision.get("reply") or "")
         # BUG-2 guard: if AI invented a price and we have no deterministic quote, scrub it.
         reply = self._scrub_invented_price(reply, real_price_quote)
+        # Scrub AI-hallucinated booking confirmations in SCHEDULING/QUOTED stages.
+        reply = _scrub_scheduling_confirmation(reply, stage)
         if not reply:
             self.db.commit()
             return _out("replied", detail="no_reply_text")
@@ -1113,6 +1264,111 @@ class ConversationEngine:
         customer = (state.customer_name or "").strip() or (lead.nombre or "").strip()
         greeting = f"Genial, {customer}!" if customer else "Genial!"
         reply = f"{greeting} ¿Qué día y horario te viene mejor para la revisión?"
+        sent_id = self._send_text_to_wa(ctx, reply)
+        return _out("replied", wa_message_id=sent_id)
+
+    # ── Website form handler ──────────────────────────────────────────────
+
+    def _handle_website_form(
+        self,
+        ctx: _Context,
+        state: "WhatsAppThreadState",
+        form_data: dict,
+    ) -> "ConversationHandleOut":
+        """Process a wa.me prefilled form submission.
+
+        Parses vehicle + zone, runs deterministic pricing, creates a candidate,
+        advances to SCHEDULING, and asks for day/time.  Sets flag=PRESUPUESTO_ENVIADO
+        because the website already showed the customer a price.
+        """
+        lead = ctx.lead
+        assert lead is not None
+
+        # ── Update lead contact details from form ─────────────────────────
+        if form_data.get("customer_name"):
+            first = form_data["customer_name"].split()[0]
+            lead.nombre = first
+            state.customer_name = form_data["customer_name"]
+        if form_data.get("phone") and not lead.telefono:
+            lead.telefono = form_data["phone"]
+
+        # ── Resolve vehicle from catalog first, fall back to form tipo ────
+        vehicle_text = form_data.get("vehicle_text", "")
+        marca: str | None = None
+        modelo: str | None = None
+        tipo_vehiculo: str | None = None
+
+        catalog_match = lookup_vehicle(vehicle_text) if vehicle_text else None
+        if catalog_match:
+            tipo_vehiculo = catalog_match.tipo_vehiculo
+            marca = catalog_match.marca
+            modelo = catalog_match.modelo
+            logger.info(
+                "M18 website_form catalog hit thread_id=%s alias=%r tipo=%s",
+                ctx.thread.id, catalog_match.matched_alias, tipo_vehiculo,
+            )
+        else:
+            # Split "Toyota Corolla 2020" → marca=Toyota, modelo=Corolla 2020
+            parts = vehicle_text.split(None, 1)
+            marca = parts[0] if parts else None
+            modelo = parts[1] if len(parts) > 1 else None
+
+        if not tipo_vehiculo and form_data.get("submitted_tipo"):
+            tipo_vehiculo = _normalize_submitted_tipo(form_data["submitted_tipo"])
+        tipo_vehiculo = tipo_vehiculo or "AUTO"
+
+        # ── Create candidate ──────────────────────────────────────────────
+        self._apply_candidate(ctx, {
+            "action": "create",
+            "marca": marca,
+            "modelo": modelo,
+            "tipo_vehiculo": tipo_vehiculo,
+            "status": "current_focus",
+        })
+
+        # ── Resolve zone ──────────────────────────────────────────────────
+        if form_data.get("zone_detail") and not state.home_zone_detail:
+            state.home_zone_detail = form_data["zone_detail"]
+            self._normalize_zone_from_db(ctx, state)
+
+        # ── Deterministic price ───────────────────────────────────────────
+        real_price_quote = self._compute_price_quote(ctx, state)
+
+        submitted_total = form_data.get("submitted_total")
+        if real_price_quote and submitted_total is not None:
+            if abs(submitted_total - real_price_quote.precio_total) > 100:
+                logger.warning(
+                    "M18 website_form price_mismatch thread_id=%s submitted=%s deterministic=%s",
+                    ctx.thread.id, submitted_total, real_price_quote.precio_total,
+                )
+
+        if form_data.get("ref"):
+            logger.info(
+                "M18 website_form ref=%r thread_id=%s", form_data["ref"], ctx.thread.id
+            )
+
+        # ── Advance state ─────────────────────────────────────────────────
+        lead.flag = "PRESUPUESTO_ENVIADO"
+        state.last_stage = STAGE_SCHEDULING
+
+        # ── Build reply ───────────────────────────────────────────────────
+        customer = (state.customer_name or "").split()[0] if state.customer_name else (lead.nombre or "")
+        greeting = f"Perfecto, {customer}!" if customer else "Perfecto!"
+
+        vehicle_desc = " ".join(filter(None, [marca, modelo])) or vehicle_text or "el vehículo"
+        zone_desc = state.home_zone_detail or form_data.get("zone_detail") or "la zona"
+
+        if real_price_quote:
+            total_str = f"${real_price_quote.precio_total:,.0f}".replace(",", ".")
+            price_block = f" El precio de la revisión es {total_str}."
+        else:
+            price_block = ""
+
+        reply = (
+            f"{greeting} Recibí tu solicitud para revisar el {vehicle_desc} en {zone_desc}.{price_block} "
+            f"¿Qué día y horario te viene mejor?"
+        )
+
         sent_id = self._send_text_to_wa(ctx, reply)
         return _out("replied", wa_message_id=sent_id)
 
@@ -1643,7 +1899,7 @@ REGLAS DE NEGOCIO:
 1. PRESUPUESTANDO → colectá tipo de vehículo y zona/ciudad. Eso es todo lo que necesitás para cotizar. Tipo de vendedor (agencia/particular) es útil pero NO bloquea la cotización; si el cliente lo ofrece, registralo, pero no lo pidas como requisito.
 2. Cuando tenés tipo_vehiculo + zona Y aparece "PRECIO CALCULADO" arriba → enviá la cotización YA con ese precio exacto y seteá lead_flag="PRESUPUESTO_ENVIADO". No preguntes nada más. Si no hay PRECIO CALCULADO, preguntá solo qué dato falta (tipo de vehículo o zona).
 3. Aceptación ("sí", "dale", "ok", "me sirve", "avanzamos") → lead_flag="ACEPTADO".
-4. Etapa SCHEDULING → preguntá qué día y horario le viene mejor.
+4. Etapa SCHEDULING → preguntá qué día y horario le viene mejor. Si el cliente menciona un día, confirmá que lo recibiste y ofrecé opciones de horario. Si el cliente menciona un horario, confirmá y avanzá.
 5. Derivá a humano si hay queja, solicitud especial o no podés resolver → needs_human=true.
 6. NUNCA uses lead_flag="PERDIDO", "BUSCANDO_AUTO", ni "RECOMPRA".
 7. Respondé en español, registro informal argentino (voseo), conciso.
@@ -1652,6 +1908,7 @@ REGLAS DE NEGOCIO:
 10. Si la zona no está disponible en tu sistema, pedí confirmación de una zona/barrio cercano. NUNCA pidas precio del vehículo ni datos de la venta.
 11. NUNCA uses "cliente" como nombre de persona. Si no sabés el nombre, salteá el nombre por completo — decí "Genial!" en lugar de "Genial, cliente!".
 12. En etapa SCHEDULING, NO menciones precio ni cotización. El cliente ya recibió la cotización. Solo pedí día y horario disponible.
+13. NUNCA digas que la revisión quedó confirmada, el turno está reservado, ni prometas enviar recordatorios. El turno se confirma solo cuando el cliente completa el formulario de datos. En SCHEDULING, tu única función es coordinar día y horario.
 
 TIPOS DE VEHÍCULO VÁLIDOS: AUTO, SUV_4X4_DEPORTIVO, SUV/4x4, CLASICO, MOTO, ESCANEO_MOTOR
 

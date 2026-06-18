@@ -3385,5 +3385,456 @@ class TestOrdinalSlotConfirmation(unittest.TestCase):
         self.assertEqual(len(flow_sent), 1)
 
 
+class TestAcceptanceKeywords(unittest.TestCase):
+    """Verify _is_acceptance recognises 'okay' and other edge cases."""
+
+    def _accept(self, texts):
+        from app.services.conversation_engine import _is_acceptance
+        return _is_acceptance(texts)
+
+    def test_okay_is_accepted(self):
+        self.assertTrue(self._accept(["okay"]))
+
+    def test_okay_uppercase_accepted(self):
+        self.assertTrue(self._accept(["Okay"]))
+
+    def test_okay_with_punctuation(self):
+        """'okay!' strips punctuation → accepted."""
+        self.assertTrue(self._accept(["okay!"]))
+
+    def test_ok_still_accepted(self):
+        self.assertTrue(self._accept(["ok"]))
+
+    def test_okay_with_more_words_rejected(self):
+        """'okay, puede ser sabado?' must NOT be accepted — it has scheduling intent."""
+        self.assertFalse(self._accept(["okay, puede ser sabado?"]))
+
+
+class TestQuotedDayOnlyPath(unittest.TestCase):
+    """QUOTED + day-only message: 'okay, puede ser sábado?' → list Saturday slots."""
+
+    def _make_quoted_state(self):
+        return _make_state(
+            last_stage="QUOTED",
+            home_zone_group="Oeste",
+            home_zone_detail="San Justo",
+        )
+
+    def _make_schedule_svc(self, slots=None):
+        from unittest.mock import MagicMock
+        svc = MagicMock()
+        ls_mock = MagicMock()
+        ls_mock.slots = slots or ["09:00", "09:30", "10:00", "10:30", "11:00", "11:30"]
+        ls_mock.business_hours = "09:00-15:00"
+        svc.list_slots.return_value = ls_mock
+        return svc
+
+    def test_day_only_in_quoted_lists_slots(self):
+        """'puede ser el sábado?' in QUOTED stage → lists Saturday slots, no AI."""
+        eng = _make_engine()
+        eng._schedule = self._make_schedule_svc()
+        texts_sent: list[str] = []
+        eng._send_text_to_wa = lambda ctx, txt: texts_sent.append(txt) or "id"
+
+        state = self._make_quoted_state()
+        ctx = _make_ctx(state=state)
+        ctx.lead.flag = "PRESUPUESTANDO"
+
+        # 2026-06-20 is a Saturday
+        result = eng._handle_day_only_request(ctx, state, "2026-06-20")
+
+        self.assertEqual(result.action, "replied")
+        self.assertEqual(len(texts_sent), 1)
+        msg = texts_sent[0]
+        # Must contain slot times
+        self.assertIn("09:00", msg)
+        # Stage transitions
+        self.assertEqual(state.active_requested_date, "2026-06-20")
+
+    def test_quoted_day_only_transitions_to_scheduling(self):
+        """After day-only proposal in QUOTED, QUOTED block advances to SCHEDULING."""
+        eng = _make_engine()
+        eng._schedule = self._make_schedule_svc()
+        eng._send_text_to_wa = lambda ctx, txt: "id"
+
+        state = self._make_quoted_state()
+        ctx = _make_ctx(state=state)
+        ctx.lead.flag = "PRESUPUESTANDO"
+
+        # Simulate what the QUOTED block does before calling _handle_day_only_request
+        ctx.lead.flag = "ACEPTADO"
+        state.last_stage = "SCHEDULING"
+        eng._handle_day_only_request(ctx, state, "2026-06-20")
+
+        self.assertEqual(state.last_stage, "SCHEDULING")
+        self.assertEqual(ctx.lead.flag, "ACEPTADO")
+        self.assertEqual(state.active_requested_date, "2026-06-20")
+
+    def test_quoted_day_only_sunday_is_rejected(self):
+        """Sunday in QUOTED → closed message, not a slot list."""
+        from unittest.mock import MagicMock
+
+        eng = _make_engine()
+        svc = MagicMock()
+        ls_mock = MagicMock()
+        ls_mock.slots = []
+        ls_mock.business_hours = "cerrado"
+        svc.list_slots.return_value = ls_mock
+        eng._schedule = svc
+        texts_sent: list[str] = []
+        eng._send_text_to_wa = lambda ctx, txt: texts_sent.append(txt) or "id"
+
+        state = self._make_quoted_state()
+        ctx = _make_ctx(state=state)
+
+        # 2026-06-21 is a Sunday
+        result = eng._handle_day_only_request(ctx, state, "2026-06-21")
+
+        self.assertEqual(result.action, "replied")
+        self.assertIn("operacion", texts_sent[0].lower().replace("é", "e").replace("ó", "o"))
+
+
+class TestSchedulingConfirmationScrub(unittest.TestCase):
+    """_scrub_scheduling_confirmation removes hallucinated booking language."""
+
+    def _scrub(self, reply, stage="SCHEDULING"):
+        from app.services.conversation_engine import _scrub_scheduling_confirmation
+        return _scrub_scheduling_confirmation(reply, stage)
+
+    def test_confirmamos_la_revision_scrubbed(self):
+        reply = "Perfecto, confirmamos la revisión para el sábado a las 11."
+        result = self._scrub(reply)
+        self.assertNotIn("confirmamos la revisión", result.lower())
+        self.assertNotIn("sábado a las 11", result)
+
+    def test_turno_confirmado_scrubbed(self):
+        reply = "Turno confirmado para el viernes 19/6 a las 14hs."
+        result = self._scrub(reply)
+        self.assertNotIn("turno confirmado", result.lower())
+
+    def test_recordatorio_scrubbed(self):
+        reply = "Todo listo! Te enviaré un recordatorio el día anterior."
+        result = self._scrub(reply)
+        self.assertNotIn("recordatorio", result.lower())
+
+    def test_scrub_fires_in_quoted_stage(self):
+        reply = "Confirmamos la revisión para el sábado."
+        result = self._scrub(reply, stage="QUOTED")
+        self.assertNotIn("confirmamos", result.lower())
+
+    def test_scrub_does_not_fire_in_qualifying(self):
+        """Forbidden phrases in QUALIFYING should NOT be scrubbed (not a booking context)."""
+        reply = "confirmamos la revisión del proceso."
+        result = self._scrub(reply, stage="QUALIFYING")
+        # Scrub must not fire — QUALIFYING is not a booking stage
+        self.assertEqual(result, reply)
+
+    def test_safe_scheduling_reply_untouched(self):
+        reply = "¿Qué día y horario te viene mejor para la revisión?"
+        result = self._scrub(reply)
+        self.assertEqual(result, reply)
+
+    def test_queda_confirmado_scrubbed(self):
+        reply = "Todo queda confirmado para mañana."
+        result = self._scrub(reply)
+        self.assertNotIn("queda confirmado", result.lower())
+
+    def test_reserva_confirmada_scrubbed(self):
+        reply = "Tu reserva confirmada está lista."
+        result = self._scrub(reply)
+        self.assertNotIn("reserva confirmada", result.lower())
+
+    def test_scrub_replacement_message_is_sensible(self):
+        """Replacement text should not itself contain hallucinated confirmation language."""
+        reply = "turno confirmado para mañana"
+        result = self._scrub(reply)
+        for phrase in ("turno confirmado", "reserva confirmada", "confirmamos"):
+            self.assertNotIn(phrase, result.lower())
+
+
+class TestParseWebsiteForm(unittest.TestCase):
+    """Unit tests for _parse_website_form."""
+
+    _FULL_FORM = (
+        "Hola, quiero solicitar una revisión pre-compra.\n"
+        "\n"
+        "* Nombre: Juan Pérez\n"
+        "* Teléfono: 1112345678\n"
+        "* Auto a revisar: Toyota Corolla 2020\n"
+        "* Tipo: Auto pequeño o mediano\n"
+        "* Localidad: Palermo\n"
+        "* Total estimado: $130.000\n"
+        "\n"
+        "Quedo atento para coordinar\n"
+        "ref: abc123"
+    )
+
+    def _parse(self, texts):
+        from app.services.conversation_engine import _parse_website_form
+        return _parse_website_form(texts)
+
+    def test_full_form_parsed(self):
+        result = self._parse([self._FULL_FORM])
+        self.assertIsNotNone(result)
+        self.assertEqual(result["customer_name"], "Juan Pérez")
+        self.assertEqual(result["phone"], "1112345678")
+        self.assertEqual(result["vehicle_text"], "Toyota Corolla 2020")
+        self.assertEqual(result["submitted_tipo"], "Auto pequeño o mediano")
+        self.assertEqual(result["zone_detail"], "Palermo")
+        self.assertEqual(result["submitted_total"], 130000)
+        self.assertEqual(result["ref"], "abc123")
+
+    def test_non_form_message_returns_none(self):
+        result = self._parse(["buenas, quiero consultar por una revisión"])
+        self.assertIsNone(result)
+
+    def test_form_without_vehicle_and_zone_returns_none(self):
+        """Form missing both vehicle and zone is not usable."""
+        minimal = "Hola, quiero solicitar una revisión pre-compra.\n* Nombre: Ana"
+        result = self._parse([minimal])
+        self.assertIsNone(result)
+
+    def test_form_with_only_vehicle_ok(self):
+        """Form with vehicle but no zone is parseable (zone optional)."""
+        form = (
+            "Hola, quiero solicitar una revisión pre-compra.\n"
+            "* Auto a revisar: Honda Civic 2019\n"
+        )
+        result = self._parse([form])
+        self.assertIsNotNone(result)
+        self.assertEqual(result["vehicle_text"], "Honda Civic 2019")
+
+    def test_form_with_only_zone_ok(self):
+        """Form with zone but no vehicle is parseable (vehicle optional)."""
+        form = (
+            "Hola, quiero solicitar una revisión pre-compra.\n"
+            "* Localidad: Belgrano\n"
+        )
+        result = self._parse([form])
+        self.assertIsNotNone(result)
+        self.assertEqual(result["zone_detail"], "Belgrano")
+
+    def test_price_with_dot_separator_parsed(self):
+        """$130.000 (Argentine format) → 130000."""
+        form = (
+            "Hola, quiero solicitar una revisión pre-compra.\n"
+            "* Auto a revisar: Ford Focus\n"
+            "* Total estimado: $130.000\n"
+        )
+        result = self._parse([form])
+        self.assertEqual(result["submitted_total"], 130000)
+
+    def test_price_with_comma_separator_parsed(self):
+        """$130,000 → 130000."""
+        form = (
+            "Hola, quiero solicitar una revisión pre-compra.\n"
+            "* Auto a revisar: Ford Focus\n"
+            "* Total estimado: $130,000\n"
+        )
+        result = self._parse([form])
+        self.assertEqual(result["submitted_total"], 130000)
+
+    def test_ref_not_required(self):
+        form = (
+            "Hola, quiero solicitar una revisión pre-compra.\n"
+            "* Auto a revisar: Renault Clio\n"
+        )
+        result = self._parse([form])
+        self.assertIsNone(result.get("ref"))
+
+    def test_multi_message_burst(self):
+        """Form split across two messages in a ráfaga still parses."""
+        part1 = "Hola, quiero solicitar una revisión pre-compra.\n* Auto a revisar: VW Gol"
+        part2 = "* Localidad: Flores"
+        result = self._parse([part1, part2])
+        self.assertIsNotNone(result)
+        self.assertEqual(result["vehicle_text"], "VW Gol")
+        self.assertEqual(result["zone_detail"], "Flores")
+
+
+class TestNormalizeSubmittedTipo(unittest.TestCase):
+    """Unit tests for _normalize_submitted_tipo."""
+
+    def _norm(self, s):
+        from app.services.conversation_engine import _normalize_submitted_tipo
+        return _normalize_submitted_tipo(s)
+
+    def test_auto_pequeño_mediano_maps_to_auto(self):
+        self.assertEqual(self._norm("Auto pequeño o mediano"), "AUTO")
+
+    def test_auto_maps_to_auto(self):
+        self.assertEqual(self._norm("auto"), "AUTO")
+
+    def test_suv_maps_to_suv(self):
+        self.assertEqual(self._norm("SUV"), "SUV/4x4")
+
+    def test_pickup_maps_to_suv(self):
+        self.assertEqual(self._norm("pickup"), "SUV/4x4")
+
+    def test_moto_maps_to_moto(self):
+        self.assertEqual(self._norm("Moto"), "MOTO")
+
+    def test_clasico_maps_to_clasico(self):
+        self.assertEqual(self._norm("Clásico"), "CLASICO")
+
+    def test_unknown_defaults_to_auto(self):
+        self.assertEqual(self._norm("camioneta grande"), "AUTO")
+
+    def test_empty_defaults_to_auto(self):
+        self.assertEqual(self._norm(""), "AUTO")
+
+
+class TestWebsiteFormHandler(unittest.TestCase):
+    """Integration tests for _handle_website_form."""
+
+    _FORM = {
+        "customer_name": "Laura García",
+        "phone": "1155443322",
+        "vehicle_text": "Ford Focus 2018",
+        "submitted_tipo": "Auto pequeño o mediano",
+        "zone_detail": "Lomas del Mirador",
+        "submitted_total": 130000,
+        "ref": "tes456",
+    }
+
+    def _make_eng_with_schedule(self):
+        from unittest.mock import MagicMock
+        eng = _make_engine()
+        eng._schedule = MagicMock()
+        texts_sent: list[str] = []
+        eng._send_text_to_wa = lambda ctx, txt: texts_sent.append(txt) or "msg-id"
+        eng._normalize_zone_from_db = lambda ctx, state: None  # no DB in unit tests
+        return eng, texts_sent
+
+    def test_form_sets_flag_presupuesto_enviado(self):
+        """Website form sets flag=PRESUPUESTO_ENVIADO before asking for day/time."""
+        eng, _ = self._make_eng_with_schedule()
+        state = _make_state(last_stage="QUALIFYING")
+        ctx = _make_ctx(state=state)
+
+        eng._handle_website_form(ctx, state, self._FORM)
+
+        self.assertEqual(ctx.lead.flag, "PRESUPUESTO_ENVIADO")
+
+    def test_form_sets_stage_scheduling(self):
+        """Website form advances stage to SCHEDULING (form implies scheduling intent)."""
+        eng, _ = self._make_eng_with_schedule()
+        state = _make_state(last_stage="QUALIFYING")
+        ctx = _make_ctx(state=state)
+
+        eng._handle_website_form(ctx, state, self._FORM)
+
+        self.assertEqual(state.last_stage, "SCHEDULING")
+
+    def test_form_creates_candidate(self):
+        """Candidate is created with correct tipo_vehiculo."""
+        eng, _ = self._make_eng_with_schedule()
+        state = _make_state(last_stage="QUALIFYING")
+        ctx = _make_ctx(state=state)
+
+        eng.db.flush = lambda: None  # avoid SQLAlchemy in unit test
+        eng.db.add = lambda obj: None
+        # Patch _apply_candidate to capture args
+        applied: list[dict] = []
+        eng._apply_candidate = lambda ctx, d: applied.append(d)
+
+        eng._handle_website_form(ctx, state, self._FORM)
+
+        self.assertEqual(len(applied), 1)
+        self.assertEqual(applied[0]["tipo_vehiculo"], "AUTO")
+        self.assertEqual(applied[0]["action"], "create")
+
+    def test_form_sets_zone_detail(self):
+        """Zone from form is stored on state when state has no zone yet."""
+        eng, _ = self._make_eng_with_schedule()
+        state = _make_state(last_stage="QUALIFYING")
+        ctx = _make_ctx(state=state)
+        eng._apply_candidate = lambda ctx, d: None
+
+        eng._handle_website_form(ctx, state, self._FORM)
+
+        self.assertEqual(state.home_zone_detail, "Lomas del Mirador")
+
+    def test_form_sets_customer_name(self):
+        eng, _ = self._make_eng_with_schedule()
+        state = _make_state(last_stage="QUALIFYING")
+        ctx = _make_ctx(state=state)
+        eng._apply_candidate = lambda ctx, d: None
+
+        eng._handle_website_form(ctx, state, self._FORM)
+
+        self.assertEqual(state.customer_name, "Laura García")
+        self.assertEqual(ctx.lead.nombre, "Laura")
+
+    def test_reply_asks_for_scheduling(self):
+        """Reply must ask for day/time, not re-ask for vehicle or zone."""
+        eng, texts_sent = self._make_eng_with_schedule()
+        state = _make_state(last_stage="QUALIFYING")
+        ctx = _make_ctx(state=state)
+        eng._apply_candidate = lambda ctx, d: None
+
+        eng._handle_website_form(ctx, state, self._FORM)
+
+        self.assertEqual(len(texts_sent), 1)
+        reply = texts_sent[0]
+        # Must ask for day/time
+        self.assertIn("día", reply.lower())
+        self.assertIn("horario", reply.lower())
+        # Must not re-ask for vehicle or zone
+        self.assertNotIn("tipo de vehículo", reply.lower())
+        self.assertNotIn("zona", reply.lower())
+
+    def test_reply_includes_vehicle_description(self):
+        eng, texts_sent = self._make_eng_with_schedule()
+        state = _make_state(last_stage="QUALIFYING")
+        ctx = _make_ctx(state=state)
+        eng._apply_candidate = lambda ctx, d: None
+
+        eng._handle_website_form(ctx, state, self._FORM)
+
+        reply = texts_sent[0]
+        # Ford or Focus should appear in the reply
+        self.assertTrue("Ford" in reply or "Focus" in reply,
+                        f"Vehicle not mentioned in reply: {reply!r}")
+
+    def test_form_without_customer_name_replies_generically(self):
+        eng, texts_sent = self._make_eng_with_schedule()
+        state = _make_state(last_stage="QUALIFYING")
+        ctx = _make_ctx(state=state)
+        ctx.lead.nombre = None
+        eng._apply_candidate = lambda ctx, d: None
+
+        form = dict(self._FORM)
+        del form["customer_name"]
+        eng._handle_website_form(ctx, state, form)
+
+        reply = texts_sent[0]
+        # Must not use "cliente" as a name
+        self.assertNotIn("cliente", reply.lower())
+
+    def test_return_action_is_replied(self):
+        eng, _ = self._make_eng_with_schedule()
+        state = _make_state(last_stage="QUALIFYING")
+        ctx = _make_ctx(state=state)
+        eng._apply_candidate = lambda ctx, d: None
+
+        result = eng._handle_website_form(ctx, state, self._FORM)
+
+        self.assertEqual(result.action, "replied")
+        self.assertTrue(result.handled)
+
+    def test_existing_zone_not_overwritten(self):
+        """If state already has a zone, form zone must not overwrite it."""
+        eng, _ = self._make_eng_with_schedule()
+        state = _make_state(last_stage="QUALIFYING", home_zone_detail="Palermo")
+        ctx = _make_ctx(state=state)
+        eng._apply_candidate = lambda ctx, d: None
+
+        eng._handle_website_form(ctx, state, self._FORM)
+
+        # home_zone_detail was already set — should not be overwritten
+        self.assertEqual(state.home_zone_detail, "Palermo")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
