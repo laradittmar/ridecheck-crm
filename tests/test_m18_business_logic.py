@@ -94,6 +94,8 @@ def _make_state(**kwargs):
     ns = types.SimpleNamespace(
         home_zone_group=None,
         home_zone_detail=None,
+        home_address=None,
+        distance_km=None,
         current_focus_candidate_id=None,
         preferred_day=None,
         preferred_time=None,
@@ -2313,6 +2315,213 @@ class TestSlotFormatting(unittest.TestCase):
             self.assertRegex(s, r"^\d{2}:\d{2}$", f"Expected HH:MM, got ISO: {s!r}")
             self.assertNotIn("T", s)
             self.assertNotIn("2026", s)
+
+
+class TestDayOnlyRequest(unittest.TestCase):
+    """Issue B regression: day-only message must never auto-send the Flow.
+    Engine must list available slots and ask for a specific time instead."""
+
+    def _make_svc_with_slots(self, slots):
+        MagicMock = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock
+        svc = MagicMock()
+        svc.check.return_value = MagicMock(valid=False, suggested_slots=[], reasons=["test"])
+        list_mock = MagicMock()
+        list_mock.slots = slots
+        list_mock.business_hours = "09:00-18:00"
+        svc.list_slots.return_value = list_mock
+        return svc
+
+    def test_parse_sabado_returns_day_no_time(self):
+        """'el sabado' parser returns a day but no time."""
+        from app.services.conversation_engine import _parse_scheduling_text
+        from datetime import date
+        day, t = _parse_scheduling_text(["el sabado"], date(2026, 6, 16))
+        self.assertIsNotNone(day)
+        self.assertIsNone(t)
+
+    def test_parse_sabado_o_lunes_returns_day_no_time(self):
+        """'sino el sábado o lunes' parser returns a day but no time."""
+        from app.services.conversation_engine import _parse_scheduling_text
+        from datetime import date
+        day, t = _parse_scheduling_text(["sino el sabado o lunes"], date(2026, 6, 16))
+        self.assertIsNotNone(day)
+        self.assertIsNone(t)
+
+    def test_day_only_lists_slots_not_flow(self):
+        """Day-only message in SCHEDULING must list slots, not send the Flow."""
+        eng = _make_engine()
+        svc = self._make_svc_with_slots(["09:00", "10:00", "14:00", "16:00"])
+        eng._schedule = svc
+
+        sent_texts: list[str] = []
+        flow_sent: list[str] = []
+        eng._send_text_to_wa = lambda ctx, txt: sent_texts.append(txt) or "id"
+        eng._send_flow_button = lambda ctx, body, token: flow_sent.append(token) or "flow-id"
+
+        state = _make_state(
+            last_stage="SCHEDULING",
+            home_zone_group="Oeste",
+            home_zone_detail="San Justo",
+        )
+        ctx = _make_ctx(state=state)
+        eng._handle_day_only_request(ctx, state, "2026-06-20")
+
+        self.assertEqual(len(flow_sent), 0, "Flow must NOT be sent for a day-only request")
+        self.assertEqual(len(sent_texts), 1)
+        reply = sent_texts[0]
+        self.assertIn("09:00", reply)
+        self.assertIn("¿A qué hora", reply)
+
+    def test_day_only_stores_offered_slots(self):
+        """_handle_day_only_request must store last_offered_slots for later period filtering."""
+        import json
+        eng = _make_engine()
+        svc = self._make_svc_with_slots(["09:00", "10:00", "14:00"])
+        eng._schedule = svc
+        eng._send_text_to_wa = lambda ctx, txt: "id"
+
+        state = _make_state(last_stage="SCHEDULING", home_zone_group="Oeste", home_zone_detail="San Justo")
+        ctx = _make_ctx(state=state)
+        eng._handle_day_only_request(ctx, state, "2026-06-20")
+
+        self.assertIsNotNone(state.last_offered_slots)
+        offered = json.loads(state.last_offered_slots)
+        self.assertIn("09:00", offered)
+
+    def test_day_only_sunday_replies_closed(self):
+        """Day-only request for Sunday tells the user we're closed."""
+        MagicMock = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock
+        eng = _make_engine()
+        svc = MagicMock()
+        list_mock = MagicMock()
+        list_mock.slots = []
+        list_mock.business_hours = "cerrado"
+        svc.list_slots.return_value = list_mock
+        eng._schedule = svc
+
+        sent_texts: list[str] = []
+        eng._send_text_to_wa = lambda ctx, txt: sent_texts.append(txt) or "id"
+
+        state = _make_state(last_stage="SCHEDULING", home_zone_group="Oeste", home_zone_detail="San Justo")
+        ctx = _make_ctx(state=state)
+        eng._handle_day_only_request(ctx, state, "2026-06-21")  # Sunday 21/06
+
+        self.assertEqual(len(sent_texts), 1)
+        reply = sent_texts[0].lower()
+        self.assertTrue(
+            "operaciones" in reply or "lunes a sábado" in reply or "no tenemos" in reply,
+            f"Reply should mention closed/unavailable: {reply!r}",
+        )
+
+
+class TestNearestSlots(unittest.TestCase):
+    """_nearest_slots must return slots closest to the requested time, not first n."""
+
+    def _near(self, slots, requested, n=3):
+        from app.services.conversation_engine import _nearest_slots
+        return _nearest_slots(slots, requested, n)
+
+    def test_late_request_returns_late_slots_first(self):
+        """Issue A: 18:00 requested → latest available slots should come first."""
+        slots = ["09:00", "09:30", "10:00", "14:00", "14:30", "16:00", "17:00"]
+        result = self._near(slots, "18:00")
+        self.assertEqual(result[0], "17:00")
+        self.assertEqual(result[1], "16:00")
+
+    def test_midday_request_returns_surrounding_slots(self):
+        """12:00 requested → slots on both sides of noon."""
+        slots = ["09:00", "09:30", "10:00", "14:00", "14:30"]
+        result = self._near(slots, "12:00")
+        self.assertIn("10:00", result)
+        self.assertIn("14:00", result)
+
+    def test_returns_at_most_n_slots(self):
+        slots = ["09:00", "10:00", "11:00", "14:00", "15:00"]
+        self.assertEqual(len(self._near(slots, "10:00", 3)), 3)
+
+    def test_empty_slots_returns_empty(self):
+        self.assertEqual(self._near([], "12:00"), [])
+
+    def test_rejection_message_uses_nearest_not_first(self):
+        """Slot rejection reply must show nearest slots, not first 3 morning slots."""
+        MagicMock = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock
+        eng = _make_engine()
+        svc = MagicMock()
+
+        check_mock = MagicMock()
+        check_mock.valid = False
+        check_mock.suggested_slots = ["09:00", "09:30"]
+        check_mock.reasons = ["Fuera de horario"]
+        svc.check.return_value = check_mock
+
+        list_mock = MagicMock()
+        list_mock.slots = ["09:00", "09:30", "10:00", "14:00", "16:00", "17:00"]
+        svc.list_slots.return_value = list_mock
+
+        eng._schedule = svc
+        sent_texts: list[str] = []
+        eng._send_text_to_wa = lambda ctx, txt: sent_texts.append(txt) or "id"
+
+        state = _make_state(last_stage="SCHEDULING", home_zone_group="Oeste", home_zone_detail="San Justo")
+        ctx = _make_ctx(state=state)
+        # User requested 18:00 → nearest 3 to 18:00 should be 17:00, 16:00, 14:00
+        eng._try_schedule_and_flow(ctx, state, "2026-06-20", "18:00", "")
+
+        self.assertEqual(len(sent_texts), 1)
+        reply = sent_texts[0]
+        self.assertIn("17:00", reply, "Nearest slot (17:00) must appear in rejection reply")
+        self.assertNotIn("09:00", reply, "09:00 is far from 18:00 and must not be shown first")
+
+
+class TestFlowFailureDetection(unittest.TestCase):
+    """_is_flow_failure must detect WhatsApp Web / form-not-opening messages."""
+
+    def _detect(self, texts):
+        from app.services.conversation_engine import _is_flow_failure
+        return _is_flow_failure(texts)
+
+    def test_no_me_abre_detected(self):
+        self.assertTrue(self._detect(["no me abre"]))
+
+    def test_whatsapp_web_detected(self):
+        self.assertTrue(self._detect(["estoy en whatsapp web"]))
+
+    def test_desde_la_computadora_detected(self):
+        self.assertTrue(self._detect(["lo estoy viendo desde la computadora"]))
+
+    def test_normal_message_not_detected(self):
+        self.assertFalse(self._detect(["el lunes me viene bien"]))
+
+    def test_flow_failure_with_token_escalates(self):
+        """When flow_booking_token is set and user can't open form → human handoff."""
+        eng = _make_engine()
+        sent_texts: list[str] = []
+        eng._send_text_to_wa = lambda ctx, txt: sent_texts.append(txt) or "id"
+
+        handoff_called: list[bool] = []
+
+        def fake_handoff(ctx, state, thread_rev_id, last_message):
+            handoff_called.append(True)
+
+        eng._send_scheduling_handoff_email = fake_handoff
+
+        state = _make_state(
+            last_stage="SCHEDULING",
+            flow_booking_token="tok-abc",
+            needs_human=False,
+        )
+        ctx = _make_ctx(state=state)
+        eng._handle_flow_failure(ctx, state, "no me abre el formulario")
+
+        self.assertTrue(state.needs_human, "needs_human must be set to True")
+        self.assertEqual(state.last_stage, "HUMAN_REQUIRED")
+        self.assertEqual(len(sent_texts), 1)
+        reply = sent_texts[0].lower()
+        self.assertTrue(
+            "julián" in reply or "julian" in reply or "manual" in reply,
+            f"Reply must mention manual processing: {reply!r}",
+        )
+        self.assertTrue(handoff_called, "Handoff email must be sent")
 
 
 if __name__ == "__main__":

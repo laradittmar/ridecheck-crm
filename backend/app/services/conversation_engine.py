@@ -166,6 +166,24 @@ _SPANISH_WEEKDAY_NAMES: list[str] = [
     "lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo",
 ]
 
+# Phrases indicating the user cannot open the WhatsApp Flow button
+# (WhatsApp Web, desktop browser, or UI glitch).
+_FLOW_FAILURE_KEYWORDS: frozenset[str] = frozenset({
+    "no me abre",
+    "no abre el formulario",
+    "no funciona el formulario",
+    "no puedo abrir",
+    "no puedo completar",
+    "no me aparece el formulario",
+    "estoy en web",
+    "whatsapp web",
+    "desde la computadora",
+    "desde la compu",
+    "desde el pc",
+    "no me carga",
+    "no carga el formulario",
+})
+
 
 def _format_date_human(date_iso: str, today: date | None = None) -> str:
     """Human-readable date: 'mañana viernes 19/06' or 'lunes 22/06'."""
@@ -229,6 +247,31 @@ def _should_escalate_scheduling_to_human(
                 if parsed_day is None or parsed_day == str(state.active_requested_date):
                     return True
     return False
+
+
+def _is_flow_failure(texts: list[str]) -> bool:
+    """Return True when the user reports they cannot open the WhatsApp Flow form."""
+    combined = " ".join(texts).lower()
+    return any(kw in combined for kw in _FLOW_FAILURE_KEYWORDS)
+
+
+def _nearest_slots(slots: list[str], requested_time_str: str, n: int = 3) -> list[str]:
+    """Return up to n slots from slots[], ordered by proximity to requested_time_str (HH:MM)."""
+    try:
+        parts = requested_time_str.split(":")
+        req_total = int(parts[0]) * 60 + (int(parts[1]) if len(parts) > 1 else 0)
+    except (ValueError, IndexError, AttributeError):
+        return slots[:n]
+
+    def distance(slot: str) -> int:
+        h = _time_hour(slot)
+        try:
+            m = int(str(slot).split(":")[1]) if ":" in str(slot) else 0
+        except (ValueError, IndexError):
+            m = 0
+        return abs(h * 60 + m - req_total)
+
+    return sorted(slots, key=distance)[:n]
 
 
 # Maps lowercased Spanish day names (accented + unaccented) to Python weekday numbers.
@@ -636,7 +679,7 @@ class ConversationEngine:
         # Sunday / closed days → rejection message with alternatives.
         if state.last_stage == STAGE_QUOTED and not state.needs_human:
             sched_day_iso, sched_time_str = _parse_scheduling_text(ai_input_messages, date.today())
-            if sched_day_iso:
+            if sched_day_iso and sched_time_str:
                 lead.flag = "ACEPTADO"
                 state.last_stage = STAGE_SCHEDULING
                 logger.info(
@@ -646,6 +689,10 @@ class ConversationEngine:
                 result = self._try_schedule_and_flow(ctx, state, sched_day_iso, sched_time_str, "")
                 if result is not None:
                     return result
+
+        # ── Flow-failure: user can't open the WhatsApp Flow form ────────────
+        if state.flow_booking_token and _is_flow_failure(ai_input_messages):
+            return self._handle_flow_failure(ctx, state, " ".join(ai_input_messages))
 
         # ── Deterministic SCHEDULING day/time parse + escalation (pre-AI) ──
         if (
@@ -683,7 +730,7 @@ class ConversationEngine:
                 except (ValueError, TypeError):
                     pass
 
-            if sched_day_iso:
+            if sched_day_iso and sched_time_str:
                 logger.info(
                     "M18 scheduling deterministic parse thread_id=%s day=%s time=%s",
                     ctx.thread.id, sched_day_iso, sched_time_str,
@@ -691,6 +738,8 @@ class ConversationEngine:
                 result = self._try_schedule_and_flow(ctx, state, sched_day_iso, sched_time_str, "")
                 if result is not None:
                     return result
+            elif sched_day_iso:
+                return self._handle_day_only_request(ctx, state, sched_day_iso)
 
         # ── Deterministic vehicle catalog lookup (pre-AI) ─────────────────
         # Search across all recent messages (not just current burst) so a
@@ -892,7 +941,7 @@ class ConversationEngine:
             det_day, det_time = _parse_scheduling_text(ai_input_messages, date.today())
             pday = det_day or state.preferred_day
             ptime = det_time or extracted.get("preferred_time_str") or state.preferred_time
-            if pday:
+            if pday and ptime:
                 result = self._try_schedule_and_flow(ctx, state, pday, ptime, decision.get("reply") or "")
                 if result is not None:
                     return result
@@ -1035,7 +1084,8 @@ class ConversationEngine:
 
             date_human = _format_date_human(preferred_day_iso, date.today())
             if all_slots:
-                slot_list = ", ".join(all_slots[:3])
+                near = _nearest_slots(all_slots, preferred_time_obj.strftime("%H:%M"))
+                slot_list = ", ".join(near)
                 msg = (
                     f"Para {date_human} a las {preferred_time_obj.strftime('%H:%M')} "
                     f"no tenemos disponibilidad. "
@@ -1084,6 +1134,100 @@ class ConversationEngine:
                 f"Para {date_human} no hay horarios disponibles por la {period_label}. "
                 f"¿Podría ser por la {alt_label}?"
             )
+        sent_id = self._send_text_to_wa(ctx, msg)
+        return _out("replied", wa_message_id=sent_id)
+
+    # ── Day-only request: user gives a day but no time ────────────────────
+
+    def _handle_day_only_request(
+        self,
+        ctx: _Context,
+        state: WhatsAppThreadState,
+        day_iso: str,
+    ) -> ConversationHandleOut:
+        """User named a day but no specific time. List available slots for that day."""
+        from ..schemas.schedule import ScheduleCheckIn
+        assert ctx.lead is not None
+        zone_parts = [state.home_zone_detail, state.home_zone_group, "Buenos Aires, Argentina"]
+        address = ", ".join(p for p in zone_parts if p)
+        sched_in = ScheduleCheckIn(
+            preferred_day=date.fromisoformat(day_iso),
+            preferred_time=time(9, 0),
+            address=address,
+            zone_group=state.home_zone_group,
+            zone_detail=state.home_zone_detail,
+            exclude_revision_id=state.current_revision_id,
+            is_holiday=False,
+        )
+        is_closed = False
+        try:
+            slots_out = self._schedule.list_slots(sched_in)
+            all_slots = [s for s in (slots_out.slots or []) if isinstance(s, str)]
+            is_closed = slots_out.business_hours == "cerrado"
+        except Exception as exc:
+            logger.warning("M18 list_slots failed in day_only thread_id=%s: %s", ctx.thread.id, exc)
+            all_slots = []
+
+        state.active_requested_date = day_iso
+        state.last_offered_slots = json.dumps(all_slots)
+
+        date_human = _format_date_human(day_iso, date.today())
+        if all_slots:
+            shown = all_slots[:4]
+            if len(shown) >= 2:
+                slot_list = ", ".join(shown[:-1]) + f" o {shown[-1]}"
+            else:
+                slot_list = shown[0]
+            msg = f"Para {date_human} tengo disponible: {slot_list}. ¿A qué hora te viene bien?"
+        elif is_closed:
+            msg = (
+                f"El {date_human} no tenemos operaciones. "
+                "¿Qué otro día te funciona? De lunes a sábado estamos disponibles."
+            )
+        else:
+            msg = (
+                f"Para {date_human} no hay horarios libres en este momento. "
+                "¿Tenés otro día preferido?"
+            )
+        logger.info(
+            "M18 day_only_request thread_id=%s day=%s slots=%d",
+            ctx.thread.id, day_iso, len(all_slots),
+        )
+        sent_id = self._send_text_to_wa(ctx, msg)
+        return _out("replied", wa_message_id=sent_id)
+
+    # ── Flow failure: user can't open the WhatsApp Flow form ─────────────
+
+    def _handle_flow_failure(
+        self,
+        ctx: _Context,
+        state: WhatsAppThreadState,
+        last_message: str,
+    ) -> ConversationHandleOut:
+        """User reports they cannot open the Flow form (e.g. on WhatsApp Web).
+        Hand off to human immediately."""
+        lead = ctx.lead
+        assert lead is not None
+
+        lead.necesita_humano = True
+        lead.estado = "ATENCION_HUMANA"
+        state.needs_human = True
+        state.last_stage = STAGE_HUMAN
+
+        logger.info(
+            "M18 flow_failure escalation thread_id=%s token=%s",
+            ctx.thread.id, state.flow_booking_token,
+        )
+
+        self._send_scheduling_handoff_email(
+            ctx=ctx, state=state, thread_rev_id=state.current_revision_id, last_message=last_message,
+        )
+
+        msg = (
+            "Entiendo, el formulario a veces no abre bien desde WhatsApp Web o la computadora. "
+            "Le paso tu solicitud a Julián para que la procese manualmente "
+            "y te confirma el turno por acá. 🙌"
+        )
         sent_id = self._send_text_to_wa(ctx, msg)
         return _out("replied", wa_message_id=sent_id)
 
