@@ -3643,6 +3643,16 @@ class TestParseWebsiteForm(unittest.TestCase):
         result = self._parse([form])
         self.assertIsNone(result.get("ref"))
 
+    def test_ref_with_hyphens_parsed(self):
+        """ref: google-ads-2026 must capture the full slug, not stop at the first hyphen."""
+        form = (
+            "Hola, quiero solicitar una revisión pre-compra.\n"
+            "* Auto a revisar: Honda Civic\n"
+            "ref: google-ads-2026"
+        )
+        result = self._parse([form])
+        self.assertEqual(result["ref"], "google-ads-2026")
+
     def test_multi_message_burst(self):
         """Form split across two messages in a ráfaga still parses."""
         part1 = "Hola, quiero solicitar una revisión pre-compra.\n* Auto a revisar: VW Gol"

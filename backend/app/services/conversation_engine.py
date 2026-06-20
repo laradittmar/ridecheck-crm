@@ -443,8 +443,8 @@ def _parse_website_form(texts: list[str]) -> dict | None:
             nums = re.sub(r"[^\d]", "", val)
             fields["submitted_total"] = int(nums) if nums else None
 
-    # Extract optional ref= from the raw text.
-    ref_m = re.search(r"\bref:\s*(\w+)", combined, re.IGNORECASE)
+    # Extract optional ref= from the raw text (value may contain hyphens/underscores).
+    ref_m = re.search(r"\bref:\s*([\w][\w\-]*)", combined, re.IGNORECASE)
     if ref_m:
         fields["ref"] = ref_m.group(1)
 
