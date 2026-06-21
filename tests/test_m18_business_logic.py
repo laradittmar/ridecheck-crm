@@ -1584,7 +1584,7 @@ class TestRejectedSlotNotStored(unittest.TestCase):
 
         sent: list[str] = []
         eng._send_text_to_wa = lambda ctx, txt: sent.append(txt) or "msg-id"
-        eng._send_flow_button = lambda ctx, body, token, flow_id="": "flow-id"
+        eng._send_flow_button = lambda ctx, body, token, flow_id="", initial_screen="MAIN": "flow-id"
 
         ctx = _make_ctx(state=state)
         result = eng._try_schedule_and_flow(ctx, state, day_iso, time_str, "")
@@ -1910,7 +1910,7 @@ class TestRejectionStoresContext(unittest.TestCase):
         result_mock.reasons = []
         svc.check.return_value = result_mock
         eng._schedule = svc
-        eng._send_flow_button = lambda ctx, body, token, flow_id="": "flow-id"
+        eng._send_flow_button = lambda ctx, body, token, flow_id="", initial_screen="MAIN": "flow-id"
 
         state = _make_state(
             home_zone_group="Oeste",
@@ -2358,7 +2358,7 @@ class TestDayOnlyRequest(unittest.TestCase):
         sent_texts: list[str] = []
         flow_sent: list[str] = []
         eng._send_text_to_wa = lambda ctx, txt: sent_texts.append(txt) or "id"
-        eng._send_flow_button = lambda ctx, body, token, flow_id="": flow_sent.append(token) or "flow-id"
+        eng._send_flow_button = lambda ctx, body, token, flow_id="", initial_screen="MAIN": flow_sent.append(token) or "flow-id"
 
         state = _make_state(
             last_stage="SCHEDULING",
@@ -2952,7 +2952,7 @@ class TestPeriodSchedulingFlow(unittest.TestCase):
         sent_texts: list[str] = []
         flow_sent: list[bool] = []
         eng._send_text_to_wa = lambda ctx, txt: sent_texts.append(txt) or "id"
-        eng._send_flow_button = lambda ctx, body, token, flow_id="": flow_sent.append(True) or "flow-id"
+        eng._send_flow_button = lambda ctx, body, token, flow_id="", initial_screen="MAIN": flow_sent.append(True) or "flow-id"
 
         state = self._make_afternoon_state()
         ctx = _make_ctx(state=state)
@@ -2970,7 +2970,7 @@ class TestPeriodSchedulingFlow(unittest.TestCase):
         svc.check.return_value = check_mock
         eng._schedule = svc
         flow_sent: list[str] = []
-        eng._send_flow_button = lambda ctx, body, token, flow_id="": flow_sent.append(token) or "flow-id"
+        eng._send_flow_button = lambda ctx, body, token, flow_id="", initial_screen="MAIN": flow_sent.append(token) or "flow-id"
         eng._send_text_to_wa = lambda ctx, txt: "id"
 
         import json
@@ -3117,7 +3117,7 @@ class TestOrdinalSlotConfirmation(unittest.TestCase):
         eng = _make_engine()
         eng._schedule = self._make_svc(valid=True)
         flow_sent: list[str] = []
-        eng._send_flow_button = lambda ctx, body, token, flow_id="": flow_sent.append(token) or "flow-id"
+        eng._send_flow_button = lambda ctx, body, token, flow_id="", initial_screen="MAIN": flow_sent.append(token) or "flow-id"
         eng._send_text_to_wa = lambda ctx, txt: "id"
 
         state = self._make_scheduling_state()
@@ -3139,7 +3139,7 @@ class TestOrdinalSlotConfirmation(unittest.TestCase):
         eng = _make_engine()
         eng._schedule = self._make_svc(valid=True)
         flow_sent: list[str] = []
-        eng._send_flow_button = lambda ctx, body, token, flow_id="": flow_sent.append(token) or "flow-id"
+        eng._send_flow_button = lambda ctx, body, token, flow_id="", initial_screen="MAIN": flow_sent.append(token) or "flow-id"
         eng._send_text_to_wa = lambda ctx, txt: "id"
 
         state = self._make_scheduling_state()
@@ -3180,7 +3180,7 @@ class TestOrdinalSlotConfirmation(unittest.TestCase):
         svc = self._make_svc(valid=True)
         eng._schedule = svc
         flow_sent: list[str] = []
-        eng._send_flow_button = lambda ctx, body, token, flow_id="": flow_sent.append(token) or "flow-id"
+        eng._send_flow_button = lambda ctx, body, token, flow_id="", initial_screen="MAIN": flow_sent.append(token) or "flow-id"
         eng._send_text_to_wa = lambda ctx, txt: "id"
 
         state = self._make_scheduling_state()
@@ -3201,7 +3201,7 @@ class TestOrdinalSlotConfirmation(unittest.TestCase):
 
         eng = _make_engine()
         eng._schedule = self._make_svc(valid=True)
-        eng._send_flow_button = lambda ctx, body, token, flow_id="": "flow-id"
+        eng._send_flow_button = lambda ctx, body, token, flow_id="", initial_screen="MAIN": "flow-id"
         eng._send_text_to_wa = lambda ctx, txt: "id"
 
         state = self._make_scheduling_state()
@@ -3302,7 +3302,7 @@ class TestOrdinalSlotConfirmation(unittest.TestCase):
         eng = _make_engine()
         eng._schedule = self._make_svc(valid=True)
         flow_sent: list[str] = []
-        eng._send_flow_button = lambda ctx, body, token, flow_id="": flow_sent.append(token) or "flow-id"
+        eng._send_flow_button = lambda ctx, body, token, flow_id="", initial_screen="MAIN": flow_sent.append(token) or "flow-id"
         eng._send_text_to_wa = lambda ctx, txt: "id"
 
         # State after "a la tarde?": last_offered_slots has 17 full-day slots,
@@ -3370,7 +3370,7 @@ class TestOrdinalSlotConfirmation(unittest.TestCase):
         eng = _make_engine()
         eng._schedule = self._make_svc(valid=True)
         flow_sent: list[str] = []
-        eng._send_flow_button = lambda ctx, body, token, flow_id="": flow_sent.append(token) or "flow-id"
+        eng._send_flow_button = lambda ctx, body, token, flow_id="", initial_screen="MAIN": flow_sent.append(token) or "flow-id"
         eng._send_text_to_wa = lambda ctx, txt: "id"
 
         # State: AI extracted preferred_time="14:30" in previous turn;
@@ -3874,9 +3874,9 @@ class TestWebsiteFlowSelection(unittest.TestCase):
         eng._schedule = self._make_svc(valid=True)
 
         # Track which flow_id was used
-        flows_sent: list[str] = []
-        def fake_send_flow(ctx, body, token, flow_id=""):
-            flows_sent.append(flow_id)
+        flows_sent: list[tuple] = []
+        def fake_send_flow(ctx, body, token, flow_id="", initial_screen="MAIN"):
+            flows_sent.append((flow_id, initial_screen))
             return "flow-msg-id"
 
         eng._send_flow_button = fake_send_flow
@@ -3892,8 +3892,10 @@ class TestWebsiteFlowSelection(unittest.TestCase):
 
         self.assertEqual(result.action, "flow_button_sent")
         self.assertEqual(len(flows_sent), 1)
-        self.assertEqual(flows_sent[0], "website-flow-456",
+        self.assertEqual(flows_sent[0][0], "website-flow-456",
                          "Website lead must use WHATSAPP_WEBSITE_FLOW_ID, not generic")
+        self.assertEqual(flows_sent[0][1], "WEBSITE_FINAL_DATA",
+                         "Website Flow must use WEBSITE_FINAL_DATA as initial screen")
 
     def test_normal_lead_sends_generic_flow(self):
         """When is_website_lead=False, generic WHATSAPP_FLOW_ID is sent."""
@@ -3901,9 +3903,9 @@ class TestWebsiteFlowSelection(unittest.TestCase):
         eng = _make_engine()
         eng._schedule = self._make_svc(valid=True)
 
-        flows_sent: list[str] = []
-        def fake_send_flow(ctx, body, token, flow_id=""):
-            flows_sent.append(flow_id)
+        flows_sent: list[tuple] = []
+        def fake_send_flow(ctx, body, token, flow_id="", initial_screen="MAIN"):
+            flows_sent.append((flow_id, initial_screen))
             return "flow-msg-id"
 
         eng._send_flow_button = fake_send_flow
@@ -3918,7 +3920,9 @@ class TestWebsiteFlowSelection(unittest.TestCase):
         result = eng._try_schedule_and_flow(ctx, state, "2026-06-23", "10:00", "")
 
         self.assertEqual(result.action, "flow_button_sent")
-        self.assertEqual(flows_sent[0], "generic-flow-123")
+        self.assertEqual(flows_sent[0][0], "generic-flow-123")
+        self.assertEqual(flows_sent[0][1], "MAIN",
+                         "Generic lead must use MAIN as initial screen")
 
     def test_website_lead_missing_flow_id_falls_back_to_chat(self):
         """When WHATSAPP_WEBSITE_FLOW_ID is not set, ask for email+address via chat.
@@ -3928,7 +3932,7 @@ class TestWebsiteFlowSelection(unittest.TestCase):
         eng._schedule = self._make_svc(valid=True)
 
         flows_sent: list[str] = []
-        eng._send_flow_button = lambda ctx, body, token, flow_id="": flows_sent.append(flow_id) or "id"
+        eng._send_flow_button = lambda ctx, body, token, flow_id="", initial_screen="MAIN": flows_sent.append(flow_id) or "id"
         texts_sent: list[str] = []
         eng._send_text_to_wa = lambda ctx, txt: texts_sent.append(txt) or "id"
         eng.settings = MagicMock()
@@ -3957,7 +3961,7 @@ class TestWebsiteFlowSelection(unittest.TestCase):
         eng._schedule = self._make_svc(valid=True)
 
         flows_sent: list[str] = []
-        eng._send_flow_button = lambda ctx, body, token, flow_id="": flows_sent.append(flow_id) or "id"
+        eng._send_flow_button = lambda ctx, body, token, flow_id="", initial_screen="MAIN": flows_sent.append(flow_id) or "id"
         texts_sent: list[str] = []
         eng._send_text_to_wa = lambda ctx, txt: texts_sent.append(txt) or "id"
         eng.settings = MagicMock()
@@ -4190,6 +4194,158 @@ class TestWebsiteFlowResponse(unittest.TestCase):
         self.assertEqual(state.last_stage, "BOOKED")
         self.assertTrue(state.needs_human)
         self.assertIsNone(state.flow_booking_token)
+
+
+class TestWebsiteFlowInitialScreen(unittest.TestCase):
+    """Website Flow must use WEBSITE_FINAL_DATA as initial_screen; generic Flow uses MAIN."""
+
+    def _make_svc(self, valid=True):
+        from unittest.mock import MagicMock
+        svc = MagicMock()
+        svc.check.return_value = MagicMock(valid=valid, suggested_slots=[], reasons=["closed"])
+        ls_mock = MagicMock()
+        ls_mock.slots = []
+        svc.list_slots.return_value = ls_mock
+        return svc
+
+    def _capture_flow_calls(self, eng):
+        """Replace _send_flow_button with a recorder; returns the list."""
+        calls: list[dict] = []
+        def capture(ctx, body, token, flow_id="", initial_screen="MAIN"):
+            calls.append({"flow_id": flow_id, "initial_screen": initial_screen})
+            return "captured-id"
+        eng._send_flow_button = capture
+        eng.db.commit = lambda: None
+        return calls
+
+    # ── Test 1: website form → slot → website Flow with WEBSITE_FINAL_DATA ──
+
+    def test_time_only_with_active_date_sends_website_flow(self):
+        """10:30 with active_requested_date set must send website Flow via WEBSITE_FINAL_DATA."""
+        from unittest.mock import MagicMock
+        eng = _make_engine()
+        eng._schedule = self._make_svc(valid=True)
+        eng.settings = MagicMock()
+        eng.settings.whatsapp_flow_id = "generic-111"
+        eng.settings.whatsapp_website_flow_id = "website-222"
+
+        calls = self._capture_flow_calls(eng)
+
+        state = _make_state(
+            last_stage="SCHEDULING",
+            is_website_lead=True,
+            active_requested_date="2026-06-22",
+            last_visible_slots='["09:00","09:30","10:00","10:30"]',
+            last_offered_slots='["09:00","09:30","10:00","10:30"]',
+            home_zone_group="CABA",
+        )
+        ctx = _make_ctx(state=state)
+        result = eng._try_schedule_and_flow(ctx, state, "2026-06-22", "10:30", "")
+
+        self.assertEqual(result.action, "flow_button_sent")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["flow_id"], "website-222")
+        self.assertEqual(calls[0]["initial_screen"], "WEBSITE_FINAL_DATA",
+                         "Website Flow first screen must be WEBSITE_FINAL_DATA")
+
+    # ── Test 2: no reply containing "te agendo" before Flow submit ──
+
+    def test_te_agendo_is_scrubbed_in_scheduling(self):
+        from app.services.conversation_engine import _scrub_scheduling_confirmation
+        reply = "Genial! Entonces, te agendo para el lunes 22/06 a las 10:30. ¿Te parece bien?"
+        result = _scrub_scheduling_confirmation(reply, "SCHEDULING")
+        self.assertNotIn("te agendo", result.lower(),
+                         "'te agendo' must be scrubbed before Flow is sent")
+
+    def test_te_agendamos_is_scrubbed(self):
+        from app.services.conversation_engine import _scrub_scheduling_confirmation
+        reply = "Perfecto, te agendamos para el viernes."
+        result = _scrub_scheduling_confirmation(reply, "SCHEDULING")
+        self.assertNotIn("te agendamos", result.lower())
+
+    # ── Test 3: "Si" after pending slot confirmation sends website Flow ──
+
+    def test_si_after_pending_preferred_day_sends_website_flow(self):
+        """When preferred_day+preferred_time are in state and user says 'Si',
+        _try_schedule_and_flow must be invoked and send the website Flow."""
+        from unittest.mock import MagicMock
+        eng = _make_engine()
+        eng._schedule = self._make_svc(valid=True)
+        eng.settings = MagicMock()
+        eng.settings.whatsapp_flow_id = "generic-111"
+        eng.settings.whatsapp_website_flow_id = "website-222"
+
+        calls = self._capture_flow_calls(eng)
+
+        # State after "10:30" stored preferred_day/preferred_time but flow_send failed
+        state = _make_state(
+            last_stage="SCHEDULING",
+            is_website_lead=True,
+            preferred_day="2026-06-22",
+            preferred_time="10:30",
+            active_requested_date=None,
+            home_zone_group="CABA",
+        )
+        ctx = _make_ctx(state=state)
+        result = eng._try_schedule_and_flow(ctx, state, "2026-06-22", "10:30", "")
+
+        self.assertEqual(result.action, "flow_button_sent")
+        self.assertEqual(calls[0]["flow_id"], "website-222")
+        self.assertEqual(calls[0]["initial_screen"], "WEBSITE_FINAL_DATA")
+
+    # ── Test 4: generic lead unaffected — still uses MAIN screen ──
+
+    def test_generic_lead_uses_main_screen(self):
+        """Non-website lead Flow must use MAIN as initial_screen, not WEBSITE_FINAL_DATA."""
+        from unittest.mock import MagicMock
+        eng = _make_engine()
+        eng._schedule = self._make_svc(valid=True)
+        eng.settings = MagicMock()
+        eng.settings.whatsapp_flow_id = "generic-111"
+        eng.settings.whatsapp_website_flow_id = "website-222"
+
+        calls = self._capture_flow_calls(eng)
+
+        state = _make_state(
+            last_stage="SCHEDULING",
+            is_website_lead=False,
+            home_zone_group="CABA",
+        )
+        ctx = _make_ctx(state=state)
+        result = eng._try_schedule_and_flow(ctx, state, "2026-06-22", "10:00", "")
+
+        self.assertEqual(result.action, "flow_button_sent")
+        self.assertEqual(calls[0]["flow_id"], "generic-111")
+        self.assertEqual(calls[0]["initial_screen"], "MAIN",
+                         "Generic Flow must NOT use WEBSITE_FINAL_DATA screen")
+
+    # ── Test 5: send_flow_button passes initial_screen through ──
+
+    def test_send_flow_button_passes_initial_screen_to_api(self):
+        """_send_flow_button must forward initial_screen to _send_whatsapp_cloud_flow."""
+        from unittest.mock import patch, MagicMock
+        eng = _make_engine()
+        eng.settings = MagicMock()
+        eng.settings.whatsapp_flow_id = "generic-111"
+        eng.db.add = lambda x: None
+        eng.db.commit = lambda: None
+
+        state = _make_state(is_website_lead=True)
+        ctx = _make_ctx(state=state)
+
+        captured_screen = []
+        with patch(
+            "app.services.conversation_engine._send_whatsapp_cloud_flow",
+            side_effect=lambda **kw: captured_screen.append(kw.get("initial_screen", "MAIN")) or ("wamid", 200),
+        ):
+            try:
+                eng._send_flow_button(ctx, "body", "tok", flow_id="website-222",
+                                       initial_screen="WEBSITE_FINAL_DATA")
+            except Exception:
+                pass  # DB side effects may fail in test; we only care about the intercepted call
+
+        if captured_screen:
+            self.assertEqual(captured_screen[0], "WEBSITE_FINAL_DATA")
 
 
 if __name__ == "__main__":

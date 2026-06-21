@@ -343,6 +343,10 @@ _SCHEDULING_FORBIDDEN_PHRASES: tuple[str, ...] = (
     "te enviaremos un recordatorio",
     "recordatorio el día anterior",
     "queda reservado",
+    "te agendo",
+    "te agendamos",
+    "ya te agendé",
+    "quedaste agendad",
 )
 
 
@@ -1473,8 +1477,11 @@ class ConversationEngine:
                 "Perfecto, ese horario está disponible 🎉 "
                 "Para confirmar el turno, completá el formulario con tus datos."
             )
+            screen = "WEBSITE_FINAL_DATA" if is_website else "MAIN"
             try:
-                sent_id = self._send_flow_button(ctx, body, flow_token, flow_id=flow_id)
+                sent_id = self._send_flow_button(
+                    ctx, body, flow_token, flow_id=flow_id, initial_screen=screen
+                )
                 return _out("flow_button_sent", wa_message_id=sent_id)
             except Exception as exc:
                 logger.error("M18 flow button send failed thread_id=%s: %s", ctx.thread.id, exc)
@@ -2407,7 +2414,8 @@ Respondé SOLO con JSON válido:
         return wa_message_id
 
     def _send_flow_button(
-        self, ctx: _Context, body_text: str, flow_token: str, flow_id: str = ""
+        self, ctx: _Context, body_text: str, flow_token: str, flow_id: str = "",
+        initial_screen: str = "MAIN",
     ) -> str:
         if not flow_id:
             flow_id = (self.settings.whatsapp_flow_id or "").strip()
@@ -2425,6 +2433,7 @@ Respondé SOLO con JSON válido:
             flow_token=flow_token,
             body_text=body_text,
             cta_label="Completar datos",
+            initial_screen=initial_screen,
         )
 
         outbound = WhatsAppMessage(

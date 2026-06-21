@@ -273,6 +273,7 @@ def _send_whatsapp_cloud_flow(
     flow_token: str,
     body_text: str,
     cta_label: str = "Completar datos",
+    initial_screen: str = "MAIN",
 ) -> tuple[str, int]:
     """M17 — Send a WhatsApp Flow button message (data-collection mode, no back-end)."""
     settings = get_settings()
@@ -305,7 +306,7 @@ def _send_whatsapp_cloud_flow(
                     "flow_id": flow_id,
                     "flow_cta": cta_label,
                     "flow_action": "navigate",
-                    "flow_action_payload": {"screen": "MAIN"},
+                    "flow_action_payload": {"screen": initial_screen},
                 },
             },
         },
