@@ -1109,8 +1109,15 @@ class ConversationEngine:
         # ── Vehicle fallback (takes priority over location) ───────────────
         if not vehicle_known:
             if state.vehicle_fallback_flow_sent:
-                # Flow already dispatched — wait for submit response, skip AI.
-                return None
+                # Flow already dispatched — do NOT call AI, do NOT re-dispatch.
+                # Send a brief reminder so the customer knows to complete the form.
+                reply = (
+                    "Por favor completá el formulario que te enviamos sobre tu vehículo "
+                    "para que podamos cotizarte la revisión."
+                )
+                self.db.commit()
+                sent_id = self._send_text_to_wa(ctx, reply)
+                return _out("replied", wa_message_id=sent_id)
             flow_id = (
                 getattr(self.settings, "whatsapp_vehicle_fallback_flow_id", "") or ""
             ).strip()
@@ -1146,7 +1153,14 @@ class ConversationEngine:
         # ── Location fallback (only when vehicle IS known) ────────────────
         if not zone_known:
             if state.location_fallback_flow_sent:
-                return None
+                # Flow already dispatched — do NOT call AI, do NOT re-dispatch.
+                reply = (
+                    "Por favor completá el formulario que te enviamos sobre la ubicación "
+                    "del auto para que podamos cotizarte la revisión."
+                )
+                self.db.commit()
+                sent_id = self._send_text_to_wa(ctx, reply)
+                return _out("replied", wa_message_id=sent_id)
             flow_id = (
                 getattr(self.settings, "whatsapp_location_fallback_flow_id", "") or ""
             ).strip()

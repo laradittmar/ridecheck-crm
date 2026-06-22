@@ -4665,7 +4665,7 @@ class TestCheckFallbackFlowTriggers(unittest.TestCase):
         self.assertFalse(state.location_fallback_flow_sent)  # location not yet triggered
 
     def test_no_trigger_when_vehicle_flow_already_sent(self):
-        """After vehicle Flow was dispatched, return None — wait for submit (loop guard)."""
+        """After vehicle Flow was dispatched, send reminder only — no re-dispatch, no AI."""
         eng = self._make_eng_with_flow_ids()
         flows = self._capture_flow_sends(eng)
         texts = self._capture_text_sends(eng)
@@ -4679,10 +4679,11 @@ class TestCheckFallbackFlowTriggers(unittest.TestCase):
 
         result = eng._check_fallback_flow_triggers(ctx, state, None, ["siguen sin saber"])
 
-        # vehicle_fallback_flow_sent=True → must return None (wait for submit, no new flow/text)
-        self.assertIsNone(result)
-        self.assertEqual(len(flows), 0)
-        self.assertEqual(len(texts), 0)
+        # vehicle_fallback_flow_sent=True → sends reminder, does NOT re-dispatch Flow
+        self.assertIsNotNone(result)
+        self.assertEqual(len(flows), 0)          # no new Flow
+        self.assertEqual(len(texts), 1)          # one reminder text
+        self.assertIn("formulario", texts[0].lower())
 
     def test_no_trigger_when_flow_id_not_configured(self):
         """If flow ID is empty, fall through to AI (chat clarification only)."""
@@ -5448,9 +5449,11 @@ class TestFallbackFlowInitialScreens(unittest.TestCase):
     # ── No-repeat loop guard ───────────────────────────────────────────────
 
     def test_vehicle_flow_not_resent_when_already_dispatched(self):
-        """vehicle_fallback_flow_sent=True → trigger returns None (no re-dispatch)."""
+        """vehicle_fallback_flow_sent=True → sends reminder, no Flow re-dispatch, no AI."""
         eng = self._make_eng()
         calls, _ce, orig = self._capture_flow_api_calls(eng)
+        texts = []
+        eng._send_text_to_wa = lambda ctx, text: texts.append(text) or "wamid-txt"
         try:
             state = _make_state(
                 last_stage="QUALIFYING",
@@ -5462,13 +5465,17 @@ class TestFallbackFlowInitialScreens(unittest.TestCase):
         finally:
             _ce._send_whatsapp_cloud_flow = orig
 
-        self.assertIsNone(result)
-        self.assertEqual(len(calls), 0)
+        self.assertIsNotNone(result)
+        self.assertEqual(len(calls), 0)       # no Flow re-dispatched
+        self.assertEqual(len(texts), 1)       # one reminder sent
+        self.assertIn("formulario", texts[0].lower())
 
     def test_location_flow_not_resent_when_already_dispatched(self):
-        """location_fallback_flow_sent=True → trigger returns None (no re-dispatch)."""
+        """location_fallback_flow_sent=True → sends reminder, no Flow re-dispatch, no AI."""
         eng = self._make_eng()
         calls, _ce, orig = self._capture_flow_api_calls(eng)
+        texts = []
+        eng._send_text_to_wa = lambda ctx, text: texts.append(text) or "wamid-txt"
         try:
             cand = _make_candidate(tipo_vehiculo="AUTO")
             state = _make_state(
@@ -5481,8 +5488,10 @@ class TestFallbackFlowInitialScreens(unittest.TestCase):
         finally:
             _ce._send_whatsapp_cloud_flow = orig
 
-        self.assertIsNone(result)
-        self.assertEqual(len(calls), 0)
+        self.assertIsNotNone(result)
+        self.assertEqual(len(calls), 0)       # no Flow re-dispatched
+        self.assertEqual(len(texts), 1)       # one reminder sent
+        self.assertIn("formulario", texts[0].lower())
 
     # ── No Flow on first unclear message ──────────────────────────────────
 
