@@ -115,10 +115,55 @@ _CABA_SYNONYMS: frozenset[str] = frozenset({
 _CABA_CANONICAL_DETAIL = "CABA"
 _CABA_CANONICAL_GROUP = "CABA"
 
+# Dock Sud aliases: "Doc Sud", "Dock Sud", and common misspellings all map to the
+# canonical zone_detail stored in viaticos_zones (zone_group=Sur, viaticos=30000).
+# None of these are CABA or La Boca — Dock Sud is in Partido de Avellaneda.
+_DOCK_SUD_ALIASES: frozenset[str] = frozenset({
+    "dock sud",
+    "doc sud",
+    "dock sue",
+    "doc sue",
+    "dique sud",
+    "dique sue",
+})
+_DOCK_SUD_CANONICAL = "Dock Sud"
+_DOCK_SUD_GROUP = "Sur"
+
+# Phone-call escalation: customer asking to call instead of chat.
+# Detected deterministically before the AI to avoid false "podés llamarme" replies.
+_PHONE_CALL_PATTERNS: tuple[re.Pattern, ...] = (
+    re.compile(r'\bllam(?:ar(?:me|te|nos)?|ame|ame)\b', re.IGNORECASE),
+    re.compile(r'\bme\s+pod[eé]s?\s+llam(?:ar|aste)\b', re.IGNORECASE),
+    re.compile(r'\bpued[oa]?\s+llam(?:ar(?:te|los?)?|ame)\b', re.IGNORECASE),
+    re.compile(r'\bte\s+puedo\s+llam(?:ar|aste)\b', re.IGNORECASE),
+    re.compile(r'\bquiero\s+llam(?:ar(?:te|los?)?\b)', re.IGNORECASE),
+    re.compile(r'\bhac(?:er|emos)\s+una\s+llam(?:ada|ado)\b', re.IGNORECASE),
+)
+
+# Guard against AI asking the customer for price/cotización info when missing
+# data is vehicle or zone.  Scrubbed before the reply is sent.
+_PRICE_REQUEST_RE = re.compile(
+    r'(?:confirm(?:ar|a|ame|ar[nm]e)\s+(?:el\s+)?(?:precio|cotizaci[oó]n|importe|valor|presupuesto)'
+    r'|(?:cu[aá]l\s+es|me\s+dec[ií]s?|me\s+pas[aá]s?|me\s+pod[eé]s?\s+(?:decir|pasar|indicar))'
+    r'\s+(?:el\s+)?(?:precio|cotizaci[oó]n|importe|valor|presupuesto\s+del\s+(?:auto|veh[ií]culo)))',
+    re.IGNORECASE,
+)
+
 
 def _is_caba_synonym(value: str) -> bool:
     """Return True if value (case-insensitive) is a known CABA synonym."""
     return " ".join((value or "").lower().split()) in _CABA_SYNONYMS
+
+
+def _is_dock_sud_alias(value: str) -> bool:
+    """Return True if value is a known Dock Sud alias (case-insensitive)."""
+    return " ".join((value or "").lower().split()) in _DOCK_SUD_ALIASES
+
+
+def _is_phone_call_request(messages: list[str]) -> bool:
+    """Return True if any message contains a phone-call request pattern."""
+    combined = " ".join(messages)
+    return any(p.search(combined) for p in _PHONE_CALL_PATTERNS)
 
 
 def _extract_year_from_text(text: str) -> int | None:
@@ -1034,7 +1079,9 @@ class ConversationEngine:
         # ── Pre-AI zone detection ──────────────────────────────────────────
         # Look up zone in DB from text so zone_group is deterministic (not
         # guessed) before the AI runs. Also populates state.home_zone_group.
-        if not state.home_zone_detail:
+        # Also re-run when detail is set but zone_group is still None (zone was
+        # captured by AI but never resolved to a viaticos group).
+        if not state.home_zone_detail or not state.home_zone_group:
             zone_hit = self._extract_zone_from_text(all_recent_text)
             if zone_hit:
                 state.home_zone_detail = zone_hit.zone_detail
@@ -1046,6 +1093,21 @@ class ConversationEngine:
 
         # ── Pre-AI deterministic price quote ──────────────────────────────
         real_price_quote = self._compute_price_quote(ctx, state)
+
+        # ── Deterministic phone-call escalation ───────────────────────────
+        # If the customer is asking to be called, escalate immediately and skip
+        # AI — avoids the AI promising a call that never happens.
+        if _is_phone_call_request(ai_input_messages):
+            logger.info("M18 phone-call escalation thread_id=%s", ctx.thread.id)
+            state.needs_human = True
+            if ctx.lead:
+                ctx.lead.necesita_humano = True
+            reply = (
+                "¡Claro! Un agente de Ridecheck te va a contactar a la brevedad. "
+                "Si preferís agilizarlo, también podés escribirnos a info@ridecheck.ar."
+            )
+            sent_id = self._send_text_to_wa(ctx, reply)
+            return _out("replied", wa_message_id=sent_id)
 
         messages_for_ai = self._build_ai_messages(
             ctx, event, ai_input_messages,
@@ -1881,20 +1943,14 @@ class ConversationEngine:
                 f"${q.precio_total:,.0f} (base ${q.precio_base:,.0f} + viáticos ${q.viaticos:,.0f})"
             ).replace(",", ".")
 
-        # History: prefer n8n-provided arrays, fall back to DB messages
+        # History: always use DB messages (chronological). The n8n-provided
+        # arrays arrive in separate buckets (all BOT, then all CLIENT) which
+        # scrambles time order — the DB is always correctly ordered by created_at.
         history_lines: list[str] = []
-        if event.recent_outbound_replies or event.recent_user_messages:
-            # Interleave outbound and user messages in approximate order
-            # n8n provides them in order already; build a simple labeled list
-            for msg in event.recent_outbound_replies[-5:]:
-                history_lines.append(f"BOT: {msg[:200]}")
-            for msg in event.recent_user_messages[-10:]:
-                history_lines.append(f"CLIENTE: {msg[:200]}")
-        else:
-            for m in ctx.db_messages[-15:]:
-                direction = "CLIENTE" if m.direction == "in" else "BOT"
-                txt = (m.text or "[multimedia]").replace("\n", " ")[:200]
-                history_lines.append(f"{direction}: {txt}")
+        for m in ctx.db_messages[-15:]:
+            direction = "CLIENTE" if m.direction == "in" else "BOT"
+            txt = (m.text or "[multimedia]").replace("\n", " ")[:200]
+            history_lines.append(f"{direction}: {txt}")
 
         history = "\n".join(history_lines) if history_lines else "(sin historial)"
 
@@ -2098,7 +2154,9 @@ Respondé SOLO con JSON válido:
             state.customer_name = extracted["customer_name"]
             if ctx.lead and not ctx.lead.nombre:
                 ctx.lead.nombre = extracted["customer_name"].split()[0]
-        if extracted.get("zone_detail"):
+        if extracted.get("zone_detail") and not state.home_zone_group:
+            # Only accept AI zone if we don't already have a DB-validated zone_group.
+            # This prevents AI from overwriting a confirmed zone with a hallucination.
             state.home_zone_detail = extracted["zone_detail"]
         # zone_group is intentionally NOT read from AI — DB normalization always
         # sets the canonical value in _normalize_zone_from_db.
@@ -2228,6 +2286,21 @@ Respondé SOLO con JSON válido:
         normalized_text = " ".join(text.lower().split())
         zones = list(self.db.execute(_select(ViaticosZone)).scalars().all())
 
+        # Dock Sud fast-path: "doc sud", "dock sud" and typo variants → Sur/Dock Sud.
+        # Must be checked BEFORE the CABA synonyms and zone_detail loop to prevent
+        # a partial "sud" match from accidentally resolving to "Avellaneda".
+        for alias in _DOCK_SUD_ALIASES:
+            if alias in normalized_text:
+                for z in zones:
+                    if (
+                        " ".join((z.zone_group or "").lower().split()) == "sur"
+                        and " ".join((z.zone_detail or "").lower().split()) == "dock sud"
+                    ):
+                        return z
+                # Defensive: migration not yet applied
+                from types import SimpleNamespace as _NS
+                return _NS(zone_group=_DOCK_SUD_GROUP, zone_detail=_DOCK_SUD_CANONICAL, viaticos=30000)  # type: ignore[return-value]
+
         # CABA synonym fast-path: "capital federal", "ciudad autónoma de buenos aires" etc.
         # Checked before the zone_detail loop because these strings don't appear
         # as zone_detail values in the DB.  "caba" / "CABA" are NOT in this set —
@@ -2280,6 +2353,17 @@ Respondé SOLO con JSON válido:
 
     def _normalize_zone_from_db(self, ctx: _Context, state: "WhatsAppThreadState | None") -> None:
         if not state or not state.home_zone_detail:
+            return
+
+        # Dock Sud synonym normalization BEFORE the DB lookup.
+        if _is_dock_sud_alias(state.home_zone_detail):
+            logger.info(
+                "M18 Dock Sud alias normalized: %r → %r thread_id=%s",
+                state.home_zone_detail, _DOCK_SUD_CANONICAL,
+                ctx.thread.id if ctx else "?",
+            )
+            state.home_zone_detail = _DOCK_SUD_CANONICAL
+            state.home_zone_group = _DOCK_SUD_GROUP
             return
 
         # Normalize CABA synonyms BEFORE the DB lookup so that all city-level
@@ -2350,6 +2434,13 @@ Respondé SOLO con JSON válido:
             )
         if _QUOTE_INTENT_RE.search(reply):
             logger.warning("M18 scrubbing AI quote-promise without amount — no deterministic quote")
+            return (
+                "Necesito confirmar algunos datos antes de darte el precio exacto. "
+                "¿Me podés indicar en qué barrio o zona de la ciudad está el auto?"
+            )
+        if _PRICE_REQUEST_RE.search(reply):
+            # AI asked the customer to supply price info — never allowed.
+            logger.warning("M18 scrubbing AI price-request reply — customer must never be asked for price")
             return (
                 "Necesito confirmar algunos datos antes de darte el precio exacto. "
                 "¿Me podés indicar en qué barrio o zona de la ciudad está el auto?"

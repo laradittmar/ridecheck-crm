@@ -4348,5 +4348,212 @@ class TestWebsiteFlowInitialScreen(unittest.TestCase):
             self.assertEqual(captured_screen[0], "WEBSITE_FINAL_DATA")
 
 
+class FakeRepoDockSud:
+    """Covers Peugeot 3008 (SUV/4x4) in Dock Sud (Sur, viaticos=30000)."""
+
+    _BASE = {
+        "SUV/4x4": FakePriceRow(tipo_vehiculo="SUV/4x4", precio_base=140000),
+        "AUTO": FakePriceRow(tipo_vehiculo="AUTO", precio_base=130000),
+    }
+    _ZONES_BY_DETAIL = {
+        "dock sud": FakeZone(zone_group="Sur", zone_detail="Dock Sud", viaticos=30000),
+    }
+
+    def find_base_price(self, tipo_vehiculo: str):
+        return self._BASE.get(tipo_vehiculo)
+
+    def find_zone_by_group_and_detail(self, db, zone_group, zone_detail):
+        key = (zone_detail or "").strip().lower()
+        return self._ZONES_BY_DETAIL.get(key)
+
+
+class TestPeugeot3008Catalog(unittest.TestCase):
+    """Peugeot 3008 must be in the vehicle catalog and map to SUV/4x4."""
+
+    def test_3008_matched_by_model_number(self):
+        match = lookup_vehicle("tengo un 3008")
+        self.assertIsNotNone(match)
+        self.assertEqual(match.marca, "Peugeot")
+        self.assertEqual(match.modelo, "3008")
+
+    def test_3008_matched_by_full_name(self):
+        match = lookup_vehicle("Peugeot 3008 2020")
+        self.assertIsNotNone(match)
+        self.assertEqual(match.tipo_vehiculo, "SUV/4x4")
+
+    def test_3008_not_matched_by_308(self):
+        """'308' must not collide with '3008'."""
+        match = lookup_vehicle("tengo un Peugeot 308")
+        if match:
+            self.assertNotEqual(match.modelo, "3008")
+
+    def test_5008_matched(self):
+        match = lookup_vehicle("tengo una 5008")
+        self.assertIsNotNone(match)
+        self.assertEqual(match.marca, "Peugeot")
+        self.assertEqual(match.modelo, "5008")
+
+
+class TestDockSudNormalization(unittest.TestCase):
+    """Dock Sud and typo variants must normalize to Sur/Dock Sud."""
+
+    def _norm(self, detail: str):
+        from app.services.conversation_engine import _is_dock_sud_alias
+        return _is_dock_sud_alias(detail)
+
+    def test_dock_sud_canonical_is_alias(self):
+        self.assertTrue(self._norm("dock sud"))
+
+    def test_doc_sud_typo_is_alias(self):
+        self.assertTrue(self._norm("doc sud"))
+
+    def test_doc_sue_typo_is_alias(self):
+        self.assertTrue(self._norm("doc sue"))
+
+    def test_dique_sud_is_alias(self):
+        self.assertTrue(self._norm("dique sud"))
+
+    def test_normalize_dock_sud_sets_group_to_sur(self):
+        eng = _make_engine(repo=FakeRepoDockSud())
+        state = _make_state(home_zone_detail="doc sud")
+        ctx = _make_ctx(state=state)
+        eng._normalize_zone_from_db(ctx, state)
+        self.assertEqual(state.home_zone_group, "Sur")
+        self.assertEqual(state.home_zone_detail, "Dock Sud")
+
+    def test_normalize_dock_sue_typo_sets_group(self):
+        eng = _make_engine(repo=FakeRepoDockSud())
+        state = _make_state(home_zone_detail="dock sue")
+        ctx = _make_ctx(state=state)
+        eng._normalize_zone_from_db(ctx, state)
+        self.assertEqual(state.home_zone_group, "Sur")
+
+    def test_pricing_dock_sud_170000(self):
+        eng = _make_engine(repo=FakeRepoDockSud())
+        c = _make_candidate(tipo_vehiculo="SUV/4x4")
+        state = _make_state(home_zone_group="Sur", home_zone_detail="Dock Sud")
+        ctx = _make_ctx(candidates=[c], state=state)
+        result = eng._compute_price_quote(ctx, state)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.precio_total, 170000)
+
+
+class TestApplyExtractedZoneGuard(unittest.TestCase):
+    """AI must not overwrite a DB-validated zone_group via _apply_extracted."""
+
+    def test_ai_cannot_overwrite_validated_zone(self):
+        """When zone_group is already set, AI zone_detail must be ignored."""
+        eng = _make_engine()
+        state = _make_state(home_zone_group="Sur", home_zone_detail="Dock Sud")
+        ctx = _make_ctx(state=state)
+
+        eng._apply_extracted(ctx, state, {"zone_detail": "Palermo"})
+
+        self.assertEqual(state.home_zone_detail, "Dock Sud")
+        self.assertEqual(state.home_zone_group, "Sur")
+
+    def test_ai_zone_accepted_when_unvalidated(self):
+        """When zone_group is None, AI zone_detail must be stored."""
+        eng = _make_engine()
+        state = _make_state(home_zone_group=None, home_zone_detail=None)
+        ctx = _make_ctx(state=state)
+
+        eng._apply_extracted(ctx, state, {"zone_detail": "Palermo"})
+
+        self.assertEqual(state.home_zone_detail, "Palermo")
+
+
+class TestPhoneCallEscalation(unittest.TestCase):
+    """Phone-call requests must set needs_human without calling AI."""
+
+    def test_is_phone_call_request_llamar(self):
+        from app.services.conversation_engine import _is_phone_call_request
+        self.assertTrue(_is_phone_call_request(["me podés llamar??"]))
+
+    def test_is_phone_call_request_llamame(self):
+        from app.services.conversation_engine import _is_phone_call_request
+        self.assertTrue(_is_phone_call_request(["llamame cuando puedan"]))
+
+    def test_is_phone_call_request_quiero_llamarlos(self):
+        from app.services.conversation_engine import _is_phone_call_request
+        self.assertTrue(_is_phone_call_request(["quiero llamarlos"]))
+
+    def test_is_phone_call_request_false_for_regular_msg(self):
+        from app.services.conversation_engine import _is_phone_call_request
+        self.assertFalse(_is_phone_call_request(["cuánto sale la inspección?"]))
+
+
+class TestPriceRequestGuard(unittest.TestCase):
+    """AI must never ask the customer for price/cotización info."""
+
+    def test_price_request_scrubbed_when_no_quote(self):
+        eng = _make_engine()
+        reply = "¿Me podés decir el precio del auto para cotizarte?"
+        scrubbed = eng._scrub_invented_price(reply, real_price_quote=None)
+        self.assertNotIn("precio del auto", scrubbed)
+        self.assertIn("barrio o zona", scrubbed)
+
+    def test_cual_es_el_precio_scrubbed(self):
+        eng = _make_engine()
+        reply = "¿Cuál es el precio del vehículo?"
+        scrubbed = eng._scrub_invented_price(reply, real_price_quote=None)
+        self.assertNotIn("precio del vehículo", scrubbed)
+
+    def test_no_scrub_when_real_quote_available(self):
+        """When we have a deterministic quote, the reply must pass through."""
+        eng = _make_engine()
+        q = PricingQuote(
+            tipo_vehiculo="SUV/4x4", zone_group="Sur", zone_detail="Dock Sud",
+            precio_base=140000, viaticos=30000,
+        )
+        reply = "El precio total es $170.000."
+        scrubbed = eng._scrub_invented_price(reply, real_price_quote=q)
+        self.assertEqual(scrubbed, reply)
+
+
+class TestThread68RegressionDockSud3008(unittest.TestCase):
+    """Regression: 'Peugeot 3008 en Doc Sud' must resolve vehicle and zone deterministically."""
+
+    def test_3008_lookup(self):
+        match = lookup_vehicle("tengo un Peugeot 3008")
+        self.assertIsNotNone(match)
+        self.assertEqual(match.modelo, "3008")
+        self.assertEqual(match.tipo_vehiculo, "SUV/4x4")
+
+    def test_doc_sud_normalize(self):
+        from app.services.conversation_engine import _is_dock_sud_alias
+        self.assertTrue(_is_dock_sud_alias("doc sud"))
+
+    def test_normalize_doc_sud_full_pipeline(self):
+        eng = _make_engine(repo=FakeRepoDockSud())
+        state = _make_state(home_zone_detail="doc sud", home_zone_group=None)
+        ctx = _make_ctx(state=state)
+        eng._normalize_zone_from_db(ctx, state)
+        self.assertEqual(state.home_zone_group, "Sur")
+        self.assertEqual(state.home_zone_detail, "Dock Sud")
+
+    def test_pricing_after_normalization(self):
+        eng = _make_engine(repo=FakeRepoDockSud())
+        c = _make_candidate(tipo_vehiculo="SUV/4x4")
+        state = _make_state(home_zone_detail="doc sud", home_zone_group=None)
+        ctx = _make_ctx(candidates=[c], state=state)
+        # Step 1: normalize (as engine does before compute)
+        eng._normalize_zone_from_db(ctx, state)
+        # Step 2: compute price
+        result = eng._compute_price_quote(ctx, state)
+        self.assertIsNotNone(result, "Price quote must resolve after zone normalization")
+        self.assertEqual(result.precio_total, 170000)
+        self.assertEqual(result.zone_group, "Sur")
+
+    def test_ai_cannot_overwrite_dock_sud_with_incorrect_zone(self):
+        """After normalization, AI must not replace Dock Sud with a hallucinated zone."""
+        eng = _make_engine()
+        state = _make_state(home_zone_group="Sur", home_zone_detail="Dock Sud")
+        ctx = _make_ctx(state=state)
+        eng._apply_extracted(ctx, state, {"zone_detail": "La Boca"})
+        self.assertEqual(state.home_zone_detail, "Dock Sud")
+        self.assertEqual(state.home_zone_group, "Sur")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -69,6 +69,10 @@ _CAT: dict[str, dict] = {
     "cronos":             {"marca": "Fiat",        "modelo": "Cronos",   "t": "AUTO"},
     "fiat cronos":        {"marca": "Fiat",        "modelo": "Cronos",   "t": "AUTO"},
     "208":                {"marca": "Peugeot",     "modelo": "208",      "t": "AUTO"},
+    "3008":               {"marca": "Peugeot",     "modelo": "3008",     "t": "SUV/4x4"},
+    "peugeot 3008":       {"marca": "Peugeot",     "modelo": "3008",     "t": "SUV/4x4"},
+    "5008":               {"marca": "Peugeot",     "modelo": "5008",     "t": "SUV/4x4"},
+    "peugeot 5008":       {"marca": "Peugeot",     "modelo": "5008",     "t": "SUV/4x4"},
     # AUTO — M13.2 additions
     "fox":                {"marca": "Volkswagen",  "modelo": "Fox",      "t": "AUTO"},
     "vw fox":             {"marca": "Volkswagen",  "modelo": "Fox",      "t": "AUTO"},
