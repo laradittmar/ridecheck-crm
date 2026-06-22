@@ -150,6 +150,28 @@ _PRICE_REQUEST_RE = re.compile(
 )
 
 
+# Qualification fallback Flow: zone_general values from Location Flow payload
+# map to canonical internal zone_group names. None means unresolvable → human.
+_FLOW_ZONE_GROUP_MAP: dict[str, str | None] = {
+    "CABA": "CABA",
+    "NORTE": "Norte",
+    "OESTE": "Oeste",
+    "SUR": "Sur",
+    "OTRO": None,
+}
+
+# Allowed tipo_vehiculo values from the Vehicle Fallback Flow payload.
+# OTRO and missing values trigger human escalation.
+_FALLBACK_VEHICLE_TYPES: frozenset[str] = frozenset({
+    "AUTO", "SUV_4X4_DEPORTIVO", "PICKUP", "UTILITARIO_FURGON",
+})
+
+_FALLBACK_WARM_HANDOFF = (
+    "Gracias por completar el formulario. Un agente de Ridecheck "
+    "te va a contactar a la brevedad para continuar con la cotización."
+)
+
+
 def _is_caba_synonym(value: str) -> bool:
     """Return True if value (case-insensitive) is a known CABA synonym."""
     return " ".join((value or "").lower().split()) in _CABA_SYNONYMS
@@ -725,6 +747,13 @@ class ConversationEngine:
         state = ctx.state
         assert state is not None
 
+        # Route to qualification fallback handlers BEFORE booking flow processing.
+        # Detection is by distinctive payload keys, not by token.
+        if "tipo_vehiculo" in flow_data:
+            return self._process_vehicle_fallback_response(ctx, state, flow_data)
+        if "zona_general" in flow_data:
+            return self._process_location_fallback_response(ctx, state, flow_data)
+
         # Token validation (warn only — don't hard-block in case of token mismatch due to clock skew)
         expected = state.flow_booking_token
         if expected and flow_token and flow_token != expected:
@@ -886,6 +915,269 @@ class ConversationEngine:
         )
         sent_id = self._send_text_to_wa(ctx, confirm_text)
         return _out("booking_created", wa_message_id=sent_id)
+
+    # ── Qualification fallback Flows ─────────────────────────────────────
+
+    def _process_vehicle_fallback_response(
+        self,
+        ctx: _Context,
+        state: "WhatsAppThreadState",
+        flow_data: dict,
+    ) -> ConversationHandleOut:
+        """Handle a Vehicle Fallback Flow submit.
+
+        Updates the candidate deterministically and resumes qualification.
+        Never creates a revision, never sends the booking Flow, never sets AGENDADO.
+        """
+        lead = ctx.lead
+        assert lead is not None
+
+        tipo = (flow_data.get("tipo_vehiculo") or "").strip().upper()
+        marca = (flow_data.get("marca") or "").strip()
+        modelo = (flow_data.get("modelo") or "").strip()
+        anio_raw = flow_data.get("anio")
+        anio: int | None = None
+        try:
+            anio = int(anio_raw) if anio_raw else None
+        except (ValueError, TypeError):
+            pass
+
+        state.vehicle_fallback_flow_sent = False  # consumed
+
+        if tipo not in _FALLBACK_VEHICLE_TYPES:
+            logger.info(
+                "M18 vehicle_fallback unresolvable tipo=%r thread_id=%s — needs_human",
+                tipo, ctx.thread.id,
+            )
+            state.needs_human = True
+            lead.necesita_humano = True
+            self.db.commit()
+            sent_id = self._send_text_to_wa(ctx, _FALLBACK_WARM_HANDOFF)
+            return _out("replied", wa_message_id=sent_id)
+
+        # Update or create candidate
+        focus = self._focus_candidate(ctx)
+        if focus:
+            if marca:
+                focus.marca = marca
+            if modelo:
+                focus.modelo = modelo
+            if tipo:
+                focus.tipo_vehiculo = tipo
+            if anio:
+                focus.anio = anio
+        else:
+            from app.models import WhatsAppThreadCandidate
+            cand = WhatsAppThreadCandidate(
+                thread_id=ctx.thread.id,
+                marca=marca or None,
+                modelo=modelo or None,
+                tipo_vehiculo=tipo,
+                anio=anio,
+                status="current_focus",
+                source_text=f"vehicle_fallback_flow: {marca} {modelo}".strip(),
+            )
+            self.db.add(cand)
+            self.db.flush()
+            ctx.candidates.append(cand)
+            state.current_focus_candidate_id = cand.id
+
+        logger.info(
+            "M18 vehicle_fallback resolved tipo=%s thread_id=%s",
+            tipo, ctx.thread.id,
+        )
+
+        real_price_quote = self._compute_price_quote(ctx, state)
+        if real_price_quote:
+            q = real_price_quote
+            total = f"${q.precio_total:,.0f}".replace(",", ".")
+            reply = (
+                f"¡Perfecto! Para el {marca} {modelo}".strip()
+                + f" el precio de la revisión es de {total} "
+                f"(base ${q.precio_base:,.0f}".replace(",", ".")
+                + f" + viáticos ${q.viaticos:,.0f})".replace(",", ".")
+                + ". ¿Cuándo te queda bien para hacerla?"
+            )
+            lead.flag = "PRESUPUESTO_ENVIADO"
+            state.last_stage = STAGE_QUOTED
+        else:
+            reply = (
+                f"¡Gracias! Ya registré el vehículo. "
+                "Para completar la cotización, ¿en qué barrio o zona de Buenos Aires está el auto?"
+            )
+
+        self.db.commit()
+        sent_id = self._send_text_to_wa(ctx, reply)
+        return _out("replied", wa_message_id=sent_id)
+
+    def _process_location_fallback_response(
+        self,
+        ctx: _Context,
+        state: "WhatsAppThreadState",
+        flow_data: dict,
+    ) -> ConversationHandleOut:
+        """Handle a Location Fallback Flow submit.
+
+        Updates zone state deterministically and resumes qualification.
+        Never creates a revision, never sends the booking Flow, never sets AGENDADO.
+        """
+        lead = ctx.lead
+        assert lead is not None
+
+        zona_general = (flow_data.get("zona_general") or "").strip().upper()
+        localidad = (flow_data.get("localidad") or "").strip()
+        referencia = (flow_data.get("referencia_ubicacion") or "").strip() or None
+
+        state.location_fallback_flow_sent = False  # consumed
+
+        canonical_group = _FLOW_ZONE_GROUP_MAP.get(zona_general)
+
+        if canonical_group is None:
+            logger.info(
+                "M18 location_fallback unresolvable zona_general=%r thread_id=%s — needs_human",
+                zona_general, ctx.thread.id,
+            )
+            state.needs_human = True
+            lead.necesita_humano = True
+            self.db.commit()
+            sent_id = self._send_text_to_wa(ctx, _FALLBACK_WARM_HANDOFF)
+            return _out("replied", wa_message_id=sent_id)
+
+        # Try to resolve localidad to a DB-validated zone_detail.
+        db_zone = self._extract_zone_from_text(localidad) if localidad else None
+        state.home_zone_group = db_zone.zone_group if db_zone else canonical_group
+        state.home_zone_detail = db_zone.zone_detail if db_zone else (localidad or None)
+        if referencia and not state.home_zone_detail:
+            state.home_zone_detail = referencia
+
+        logger.info(
+            "M18 location_fallback resolved zone_group=%s zone_detail=%s thread_id=%s",
+            state.home_zone_group, state.home_zone_detail, ctx.thread.id,
+        )
+
+        real_price_quote = self._compute_price_quote(ctx, state)
+        if real_price_quote:
+            q = real_price_quote
+            total = f"${q.precio_total:,.0f}".replace(",", ".")
+            reply = (
+                f"¡Perfecto! El precio de la revisión es de {total} "
+                f"(base ${q.precio_base:,.0f}".replace(",", ".")
+                + f" + viáticos ${q.viaticos:,.0f})".replace(",", ".")
+                + ". ¿Cuándo te queda bien para hacerla?"
+            )
+            lead.flag = "PRESUPUESTO_ENVIADO"
+            state.last_stage = STAGE_QUOTED
+        else:
+            # Zone known but vehicle still missing — or zone not in pricing DB.
+            focus = self._focus_candidate(ctx)
+            if not (focus and focus.tipo_vehiculo):
+                reply = (
+                    "¡Gracias! Ya tenemos la zona. "
+                    "Para completar la cotización, ¿cuál es la marca y modelo del auto?"
+                )
+            else:
+                # Vehicle known but pricing not found for this zone → human
+                state.needs_human = True
+                lead.necesita_humano = True
+                self.db.commit()
+                sent_id = self._send_text_to_wa(ctx, _FALLBACK_WARM_HANDOFF)
+                return _out("replied", wa_message_id=sent_id)
+
+        self.db.commit()
+        sent_id = self._send_text_to_wa(ctx, reply)
+        return _out("replied", wa_message_id=sent_id)
+
+    def _check_fallback_flow_triggers(
+        self,
+        ctx: _Context,
+        state: "WhatsAppThreadState",
+        pre_detected_vehicle: "VehicleMatch | None",
+        ai_input_messages: list[str],
+    ) -> "ConversationHandleOut | None":
+        """Check if a qualification fallback Flow should be triggered.
+
+        Vehicle is always resolved before location (Rule 8). When vehicle is
+        unresolved in ANY state, location check is skipped entirely so the two
+        paths never interleave. Returns None to continue normal AI processing.
+        """
+        focus = self._focus_candidate(ctx)
+        vehicle_known = pre_detected_vehicle is not None or bool(
+            focus and focus.tipo_vehiculo
+        )
+        zone_known = bool(state.home_zone_group)
+
+        # ── Vehicle fallback (takes priority over location) ───────────────
+        if not vehicle_known:
+            if state.vehicle_fallback_flow_sent:
+                # Flow already dispatched — wait for submit response, skip AI.
+                return None
+            flow_id = (
+                getattr(self.settings, "whatsapp_vehicle_fallback_flow_id", "") or ""
+            ).strip()
+            if state.vehicle_clarification_sent and flow_id:
+                # One chat clarification already failed — send Flow.
+                logger.info(
+                    "M18 vehicle_fallback flow dispatched thread_id=%s flow_id=%s",
+                    ctx.thread.id, flow_id,
+                )
+                state.vehicle_fallback_flow_sent = True
+                body = (
+                    "Completá los datos del vehículo para que podamos cotizarte "
+                    "la revisión mecánica."
+                )
+                flow_token = secrets.token_urlsafe(24)
+                sent_id = self._send_flow_button(
+                    ctx, body, flow_token, flow_id=flow_id, initial_screen="MAIN"
+                )
+                return _out("replied", wa_message_id=sent_id)
+            if not state.vehicle_clarification_sent:
+                # First attempt — ask via chat.
+                state.vehicle_clarification_sent = True
+                reply = (
+                    "Para cotizarte la revisión necesito saber qué vehículo tenés. "
+                    "¿Me podés indicar la marca y el modelo?"
+                )
+                self.db.commit()
+                sent_id = self._send_text_to_wa(ctx, reply)
+                return _out("replied", wa_message_id=sent_id)
+            # Clarification sent but no flow ID configured — fall through to AI.
+            return None
+
+        # ── Location fallback (only when vehicle IS known) ────────────────
+        if not zone_known:
+            if state.location_fallback_flow_sent:
+                return None
+            flow_id = (
+                getattr(self.settings, "whatsapp_location_fallback_flow_id", "") or ""
+            ).strip()
+            if state.location_clarification_sent and flow_id:
+                logger.info(
+                    "M18 location_fallback flow dispatched thread_id=%s flow_id=%s",
+                    ctx.thread.id, flow_id,
+                )
+                state.location_fallback_flow_sent = True
+                body = (
+                    "Indicanos dónde está el auto para calcular los viáticos "
+                    "de la revisión."
+                )
+                flow_token = secrets.token_urlsafe(24)
+                sent_id = self._send_flow_button(
+                    ctx, body, flow_token, flow_id=flow_id, initial_screen="MAIN"
+                )
+                return _out("replied", wa_message_id=sent_id)
+            if not state.location_clarification_sent:
+                state.location_clarification_sent = True
+                reply = (
+                    "¿En qué zona o barrio de Buenos Aires está el auto? "
+                    "(por ejemplo: Palermo, Dock Sud, Lomas de Zamora)"
+                )
+                self.db.commit()
+                sent_id = self._send_text_to_wa(ctx, reply)
+                return _out("replied", wa_message_id=sent_id)
+            # Clarification sent but no flow ID configured — fall through to AI.
+            return None
+
+        return None
 
     # ── Text / AI path ────────────────────────────────────────────────────
 
@@ -1093,6 +1385,17 @@ class ConversationEngine:
 
         # ── Pre-AI deterministic price quote ──────────────────────────────
         real_price_quote = self._compute_price_quote(ctx, state)
+
+        # ── Qualification fallback Flow triggers ──────────────────────────
+        # Only active during QUALIFYING stage. After one failed chat clarification
+        # (tracked by *_clarification_sent flags), dispatch the appropriate Meta
+        # Flow if the Flow ID is configured. Never fires in QUOTED/SCHEDULING/etc.
+        if state.last_stage in (STAGE_QUALIFYING, None) and not state.needs_human:
+            _fb_result = self._check_fallback_flow_triggers(
+                ctx, state, pre_detected_vehicle, ai_input_messages
+            )
+            if _fb_result is not None:
+                return _fb_result
 
         # ── Deterministic phone-call escalation ───────────────────────────
         # If the customer is asking to be called, escalate immediately and skip

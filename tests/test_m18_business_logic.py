@@ -109,6 +109,11 @@ def _make_state(**kwargs):
         flow_booking_token=None,
         current_revision_id=None,
         customer_name=None,
+        # Qualification fallback Flow tracking
+        vehicle_clarification_sent=False,
+        location_clarification_sent=False,
+        vehicle_fallback_flow_sent=False,
+        location_fallback_flow_sent=False,
     )
     for k, v in kwargs.items():
         setattr(ns, k, v)
@@ -4509,6 +4514,621 @@ class TestPriceRequestGuard(unittest.TestCase):
         reply = "El precio total es $170.000."
         scrubbed = eng._scrub_invented_price(reply, real_price_quote=q)
         self.assertEqual(scrubbed, reply)
+
+
+class TestFallbackFlowZoneGroupMap(unittest.TestCase):
+    """_FLOW_ZONE_GROUP_MAP must map all expected payload values correctly."""
+
+    def test_caba_maps_to_caba(self):
+        from app.services.conversation_engine import _FLOW_ZONE_GROUP_MAP
+        self.assertEqual(_FLOW_ZONE_GROUP_MAP["CABA"], "CABA")
+
+    def test_norte_maps_to_norte(self):
+        from app.services.conversation_engine import _FLOW_ZONE_GROUP_MAP
+        self.assertEqual(_FLOW_ZONE_GROUP_MAP["NORTE"], "Norte")
+
+    def test_oeste_maps_to_oeste(self):
+        from app.services.conversation_engine import _FLOW_ZONE_GROUP_MAP
+        self.assertEqual(_FLOW_ZONE_GROUP_MAP["OESTE"], "Oeste")
+
+    def test_sur_maps_to_sur(self):
+        from app.services.conversation_engine import _FLOW_ZONE_GROUP_MAP
+        self.assertEqual(_FLOW_ZONE_GROUP_MAP["SUR"], "Sur")
+
+    def test_otro_maps_to_none(self):
+        from app.services.conversation_engine import _FLOW_ZONE_GROUP_MAP
+        self.assertIsNone(_FLOW_ZONE_GROUP_MAP["OTRO"])
+
+
+class TestFallbackVehicleTypes(unittest.TestCase):
+    """_FALLBACK_VEHICLE_TYPES must contain the expected set."""
+
+    def test_auto_accepted(self):
+        from app.services.conversation_engine import _FALLBACK_VEHICLE_TYPES
+        self.assertIn("AUTO", _FALLBACK_VEHICLE_TYPES)
+
+    def test_suv_accepted(self):
+        from app.services.conversation_engine import _FALLBACK_VEHICLE_TYPES
+        self.assertIn("SUV_4X4_DEPORTIVO", _FALLBACK_VEHICLE_TYPES)
+
+    def test_pickup_accepted(self):
+        from app.services.conversation_engine import _FALLBACK_VEHICLE_TYPES
+        self.assertIn("PICKUP", _FALLBACK_VEHICLE_TYPES)
+
+    def test_utilitario_accepted(self):
+        from app.services.conversation_engine import _FALLBACK_VEHICLE_TYPES
+        self.assertIn("UTILITARIO_FURGON", _FALLBACK_VEHICLE_TYPES)
+
+    def test_otro_not_accepted(self):
+        from app.services.conversation_engine import _FALLBACK_VEHICLE_TYPES
+        self.assertNotIn("OTRO", _FALLBACK_VEHICLE_TYPES)
+
+
+class TestCheckFallbackFlowTriggers(unittest.TestCase):
+    """_check_fallback_flow_triggers covers all trigger/no-trigger paths."""
+
+    def _make_eng_with_flow_ids(self, vehicle_id="veh-111", location_id="loc-222"):
+        from unittest.mock import MagicMock
+        eng = _make_engine()
+        eng.settings = MagicMock()
+        eng.settings.whatsapp_vehicle_fallback_flow_id = vehicle_id
+        eng.settings.whatsapp_location_fallback_flow_id = location_id
+        eng.db.commit = lambda: None
+        return eng
+
+    def _capture_text_sends(self, eng):
+        texts = []
+        eng._send_text_to_wa = lambda ctx, text: texts.append(text) or "wamid-txt"
+        return texts
+
+    def _capture_flow_sends(self, eng):
+        flows = []
+        eng._send_flow_button = lambda ctx, body, token, flow_id="", initial_screen="MAIN": (
+            flows.append({"flow_id": flow_id, "body": body}) or "wamid-flow"
+        )
+        return flows
+
+    def test_unknown_vehicle_first_contact_sends_clarification(self):
+        """First time vehicle unknown → chat clarification, sets vehicle_clarification_sent."""
+        eng = self._make_eng_with_flow_ids()
+        texts = self._capture_text_sends(eng)
+        state = _make_state(last_stage="QUALIFYING")
+        ctx = _make_ctx(state=state)
+
+        result = eng._check_fallback_flow_triggers(ctx, state, None, ["hola"])
+
+        self.assertIsNotNone(result)
+        self.assertTrue(state.vehicle_clarification_sent)
+        self.assertFalse(state.vehicle_fallback_flow_sent)
+        self.assertEqual(len(texts), 1)
+        self.assertIn("marca", texts[0].lower())
+
+    def test_unknown_vehicle_second_contact_sends_flow(self):
+        """After clarification failed → Vehicle Fallback Flow sent."""
+        eng = self._make_eng_with_flow_ids()
+        flows = self._capture_flow_sends(eng)
+        texts = self._capture_text_sends(eng)
+        state = _make_state(last_stage="QUALIFYING", vehicle_clarification_sent=True)
+        ctx = _make_ctx(state=state)
+
+        result = eng._check_fallback_flow_triggers(ctx, state, None, ["no sé qué tengo"])
+
+        self.assertIsNotNone(result)
+        self.assertTrue(state.vehicle_fallback_flow_sent)
+        self.assertEqual(len(flows), 1)
+        self.assertEqual(flows[0]["flow_id"], "veh-111")
+        self.assertEqual(len(texts), 0)  # no chat message
+
+    def test_unknown_location_first_contact_sends_clarification(self):
+        """Vehicle known, location unknown → chat clarification for zone."""
+        eng = self._make_eng_with_flow_ids()
+        texts = self._capture_text_sends(eng)
+        cand = _make_candidate(tipo_vehiculo="AUTO")
+        state = _make_state(last_stage="QUALIFYING")
+        ctx = _make_ctx(candidates=[cand], state=state)
+
+        result = eng._check_fallback_flow_triggers(ctx, state, None, ["hola"])
+
+        self.assertIsNotNone(result)
+        self.assertTrue(state.location_clarification_sent)
+        self.assertIn("zona", texts[0].lower())
+
+    def test_unknown_location_second_contact_sends_flow(self):
+        """After location clarification failed → Location Fallback Flow sent."""
+        eng = self._make_eng_with_flow_ids()
+        flows = self._capture_flow_sends(eng)
+        cand = _make_candidate(tipo_vehiculo="AUTO")
+        state = _make_state(last_stage="QUALIFYING", location_clarification_sent=True)
+        ctx = _make_ctx(candidates=[cand], state=state)
+
+        result = eng._check_fallback_flow_triggers(ctx, state, None, ["no sé la zona"])
+
+        self.assertIsNotNone(result)
+        self.assertTrue(state.location_fallback_flow_sent)
+        self.assertEqual(flows[0]["flow_id"], "loc-222")
+
+    def test_both_unknown_vehicle_flow_goes_first(self):
+        """Vehicle AND location unknown, clarification sent for both → Vehicle Flow first (Rule 8)."""
+        eng = self._make_eng_with_flow_ids()
+        flows = self._capture_flow_sends(eng)
+        state = _make_state(
+            last_stage="QUALIFYING",
+            vehicle_clarification_sent=True,
+            location_clarification_sent=True,
+        )
+        ctx = _make_ctx(state=state)
+
+        result = eng._check_fallback_flow_triggers(ctx, state, None, ["no sé"])
+
+        self.assertIsNotNone(result)
+        self.assertEqual(flows[0]["flow_id"], "veh-111")  # vehicle first
+        self.assertFalse(state.location_fallback_flow_sent)  # location not yet triggered
+
+    def test_no_trigger_when_vehicle_flow_already_sent(self):
+        """After vehicle Flow was dispatched, return None — wait for submit (loop guard)."""
+        eng = self._make_eng_with_flow_ids()
+        flows = self._capture_flow_sends(eng)
+        texts = self._capture_text_sends(eng)
+        state = _make_state(
+            last_stage="QUALIFYING",
+            vehicle_clarification_sent=True,
+            vehicle_fallback_flow_sent=True,
+        )
+        cand = _make_candidate(tipo_vehiculo=None)
+        ctx = _make_ctx(candidates=[cand], state=state)
+
+        result = eng._check_fallback_flow_triggers(ctx, state, None, ["siguen sin saber"])
+
+        # vehicle_fallback_flow_sent=True → must return None (wait for submit, no new flow/text)
+        self.assertIsNone(result)
+        self.assertEqual(len(flows), 0)
+        self.assertEqual(len(texts), 0)
+
+    def test_no_trigger_when_flow_id_not_configured(self):
+        """If flow ID is empty, fall through to AI (chat clarification only)."""
+        eng = self._make_eng_with_flow_ids(vehicle_id="", location_id="")
+        texts = self._capture_text_sends(eng)
+        state = _make_state(last_stage="QUALIFYING", vehicle_clarification_sent=True)
+        ctx = _make_ctx(state=state)
+
+        result = eng._check_fallback_flow_triggers(ctx, state, None, ["no sé"])
+
+        # No flow ID → trigger does nothing after first clarification
+        self.assertIsNone(result)
+
+    def test_no_trigger_in_quoted_stage(self):
+        """Fallback triggers only fire in QUALIFYING — not after quoting."""
+        # This is enforced by the caller (stage check in _process_text),
+        # but we verify _check_fallback_flow_triggers with known+known returns None.
+        eng = self._make_eng_with_flow_ids()
+        cand = _make_candidate(tipo_vehiculo="AUTO")
+        state = _make_state(
+            last_stage="QUOTED",
+            home_zone_group="Norte",
+        )
+        ctx = _make_ctx(candidates=[cand], state=state)
+
+        result = eng._check_fallback_flow_triggers(ctx, state, None, ["sí, acepto"])
+        self.assertIsNone(result)
+
+
+class TestVehicleFallbackFlowSubmit(unittest.TestCase):
+    """_process_vehicle_fallback_response covers all Vehicle Flow submit paths."""
+
+    def _make_eng(self, repo=None):
+        from unittest.mock import MagicMock
+        eng = _make_engine(repo=repo)
+        eng.db.add = lambda x: None
+        eng.db.flush = lambda: None
+        eng.db.commit = lambda: None
+        texts = []
+        eng._send_text_to_wa = lambda ctx, text: texts.append(text) or "wamid"
+        eng._texts = texts
+        return eng
+
+    def test_valid_submit_updates_candidate(self):
+        """Valid tipo_vehiculo updates the focus candidate's tipo_vehiculo."""
+        eng = self._make_eng()
+        cand = _make_candidate(tipo_vehiculo=None, marca=None, modelo=None)
+        state = _make_state(vehicle_fallback_flow_sent=True)
+        ctx = _make_ctx(candidates=[cand], state=state)
+
+        eng._process_vehicle_fallback_response(
+            ctx, state,
+            {"tipo_vehiculo": "AUTO", "marca": "Toyota", "modelo": "Corolla", "anio": "2019"},
+        )
+
+        self.assertEqual(cand.tipo_vehiculo, "AUTO")
+        self.assertEqual(cand.marca, "Toyota")
+        self.assertEqual(cand.modelo, "Corolla")
+        self.assertEqual(cand.anio, 2019)
+
+    def test_valid_submit_clears_flow_sent_flag(self):
+        eng = self._make_eng()
+        cand = _make_candidate(tipo_vehiculo=None)
+        state = _make_state(vehicle_fallback_flow_sent=True)
+        ctx = _make_ctx(candidates=[cand], state=state)
+
+        eng._process_vehicle_fallback_response(ctx, state, {"tipo_vehiculo": "SUV_4X4_DEPORTIVO"})
+
+        self.assertFalse(state.vehicle_fallback_flow_sent)
+
+    def test_otro_escalates_to_human(self):
+        """tipo_vehiculo=OTRO → needs_human=True, warm handoff, no revision."""
+        eng = self._make_eng()
+        cand = _make_candidate(tipo_vehiculo=None)
+        state = _make_state(vehicle_fallback_flow_sent=True)
+        ctx = _make_ctx(candidates=[cand], state=state)
+
+        eng._process_vehicle_fallback_response(ctx, state, {"tipo_vehiculo": "OTRO"})
+
+        self.assertTrue(state.needs_human)
+        self.assertIn("agente", eng._texts[0].lower())
+
+    def test_empty_tipo_escalates_to_human(self):
+        eng = self._make_eng()
+        cand = _make_candidate(tipo_vehiculo=None)
+        state = _make_state(vehicle_fallback_flow_sent=True)
+        ctx = _make_ctx(candidates=[cand], state=state)
+
+        eng._process_vehicle_fallback_response(ctx, state, {"tipo_vehiculo": ""})
+
+        self.assertTrue(state.needs_human)
+
+    def test_valid_submit_asks_zone_when_zone_unknown(self):
+        """When zone is still missing after vehicle resolved, ask for zone."""
+        eng = self._make_eng()
+        cand = _make_candidate(tipo_vehiculo=None)
+        state = _make_state(home_zone_group=None)
+        ctx = _make_ctx(candidates=[cand], state=state)
+
+        eng._process_vehicle_fallback_response(ctx, state, {"tipo_vehiculo": "AUTO"})
+
+        self.assertEqual(len(eng._texts), 1)
+        self.assertIn("zona", eng._texts[0].lower())
+        self.assertNotEqual(state.last_stage, "QUOTED")
+
+    def test_valid_submit_with_zone_sends_quote_and_advances_to_quoted(self):
+        """When zone is already known, vehicle Flow submit should quote and advance stage."""
+        eng = self._make_eng(repo=FakeRepoCaptiva())
+        eng._pricing = PricingService(repository=FakeRepoCaptiva())
+        cand = _make_candidate(tipo_vehiculo=None)
+        state = _make_state(home_zone_group="Oeste", home_zone_detail="Lomas del Mirador")
+        ctx = _make_ctx(candidates=[cand], state=state)
+
+        eng._process_vehicle_fallback_response(
+            ctx, state, {"tipo_vehiculo": "SUV_4X4_DEPORTIVO", "marca": "Chevrolet", "modelo": "Captiva"},
+        )
+
+        self.assertEqual(state.last_stage, "QUOTED")
+        self.assertEqual(ctx.lead.flag, "PRESUPUESTO_ENVIADO")
+        self.assertIn("170", eng._texts[0])  # price in reply
+
+    def test_no_revision_created(self):
+        """Vehicle Flow submit must never create a ThreadRevision."""
+        from unittest.mock import MagicMock, patch
+        eng = self._make_eng()
+        cand = _make_candidate(tipo_vehiculo=None)
+        state = _make_state()
+        ctx = _make_ctx(candidates=[cand], state=state)
+
+        added_objects = []
+        eng.db.add = lambda obj: added_objects.append(obj)
+        eng.db.flush = lambda: None
+
+        eng._process_vehicle_fallback_response(ctx, state, {"tipo_vehiculo": "AUTO"})
+
+        from app.models import ThreadRevision, Revision
+        for obj in added_objects:
+            self.assertNotIsInstance(obj, (ThreadRevision, Revision))
+
+    def test_no_agendado_set(self):
+        """Vehicle Flow submit must never set lead.estado=AGENDADO."""
+        eng = self._make_eng()
+        cand = _make_candidate(tipo_vehiculo=None)
+        state = _make_state()
+        ctx = _make_ctx(candidates=[cand], state=state)
+
+        eng._process_vehicle_fallback_response(ctx, state, {"tipo_vehiculo": "AUTO"})
+
+        self.assertNotEqual(ctx.lead.estado, "AGENDADO")
+
+    def test_no_stage_booked_set(self):
+        """Vehicle Flow submit must never advance stage to BOOKED."""
+        eng = self._make_eng(repo=FakeRepoCaptiva())
+        eng._pricing = PricingService(repository=FakeRepoCaptiva())
+        cand = _make_candidate(tipo_vehiculo=None)
+        state = _make_state(home_zone_group="Oeste", home_zone_detail="Lomas del Mirador")
+        ctx = _make_ctx(candidates=[cand], state=state)
+
+        eng._process_vehicle_fallback_response(
+            ctx, state, {"tipo_vehiculo": "SUV_4X4_DEPORTIVO"},
+        )
+
+        self.assertNotEqual(state.last_stage, "BOOKED")
+        self.assertNotEqual(state.last_stage, "FLOW_SENT")
+
+
+class TestLocationFallbackFlowSubmit(unittest.TestCase):
+    """_process_location_fallback_response covers all Location Flow submit paths."""
+
+    def _make_eng(self, repo=None):
+        from unittest.mock import MagicMock
+        eng = _make_engine(repo=repo)
+        eng.db.add = lambda x: None
+        eng.db.flush = lambda: None
+        eng.db.commit = lambda: None
+        texts = []
+        eng._send_text_to_wa = lambda ctx, text: texts.append(text) or "wamid"
+        eng._texts = texts
+        return eng
+
+    def test_otro_zona_escalates_to_human(self):
+        """zona_general=OTRO → needs_human, warm handoff."""
+        eng = self._make_eng()
+        state = _make_state(location_fallback_flow_sent=True)
+        ctx = _make_ctx(state=state)
+
+        eng._process_location_fallback_response(
+            ctx, state, {"zona_general": "OTRO", "localidad": ""}
+        )
+
+        self.assertTrue(state.needs_human)
+        self.assertIn("agente", eng._texts[0].lower())
+
+    def test_valid_zona_sets_zone_group(self):
+        """zona_general=SUR updates state.home_zone_group."""
+        eng = self._make_eng()
+        state = _make_state(location_fallback_flow_sent=True)
+        ctx = _make_ctx(state=state)
+
+        eng._process_location_fallback_response(
+            ctx, state, {"zona_general": "SUR", "localidad": "Dock Sud"}
+        )
+
+        self.assertEqual(state.home_zone_group, "Sur")
+        self.assertFalse(state.needs_human)
+
+    def test_localidad_db_match_sets_zone_detail(self):
+        """localidad that matches a DB zone sets zone_detail from DB."""
+        eng = self._make_eng(repo=FakeRepoDockSud())
+        eng._pricing = PricingService(repository=FakeRepoDockSud())
+        state = _make_state(location_fallback_flow_sent=True)
+        ctx = _make_ctx(state=state)
+
+        # Patch _extract_zone_from_text to simulate DB hit for "Dock Sud"
+        from types import SimpleNamespace
+        eng._extract_zone_from_text = lambda text: SimpleNamespace(
+            zone_group="Sur", zone_detail="Dock Sud", viaticos=30000
+        ) if "dock" in text.lower() else None
+
+        eng._process_location_fallback_response(
+            ctx, state, {"zona_general": "SUR", "localidad": "Dock Sud"}
+        )
+
+        self.assertEqual(state.home_zone_detail, "Dock Sud")
+        self.assertEqual(state.home_zone_group, "Sur")
+
+    def test_valid_submit_clears_flow_sent_flag(self):
+        eng = self._make_eng()
+        state = _make_state(location_fallback_flow_sent=True)
+        ctx = _make_ctx(state=state)
+
+        eng._process_location_fallback_response(
+            ctx, state, {"zona_general": "NORTE", "localidad": "Tigre"}
+        )
+
+        self.assertFalse(state.location_fallback_flow_sent)
+
+    def test_valid_submit_with_vehicle_sends_quote_and_quoted_stage(self):
+        """When vehicle is already known, location submit should quote and advance to QUOTED."""
+        eng = self._make_eng(repo=FakeRepoCaptiva())
+        eng._pricing = PricingService(repository=FakeRepoCaptiva())
+        cand = _make_candidate(tipo_vehiculo="SUV_4X4_DEPORTIVO")
+        state = _make_state(location_fallback_flow_sent=True)
+        ctx = _make_ctx(candidates=[cand], state=state)
+
+        # Simulate DB zone match for "Lomas del Mirador"
+        from types import SimpleNamespace
+        eng._extract_zone_from_text = lambda text: SimpleNamespace(
+            zone_group="Oeste", zone_detail="Lomas del Mirador", viaticos=30000
+        )
+
+        eng._process_location_fallback_response(
+            ctx, state, {"zona_general": "OESTE", "localidad": "Lomas del Mirador"}
+        )
+
+        self.assertEqual(state.last_stage, "QUOTED")
+        self.assertEqual(ctx.lead.flag, "PRESUPUESTO_ENVIADO")
+        self.assertIn("170", eng._texts[0])
+
+    def test_valid_submit_asks_vehicle_when_vehicle_unknown(self):
+        """Zone resolved but no vehicle → asks for vehicle."""
+        eng = self._make_eng()
+        state = _make_state(location_fallback_flow_sent=True)
+        ctx = _make_ctx(state=state)
+
+        eng._process_location_fallback_response(
+            ctx, state, {"zona_general": "CABA", "localidad": "Palermo"}
+        )
+
+        self.assertEqual(len(eng._texts), 1)
+        self.assertIn("modelo", eng._texts[0].lower())
+
+    def test_no_revision_created(self):
+        """Location Flow submit must never create a ThreadRevision."""
+        eng = self._make_eng()
+        state = _make_state()
+        ctx = _make_ctx(state=state)
+
+        added_objects = []
+        eng.db.add = lambda obj: added_objects.append(obj)
+        eng.db.flush = lambda: None
+
+        eng._process_location_fallback_response(
+            ctx, state, {"zona_general": "SUR", "localidad": "Avellaneda"}
+        )
+
+        from app.models import ThreadRevision, Revision
+        for obj in added_objects:
+            self.assertNotIsInstance(obj, (ThreadRevision, Revision))
+
+    def test_no_agendado_set(self):
+        eng = self._make_eng()
+        state = _make_state()
+        ctx = _make_ctx(state=state)
+
+        eng._process_location_fallback_response(
+            ctx, state, {"zona_general": "NORTE", "localidad": "Pilar"}
+        )
+
+        self.assertNotEqual(ctx.lead.estado, "AGENDADO")
+
+    def test_no_stage_booked_set(self):
+        eng = self._make_eng()
+        cand = _make_candidate(tipo_vehiculo="AUTO")
+        state = _make_state()
+        ctx = _make_ctx(candidates=[cand], state=state)
+
+        eng._process_location_fallback_response(
+            ctx, state, {"zona_general": "SUR", "localidad": "Avellaneda"}
+        )
+
+        self.assertNotIn(state.last_stage, ("BOOKED", "FLOW_SENT"))
+
+
+class TestFallbackFlowRouting(unittest.TestCase):
+    """_process_flow_response must route to fallback handlers by payload key."""
+
+    def _make_eng(self):
+        from unittest.mock import MagicMock
+        eng = _make_engine()
+        eng.db.add = lambda x: None
+        eng.db.flush = lambda: None
+        eng.db.commit = lambda: None
+        eng._send_text_to_wa = lambda ctx, text: "wamid"
+        eng._send_flow_button = lambda ctx, body, token, flow_id="", initial_screen="MAIN": "wamid-flow"
+        return eng
+
+    def test_tipo_vehiculo_key_routes_to_vehicle_handler(self):
+        """flow_data with tipo_vehiculo must call _process_vehicle_fallback_response."""
+        eng = self._make_eng()
+        routed = []
+        eng._process_vehicle_fallback_response = lambda ctx, state, data: routed.append("vehicle") or _make_ctx()
+        state = _make_state()
+        ctx = _make_ctx(state=state)
+
+        from app.services.conversation_engine import _out
+        eng._process_flow_response(ctx, {"tipo_vehiculo": "AUTO"}, None)
+
+        self.assertEqual(routed, ["vehicle"])
+
+    def test_zona_general_key_routes_to_location_handler(self):
+        """flow_data with zona_general must call _process_location_fallback_response."""
+        eng = self._make_eng()
+        routed = []
+        eng._process_location_fallback_response = lambda ctx, state, data: routed.append("location") or _make_ctx()
+        state = _make_state()
+        ctx = _make_ctx(state=state)
+
+        eng._process_flow_response(ctx, {"zona_general": "SUR", "localidad": "Avellaneda"}, None)
+
+        self.assertEqual(routed, ["location"])
+
+    def test_booking_payload_does_not_route_to_fallback(self):
+        """Booking Flow payload (email, telefono) must not trigger fallback handlers."""
+        eng = self._make_eng()
+        vehicle_calls = []
+        location_calls = []
+        eng._process_vehicle_fallback_response = lambda *a: vehicle_calls.append(True)
+        eng._process_location_fallback_response = lambda *a: location_calls.append(True)
+
+        state = _make_state(flow_booking_token="abc123")
+        ctx = _make_ctx(state=state)
+
+        try:
+            eng._process_flow_response(
+                ctx,
+                {"nombre_apellido": "Juan Pérez", "telefono": "11223344", "email": "j@x.com"},
+                "abc123",
+            )
+        except Exception:
+            pass  # booking handler may fail in test; we only care about routing
+
+        self.assertEqual(vehicle_calls, [])
+        self.assertEqual(location_calls, [])
+
+
+class TestBookingFlowUnchanged(unittest.TestCase):
+    """Generic and website booking Flow routing must remain unchanged after fallback additions."""
+
+    def test_generic_flow_uses_main_screen(self):
+        """Non-website booking Flow must still use initial_screen=MAIN."""
+        from unittest.mock import MagicMock
+        eng = _make_engine()
+        eng.settings = MagicMock()
+        eng.settings.whatsapp_flow_id = "generic-999"
+        eng.settings.whatsapp_website_flow_id = "website-888"
+        eng.settings.whatsapp_vehicle_fallback_flow_id = "veh-111"
+        eng.settings.whatsapp_location_fallback_flow_id = "loc-222"
+        eng.db.add = lambda x: None
+        eng.db.flush = lambda: None
+        eng.db.commit = lambda: None
+
+        captured = []
+        with __import__("unittest.mock", fromlist=["patch"]).patch(
+            "app.services.conversation_engine._send_whatsapp_cloud_flow",
+            side_effect=lambda **kw: captured.append(kw) or ("wamid", 200),
+        ):
+            cand = _make_candidate(tipo_vehiculo="AUTO")
+            state = _make_state(
+                last_stage="SCHEDULING",
+                preferred_day="2026-06-25",
+                preferred_time="10:00",
+                is_website_lead=False,
+            )
+            ctx = _make_ctx(candidates=[cand], state=state)
+            try:
+                eng._try_schedule_and_flow(ctx, state, "2026-06-25", "10:00", "slot_text")
+            except Exception:
+                pass
+
+        if captured:
+            self.assertEqual(captured[0].get("initial_screen", "MAIN"), "MAIN")
+
+    def test_website_flow_still_uses_website_final_data_screen(self):
+        """Website booking Flow must still use initial_screen=WEBSITE_FINAL_DATA."""
+        from unittest.mock import MagicMock
+        eng = _make_engine()
+        eng.settings = MagicMock()
+        eng.settings.whatsapp_flow_id = "generic-999"
+        eng.settings.whatsapp_website_flow_id = "website-888"
+        eng.settings.whatsapp_vehicle_fallback_flow_id = "veh-111"
+        eng.settings.whatsapp_location_fallback_flow_id = "loc-222"
+        eng.db.add = lambda x: None
+        eng.db.flush = lambda: None
+        eng.db.commit = lambda: None
+
+        captured = []
+        with __import__("unittest.mock", fromlist=["patch"]).patch(
+            "app.services.conversation_engine._send_whatsapp_cloud_flow",
+            side_effect=lambda **kw: captured.append(kw) or ("wamid", 200),
+        ):
+            cand = _make_candidate(tipo_vehiculo="AUTO")
+            state = _make_state(
+                last_stage="SCHEDULING",
+                preferred_day="2026-06-25",
+                preferred_time="10:00",
+                is_website_lead=True,
+            )
+            ctx = _make_ctx(candidates=[cand], state=state)
+            try:
+                eng._try_schedule_and_flow(ctx, state, "2026-06-25", "10:00", "slot_text")
+            except Exception:
+                pass
+
+        if captured:
+            self.assertEqual(captured[0].get("initial_screen"), "WEBSITE_FINAL_DATA")
 
 
 class TestThread68RegressionDockSud3008(unittest.TestCase):

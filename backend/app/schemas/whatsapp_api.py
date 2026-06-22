@@ -78,6 +78,10 @@ class WhatsAppThreadStateRead(BaseModel):
     preferred_day: str | None = None
     preferred_time: str | None = None
     flow_booking_token: str | None = None
+    vehicle_clarification_sent: bool = False
+    location_clarification_sent: bool = False
+    vehicle_fallback_flow_sent: bool = False
+    location_fallback_flow_sent: bool = False
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
