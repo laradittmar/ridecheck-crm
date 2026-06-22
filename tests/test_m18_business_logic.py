@@ -5131,6 +5131,397 @@ class TestBookingFlowUnchanged(unittest.TestCase):
             self.assertEqual(captured[0].get("initial_screen"), "WEBSITE_FINAL_DATA")
 
 
+class TestFallbackFlowInitialScreens(unittest.TestCase):
+    """Regression: correct initial_screen sent for every Flow type (8 published screens)."""
+
+    _VEH_FLOW_ID = "27205677485784073"
+    _LOC_FLOW_ID = "2550767958730294"
+    _GEN_FLOW_ID = "generic-999"
+    _WEB_FLOW_ID = "website-888"
+
+    def _make_eng(self, vehicle_id=_VEH_FLOW_ID, location_id=_LOC_FLOW_ID,
+                  generic_id=_GEN_FLOW_ID, website_id=_WEB_FLOW_ID):
+        from unittest.mock import MagicMock
+        eng = _make_engine()
+        eng.settings = MagicMock()
+        eng.settings.whatsapp_vehicle_fallback_flow_id = vehicle_id
+        eng.settings.whatsapp_location_fallback_flow_id = location_id
+        eng.settings.whatsapp_flow_id = generic_id
+        eng.settings.whatsapp_website_flow_id = website_id
+        eng.db.add = lambda x: None
+        eng.db.flush = lambda: None
+        eng.db.commit = lambda: None
+        eng._send_text_to_wa = lambda ctx, text: "wamid-txt"
+        return eng
+
+    def _capture_flow_api_calls(self, eng):
+        """Intercept _send_whatsapp_cloud_flow to capture (flow_id, initial_screen) pairs."""
+        calls = []
+        import app.services.conversation_engine as _ce
+        orig = _ce._send_whatsapp_cloud_flow
+
+        def fake(**kw):
+            calls.append({"flow_id": kw.get("flow_id"), "initial_screen": kw.get("initial_screen")})
+            return ("wamid-flow", 200)
+
+        _ce._send_whatsapp_cloud_flow = fake
+        eng._orig_flow_api = orig
+        return calls, _ce, orig
+
+    # ── Test 1: Vehicle fallback → VEHICLE_DETAILS ────────────────────────
+
+    def test_vehicle_fallback_sends_vehicle_details_screen(self):
+        """After one clarification, Vehicle Flow uses initial_screen=VEHICLE_DETAILS."""
+        eng = self._make_eng()
+        calls, _ce, orig = self._capture_flow_api_calls(eng)
+        try:
+            state = _make_state(last_stage="QUALIFYING", vehicle_clarification_sent=True)
+            ctx = _make_ctx(state=state)
+            eng._check_fallback_flow_triggers(ctx, state, None, ["no sé la marca"])
+        finally:
+            _ce._send_whatsapp_cloud_flow = orig
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["flow_id"], self._VEH_FLOW_ID)
+        self.assertEqual(calls[0]["initial_screen"], "VEHICLE_DETAILS")
+
+    def test_vehicle_fallback_uses_correct_flow_id(self):
+        """Vehicle fallback must use WHATSAPP_VEHICLE_FALLBACK_FLOW_ID=27205677485784073."""
+        eng = self._make_eng()
+        calls, _ce, orig = self._capture_flow_api_calls(eng)
+        try:
+            state = _make_state(last_stage="QUALIFYING", vehicle_clarification_sent=True)
+            ctx = _make_ctx(state=state)
+            eng._check_fallback_flow_triggers(ctx, state, None, ["no sé"])
+        finally:
+            _ce._send_whatsapp_cloud_flow = orig
+
+        self.assertEqual(calls[0]["flow_id"], "27205677485784073")
+
+    # ── Test 2: Location fallback → LOCATION_DETAILS ──────────────────────
+
+    def test_location_fallback_sends_location_details_screen(self):
+        """After one clarification, Location Flow uses initial_screen=LOCATION_DETAILS."""
+        eng = self._make_eng()
+        calls, _ce, orig = self._capture_flow_api_calls(eng)
+        try:
+            cand = _make_candidate(tipo_vehiculo="AUTO")
+            state = _make_state(last_stage="QUALIFYING", location_clarification_sent=True)
+            ctx = _make_ctx(candidates=[cand], state=state)
+            eng._check_fallback_flow_triggers(ctx, state, None, ["no recuerdo la zona"])
+        finally:
+            _ce._send_whatsapp_cloud_flow = orig
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["flow_id"], self._LOC_FLOW_ID)
+        self.assertEqual(calls[0]["initial_screen"], "LOCATION_DETAILS")
+
+    def test_location_fallback_uses_correct_flow_id(self):
+        """Location fallback must use WHATSAPP_LOCATION_FALLBACK_FLOW_ID=2550767958730294."""
+        eng = self._make_eng()
+        calls, _ce, orig = self._capture_flow_api_calls(eng)
+        try:
+            cand = _make_candidate(tipo_vehiculo="SUV_4X4_DEPORTIVO")
+            state = _make_state(last_stage="QUALIFYING", location_clarification_sent=True)
+            ctx = _make_ctx(candidates=[cand], state=state)
+            eng._check_fallback_flow_triggers(ctx, state, None, ["no sé"])
+        finally:
+            _ce._send_whatsapp_cloud_flow = orig
+
+        self.assertEqual(calls[0]["flow_id"], "2550767958730294")
+
+    # ── Test 3: Both unknown → Vehicle Flow first ─────────────────────────
+
+    def test_both_unknown_vehicle_flow_sent_first_with_vehicle_details(self):
+        """Both vehicle and location unknown → Vehicle Flow dispatched first with VEHICLE_DETAILS."""
+        eng = self._make_eng()
+        calls, _ce, orig = self._capture_flow_api_calls(eng)
+        try:
+            state = _make_state(
+                last_stage="QUALIFYING",
+                vehicle_clarification_sent=True,
+                location_clarification_sent=True,
+            )
+            ctx = _make_ctx(state=state)
+            eng._check_fallback_flow_triggers(ctx, state, None, ["nada"])
+        finally:
+            _ce._send_whatsapp_cloud_flow = orig
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["flow_id"], self._VEH_FLOW_ID)
+        self.assertEqual(calls[0]["initial_screen"], "VEHICLE_DETAILS")
+
+    # ── Test 4: Vehicle Flow submit resumes quote if location valid ────────
+
+    def test_vehicle_flow_submit_with_known_zone_sends_quote(self):
+        """Vehicle Flow submit when zone already known → compute quote and send PRESUPUESTO."""
+        eng = _make_engine(repo=FakeRepoCaptiva())
+        eng._pricing = PricingService(repository=FakeRepoCaptiva())
+        eng.db.add = lambda x: None
+        eng.db.flush = lambda: None
+        eng.db.commit = lambda: None
+        texts = []
+        eng._send_text_to_wa = lambda ctx, text: texts.append(text) or "wamid"
+
+        cand = _make_candidate(tipo_vehiculo=None)
+        state = _make_state(
+            home_zone_group="Oeste",
+            home_zone_detail="Lomas del Mirador",
+            vehicle_fallback_flow_sent=True,
+        )
+        ctx = _make_ctx(candidates=[cand], state=state)
+
+        eng._process_vehicle_fallback_response(
+            ctx, state,
+            {"tipo_vehiculo": "SUV_4X4_DEPORTIVO", "marca": "Chevrolet", "modelo": "Captiva", "anio": "2018"},
+        )
+
+        self.assertEqual(state.last_stage, "QUOTED")
+        self.assertEqual(ctx.lead.flag, "PRESUPUESTO_ENVIADO")
+        self.assertIn("170", texts[0])
+
+    # ── Test 5: Location Flow submit normalizes zone, resumes quote ────────
+
+    def test_location_flow_submit_with_known_vehicle_sends_quote(self):
+        """Location Flow submit when vehicle known → normalize zone, compute quote."""
+        from types import SimpleNamespace
+        eng = _make_engine(repo=FakeRepoCaptiva())
+        eng._pricing = PricingService(repository=FakeRepoCaptiva())
+        eng.db.add = lambda x: None
+        eng.db.flush = lambda: None
+        eng.db.commit = lambda: None
+        texts = []
+        eng._send_text_to_wa = lambda ctx, text: texts.append(text) or "wamid"
+        eng._extract_zone_from_text = lambda text: SimpleNamespace(
+            zone_group="Oeste", zone_detail="Lomas del Mirador", viaticos=30000
+        )
+
+        cand = _make_candidate(tipo_vehiculo="SUV_4X4_DEPORTIVO")
+        state = _make_state(location_fallback_flow_sent=True)
+        ctx = _make_ctx(candidates=[cand], state=state)
+
+        eng._process_location_fallback_response(
+            ctx, state,
+            {"zona_general": "OESTE", "localidad": "Lomas del Mirador", "referencia_ubicacion": ""},
+        )
+
+        self.assertEqual(state.last_stage, "QUOTED")
+        self.assertEqual(state.home_zone_group, "Oeste")
+        self.assertIn("170", texts[0])
+
+    # ── Test 6: Unresolvable data after submit → human, no loop ───────────
+
+    def test_vehicle_otro_after_submit_escalates_no_loop(self):
+        """tipo_vehiculo=OTRO after Vehicle Flow submit → needs_human, no re-dispatch."""
+        eng = _make_engine()
+        eng.db.add = lambda x: None
+        eng.db.flush = lambda: None
+        eng.db.commit = lambda: None
+        texts = []
+        eng._send_text_to_wa = lambda ctx, text: texts.append(text) or "wamid"
+
+        cand = _make_candidate(tipo_vehiculo=None)
+        state = _make_state(vehicle_fallback_flow_sent=True)
+        ctx = _make_ctx(candidates=[cand], state=state)
+
+        eng._process_vehicle_fallback_response(ctx, state, {"tipo_vehiculo": "OTRO"})
+
+        self.assertTrue(state.needs_human)
+        self.assertFalse(state.vehicle_fallback_flow_sent)  # consumed, not re-armed
+        self.assertEqual(len(texts), 1)
+
+    def test_location_otro_after_submit_escalates_no_loop(self):
+        """zona_general=OTRO after Location Flow submit → needs_human, no re-dispatch."""
+        eng = _make_engine()
+        eng.db.add = lambda x: None
+        eng.db.flush = lambda: None
+        eng.db.commit = lambda: None
+        texts = []
+        eng._send_text_to_wa = lambda ctx, text: texts.append(text) or "wamid"
+
+        state = _make_state(location_fallback_flow_sent=True)
+        ctx = _make_ctx(state=state)
+
+        eng._process_location_fallback_response(ctx, state, {"zona_general": "OTRO", "localidad": ""})
+
+        self.assertTrue(state.needs_human)
+        self.assertFalse(state.location_fallback_flow_sent)  # consumed, not re-armed
+        self.assertEqual(len(texts), 1)
+
+    # ── Test 7: No revision / booking Flow / AGENDADO ─────────────────────
+
+    def test_vehicle_submit_creates_no_revision_or_crm_record(self):
+        """Vehicle Flow submit must never add a ThreadRevision or Revision to the session."""
+        eng = _make_engine()
+        eng.db.flush = lambda: None
+        eng.db.commit = lambda: None
+        eng._send_text_to_wa = lambda ctx, text: "wamid"
+
+        added = []
+        eng.db.add = lambda obj: added.append(obj)
+
+        cand = _make_candidate(tipo_vehiculo=None)
+        state = _make_state()
+        ctx = _make_ctx(candidates=[cand], state=state)
+
+        eng._process_vehicle_fallback_response(ctx, state, {"tipo_vehiculo": "AUTO"})
+
+        from app.models import ThreadRevision, Revision
+        for obj in added:
+            self.assertNotIsInstance(obj, (ThreadRevision, Revision))
+        self.assertNotEqual(ctx.lead.estado, "AGENDADO")
+        self.assertNotIn(state.last_stage, ("BOOKED", "FLOW_SENT"))
+
+    def test_location_submit_creates_no_revision_or_crm_record(self):
+        """Location Flow submit must never add a ThreadRevision or Revision to the session."""
+        eng = _make_engine()
+        eng.db.flush = lambda: None
+        eng.db.commit = lambda: None
+        eng._send_text_to_wa = lambda ctx, text: "wamid"
+
+        added = []
+        eng.db.add = lambda obj: added.append(obj)
+
+        state = _make_state()
+        ctx = _make_ctx(state=state)
+
+        eng._process_location_fallback_response(
+            ctx, state, {"zona_general": "NORTE", "localidad": "Pilar", "referencia_ubicacion": ""}
+        )
+
+        from app.models import ThreadRevision, Revision
+        for obj in added:
+            self.assertNotIsInstance(obj, (ThreadRevision, Revision))
+        self.assertNotEqual(ctx.lead.estado, "AGENDADO")
+        self.assertNotIn(state.last_stage, ("BOOKED", "FLOW_SENT"))
+
+    # ── Test 8: Generic and website booking Flows unchanged ───────────────
+
+    def test_generic_booking_flow_still_uses_main_screen(self):
+        """Generic booking Flow must send initial_screen=MAIN regardless of fallback additions."""
+        eng = self._make_eng()
+        calls, _ce, orig = self._capture_flow_api_calls(eng)
+        try:
+            cand = _make_candidate(tipo_vehiculo="AUTO")
+            state = _make_state(
+                last_stage="SCHEDULING",
+                preferred_day="2026-06-28",
+                preferred_time="10:00",
+                is_website_lead=False,
+            )
+            ctx = _make_ctx(candidates=[cand], state=state)
+            try:
+                eng._try_schedule_and_flow(ctx, state, "2026-06-28", "10:00", "slot_text")
+            except Exception:
+                pass
+        finally:
+            _ce._send_whatsapp_cloud_flow = orig
+
+        booking_calls = [c for c in calls if c["flow_id"] == self._GEN_FLOW_ID]
+        if booking_calls:
+            self.assertEqual(booking_calls[0]["initial_screen"], "MAIN")
+
+    def test_website_booking_flow_still_uses_website_final_data_screen(self):
+        """Website short Flow must send initial_screen=WEBSITE_FINAL_DATA."""
+        eng = self._make_eng()
+        calls, _ce, orig = self._capture_flow_api_calls(eng)
+        try:
+            cand = _make_candidate(tipo_vehiculo="AUTO")
+            state = _make_state(
+                last_stage="SCHEDULING",
+                preferred_day="2026-06-28",
+                preferred_time="10:00",
+                is_website_lead=True,
+            )
+            ctx = _make_ctx(candidates=[cand], state=state)
+            try:
+                eng._try_schedule_and_flow(ctx, state, "2026-06-28", "10:00", "slot_text")
+            except Exception:
+                pass
+        finally:
+            _ce._send_whatsapp_cloud_flow = orig
+
+        website_calls = [c for c in calls if c["flow_id"] == self._WEB_FLOW_ID]
+        if website_calls:
+            self.assertEqual(website_calls[0]["initial_screen"], "WEBSITE_FINAL_DATA")
+
+    # ── No-repeat loop guard ───────────────────────────────────────────────
+
+    def test_vehicle_flow_not_resent_when_already_dispatched(self):
+        """vehicle_fallback_flow_sent=True → trigger returns None (no re-dispatch)."""
+        eng = self._make_eng()
+        calls, _ce, orig = self._capture_flow_api_calls(eng)
+        try:
+            state = _make_state(
+                last_stage="QUALIFYING",
+                vehicle_clarification_sent=True,
+                vehicle_fallback_flow_sent=True,
+            )
+            ctx = _make_ctx(state=state)
+            result = eng._check_fallback_flow_triggers(ctx, state, None, ["nada"])
+        finally:
+            _ce._send_whatsapp_cloud_flow = orig
+
+        self.assertIsNone(result)
+        self.assertEqual(len(calls), 0)
+
+    def test_location_flow_not_resent_when_already_dispatched(self):
+        """location_fallback_flow_sent=True → trigger returns None (no re-dispatch)."""
+        eng = self._make_eng()
+        calls, _ce, orig = self._capture_flow_api_calls(eng)
+        try:
+            cand = _make_candidate(tipo_vehiculo="AUTO")
+            state = _make_state(
+                last_stage="QUALIFYING",
+                location_clarification_sent=True,
+                location_fallback_flow_sent=True,
+            )
+            ctx = _make_ctx(candidates=[cand], state=state)
+            result = eng._check_fallback_flow_triggers(ctx, state, None, ["nada"])
+        finally:
+            _ce._send_whatsapp_cloud_flow = orig
+
+        self.assertIsNone(result)
+        self.assertEqual(len(calls), 0)
+
+    # ── No Flow on first unclear message ──────────────────────────────────
+
+    def test_no_flow_on_first_unclear_vehicle_message(self):
+        """First unclear vehicle message → chat clarification only, no Flow."""
+        eng = self._make_eng()
+        calls, _ce, orig = self._capture_flow_api_calls(eng)
+        texts = []
+        eng._send_text_to_wa = lambda ctx, text: texts.append(text) or "wamid"
+        try:
+            state = _make_state(last_stage="QUALIFYING", vehicle_clarification_sent=False)
+            ctx = _make_ctx(state=state)
+            eng._check_fallback_flow_triggers(ctx, state, None, ["hola quiero una revisión"])
+        finally:
+            _ce._send_whatsapp_cloud_flow = orig
+
+        self.assertEqual(len(calls), 0)
+        self.assertEqual(len(texts), 1)
+        self.assertTrue(state.vehicle_clarification_sent)
+
+    def test_no_flow_on_first_unclear_location_message(self):
+        """First unclear location message → chat clarification only, no Flow."""
+        eng = self._make_eng()
+        calls, _ce, orig = self._capture_flow_api_calls(eng)
+        texts = []
+        eng._send_text_to_wa = lambda ctx, text: texts.append(text) or "wamid"
+        try:
+            cand = _make_candidate(tipo_vehiculo="AUTO")
+            state = _make_state(last_stage="QUALIFYING", location_clarification_sent=False)
+            ctx = _make_ctx(candidates=[cand], state=state)
+            eng._check_fallback_flow_triggers(ctx, state, None, ["hola"])
+        finally:
+            _ce._send_whatsapp_cloud_flow = orig
+
+        self.assertEqual(len(calls), 0)
+        self.assertEqual(len(texts), 1)
+        self.assertTrue(state.location_clarification_sent)
+
+
 class TestThread68RegressionDockSud3008(unittest.TestCase):
     """Regression: 'Peugeot 3008 en Doc Sud' must resolve vehicle and zone deterministically."""
 

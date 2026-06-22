@@ -1127,7 +1127,7 @@ class ConversationEngine:
                 )
                 flow_token = secrets.token_urlsafe(24)
                 sent_id = self._send_flow_button(
-                    ctx, body, flow_token, flow_id=flow_id, initial_screen="MAIN"
+                    ctx, body, flow_token, flow_id=flow_id, initial_screen="VEHICLE_DETAILS"
                 )
                 return _out("replied", wa_message_id=sent_id)
             if not state.vehicle_clarification_sent:
@@ -1162,7 +1162,7 @@ class ConversationEngine:
                 )
                 flow_token = secrets.token_urlsafe(24)
                 sent_id = self._send_flow_button(
-                    ctx, body, flow_token, flow_id=flow_id, initial_screen="MAIN"
+                    ctx, body, flow_token, flow_id=flow_id, initial_screen="LOCATION_DETAILS"
                 )
                 return _out("replied", wa_message_id=sent_id)
             if not state.location_clarification_sent:
