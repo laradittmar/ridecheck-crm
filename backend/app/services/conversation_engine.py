@@ -953,6 +953,9 @@ class ConversationEngine:
             lead.necesita_humano = True
             self.db.commit()
             sent_id = self._send_text_to_wa(ctx, _FALLBACK_WARM_HANDOFF)
+            self._send_fallback_human_review_notification(
+                ctx, state, reason="otro_vehicle_type"
+            )
             return _out("replied", wa_message_id=sent_id)
 
         # Update or create candidate
@@ -1041,6 +1044,9 @@ class ConversationEngine:
             lead.necesita_humano = True
             self.db.commit()
             sent_id = self._send_text_to_wa(ctx, _FALLBACK_WARM_HANDOFF)
+            self._send_fallback_human_review_notification(
+                ctx, state, reason="otro_zona_general"
+            )
             return _out("replied", wa_message_id=sent_id)
 
         # Try to resolve localidad to a DB-validated zone_detail.
@@ -1076,11 +1082,20 @@ class ConversationEngine:
                     "Para completar la cotización, ¿cuál es la marca y modelo del auto?"
                 )
             else:
-                # Vehicle known but pricing not found for this zone → human
+                # Vehicle known, zone known via zona_general, but exact localidad
+                # viaticos not in DB.  Send an explicit, non-generic customer message
+                # and fire a Resend internal alert so an agent can follow up.
                 state.needs_human = True
                 lead.necesita_humano = True
+                customer_msg = (
+                    "Gracias, ya recibimos los datos. Estamos verificando la zona "
+                    "exacta para calcular el traslado y te confirmamos a la brevedad."
+                )
                 self.db.commit()
-                sent_id = self._send_text_to_wa(ctx, _FALLBACK_WARM_HANDOFF)
+                sent_id = self._send_text_to_wa(ctx, customer_msg)
+                self._send_fallback_human_review_notification(
+                    ctx, state, reason="unresolved_localidad"
+                )
                 return _out("replied", wa_message_id=sent_id)
 
         self.db.commit()
@@ -1101,9 +1116,12 @@ class ConversationEngine:
         paths never interleave. Returns None to continue normal AI processing.
         """
         focus = self._focus_candidate(ctx)
-        vehicle_known = pre_detected_vehicle is not None or bool(
-            focus and focus.tipo_vehiculo
-        )
+        # Require tipo_vehiculo to be explicitly set — a brand-only catalog hit that
+        # resolves marca but leaves tipo_vehiculo empty must NOT block the flow trigger.
+        vehicle_known = (
+            pre_detected_vehicle is not None
+            and bool(pre_detected_vehicle.tipo_vehiculo)
+        ) or bool(focus and focus.tipo_vehiculo)
         zone_known = bool(state.home_zone_group)
 
         # ── Vehicle fallback (takes priority over location) ───────────────
@@ -1182,8 +1200,8 @@ class ConversationEngine:
             if not state.location_clarification_sent:
                 state.location_clarification_sent = True
                 reply = (
-                    "¿En qué zona o barrio de Buenos Aires está el auto? "
-                    "(por ejemplo: Palermo, Dock Sud, Lomas de Zamora)"
+                    "¿En qué localidad o barrio está el auto? "
+                    "Por ejemplo: Palermo, Tigre, Dock Sud o Lomas de Zamora."
                 )
                 self.db.commit()
                 sent_id = self._send_text_to_wa(ctx, reply)
@@ -2850,6 +2868,7 @@ Respondé SOLO con JSON válido:
             direction="out",
             status="sent",
             timestamp=now_utc,
+            message_type="flow",
             text=body_text,
         )
         self.db.add(outbound)
@@ -2858,6 +2877,61 @@ Respondé SOLO con JSON válido:
         reset_unanswered_alert(self.db, ctx.thread.id)
         self.db.commit()
         return wa_message_id
+
+    # ── Fallback human-review alert ───────────────────────────────────────
+
+    def _send_fallback_human_review_notification(
+        self,
+        ctx: "_Context",
+        state: "WhatsAppThreadState",
+        reason: str,
+    ) -> None:
+        """Fire a Resend internal alert when a fallback Flow submit needs human review."""
+        from ..services.resend_email import send_human_review_notification
+
+        settings = self.settings
+        if not settings.resend_api_key:
+            logger.warning(
+                "M18 fallback human review — RESEND_API_KEY not set, skipping notification"
+            )
+            return
+        to_email = (getattr(settings, "internal_booking_email_to", "") or "").strip()
+        from_email = (
+            getattr(settings, "internal_booking_email_from", "")
+            or "notificaciones@ridecheck.ar"
+        ).strip()
+        if not to_email:
+            return
+        lead = ctx.lead
+        focus = self._focus_candidate(ctx)
+        vehicle_parts: list[str] = []
+        tipo_str = ""
+        if focus:
+            if focus.marca:
+                vehicle_parts.append(focus.marca)
+            if focus.modelo:
+                vehicle_parts.append(focus.modelo)
+            tipo_str = focus.tipo_vehiculo or ""
+        vehicle_str = " ".join(vehicle_parts).strip() or tipo_str
+
+        try:
+            send_human_review_notification(
+                api_key=settings.resend_api_key,
+                from_email=from_email,
+                to_email=to_email,
+                lead_id=lead.id if lead else ctx.thread.lead_id or "?",
+                thread_id=ctx.thread.id,
+                wa_id=ctx.contact.wa_id,
+                vehicle=vehicle_str,
+                zone_group=state.home_zone_group or "",
+                zone_detail=state.home_zone_detail or "",
+                reason=reason,
+            )
+        except Exception as exc:
+            logger.error(
+                "M18 fallback human review notification failed thread_id=%s: %s",
+                ctx.thread.id, exc,
+            )
 
     # ── Booking notification ──────────────────────────────────────────────
 

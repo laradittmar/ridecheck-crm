@@ -454,6 +454,99 @@ print(f"  ✓ needs_human=True  warm handoff sent  no revision  NOT AGENDADO")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# TEST E: Real-production replay — Peugeot 3008 + NORTE/Benavidez
+#   Now that Benavidez is in viaticos_zones (Norte, viaticos=0) the submit
+#   must resolve to a quote ($140.000) NOT needs_human.
+# ═════════════════════════════════════════════════════════════════════════════
+
+_print_section("TEST E  —  Peugeot 3008 + NORTE/Benavidez (prod replay, should now quote)")
+with Session(engine) as db:
+    cid_e, lid_e, tid_e, wid_e = _make_fixtures(db, "E")
+    # Pre-seed: Peugeot 3008 candidate already created, location Flow dispatched
+    db.execute(text("""
+        INSERT INTO whatsapp_thread_candidates
+          (thread_id, tipo_vehiculo, marca, modelo, status, source_text)
+        VALUES (:t, 'SUV/4x4', 'Peugeot', '3008', 'current_focus', 'smoke_e')
+    """), {"t": tid_e})
+    db.execute(text("""
+        UPDATE whatsapp_thread_states
+        SET location_clarification_sent=true, location_fallback_flow_sent=true,
+            current_focus_candidate_id=(
+                SELECT id FROM whatsapp_thread_candidates WHERE thread_id=:t LIMIT 1
+            )
+        WHERE thread_id=:t
+    """), {"t": tid_e})
+    db.commit()
+print(f"  thread_id={tid_e}  (Peugeot 3008 candidate, location_fallback_flow_sent=True)")
+
+wa_sends.clear()
+r = _run_step(tid_e, wid_e, "sme-1", "flow_response",
+              flow_response={"zona_general": "NORTE", "localidad": "Benavidez",
+                             "referencia_ubicacion": ""},
+              flow_token="fake-token-e")
+assert r.action == "replied", f"Expected replied, got {r.action}"
+s = _db_state(tid_e)
+lead_e = _db_lead(lid_e)
+tr_e, cr_e = _db_revision_count(tid_e, lid_e)
+reply_e = wa_sends[-1]["text"] if wa_sends else ""
+print(f"  action={r.action}")
+print(f"  reply:  {reply_e[:120]}")
+print(f"  DB state:  zone_group={s[2]}  zone_detail={s[3]}  stage={s[0]}")
+print(f"  DB lead:   flag={lead_e[0]}  necesita_humano={lead_e[2]}")
+print(f"  Revisions: thread_revisions={tr_e}  crm_revisions={cr_e}")
+
+assert s[2] == "Norte",                   f"zone_group must be Norte, got {s[2]}"
+assert s[3] == "Benavidez",              f"zone_detail must be Benavidez, got {s[3]}"
+assert s[0] == "QUOTED",                  f"stage must be QUOTED, got {s[0]}"
+assert s[1] is False,                     "needs_human must be False (Benavidez now in DB)"
+assert lead_e[0] == "PRESUPUESTO_ENVIADO", f"flag must be PRESUPUESTO_ENVIADO, got {lead_e[0]}"
+assert lead_e[2] is False,               "necesita_humano must be False"
+assert tr_e == 0,                         f"No ThreadRevision expected, got {tr_e}"
+assert cr_e == 0,                         f"No CRM Revision expected, got {cr_e}"
+assert "140" in reply_e,                  f"Reply must contain $140.000 (SUV/4x4+Norte/viaticos=0), got: {reply_e}"
+print(f"  ✓ Norte/Benavidez now resolves to a quote (viaticos=0)")
+print(f"  ✓ price $140.000  stage=QUOTED  NO revision  NOT AGENDADO")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TEST F: Outbound Flow message saved with message_type='flow'
+# ═════════════════════════════════════════════════════════════════════════════
+
+_print_section("TEST F  —  Outbound Flow message_type='flow' in DB")
+with Session(engine) as db:
+    # Check thread A — the vehicle fallback flow was sent in step 2
+    # But tid_a fixtures are already cleaned up (we'll verify from thread E flow step)
+    # Instead verify a fresh step via thread lookup
+    _cid_f, _lid_f, _tid_f, _wid_f = _make_fixtures(db, "F")
+
+with Session(engine) as db:
+    db.execute(text("""
+        UPDATE whatsapp_thread_states
+        SET vehicle_clarification_sent=true
+        WHERE thread_id=:t
+    """), {"t": _tid_f})
+    db.commit()
+
+wa_sends.clear()
+_run_step(_tid_f, _wid_f, "smf-1", "text", "no sé qué auto tengo",
+          unanswered=["no sé qué auto tengo"],
+          recent_user=["no sé qué auto tengo"])
+
+with Session(engine) as db:
+    row = db.execute(text("""
+        SELECT message_type, text FROM whatsapp_messages
+        WHERE thread_id=:t AND direction='out'
+        ORDER BY id DESC LIMIT 1
+    """), {"t": _tid_f}).fetchone()
+
+print(f"  Outbound message: type={row[0]}  text={row[1][:60]!r}")
+assert row[0] == "flow", f"message_type must be 'flow', got {row[0]!r}"
+assert row[1] and row[1] != "-", "Flow body text must be stored (not empty)"
+print(f"  ✓ message_type='flow' correctly stored for CRM rendering")
+_cleanup(_tid_f, _lid_f, _cid_f)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Summary
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -462,7 +555,8 @@ with Session(engine) as db:
     def count(sql, p): return db.execute(text(sql), p).scalar()
 
     for label, tid, lid in [("Test A", tid_a, lid_a), ("Test B", tid_b, lid_b),
-                              ("Test C", tid_c, lid_c), ("Test D", tid_d, lid_d)]:
+                              ("Test C", tid_c, lid_c), ("Test D", tid_d, lid_d),
+                              ("Test E", tid_e, lid_e)]:
         tc = count("SELECT COUNT(*) FROM whatsapp_thread_candidates WHERE thread_id=:t", {"t": tid})
         tr_ = count("SELECT COUNT(*) FROM thread_revisions WHERE thread_id=:t", {"t": tid})
         cr_ = count("SELECT COUNT(*) FROM revisions WHERE lead_id=:l", {"l": lid})
@@ -475,7 +569,8 @@ with Session(engine) as db:
 # ─────────────────────────────────────────────────────────────────────────────
 
 for tid, lid, cid in [(tid_a, lid_a, cid_a), (tid_b, lid_b, cid_b),
-                       (tid_c, lid_c, cid_c), (tid_d, lid_d, cid_d)]:
+                       (tid_c, lid_c, cid_c), (tid_d, lid_d, cid_d),
+                       (tid_e, lid_e, cid_e)]:
     _cleanup(tid, lid, cid)
 
 print("\n[DB] All test fixtures cleaned up.")

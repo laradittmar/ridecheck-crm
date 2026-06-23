@@ -4631,7 +4631,8 @@ class TestCheckFallbackFlowTriggers(unittest.TestCase):
 
         self.assertIsNotNone(result)
         self.assertTrue(state.location_clarification_sent)
-        self.assertIn("zona", texts[0].lower())
+        # Updated wording uses "localidad" instead of "zona o barrio de Buenos Aires"
+        self.assertIn("localidad", texts[0].lower())
 
     def test_unknown_location_second_contact_sends_flow(self):
         """After location clarification failed → Location Fallback Flow sent."""
@@ -5573,6 +5574,279 @@ class TestThread68RegressionDockSud3008(unittest.TestCase):
         eng._apply_extracted(ctx, state, {"zone_detail": "La Boca"})
         self.assertEqual(state.home_zone_detail, "Dock Sud")
         self.assertEqual(state.home_zone_group, "Sur")
+
+
+class TestProdRegressionVehicleFlowTrigger(unittest.TestCase):
+    """Regression: real-thread B — vehicle Flow must fire even when catalog returns
+    a partial match with an empty tipo_vehiculo string."""
+
+    def _make_eng_with_flow_ids(self, vehicle_id="veh-999", location_id="loc-999"):
+        from unittest.mock import MagicMock
+        eng = _make_engine()
+        eng.settings = MagicMock()
+        eng.settings.whatsapp_vehicle_fallback_flow_id = vehicle_id
+        eng.settings.whatsapp_location_fallback_flow_id = location_id
+        eng.db.commit = lambda: None
+        return eng
+
+    def _capture_flow_sends(self, eng):
+        flows = []
+        eng._send_flow_button = lambda ctx, body, token, flow_id="", initial_screen="MAIN": (
+            flows.append({"flow_id": flow_id, "body": body, "screen": initial_screen}) or "wamid-flow"
+        )
+        return flows
+
+    def _capture_text_sends(self, eng):
+        texts = []
+        eng._send_text_to_wa = lambda ctx, text: texts.append(text) or "wamid-txt"
+        return texts
+
+    def test_partial_catalog_hit_empty_tipo_vehiculo_still_triggers_flow(self):
+        """A VehicleMatch with tipo_vehiculo='' must NOT count as vehicle_known."""
+        from app.services.vehicle_catalog import VehicleMatch
+        eng = self._make_eng_with_flow_ids()
+        flows = self._capture_flow_sends(eng)
+        partial_match = VehicleMatch(
+            marca="Toyota", modelo="", tipo_vehiculo="",
+            confidence="low", matched_alias="toyota",
+        )
+        state = _make_state(last_stage="QUALIFYING", vehicle_clarification_sent=True)
+        ctx = _make_ctx(state=state)
+
+        result = eng._check_fallback_flow_triggers(ctx, state, partial_match, ["Toyota pero no sé el modelo"])
+
+        # With fix: empty tipo_vehiculo → vehicle NOT considered known → flow dispatched
+        self.assertIsNotNone(result)
+        self.assertEqual(len(flows), 1)
+        self.assertTrue(state.vehicle_fallback_flow_sent)
+
+    def test_exact_sequence_xylo_z9_palermo_second_reply_triggers_vehicle_flow(self):
+        """Exact production Thread-B replay: Xylo Z9 (not in catalog) → clarification
+        sent → second unresolved reply → Vehicle Flow fires."""
+        eng = self._make_eng_with_flow_ids()
+        flows = self._capture_flow_sends(eng)
+        # Pre-condition: clarification was already sent on the first reply
+        state = _make_state(
+            last_stage="QUALIFYING",
+            home_zone_group="CABA",  # Palermo was extracted from the first message
+            home_zone_detail="Palermo",
+            vehicle_clarification_sent=True,
+        )
+        ctx = _make_ctx(state=state)
+
+        result = eng._check_fallback_flow_triggers(
+            ctx, state,
+            pre_detected_vehicle=None,  # Xylo Z9 still not in catalog
+            ai_input_messages=["no sé, es un auto medio raro"],
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(len(flows), 1)
+        self.assertEqual(flows[0]["screen"], "VEHICLE_DETAILS")
+        self.assertTrue(state.vehicle_fallback_flow_sent)
+
+    def test_full_catalog_hit_with_tipo_vehiculo_is_still_vehicle_known(self):
+        """A proper VehicleMatch with tipo_vehiculo set must still count as vehicle_known
+        so the flow is NOT dispatched (existing behavior preserved)."""
+        from app.services.vehicle_catalog import VehicleMatch
+        eng = self._make_eng_with_flow_ids()
+        flows = self._capture_flow_sends(eng)
+        texts = self._capture_text_sends(eng)
+        full_match = VehicleMatch(
+            marca="Toyota", modelo="Corolla", tipo_vehiculo="AUTO",
+            confidence="high", matched_alias="toyota corolla",
+        )
+        state = _make_state(
+            last_stage="QUALIFYING",
+            home_zone_group="CABA",
+            home_zone_detail="Palermo",
+            vehicle_clarification_sent=True,
+        )
+        ctx = _make_ctx(state=state)
+
+        result = eng._check_fallback_flow_triggers(ctx, state, full_match, ["Toyota Corolla"])
+
+        # Vehicle IS known (tipo_vehiculo set) → trigger returns None, no flow
+        self.assertIsNone(result)
+        self.assertEqual(len(flows), 0)
+
+
+class TestProdRegressionLocationFlowUnresolved(unittest.TestCase):
+    """Regression: real-thread A — Norte/Benavidez unresolved localidad must produce
+    explicit customer message + Resend alert, not generic warm handoff."""
+
+    def _make_eng(self, repo=None):
+        from unittest.mock import MagicMock
+        eng = _make_engine(repo=repo)
+        eng.db.add = lambda x: None
+        eng.db.flush = lambda: None
+        eng.db.commit = lambda: None
+        texts = []
+        eng._send_text_to_wa = lambda ctx, text: texts.append(text) or "wamid"
+        eng._texts = texts
+        # Suppress Resend so unit tests don't need network
+        eng._send_fallback_human_review_notification = lambda ctx, state, reason: None
+        return eng
+
+    def test_norte_unresolved_localidad_sends_explicit_verify_message(self):
+        """When zona_general=NORTE, localidad not in DB, vehicle known →
+        sends 'Gracias, ya recibimos' message (NOT the generic agente/handoff)."""
+        eng = self._make_eng()
+        # _extract_zone_from_text("Benavidez") returns None (no DB match)
+        eng._extract_zone_from_text = lambda text: None
+        cand = _make_candidate(tipo_vehiculo="SUV/4x4")
+        state = _make_state(location_fallback_flow_sent=True)
+        ctx = _make_ctx(candidates=[cand], state=state)
+
+        eng._process_location_fallback_response(
+            ctx, state, {"zona_general": "NORTE", "localidad": "Benavidez", "referencia_ubicacion": ""}
+        )
+
+        self.assertTrue(state.needs_human)
+        self.assertEqual(len(eng._texts), 1)
+        # Must be the explicit verify message, not the generic warm handoff
+        self.assertIn("verificando", eng._texts[0].lower())
+        self.assertIn("zona", eng._texts[0].lower())
+        # Must NOT contain "agente" (generic handoff)
+        self.assertNotIn("agente", eng._texts[0].lower())
+
+    def test_norte_unresolved_localidad_zone_group_set_from_zona_general(self):
+        """Even when localidad is unresolved, home_zone_group must be set to Norte
+        so agents can see the zone in CRM."""
+        eng = self._make_eng()
+        eng._extract_zone_from_text = lambda text: None
+        cand = _make_candidate(tipo_vehiculo="SUV/4x4")
+        state = _make_state(location_fallback_flow_sent=True)
+        ctx = _make_ctx(candidates=[cand], state=state)
+
+        eng._process_location_fallback_response(
+            ctx, state, {"zona_general": "NORTE", "localidad": "Benavidez", "referencia_ubicacion": ""}
+        )
+
+        self.assertEqual(state.home_zone_group, "Norte")
+        self.assertEqual(state.home_zone_detail, "Benavidez")
+
+    def test_otro_zona_general_uses_warm_handoff(self):
+        """zona_general=OTRO must still use the warm handoff text (no change)."""
+        eng = self._make_eng()
+        state = _make_state(location_fallback_flow_sent=True)
+        ctx = _make_ctx(state=state)
+
+        eng._process_location_fallback_response(
+            ctx, state, {"zona_general": "OTRO", "localidad": ""}
+        )
+
+        self.assertTrue(state.needs_human)
+        # Warm handoff contains "agente"
+        self.assertIn("agente", eng._texts[0].lower())
+
+    def test_no_revision_created_for_unresolved_localidad(self):
+        """needs_human path from unresolved localidad must not create any revision."""
+        from unittest.mock import MagicMock, patch
+        eng = self._make_eng()
+        eng._extract_zone_from_text = lambda text: None
+        cand = _make_candidate(tipo_vehiculo="AUTO")
+        state = _make_state(location_fallback_flow_sent=True)
+        ctx = _make_ctx(candidates=[cand], state=state)
+
+        added_objects = []
+        real_add = lambda x: added_objects.append(x)
+        eng.db.add = real_add
+
+        eng._process_location_fallback_response(
+            ctx, state, {"zona_general": "NORTE", "localidad": "SomethingUnknown"}
+        )
+
+        from app.models import ThreadRevision, Revision
+        revision_types = tuple({ThreadRevision, Revision})
+        for obj in added_objects:
+            self.assertNotIsInstance(obj, revision_types)
+
+
+class TestProdRegressionCRMFlowRendering(unittest.TestCase):
+    """Regression: outbound Flow messages must save message_type='flow';
+    inbound flow_response must render a summary not '-'."""
+
+    def test_send_flow_button_saves_message_type_flow(self):
+        """_send_flow_button must save WhatsAppMessage with message_type='flow'."""
+        from unittest.mock import MagicMock, patch
+        from app.models import WhatsAppMessage
+        eng = _make_engine()
+        eng.db.commit = lambda: None
+        eng.db.flush = lambda: None
+        saved_messages: list[WhatsAppMessage] = []
+        eng.db.add = lambda obj: saved_messages.append(obj) if isinstance(obj, WhatsAppMessage) else None
+
+        ctx = _make_ctx()
+
+        with patch(
+            "app.services.conversation_engine._send_whatsapp_cloud_flow",
+            return_value=("wamid-flow-test", 200),
+        ), patch(
+            "app.services.unanswered_alert.reset_unanswered_alert"
+        ):
+            eng._send_flow_button(ctx, "Test body", "tok-123", flow_id="flow-999")
+
+        flow_msgs = [m for m in saved_messages if isinstance(m, WhatsAppMessage)]
+        self.assertEqual(len(flow_msgs), 1)
+        self.assertEqual(flow_msgs[0].message_type, "flow")
+        self.assertEqual(flow_msgs[0].text, "Test body")
+
+    def test_send_text_to_wa_does_not_set_flow_message_type(self):
+        """Normal text messages must NOT have message_type='flow'."""
+        from unittest.mock import MagicMock, patch
+        from app.models import WhatsAppMessage
+        eng = _make_engine()
+        eng.db.commit = lambda: None
+        saved_messages: list[WhatsAppMessage] = []
+        eng.db.add = lambda obj: saved_messages.append(obj) if isinstance(obj, WhatsAppMessage) else None
+
+        ctx = _make_ctx()
+
+        with patch(
+            "app.services.conversation_engine._send_whatsapp_cloud_text",
+            return_value=("wamid-txt-test", 200),
+        ), patch(
+            "app.services.unanswered_alert.reset_unanswered_alert"
+        ):
+            eng._send_text_to_wa(ctx, "Hello world")
+
+        txt_msgs = [m for m in saved_messages if isinstance(m, WhatsAppMessage)]
+        self.assertTrue(len(txt_msgs) >= 1)
+        for m in txt_msgs:
+            self.assertNotEqual(m.message_type, "flow", "Text message must not have message_type='flow'")
+
+
+class TestProdRegressionLocationWording(unittest.TestCase):
+    """Regression: location clarification must mention GBA, not only Buenos Aires."""
+
+    def test_location_clarification_wording_covers_gba(self):
+        """First location clarification must mention Tigre and/or Lomas de Zamora
+        to signal GBA coverage (not just Buenos Aires city)."""
+        from unittest.mock import MagicMock
+        eng = _make_engine()
+        eng.settings = MagicMock()
+        eng.settings.whatsapp_vehicle_fallback_flow_id = "veh-id"
+        eng.settings.whatsapp_location_fallback_flow_id = "loc-id"
+        eng.db.commit = lambda: None
+        texts = []
+        eng._send_text_to_wa = lambda ctx, text: texts.append(text) or "wamid"
+
+        cand = _make_candidate(tipo_vehiculo="AUTO")
+        state = _make_state(last_stage="QUALIFYING", home_zone_group=None)
+        ctx = _make_ctx(candidates=[cand], state=state)
+
+        eng._check_fallback_flow_triggers(ctx, state, None, ["hola"])
+
+        # First trigger fires location clarification (since vehicle IS known via candidate)
+        # Actually with vehicle known, it checks location.
+        # state has no zone → location clarification fires on first call.
+        self.assertEqual(len(texts), 1)
+        msg_lower = texts[0].lower()
+        # Must NOT limit to only "buenos aires" (ciudad)
+        self.assertNotIn("zona o barrio de buenos aires", msg_lower)
+        # Must give GBA examples
+        self.assertIn("tigre", msg_lower)
 
 
 if __name__ == "__main__":

@@ -1812,6 +1812,55 @@ def whatsapp_thread(thread_id: str, request: Request, db: Session = Depends(get_
     else:
         thread_lead_id_txt = "Sin lead vinculado"
 
+    def _render_flow_outbound_bubble(body: str, ts: str, status_html: str) -> str:
+        label = (
+            '<div style="font-size:11px;font-weight:600;color:#0f766e;margin-bottom:3px;">'
+            "📋 Formulario enviado</div>"
+        )
+        display = body if body and body != "-" else "Formulario enviado"
+        return (
+            f"      {label}"
+            f'      <div class="wa-msg-text">{html_lib.escape(display)}</div>'
+            f'      <div class="wa-msg-meta">'
+            f'<span class="wa-msg-time">{html_lib.escape(ts)}</span>{status_html}</div>'
+        )
+
+    def _render_flow_response_bubble(payload: dict, ts: str) -> str:
+        fd: dict = {}
+        try:
+            nfm = (payload.get("interactive") or {}).get("nfm_reply") or {}
+            rj = str(nfm.get("response_json") or "")
+            if rj:
+                fd = json.loads(rj)
+        except Exception:
+            pass
+        parts: list[str] = []
+        if fd.get("zona_general"):
+            parts.append(f"Zona: {fd['zona_general']}")
+        if fd.get("localidad"):
+            parts.append(f"Localidad: {fd['localidad']}")
+        if fd.get("referencia_ubicacion"):
+            parts.append(f"Ref: {fd['referencia_ubicacion']}")
+        if fd.get("tipo_vehiculo"):
+            parts.append(f"Vehículo: {fd['tipo_vehiculo']}")
+        if fd.get("marca"):
+            parts.append(f"Marca: {fd['marca']}")
+        if fd.get("modelo"):
+            parts.append(f"Modelo: {fd['modelo']}")
+        if fd.get("anio"):
+            parts.append(f"Año: {fd['anio']}")
+        summary = " · ".join(parts) if parts else "Formulario completado"
+        label = (
+            '<div style="font-size:11px;font-weight:600;color:#6b7280;margin-bottom:3px;">'
+            "📋 Formulario recibido</div>"
+        )
+        return (
+            f"      {label}"
+            f'      <div class="wa-msg-text">{html_lib.escape(summary)}</div>'
+            f'      <div class="wa-msg-meta">'
+            f'<span class="wa-msg-time">{html_lib.escape(ts)}</span></div>'
+        )
+
     if message_rows:
         msg_html = []
         text_by_id: dict[int, str] = {}
@@ -1923,6 +1972,10 @@ def whatsapp_thread(thread_id: str, request: Request, db: Session = Depends(get_
                     _render_audio_player(media_id_val, ts=ts, status_html=status_html)
                     + (f'<div class="wa-msg-text">{html_lib.escape(msg_text)}</div>' if msg_text and msg_text != "-" else "")
                     if msg_type == "audio" and media_id_val
+                    else _render_flow_outbound_bubble(msg_text, ts, status_html)
+                    if msg_type == "flow"
+                    else _render_flow_response_bubble(raw_payload, ts)
+                    if msg_type == "flow_response"
                     else (
                         f'      <div class="wa-msg-text">{html_lib.escape(msg_text)}</div>'
                         + f'      <div class="wa-msg-meta"><span class="wa-msg-time">{html_lib.escape(ts)}</span>{status_html}</div>'

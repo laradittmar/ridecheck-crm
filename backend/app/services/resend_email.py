@@ -359,3 +359,100 @@ def send_scheduling_handoff_notification(
     except Exception as exc:  # noqa: BLE001
         logger.error("[M15.8] Handoff email unexpected error lead_id=%s: %s", lead_id, exc)
         return False
+
+
+def send_human_review_notification(
+    *,
+    api_key: str,
+    from_email: str,
+    to_email: str,
+    lead_id: int | str,
+    thread_id: int | str,
+    wa_id: str,
+    vehicle: str,
+    zone_group: str,
+    zone_detail: str,
+    reason: str,
+) -> bool:
+    """Send an alert when a fallback Flow submit requires manual human review."""
+    if not api_key:
+        logger.error("[M15.8] RESEND_API_KEY not set — human review email not sent lead_id=%s", lead_id)
+        return False
+    if not to_email:
+        logger.error("[M15.8] INTERNAL_BOOKING_EMAIL_TO not set — human review email not sent lead_id=%s", lead_id)
+        return False
+
+    reason_labels: dict[str, str] = {
+        "unresolved_localidad": "Localidad no encontrada en base de viáticos",
+        "otro_vehicle_type": "Tipo de vehículo 'OTRO' seleccionado en formulario",
+        "otro_zona_general": "Zona 'OTRO' seleccionada en formulario de ubicación",
+    }
+    reason_label = reason_labels.get(reason, reason)
+    vehicle_display = _fmt(vehicle)
+    zone_display = f"{zone_group} / {zone_detail}" if zone_detail else zone_group or "Sin dato"
+    crm_url = f"https://crm.ridecheck.ar/whatsapp/thread/{thread_id}"
+
+    subject = f"⚠️ Revisión manual — {vehicle_display} · {_fmt(zone_display)}"
+
+    html_body = f"""<!DOCTYPE html>
+<html lang="es">
+<body style="font-family:Arial,sans-serif;font-size:14px;color:#333;max-width:600px;margin:0 auto;padding:20px;">
+<h2 style="color:#b45309;">⚠️ Revisión manual requerida</h2>
+<p>Un cliente completó un formulario de calificación pero no pudo resolverse automáticamente.</p>
+<table style="width:100%;border-collapse:collapse;margin:12px 0;">
+<tr><td style="padding:4px 0;width:160px;"><strong>Motivo:</strong></td><td>{_fmt(reason_label)}</td></tr>
+<tr><td style="padding:4px 0;"><strong>Lead ID:</strong></td><td>{_fmt(lead_id)}</td></tr>
+<tr><td style="padding:4px 0;"><strong>Thread ID:</strong></td><td>{_fmt(thread_id)}</td></tr>
+<tr><td style="padding:4px 0;"><strong>WhatsApp:</strong></td><td>{_fmt(wa_id)}</td></tr>
+<tr><td style="padding:4px 0;"><strong>Vehículo:</strong></td><td>{_fmt(vehicle)}</td></tr>
+<tr><td style="padding:4px 0;"><strong>Zona:</strong></td><td>{_fmt(zone_display)}</td></tr>
+</table>
+<table cellpadding="0" cellspacing="0" border="0" style="margin:16px 0 8px;">
+  <tr>
+    <td align="center" bgcolor="#b45309" style="border-radius:6px;">
+      <a href="{crm_url}"
+         style="display:inline-block;padding:12px 28px;color:#fff;text-decoration:none;font-weight:bold;font-family:Arial,sans-serif;font-size:15px;border-radius:6px;background-color:#b45309;">
+        Ver conversación en CRM
+      </a>
+    </td>
+  </tr>
+</table>
+</body>
+</html>"""
+
+    payload = json.dumps({
+        "from": from_email,
+        "to": [to_email],
+        "subject": subject,
+        "html": html_body,
+    }).encode("utf-8")
+
+    req = urlrequest.Request(
+        _RESEND_API_URL,
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "RideCheck-CRM/1.0",
+        },
+    )
+
+    try:
+        with urlrequest.urlopen(req, timeout=15) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+        logger.info(
+            "[M15.8] Human review email sent OK lead_id=%s reason=%s — %s",
+            lead_id, reason, body,
+        )
+        return True
+    except error.HTTPError as exc:
+        err_body = exc.read().decode("utf-8", errors="replace")
+        logger.error("[M15.8] Human review email HTTP error %s lead_id=%s: %s", exc.code, lead_id, err_body)
+        return False
+    except error.URLError as exc:
+        logger.error("[M15.8] Human review email URL error lead_id=%s: %s", lead_id, exc.reason)
+        return False
+    except Exception as exc:  # noqa: BLE001
+        logger.error("[M15.8] Human review email unexpected error lead_id=%s: %s", lead_id, exc)
+        return False
