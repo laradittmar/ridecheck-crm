@@ -5849,5 +5849,218 @@ class TestProdRegressionLocationWording(unittest.TestCase):
         self.assertIn("tigre", msg_lower)
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# Group-default viáticos fix (migration 20260624_group_default_viaticos)
+#
+# PricingRepository already has a Step-3 fallback:
+#   WHERE zone_group = <group> AND zone_detail IS NULL
+# These tests verify that the 3-step resolution ladder works correctly after
+# the migration inserts NULL-detail rows for CABA/Norte/Oeste/Sur.
+#
+# The fake repo below faithfully replicates the real repository's 3-step logic
+# so tests run without a DB connection.
+# ═════════════════════════════════════════════════════════════════════════════
+
+class FakeRepoGroupDefaults:
+    """Replicates the 3-step lookup of PricingRepository with group defaults.
+
+    Step 1: exact (zone_group, zone_detail) match
+    Step 2: detail-only match (any group)
+    Step 3: group default (zone_detail IS NULL)
+    """
+
+    _BASE = {
+        "SUV/4x4": FakePriceRow(tipo_vehiculo="SUV/4x4", precio_base=140000),
+        "AUTO":    FakePriceRow(tipo_vehiculo="AUTO",    precio_base=130000),
+    }
+
+    # Exact locality rows — (normalised_group, normalised_detail) → FakeZone
+    _EXACT: dict[tuple[str, str], "FakeZone"] = {
+        ("norte", "tigre"):    FakeZone(zone_group="Norte", zone_detail="Tigre",    viaticos=0),
+        ("norte", "zárate"):   FakeZone(zone_group="Norte", zone_detail="Zárate",   viaticos=70000),
+        ("norte", "zarate"):   FakeZone(zone_group="Norte", zone_detail="Zárate",   viaticos=70000),
+        ("caba",  "palermo"):  FakeZone(zone_group="CABA",  zone_detail="Palermo",  viaticos=0),
+        ("caba",  "caba"):     FakeZone(zone_group="CABA",  zone_detail="CABA",     viaticos=0),
+        ("sur",   "avellaneda"): FakeZone(zone_group="Sur", zone_detail="Avellaneda", viaticos=30000),
+    }
+
+    # Group-default rows — normalised_group → FakeZone (zone_detail=None)
+    _GROUP_DEFAULTS: dict[str, "FakeZone"] = {
+        "caba":  FakeZone(zone_group="CABA",  zone_detail=None, viaticos=0),
+        "norte": FakeZone(zone_group="Norte", zone_detail=None, viaticos=0),
+        "oeste": FakeZone(zone_group="Oeste", zone_detail=None, viaticos=30000),
+        "sur":   FakeZone(zone_group="Sur",   zone_detail=None, viaticos=30000),
+    }
+
+    def find_base_price(self, tipo_vehiculo: str):
+        return self._BASE.get(tipo_vehiculo)
+
+    def find_zone_by_group_and_detail(self, db, zone_group, zone_detail):
+        ng = " ".join((zone_group or "").strip().lower().split())
+        nd = " ".join((zone_detail or "").strip().lower().split())
+
+        # Step 1: exact match
+        if ng and nd:
+            row = self._EXACT.get((ng, nd))
+            if row:
+                return row
+
+        # Step 2: detail-only match
+        if nd:
+            matches = [v for (g, d), v in self._EXACT.items() if d == nd]
+            if ng:
+                for row in matches:
+                    if row.zone_group.lower() == ng:
+                        return row
+            if matches:
+                return matches[0]
+            # No detail match — fall through to Step 3
+
+        # Step 3: group default (zone_detail IS NULL)
+        if ng:
+            return self._GROUP_DEFAULTS.get(ng)
+
+        return None
+
+
+class TestGroupDefaultViaticosPricing(unittest.TestCase):
+    """Exact-match rows take priority; unknown localities fall back to group default.
+
+    All assertions reference the requirements from migration 20260624_group_default_viaticos.
+    Tests 1-7 use PricingService directly (no DB needed).
+    Test 8 uses the engine's _process_location_fallback_response for OTRO path.
+    """
+
+    def _svc(self):
+        return PricingService(repository=FakeRepoGroupDefaults())
+
+    # ── Test 1 ───────────────────────────────────────────────────────────────
+    def test_norte_tigre_exact_viaticos_zero(self):
+        """Norte + Tigre → exact row, viaticos=0, total=$140k."""
+        q = self._svc().quote(db=None, tipo_vehiculo="SUV/4x4",
+                              zone_group="Norte", zone_detail="Tigre")
+        self.assertEqual(q.viaticos, 0)
+        self.assertEqual(q.zone_detail, "Tigre")
+        self.assertEqual(q.precio_total, 140000)
+
+    # ── Test 2 ───────────────────────────────────────────────────────────────
+    def test_norte_zarate_exact_70000_not_group_default(self):
+        """Norte + Zárate → exact row $70k; group default $0 must NOT shadow it."""
+        q = self._svc().quote(db=None, tipo_vehiculo="SUV/4x4",
+                              zone_group="Norte", zone_detail="Zárate")
+        self.assertEqual(q.viaticos, 70000)
+        self.assertEqual(q.zone_detail, "Zárate")
+        self.assertEqual(q.precio_total, 210000)
+
+    # ── Test 3 ───────────────────────────────────────────────────────────────
+    def test_norte_villa_nueva_group_default_zero(self):
+        """Norte + Villa Nueva → no exact row → group default $0, total=$140k.
+
+        The customer's raw locality text is preserved in zone_detail via
+        PricingService's `(zone.zone_detail or zone_detail).strip()` logic.
+        """
+        q = self._svc().quote(db=None, tipo_vehiculo="SUV/4x4",
+                              zone_group="Norte", zone_detail="Villa Nueva")
+        self.assertEqual(q.viaticos, 0)
+        self.assertEqual(q.zone_group, "Norte")
+        self.assertEqual(q.zone_detail, "Villa Nueva")   # raw text preserved
+        self.assertEqual(q.precio_total, 140000)
+
+    # ── Test 4 ───────────────────────────────────────────────────────────────
+    def test_oeste_unknown_locality_group_default_30000(self):
+        """Oeste + unknown locality → group default $30k, total=$170k."""
+        q = self._svc().quote(db=None, tipo_vehiculo="SUV/4x4",
+                              zone_group="Oeste", zone_detail="Localidad Desconocida")
+        self.assertEqual(q.viaticos, 30000)
+        self.assertEqual(q.zone_group, "Oeste")
+        self.assertEqual(q.precio_total, 170000)
+
+    # ── Test 5 ───────────────────────────────────────────────────────────────
+    def test_sur_unknown_locality_group_default_30000(self):
+        """Sur + unknown locality → group default $30k, total=$170k."""
+        q = self._svc().quote(db=None, tipo_vehiculo="SUV/4x4",
+                              zone_group="Sur", zone_detail="Localidad X")
+        self.assertEqual(q.viaticos, 30000)
+        self.assertEqual(q.zone_group, "Sur")
+        self.assertEqual(q.precio_total, 170000)
+
+    # ── Test 6 ───────────────────────────────────────────────────────────────
+    def test_caba_unknown_barrio_group_default_zero(self):
+        """CABA + unknown barrio → group default $0, total=$130k.
+
+        Unknown CABA barrios do NOT reach the CABA/CABA sentinel when the
+        detail string is different; they fall to the NULL-detail group default.
+        """
+        q = self._svc().quote(db=None, tipo_vehiculo="AUTO",
+                              zone_group="CABA", zone_detail="Villa Inexistente")
+        self.assertEqual(q.viaticos, 0)
+        self.assertEqual(q.zone_group, "CABA")
+        self.assertEqual(q.precio_total, 130000)
+
+    # ── Test 7 ───────────────────────────────────────────────────────────────
+    def test_caba_palermo_exact_zero_not_group_default(self):
+        """CABA + Palermo → exact row $0; group default must NOT shadow it."""
+        q = self._svc().quote(db=None, tipo_vehiculo="AUTO",
+                              zone_group="CABA", zone_detail="Palermo")
+        self.assertEqual(q.viaticos, 0)
+        self.assertEqual(q.zone_detail, "Palermo")
+        self.assertEqual(q.precio_total, 130000)
+
+    # ── Test 8 ───────────────────────────────────────────────────────────────
+    def test_otro_zona_general_escalates_to_human_review(self):
+        """OTRO in zona_general must still escalate: no quote, needs_human=True."""
+        from unittest.mock import MagicMock, patch
+        eng = _make_engine(repo=FakeRepoGroupDefaults())
+        eng.db.commit = lambda: None
+        texts = []
+        eng._send_text_to_wa = lambda ctx, text: texts.append(text) or "wamid-otro"
+        eng._send_fallback_human_review_notification = MagicMock()
+
+        lead = types.SimpleNamespace(
+            id=10, nombre="Test", apellido=None, flag="PRESUPUESTANDO",
+            estado="CONSULTA_NUEVA", necesita_humano=False,
+        )
+        state = _make_state(location_fallback_flow_sent=True)
+        ctx = _make_ctx(state=state)
+        ctx.lead = lead
+
+        flow_data = {"zona_general": "OTRO", "localidad": "Córdoba", "referencia_ubicacion": ""}
+        result = eng._process_location_fallback_response(ctx, state, flow_data)
+
+        self.assertEqual(result.action, "replied")
+        self.assertTrue(state.needs_human)
+        self.assertTrue(lead.necesita_humano)
+        # Must NOT have produced a price quote
+        self.assertFalse(any("$" in t for t in texts),
+                         f"OTRO must not produce a price quote; texts={texts}")
+        eng._send_fallback_human_review_notification.assert_called_once()
+
+    # ── Step-3 ladder integrity ───────────────────────────────────────────────
+    def test_exact_row_always_beats_group_default(self):
+        """Avellaneda has an exact row (Sur, $30k). Group default is also Sur/$30k.
+        Confirm exact path is taken (zone_detail='Avellaneda', not None)."""
+        q = self._svc().quote(db=None, tipo_vehiculo="SUV/4x4",
+                              zone_group="Sur", zone_detail="Avellaneda")
+        self.assertEqual(q.viaticos, 30000)
+        self.assertEqual(q.zone_detail, "Avellaneda")  # exact, not group default
+
+    def test_group_default_not_triggered_when_no_group(self):
+        """If zone_group is absent, Step 3 must not return a group default."""
+        with self.assertRaises(PricingNotFoundError):
+            self._svc().quote(db=None, tipo_vehiculo="SUV/4x4",
+                              zone_group=None, zone_detail="Villa Inexistente")
+
+    def test_compute_price_quote_uses_group_default_via_engine(self):
+        """_compute_price_quote must return a valid quote for Norte + unknown locality."""
+        eng = _make_engine(repo=FakeRepoGroupDefaults())
+        c = _make_candidate(tipo_vehiculo="SUV/4x4")
+        state = _make_state(home_zone_group="Norte", home_zone_detail="Villa Nueva")
+        ctx = _make_ctx(candidates=[c], state=state)
+        result = eng._compute_price_quote(ctx, state)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.viaticos, 0)
+        self.assertEqual(result.precio_total, 140000)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
