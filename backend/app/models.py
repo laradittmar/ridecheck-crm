@@ -440,7 +440,7 @@ class WhatsAppMessage(Base):
     __table_args__ = (
         CheckConstraint("direction IN ('in', 'out')", name="ck_whatsapp_messages_direction"),
         CheckConstraint(
-            "status IN ('received', 'sent', 'delivered', 'read', 'failed')",
+            "status IN ('received', 'pending', 'sent', 'delivered', 'read', 'failed', 'blocked')",
             name="ck_whatsapp_messages_status",
         ),
     )
@@ -459,8 +459,55 @@ class WhatsAppMessage(Base):
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="received", server_default="received")
     raw_payload: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    # Safety gate fields — populated for automated bot sends only.
+    automated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    content_fingerprint: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    blocked_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     thread: Mapped["WhatsAppThread"] = relationship("WhatsAppThread", back_populates="messages")
+
+
+class WhatsAppOutboundDedup(Base):
+    """One row per automated outbound send attempt, used for rolling-window dedup.
+
+    The rolling dedup SELECT checks for rows with the same (wa_id, message_kind,
+    content_fingerprint) created within the last 10 minutes, allowing concurrent
+    sends to race on the application side before the Meta API call.
+
+    Keyed by wa_id (not thread_id) so that duplicates are caught even when the
+    same WhatsApp contact has more than one CRM thread.
+
+    thread_id is stored for audit/debug but is not part of the dedup key.
+
+    Rows older than ~1 day can be purged with:
+      DELETE FROM whatsapp_outbound_dedup WHERE created_at < NOW() - INTERVAL '1 day'
+    """
+
+    __tablename__ = "whatsapp_outbound_dedup"
+    __table_args__ = ()
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    wa_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    thread_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    message_kind: Mapped[str] = mapped_column(String(20), nullable=False, default="text", server_default="text")
+    content_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class WhatsAppRecipientLock(Base):
+    """One row per wa_id while an automated send is in-flight.
+
+    The presence of a row (enforced by the UNIQUE constraint on wa_id) is an
+    advisory lock that serialises concurrent automated sends to the same contact.
+    The row is inserted before the Meta API call and deleted after it completes
+    (or fails).
+    """
+
+    __tablename__ = "whatsapp_recipient_locks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    wa_id: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
 class AiEvent(Base):
@@ -493,3 +540,5 @@ Index("ix_whatsapp_messages_thread_id_timestamp", WhatsAppMessage.thread_id, Wha
 Index("ix_whatsapp_messages_wa_message_id", WhatsAppMessage.wa_message_id, unique=True)
 Index("ix_ai_events_thread_id", AiEvent.thread_id)
 Index("ix_ai_events_wa_message_id", AiEvent.wa_message_id, unique=True)
+Index("ix_recipient_locks_wa_id", WhatsAppRecipientLock.wa_id, unique=True)
+Index("ix_dedup_wa_kind_fp_created", WhatsAppOutboundDedup.wa_id, WhatsAppOutboundDedup.message_kind, WhatsAppOutboundDedup.content_fingerprint, WhatsAppOutboundDedup.created_at)

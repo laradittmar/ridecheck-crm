@@ -21,7 +21,13 @@ target_metadata = Base.metadata
 
 
 def _get_database_url() -> str:
-    return os.getenv("DATABASE_URL", DATABASE_URL)
+    url = os.environ.get("DATABASE_URL", "").strip()
+    if not url:
+        raise RuntimeError(
+            "DATABASE_URL is required for migrations but not set. "
+            "Pass it explicitly; no fallback is permitted."
+        )
+    return url
 
 
 def run_migrations_offline() -> None:

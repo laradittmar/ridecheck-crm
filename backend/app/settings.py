@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import os
 from dataclasses import dataclass
@@ -27,6 +27,8 @@ class Settings:
     whatsapp_location_fallback_flow_id: str = ""
     conversation_engine_direct_webhook_enabled: bool = False
     openai_chat_model: str = "gpt-4o-mini"
+    quarantined_test_wa_ids: tuple[str, ...] = ()
+    closed_beta_allowed_wa_ids: tuple[str, ...] = ()
 
     @property
     def whatsapp_enabled(self) -> bool:
@@ -49,6 +51,20 @@ class Settings:
 
 def _getenv(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
+
+
+def _parse_quarantined_wa_ids() -> tuple[str, ...]:
+    raw = os.getenv("QUARANTINED_TEST_WA_IDS", "").strip()
+    if not raw:
+        return ()
+    return tuple(wa_id.strip() for wa_id in raw.split(",") if wa_id.strip())
+
+
+def _parse_closed_beta_allowed_wa_ids() -> tuple[str, ...]:
+    raw = os.getenv("CLOSED_BETA_ALLOWED_WA_IDS", "").strip()
+    if not raw:
+        return ()
+    return tuple(wa_id.strip() for wa_id in raw.split(",") if wa_id.strip())
 
 
 @lru_cache(maxsize=1)
@@ -74,4 +90,6 @@ def get_settings() -> Settings:
         whatsapp_location_fallback_flow_id=_getenv("WHATSAPP_LOCATION_FALLBACK_FLOW_ID"),
         conversation_engine_direct_webhook_enabled=_getenv("CONVERSATION_ENGINE_DIRECT_WEBHOOK_ENABLED", "false").lower() in ("1", "true", "yes"),
         openai_chat_model=_getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
+        quarantined_test_wa_ids=_parse_quarantined_wa_ids(),
+        closed_beta_allowed_wa_ids=_parse_closed_beta_allowed_wa_ids(),
     )

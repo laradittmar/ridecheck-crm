@@ -20,6 +20,7 @@ from ..db import get_db
 from ..models import Lead, WhatsAppContact, WhatsAppMessage, WhatsAppThread
 from ..schemas.whatsapp_api import WhatsAppThreadOut
 from ..services.db_errors import commit_or_400
+from ..services.outbound_guard import OutboundBlockedError, enforce_outbound_enabled
 from ..services.unanswered_alert import reset_unanswered_alert
 from ..services.whatsapp_threads import load_thread_payload
 from ..settings import get_settings
@@ -83,6 +84,7 @@ def _build_test_wa_message_id(ts: datetime) -> str:
 
 
 def _send_whatsapp_cloud_text(to_wa_id: str, text: str) -> tuple[str, int]:
+    enforce_outbound_enabled("whatsapp_ui._send_whatsapp_cloud_text", "text", to_wa_id, text=text)
     settings = get_settings()
     token = (settings.whatsapp_token or "").strip()
     phone_number_id = (settings.whatsapp_phone_number_id or "").strip()
@@ -138,6 +140,7 @@ def _send_whatsapp_cloud_interactive(
     buttons: list[dict[str, str]],
 ) -> tuple[str, int]:
     """Send a WhatsApp interactive button message (M16.3 — max 3 buttons)."""
+    enforce_outbound_enabled("whatsapp_ui._send_whatsapp_cloud_interactive", "interactive", to_wa_id, text=body_text)
     settings = get_settings()
     token = (settings.whatsapp_token or "").strip()
     phone_number_id = (settings.whatsapp_phone_number_id or "").strip()
@@ -204,6 +207,7 @@ def _send_whatsapp_cloud_list(
     rows: list[dict],
 ) -> tuple[str, int]:
     """Send a WhatsApp interactive list message (M16.4 — up to 10 rows)."""
+    enforce_outbound_enabled("whatsapp_ui._send_whatsapp_cloud_list", "list", to_wa_id, text=body_text)
     settings = get_settings()
     token = (settings.whatsapp_token or "").strip()
     phone_number_id = (settings.whatsapp_phone_number_id or "").strip()
@@ -276,6 +280,7 @@ def _send_whatsapp_cloud_flow(
     initial_screen: str = "MAIN",
 ) -> tuple[str, int]:
     """M17 — Send a WhatsApp Flow button message (data-collection mode, no back-end)."""
+    enforce_outbound_enabled("whatsapp_ui._send_whatsapp_cloud_flow", "flow", to_wa_id, text=body_text)
     settings = get_settings()
     token = (settings.whatsapp_token or "").strip()
     phone_number_id = (settings.whatsapp_phone_number_id or "").strip()
@@ -2319,6 +2324,13 @@ def whatsapp_thread_send(thread_id: int, payload: WhatsAppSendPayload, db: Sessi
         outbound.wa_message_id = wa_message_id
         db.add(outbound)
         db.commit()
+    except OutboundBlockedError:
+        db.rollback()
+        outbound.status = "blocked"
+        outbound.blocked_reason = "KILL_SWITCH"
+        db.add(outbound)
+        db.commit()
+        return JSONResponse({"ok": False, "error": "OUTBOUND_DISABLED"}, status_code=503)
     except Exception as exc:
         db.rollback()
         outbound.status = "failed"

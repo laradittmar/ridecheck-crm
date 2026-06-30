@@ -46,6 +46,7 @@ from ..schemas.whatsapp_api import (
 )
 from ..settings import get_settings
 from ..services.db_errors import commit_or_400
+from ..services.outbound_guard import OutboundBlockedError
 from ..services.unanswered_alert import reset_unanswered_alert
 from ..services.whatsapp_thread_state import build_thread_state_read, upsert_thread_state
 from ..services.whatsapp_threads import load_latest_inbound_message, load_recent_thread_messages, load_thread_payload
@@ -418,43 +419,41 @@ def send_thread_text(thread_id: int, payload: WhatsAppSendTextIn, db: Session = 
     if not to_wa_id:
         raise HTTPException(status_code=400, detail="Thread has no wa_id")
 
-    from zoneinfo import ZoneInfo; now_utc = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
-    outbound = WhatsAppMessage(
-        thread_id=thread_id,
-        wa_message_id=None,
-        direction="out",
-        status="pending",
-        timestamp=now_utc,
-        text=text,
-        raw_payload={"reply_to_message_id": payload.reply_to_message_id}
-        if payload.reply_to_message_id is not None
-        else None,
-    )
-    db.add(outbound)
+    from zoneinfo import ZoneInfo
+    from ..services.outbound_safety_gate import GateOutcome, OutboundSafetyGate
+    now_utc = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
+
+    # M19.R1.2 safety-first: route has no server-verified auth; treated as automated.
+    gate = OutboundSafetyGate(db)
+    gate_result = gate.attempt(wa_id=to_wa_id, thread_id=thread_id, text=text,
+                               message_type="text", now=now_utc)
+    if gate_result.outcome == GateOutcome.BLOCKED_KILL_SWITCH:
+        raise HTTPException(status_code=503, detail="OUTBOUND_DISABLED")
+    if gate_result.outcome != GateOutcome.ALLOWED:
+        raise HTTPException(status_code=503,
+                            detail=f"OUTBOUND_GATE_{gate_result.outcome.value.upper()}")
+
+    # Preserve reply_to_message_id metadata on the pending record the gate created.
+    if payload.reply_to_message_id is not None:
+        pending_msg = db.get(WhatsAppMessage, gate_result.message_id)
+        if pending_msg is not None:
+            pending_msg.raw_payload = {"reply_to_message_id": payload.reply_to_message_id}
+            db.commit()
+
     thread.last_message_at = now_utc
-    try:
-        db.commit()
-    except IntegrityError:
-        db.rollback()
-        outbound.status = "sent"
-        db.add(outbound)
-        thread.last_message_at = now_utc
-        db.commit()
+    db.commit()
     reset_unanswered_alert(db, thread_id)
     db.commit()
 
     try:
         wa_message_id, _ = _send_whatsapp_cloud_text(to_wa_id=to_wa_id, text=text)
-        outbound.status = "sent"
-        outbound.wa_message_id = wa_message_id
-        db.add(outbound)
-        db.commit()
+        gate.mark_sent(gate_result.message_id, wa_message_id)
         return WhatsAppSendTextOut(ok=True, thread_id=thread_id, wa_message_id=wa_message_id, text=text)
+    except OutboundBlockedError:
+        gate.mark_failed(gate_result.message_id)
+        raise HTTPException(status_code=503, detail="OUTBOUND_DISABLED")
     except Exception as exc:
-        db.rollback()
-        outbound.status = "failed"
-        db.add(outbound)
-        db.commit()
+        gate.mark_failed(gate_result.message_id)
         raise HTTPException(status_code=502, detail=f"WhatsApp outbound send failed: {exc}") from exc
 
 
@@ -465,43 +464,41 @@ def _store_outbound_and_send(
     to_wa_id: str,
     body_text: str,
     send_fn,
+    message_type: str = "text",
 ) -> tuple[WhatsAppMessage, str]:
-    """Shared helper: persist outbound message then call send_fn(to_wa_id, ...) → wa_message_id."""
+    """Gate-mediated send: check recipient gate, persist pending record, call send_fn → wa_message_id.
+
+    M19.R1.2 safety-first: all callers of this helper have no server-verified auth session;
+    all sends are classified as automated and enter the recipient safety gate.
+    """
     from zoneinfo import ZoneInfo
+    from ..services.outbound_safety_gate import GateOutcome, OutboundSafetyGate
     now_utc = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
-    outbound = WhatsAppMessage(
-        thread_id=thread_id,
-        wa_message_id=None,
-        direction="out",
-        status="pending",
-        timestamp=now_utc,
-        text=body_text,
-    )
-    db.add(outbound)
+
+    gate = OutboundSafetyGate(db)
+    gate_result = gate.attempt(wa_id=to_wa_id, thread_id=thread_id, text=body_text,
+                               message_type=message_type, now=now_utc)
+    if gate_result.outcome == GateOutcome.BLOCKED_KILL_SWITCH:
+        raise HTTPException(status_code=503, detail="OUTBOUND_DISABLED")
+    if gate_result.outcome != GateOutcome.ALLOWED:
+        raise HTTPException(status_code=503,
+                            detail=f"OUTBOUND_GATE_{gate_result.outcome.value.upper()}")
+
     thread.last_message_at = now_utc
-    try:
-        db.commit()
-    except IntegrityError:
-        db.rollback()
-        outbound.status = "sent"
-        db.add(outbound)
-        thread.last_message_at = now_utc
-        db.commit()
+    db.commit()
     reset_unanswered_alert(db, thread_id)
     db.commit()
 
     try:
         wa_message_id = send_fn(to_wa_id)
-        outbound.status = "sent"
-        outbound.wa_message_id = wa_message_id
-        db.add(outbound)
-        db.commit()
+        gate.mark_sent(gate_result.message_id, wa_message_id)
+        outbound = db.get(WhatsAppMessage, gate_result.message_id)
         return outbound, wa_message_id
+    except OutboundBlockedError:
+        gate.mark_failed(gate_result.message_id)
+        raise HTTPException(status_code=503, detail="OUTBOUND_DISABLED")
     except Exception as exc:
-        db.rollback()
-        outbound.status = "failed"
-        db.add(outbound)
-        db.commit()
+        gate.mark_failed(gate_result.message_id)
         raise exc
 
 
@@ -535,6 +532,7 @@ def send_thread_interactive(thread_id: int, payload: WhatsAppSendInteractiveIn, 
         _, wa_message_id = _store_outbound_and_send(
             db, thread_id, thread, to_wa_id, body_text,
             lambda wa_id: _send_whatsapp_cloud_interactive(wa_id, body_text, buttons)[0],
+            message_type="interactive",
         )
         return WhatsAppSendInteractiveOut(ok=True, thread_id=thread_id, wa_message_id=wa_message_id, body=body_text)
     except Exception as exc:
@@ -559,6 +557,7 @@ def send_thread_list(thread_id: int, payload: WhatsAppSendListIn, db: Session = 
             lambda wa_id: _send_whatsapp_cloud_list(
                 wa_id, body_text, payload.button_label, payload.section_title, rows
             )[0],
+            message_type="list",
         )
         return WhatsAppSendListOut(ok=True, thread_id=thread_id, wa_message_id=wa_message_id, body=body_text)
     except Exception as exc:
@@ -596,6 +595,7 @@ def send_thread_flow(thread_id: int, payload: WhatsAppSendFlowIn, db: Session = 
                 body_text=body_text,
                 cta_label=cta_label,
             )[0],
+            message_type="flow",
         )
         return WhatsAppSendFlowOut(
             ok=True,
@@ -703,31 +703,33 @@ def send_to_phone(payload: SendToPhoneIn, db: Session = Depends(get_db)):
 
     db.commit()
 
-    # Send to Meta first, then persist the result for delivery tracking.
+    # M19.R1.2 — automated send: enter recipient safety gate (dedup + flood).
+    # Gate creates the durable pending audit record BEFORE the Meta API call.
+    from ..services.outbound_safety_gate import GateOutcome, OutboundSafetyGate
+    gate = OutboundSafetyGate(db)
+    gate_result = gate.attempt(wa_id=wa_id, thread_id=thread.id, text=text, now=now_utc)
+    if gate_result.outcome == GateOutcome.BLOCKED_KILL_SWITCH:
+        raise HTTPException(status_code=503, detail="OUTBOUND_DISABLED")
+    if gate_result.outcome != GateOutcome.ALLOWED:
+        raise HTTPException(
+            status_code=503,
+            detail=f"OUTBOUND_GATE_{gate_result.outcome.value.upper()}",
+        )
+
+    thread.last_message_at = now_utc
+    db.commit()
+
     send_exc: Exception | None = None
     wa_message_id: str | None = None
-    final_status = "failed"
     try:
         wa_message_id, _ = _send_whatsapp_cloud_text(to_wa_id=wa_id, text=text)
-        final_status = "sent"
+        gate.mark_sent(gate_result.message_id, wa_message_id)
+    except OutboundBlockedError:
+        gate.mark_failed(gate_result.message_id)
+        raise HTTPException(status_code=503, detail="OUTBOUND_DISABLED")
     except Exception as exc:
         send_exc = exc
-
-    # Save the message record with the real status so the webhook handler can track delivery.
-    try:
-        outbound = WhatsAppMessage(
-            thread_id=thread.id,
-            wa_message_id=wa_message_id,
-            direction="out",
-            status=final_status,
-            timestamp=now_utc,
-            text=text,
-        )
-        db.add(outbound)
-        thread.last_message_at = now_utc
-        db.commit()
-    except Exception:
-        db.rollback()
+        gate.mark_failed(gate_result.message_id)
 
     if send_exc is not None:
         raise HTTPException(status_code=502, detail=f"WhatsApp send failed: {send_exc}") from send_exc

@@ -1,6 +1,7 @@
 """End-to-end smoke tests for Vehicle and Location fallback Flows.
 
-Tests A and B run against the real DB with intercepted WhatsApp API calls.
+Runs against crm_test only. Never touches production.
+Tests A-F run with intercepted WhatsApp API calls.
 No actual messages are sent to Meta or any real user.
 All fixtures are cleaned up at the end.
 
@@ -8,14 +9,36 @@ Expected pricing:
   AUTO  + Palermo (CABA, viaticos=0)      = $130.000
   SUV/4x4 + Avellaneda (Sur, viaticos=30000) = $170.000
 """
+import os
+import sys
+from urllib.parse import urlparse
+
+# ── Fail-closed guards (must run before any DB/app import) ───────────────────
+_TEST_DB_URL = os.environ.get("TEST_DATABASE_URL", "").strip()
+if not _TEST_DB_URL:
+    sys.exit("ABORT: TEST_DATABASE_URL is required to run smoke tests. "
+             "Set it to postgresql+psycopg://crm:crm@<host>:5432/crm_test")
+
+_parsed_db = urlparse(_TEST_DB_URL)
+_db_name = _parsed_db.path.lstrip("/")
+if _db_name != "crm_test":
+    sys.exit(f"ABORT: TEST_DATABASE_URL must target database 'crm_test', got '{_db_name}'. "
+             "Refusing to run against any database other than crm_test.")
+
+if os.environ.get("OUTBOUND_ENABLED") == "true":
+    sys.exit("ABORT: OUTBOUND_ENABLED=true is set. "
+             "Smoke tests must never run with outbound enabled.")
+
+# Wire DATABASE_URL for app.db before importing any app code.
+os.environ["DATABASE_URL"] = _TEST_DB_URL
+DATABASE_URL = _TEST_DB_URL
+
 import secrets
 import json
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
-import os
 from unittest.mock import patch
 
-DATABASE_URL = os.environ["DATABASE_URL"]
 engine = create_engine(DATABASE_URL)
 
 from app.models import (

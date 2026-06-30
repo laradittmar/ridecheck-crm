@@ -81,13 +81,29 @@ def _run_check() -> None:
         for row in rows:
             thread_id: int = row.thread_id
             wa_id: str = row.wa_id
+            gate_result = None
             try:
                 from ..ui.whatsapp_ui import _send_whatsapp_cloud_text
-                _send_whatsapp_cloud_text(to_wa_id=wa_id, text=_FOLLOWUP_MSG)
+                from .outbound_safety_gate import GateOutcome, OutboundSafetyGate
+                gate = OutboundSafetyGate(db)
+                gate_result = gate.attempt(wa_id=wa_id, thread_id=thread_id, text=_FOLLOWUP_MSG)
+                if gate_result.outcome != GateOutcome.ALLOWED:
+                    logger.info(
+                        "quote_followup gate-blocked thread_id=%s wa_id=...%s: %s",
+                        thread_id, wa_id[-4:], gate_result.blocked_reason,
+                    )
+                    continue
+                wa_mid, _ = _send_whatsapp_cloud_text(to_wa_id=wa_id, text=_FOLLOWUP_MSG)
+                gate.mark_sent(gate_result.message_id, wa_mid)
                 db.execute(_UPSERT_SQL, {"thread_id": thread_id})
                 db.commit()
-                logger.info("quote_followup sent thread_id=%s wa_id=%s", thread_id, wa_id)
+                logger.info("quote_followup sent thread_id=%s wa_id=...%s", thread_id, wa_id[-4:])
             except Exception:
+                if gate_result is not None and gate_result.outcome == GateOutcome.ALLOWED:
+                    try:
+                        gate.mark_failed(gate_result.message_id)
+                    except Exception:
+                        pass
                 db.rollback()
                 logger.exception("quote_followup failed thread_id=%s", thread_id)
     except Exception:

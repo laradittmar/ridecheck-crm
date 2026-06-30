@@ -221,6 +221,24 @@ async def inbound_webhook(request: Request, db: Session = Depends(get_db)):
                         )
                         continue
 
+                    if wa_id in settings.quarantined_test_wa_ids:
+                        logger.info(
+                            "WHATSAPP_WEBHOOK_QUARANTINED wa_id=...%s wa_message_id=%s "
+                            "reason=QUARANTINED_TEST_WA_ID — no contact/thread/message/AI-event created",
+                            wa_id[-4:],
+                            wa_message_id,
+                        )
+                        continue
+
+                    if settings.closed_beta_allowed_wa_ids and wa_id not in settings.closed_beta_allowed_wa_ids:
+                        logger.info(
+                            "WHATSAPP_WEBHOOK_CLOSED_BETA_NOT_ALLOWED wa_id=...%s wa_message_id=%s "
+                            "reason=CLOSED_BETA_NOT_ALLOWED — no contact/thread/message/AI-event created",
+                            wa_id[-4:],
+                            wa_message_id,
+                        )
+                        continue
+
                     message_ts = _parse_wa_timestamp(message.get("timestamp"))
                     if message_ts is None:
                         logger.warning(

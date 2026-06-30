@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import secrets
 import time as _time
@@ -57,6 +58,8 @@ from ..services.pricing import PricingNotFoundError, PricingQuote, PricingServic
 from ..services.schedule import ScheduleService
 from ..services.unanswered_alert import reset_unanswered_alert
 from ..services.vehicle_catalog import VehicleMatch, lookup_vehicle
+from ..services.outbound_guard import OutboundBlockedError
+from ..services.outbound_safety_gate import GateOutcome, OutboundSafetyGate
 from ..settings import Settings
 from ..ui.whatsapp_ui import _send_whatsapp_cloud_flow, _send_whatsapp_cloud_text
 
@@ -686,6 +689,22 @@ class ConversationEngine:
     def handle(self, event: ConversationHandleIn) -> ConversationHandleOut:
         try:
             return self._handle(event)
+        except OutboundBlockedError as exc:
+            outcome = getattr(exc, "gate_outcome", "BLOCKED_KILL_SWITCH")
+            detail = (
+                "OUTBOUND_DISABLED"
+                if outcome == "BLOCKED_KILL_SWITCH"
+                else f"OUTBOUND_GATE_{outcome.upper()}"
+            )
+            logger.warning(
+                "M19 OUTBOUND_BLOCKED thread_id=%s outcome=%s wa=%s",
+                event.thread_id, outcome, event.wa_message_id,
+            )
+            try:
+                self.db.rollback()
+            except Exception:
+                pass
+            return _out("error", detail=detail)
         except Exception:
             logger.exception(
                 "M18 engine unhandled error thread_id=%s wa=%s",
@@ -1145,11 +1164,16 @@ class ConversationEngine:
                     "M18 vehicle_fallback flow dispatched thread_id=%s flow_id=%s",
                     ctx.thread.id, flow_id,
                 )
-                state.vehicle_fallback_flow_sent = True
                 body = (
                     "Completá los datos del vehículo para que podamos cotizarte "
                     "la revisión mecánica."
                 )
+                if os.environ.get("OUTBOUND_ENABLED") != "true":
+                    OutboundSafetyGate(self.db).attempt(
+                        wa_id=ctx.contact.wa_id, thread_id=ctx.thread.id, text=body,
+                    )
+                    return _out("error", detail="OUTBOUND_DISABLED")
+                state.vehicle_fallback_flow_sent = True
                 flow_token = secrets.token_urlsafe(24)
                 sent_id = self._send_flow_button(
                     ctx, body, flow_token, flow_id=flow_id, initial_screen="VEHICLE_DETAILS"
@@ -1157,11 +1181,16 @@ class ConversationEngine:
                 return _out("replied", wa_message_id=sent_id)
             if not state.vehicle_clarification_sent:
                 # First attempt — ask via chat.
-                state.vehicle_clarification_sent = True
                 reply = (
                     "Para cotizarte la revisión necesito saber qué vehículo tenés. "
                     "¿Me podés indicar la marca y el modelo?"
                 )
+                if os.environ.get("OUTBOUND_ENABLED") != "true":
+                    OutboundSafetyGate(self.db).attempt(
+                        wa_id=ctx.contact.wa_id, thread_id=ctx.thread.id, text=reply,
+                    )
+                    return _out("error", detail="OUTBOUND_DISABLED")
+                state.vehicle_clarification_sent = True
                 self.db.commit()
                 sent_id = self._send_text_to_wa(ctx, reply)
                 return _out("replied", wa_message_id=sent_id)
@@ -1187,22 +1216,32 @@ class ConversationEngine:
                     "M18 location_fallback flow dispatched thread_id=%s flow_id=%s",
                     ctx.thread.id, flow_id,
                 )
-                state.location_fallback_flow_sent = True
                 body = (
                     "Indicanos dónde está el auto para calcular los viáticos "
                     "de la revisión."
                 )
+                if os.environ.get("OUTBOUND_ENABLED") != "true":
+                    OutboundSafetyGate(self.db).attempt(
+                        wa_id=ctx.contact.wa_id, thread_id=ctx.thread.id, text=body,
+                    )
+                    return _out("error", detail="OUTBOUND_DISABLED")
+                state.location_fallback_flow_sent = True
                 flow_token = secrets.token_urlsafe(24)
                 sent_id = self._send_flow_button(
                     ctx, body, flow_token, flow_id=flow_id, initial_screen="LOCATION_DETAILS"
                 )
                 return _out("replied", wa_message_id=sent_id)
             if not state.location_clarification_sent:
-                state.location_clarification_sent = True
                 reply = (
                     "¿En qué localidad o barrio está el auto? "
                     "Por ejemplo: Palermo, Tigre, Dock Sud o Lomas de Zamora."
                 )
+                if os.environ.get("OUTBOUND_ENABLED") != "true":
+                    OutboundSafetyGate(self.db).attempt(
+                        wa_id=ctx.contact.wa_id, thread_id=ctx.thread.id, text=reply,
+                    )
+                    return _out("error", detail="OUTBOUND_DISABLED")
+                state.location_clarification_sent = True
                 self.db.commit()
                 sent_id = self._send_text_to_wa(ctx, reply)
                 return _out("replied", wa_message_id=sent_id)
@@ -2812,27 +2851,21 @@ Respondé SOLO con JSON válido:
         from zoneinfo import ZoneInfo
         now_utc = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
         wa_id = ctx.contact.wa_id
-
-        # Call the WhatsApp API BEFORE writing to the DB so that all session
-        # state (including last_processed_inbound_wa_message_id) is only
-        # committed after we know whether the send succeeded or failed.
-        wa_message_id = None
-        final_status = "failed"
+        gate = OutboundSafetyGate(self.db)
+        result = gate.attempt(wa_id=wa_id, thread_id=ctx.thread.id, text=text, now=now_utc)
+        if result.outcome != GateOutcome.ALLOWED:
+            raise OutboundBlockedError(
+                sender_path="engine._send_text_to_wa", kind="text",
+                to_wa_id=wa_id, thread_id=ctx.thread.id, text=text,
+                gate_outcome=result.outcome.value,
+            )
+        wa_message_id: str | None = None
         try:
             wa_message_id, _ = _send_whatsapp_cloud_text(to_wa_id=wa_id, text=text)
-            final_status = "sent"
+            gate.mark_sent(result.message_id, wa_message_id)
         except Exception as exc:
             logger.error("M18 send_text failed thread_id=%s: %s", ctx.thread.id, exc)
-
-        outbound = WhatsAppMessage(
-            thread_id=ctx.thread.id,
-            wa_message_id=wa_message_id,
-            direction="out",
-            status=final_status,
-            timestamp=now_utc,
-            text=text,
-        )
-        self.db.add(outbound)
+            gate.mark_failed(result.message_id)
         ctx.thread.last_message_at = now_utc
         self.db.commit()
         reset_unanswered_alert(self.db, ctx.thread.id)
@@ -2852,26 +2885,32 @@ Respondé SOLO con JSON válido:
         now_utc = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
         wa_id = ctx.contact.wa_id
 
-        # Send first; raises on failure so the caller can revert state.
-        wa_message_id, _ = _send_whatsapp_cloud_flow(
-            to_wa_id=wa_id,
-            flow_id=flow_id,
-            flow_token=flow_token,
-            body_text=body_text,
-            cta_label="Completar datos",
-            initial_screen=initial_screen,
-        )
+        # Safety gate: pre-send audit + duplicate/flood checks.
+        gate = OutboundSafetyGate(self.db)
+        result = gate.attempt(wa_id=wa_id, thread_id=ctx.thread.id, text=body_text, message_type="flow", now=now_utc)
+        if result.outcome != GateOutcome.ALLOWED:
+            raise OutboundBlockedError(
+                sender_path="engine._send_flow_button",
+                kind="flow",
+                to_wa_id=wa_id,
+                thread_id=ctx.thread.id,
+                gate_outcome=result.outcome.value,
+            )
 
-        outbound = WhatsAppMessage(
-            thread_id=ctx.thread.id,
-            wa_message_id=wa_message_id,
-            direction="out",
-            status="sent",
-            timestamp=now_utc,
-            message_type="flow",
-            text=body_text,
-        )
-        self.db.add(outbound)
+        try:
+            wa_message_id, _ = _send_whatsapp_cloud_flow(
+                to_wa_id=wa_id,
+                flow_id=flow_id,
+                flow_token=flow_token,
+                body_text=body_text,
+                cta_label="Completar datos",
+                initial_screen=initial_screen,
+            )
+            gate.mark_sent(result.message_id, wa_message_id)
+        except Exception:
+            gate.mark_failed(result.message_id)
+            raise  # caller can revert state on flow-send failure
+
         ctx.thread.last_message_at = now_utc
         self.db.commit()
         reset_unanswered_alert(self.db, ctx.thread.id)
