@@ -31,7 +31,7 @@ class ConversationHandleIn(BaseModel):
 
 class ConversationHandleOut(BaseModel):
     ok: bool
-    # replied | flow_button_sent | booking_created | skipped_human | skipped_dedup | no_lead | error
+    # replied | flow_button_sent | booking_created | skipped_human | skipped_dedup | no_lead | error | blocked_dispatch
     action: str
     # True  → engine owned the turn; n8n should stop
     # False → engine could not process; n8n may continue legacy fallback

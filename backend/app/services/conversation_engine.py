@@ -85,7 +85,12 @@ def _is_acceptance(texts: list[str]) -> bool:
     """Return True when all user messages together express unambiguous acceptance."""
     combined = " ".join(texts).strip()
     normalized = combined.lower().strip("!.¡ ").strip()
-    return normalized in _ACCEPTANCE_KEYWORDS
+    if normalized in _ACCEPTANCE_KEYWORDS:
+        return True
+    # Handles word combinations like "Si avancemos" / "Sí, avancemos" where each
+    # individual token is itself an acceptance word but the combined string is not.
+    words = re.sub(r"[^\w\s]", " ", normalized).split()
+    return bool(words) and all(w in _ACCEPTANCE_KEYWORDS for w in words)
 
 
 # Matches a vehicle model year: 1980–2029
@@ -660,7 +665,7 @@ def _parse_scheduling_text(texts: list[str], today: date) -> tuple[str | None, s
 
 def _out(action: str, **kwargs) -> ConversationHandleOut:
     return ConversationHandleOut(
-        ok=action not in ("error",),
+        ok=action not in ("error", "blocked_dispatch"),
         action=action,
         handled=action in HANDLED_ACTIONS,
         **kwargs,
@@ -691,15 +696,24 @@ class ConversationEngine:
             return self._handle(event)
         except OutboundBlockedError as exc:
             outcome = getattr(exc, "gate_outcome", "BLOCKED_KILL_SWITCH")
-            detail = (
-                "OUTBOUND_DISABLED"
-                if outcome == "BLOCKED_KILL_SWITCH"
-                else f"OUTBOUND_GATE_{outcome.upper()}"
-            )
+            detail = f"OUTBOUND_GATE_{outcome.upper()}"
             logger.warning(
                 "M19 OUTBOUND_BLOCKED thread_id=%s outcome=%s wa=%s",
                 event.thread_id, outcome, event.wa_message_id,
             )
+            if outcome.upper() == "BLOCKED_KILL_SWITCH":
+                # Kill switch: CE computed the full logical result before reaching
+                # the send. Commit CE session to persist conversation state.
+                # Blocked audit is already committed in the gate's dedicated session.
+                try:
+                    self.db.commit()
+                except Exception:
+                    try:
+                        self.db.rollback()
+                    except Exception:
+                        pass
+                return _out("blocked_dispatch", detail=detail)
+            # Duplicate / flood: CE may have partial state — do not commit.
             try:
                 self.db.rollback()
             except Exception:
@@ -926,11 +940,18 @@ class ConversationEngine:
             scheduled_time=sched_time.strftime("%H:%M") if sched_time else None,
         )
 
-        buyer_display = buyer_first or state.customer_name or ""
+        name_display = buyer_first or state.customer_name or ""
+        date_display = _format_date_human(sched_date.isoformat(), date.today()) if sched_date else None
+        time_display = sched_time.strftime("%H:%M") if sched_time else None
+        if name_display and date_display and time_display:
+            opener = f"¡Listo, {name_display}! Recibimos tu solicitud para el {date_display} a las {time_display} 🎉"
+        elif name_display:
+            opener = f"¡Listo, {name_display}! Recibimos tu solicitud 🎉"
+        else:
+            opener = "¡Listo! Recibimos tu solicitud 🎉"
         confirm_text = (
-            f"¡Perfecto{', ' + buyer_display if buyer_display else ''}! Tu solicitud de turno quedó registrada 🎉\n\n"
-            "Un asesor va a revisar la disponibilidad y te confirma el turno a la brevedad. "
-            "Cualquier consulta respondé por acá."
+            f"{opener}\n\n"
+            "Un asesor va a revisar los datos y te confirma el turno a la brevedad."
         )
         sent_id = self._send_text_to_wa(ctx, confirm_text)
         return _out("booking_created", wa_message_id=sent_id)
@@ -1172,7 +1193,8 @@ class ConversationEngine:
                     OutboundSafetyGate(self.db).attempt(
                         wa_id=ctx.contact.wa_id, thread_id=ctx.thread.id, text=body,
                     )
-                    return _out("error", detail="OUTBOUND_DISABLED")
+                    self.db.commit()
+                    return _out("blocked_dispatch", detail="OUTBOUND_GATE_BLOCKED_KILL_SWITCH")
                 state.vehicle_fallback_flow_sent = True
                 flow_token = secrets.token_urlsafe(24)
                 sent_id = self._send_flow_button(
@@ -1189,7 +1211,8 @@ class ConversationEngine:
                     OutboundSafetyGate(self.db).attempt(
                         wa_id=ctx.contact.wa_id, thread_id=ctx.thread.id, text=reply,
                     )
-                    return _out("error", detail="OUTBOUND_DISABLED")
+                    self.db.commit()
+                    return _out("blocked_dispatch", detail="OUTBOUND_GATE_BLOCKED_KILL_SWITCH")
                 state.vehicle_clarification_sent = True
                 self.db.commit()
                 sent_id = self._send_text_to_wa(ctx, reply)
@@ -1224,7 +1247,8 @@ class ConversationEngine:
                     OutboundSafetyGate(self.db).attempt(
                         wa_id=ctx.contact.wa_id, thread_id=ctx.thread.id, text=body,
                     )
-                    return _out("error", detail="OUTBOUND_DISABLED")
+                    self.db.commit()
+                    return _out("blocked_dispatch", detail="OUTBOUND_GATE_BLOCKED_KILL_SWITCH")
                 state.location_fallback_flow_sent = True
                 flow_token = secrets.token_urlsafe(24)
                 sent_id = self._send_flow_button(
@@ -1240,7 +1264,8 @@ class ConversationEngine:
                     OutboundSafetyGate(self.db).attempt(
                         wa_id=ctx.contact.wa_id, thread_id=ctx.thread.id, text=reply,
                     )
-                    return _out("error", detail="OUTBOUND_DISABLED")
+                    self.db.commit()
+                    return _out("blocked_dispatch", detail="OUTBOUND_GATE_BLOCKED_KILL_SWITCH")
                 state.location_clarification_sent = True
                 self.db.commit()
                 sent_id = self._send_text_to_wa(ctx, reply)
@@ -1718,9 +1743,7 @@ class ConversationEngine:
         # state.current_revision_id stays null
         # state.needs_human stays false
 
-        customer = (state.customer_name or "").strip() or (lead.nombre or "").strip()
-        greeting = f"Genial, {customer}!" if customer else "Genial!"
-        reply = f"{greeting} ¿Qué día y horario te viene mejor para la revisión?"
+        reply = "¡Perfecto! ¿Qué día y horario te viene mejor para la revisión?"
         sent_id = self._send_text_to_wa(ctx, reply)
         return _out("replied", wa_message_id=sent_id)
 
@@ -1895,7 +1918,7 @@ class ConversationEngine:
                     # Don't send the generic Flow (it would re-ask data already collected).
                     # Ask for the two remaining missing pieces via chat.
                     fallback = (
-                        "Perfecto, ese horario está disponible 🎉 "
+                        "Ese horario está disponible 🎉 "
                         "Para confirmar el turno necesito dos datos más: "
                         "¿Me podés dar tu email y la dirección exacta donde está el vehículo?"
                     )
@@ -1910,7 +1933,7 @@ class ConversationEngine:
                     return _out("replied", wa_message_id=sent_id)
 
             body = (
-                "Perfecto, ese horario está disponible 🎉 "
+                "Ese horario está disponible 🎉 "
                 "Para confirmar el turno, completá el formulario con tus datos."
             )
             screen = "WEBSITE_FINAL_DATA" if is_website else "MAIN"
@@ -2657,7 +2680,14 @@ Respondé SOLO con JSON válido:
 
     def _extract_zone_from_text(self, text: str) -> "ViaticosZone | None":
         from sqlalchemy import select as _select
-        normalized_text = " ".join(text.lower().split())
+
+        # Normalize: strip Unicode diacritics, lowercase, collapse whitespace.
+        # Applied to both the customer text and every DB/alias value compared below
+        # so that "Benavídez" matches the stored "Benavidez" (and vice-versa).
+        def _n(s: str) -> str:
+            return " ".join(_strip_accents(s).split())
+
+        normalized_text = _n(text)
         zones = list(self.db.execute(_select(ViaticosZone)).scalars().all())
 
         # Dock Sud fast-path: "doc sud", "dock sud" and typo variants → Sur/Dock Sud.
@@ -2667,8 +2697,8 @@ Respondé SOLO con JSON válido:
             if alias in normalized_text:
                 for z in zones:
                     if (
-                        " ".join((z.zone_group or "").lower().split()) == "sur"
-                        and " ".join((z.zone_detail or "").lower().split()) == "dock sud"
+                        _n(z.zone_group or "") == "sur"
+                        and _n(z.zone_detail or "") == "dock sud"
                     ):
                         return z
                 # Defensive: migration not yet applied
@@ -2680,13 +2710,10 @@ Respondé SOLO con JSON válido:
         # as zone_detail values in the DB.  "caba" / "CABA" are NOT in this set —
         # they're handled by the zone_detail="CABA" sentinel row in the loop below.
         for synonym in _CABA_SYNONYMS:
-            if synonym in normalized_text:
+            if _n(synonym) in normalized_text:
                 # Return the CABA sentinel row from the already-loaded zones list.
                 for z in zones:
-                    if (
-                        " ".join((z.zone_group or "").lower().split()) == "caba"
-                        and " ".join((z.zone_detail or "").lower().split()) == "caba"
-                    ):
+                    if _n(z.zone_group or "") == "caba" and _n(z.zone_detail or "") == "caba":
                         return z
                 # Defensive sentinel if migration hasn't run yet.
                 from types import SimpleNamespace
@@ -2703,7 +2730,7 @@ Respondé SOLO con JSON válido:
         for zone in zones_sorted:
             if not zone.zone_detail:
                 continue
-            zone_norm = " ".join(zone.zone_detail.lower().split())
+            zone_norm = _n(zone.zone_detail)
             if zone_norm in normalized_text:
                 return zone
 
@@ -2713,7 +2740,7 @@ Respondé SOLO con JSON válido:
         seen_groups: set[str] = set()
         for zone in zones:
             if zone.zone_group:
-                g_norm = " ".join(zone.zone_group.lower().split())
+                g_norm = _n(zone.zone_group)
                 if g_norm in seen_groups:
                     continue
                 seen_groups.add(g_norm)
