@@ -179,6 +179,120 @@ _FALLBACK_WARM_HANDOFF = (
     "te va a contactar a la brevedad para continuar con la cotización."
 )
 
+# ── M20.6D.2B Routing gate constants ─────────────────────────────────────────
+
+# Clearly out-of-coverage cities/provinces. Accent-stripped lowercase forms;
+# matched against _norm_lower(message). GBA localities are NOT listed here.
+_OUTSIDE_COVERAGE_CITIES: frozenset[str] = frozenset({
+    "cordoba", "rosario", "mendoza", "tucuman", "santa fe",
+    "mar del plata", "salta", "jujuy", "san juan", "san luis",
+    "neuquen", "bariloche", "bahia blanca", "resistencia",
+    "corrientes", "posadas", "formosa", "rio cuarto",
+    "comodoro rivadavia", "rio gallegos", "santa rosa", "rawson", "ushuaia",
+})
+
+# Words indicating the customer has a concern about the vehicle condition.
+_VEHICLE_CONCERN_WORDS: frozenset[str] = frozenset({
+    "temperatura", "calor", "sobrecalenta", "humo", "fuma",
+    "ruido", "golpe", "traqueteo", "vibracion", "vibra",
+    "fuga", "pierde", "perdida",
+    "freno", "frenos",
+    "falla", "fallo", "problema", "preocupa",
+})
+
+# Words/phrases signalling the customer wants a price or quote.
+# Accent-stripped lowercase; matched as substrings of _norm_lower(message).
+_PRICE_INTENT_WORDS: frozenset[str] = frozenset({
+    "cuanto sale", "cuanto cuesta", "cuanto seria",
+    "cuanto cobra", "cuanto esta el servicio",
+    "precio", "cotizacion", "cotizar", "presupuesto",
+})
+
+# Location Flow body — concern-aware variant
+_LOC_FLOW_BODY_CONCERN = (
+    "Entiendo. En la revisión podemos revisar ese punto junto con el resto del auto.\n\n"
+    "Para calcular los viáticos, completá dónde está el vehículo."
+)
+# Location Flow body — standard (no concern)
+_LOC_FLOW_BODY_STANDARD = (
+    "Para calcular los viáticos de la revisión, completá dónde está el auto."
+)
+# Vehicle Flow body — generic vehicle or logistics question
+_VEH_FLOW_BODY_GENERIC = (
+    "La revisión se realiza donde está el auto.\n\n"
+    "Para cotizarte bien, completá estos datos del vehículo."
+)
+# Vehicle Flow body — garbled/unrecognised vehicle model
+_VEH_FLOW_BODY_GARBLED = (
+    "Para cotizarte bien, completá estos datos del vehículo."
+)
+# Out-of-coverage deterministic response (exact copy)
+_COVERAGE_RESPONSE = (
+    "Por el momento trabajamos en CABA y GBA.\n\n"
+    "Para una revisión fuera de esa zona tenemos que evaluar la logística. "
+    "Te confirmamos si podemos hacerlo."
+)
+
+# Accent-stripped lowercase phrases that signal a service FAQ or soft conversation close.
+# Matched as substrings of _norm_lower(message). Conservative set — do not add price
+# or concern words here; those are handled by _wants_price_quote / _has_vehicle_concern.
+_FAQ_OR_SOFT_CLOSE_PHRASES: frozenset[str] = frozenset({
+    # Service-information / FAQ
+    "que revisan",
+    "que incluye",
+    "cuanto dura",
+    "como trabajan",
+    "como hacen",
+    "con cuanto tiempo de anticipo",
+    "con cuanta anticipacion",
+    "como coordinan",
+    # Soft-close / polite exit
+    "gracias",
+    "lo tengo en cuenta",
+    "los tengo en cuenta",
+    "cualquier cosa te escribo",
+    "te aviso",
+    "por ahora no",
+    "mas adelante",
+})
+
+
+def _norm_lower(s: str) -> str:
+    """Accent-strip, lowercase, and collapse whitespace — for keyword matching."""
+    return " ".join(_strip_accents(s).lower().split())
+
+
+def _is_outside_coverage(text: str) -> bool:
+    n = _norm_lower(text)
+    return any(city in n for city in _OUTSIDE_COVERAGE_CITIES)
+
+
+def _has_vehicle_concern(text: str) -> bool:
+    n = _norm_lower(text)
+    return any(w in n for w in _VEHICLE_CONCERN_WORDS)
+
+
+def _wants_price_quote(text: str) -> bool:
+    n = _norm_lower(text)
+    return any(phrase in n for phrase in _PRICE_INTENT_WORDS)
+
+
+def _is_generic_vehicle_text(text: str) -> bool:
+    """True when text mentions 'auto'/'vehículo' generically (not a specific model)."""
+    n = _norm_lower(text)
+    return "auto" in n.split() or "vehiculo" in n
+
+
+def _is_general_faq_or_soft_close(text: str) -> bool:
+    """True when text signals a service FAQ, info question, or soft conversation close.
+
+    Deterministic substring match — no LLM involved. Conservative phrase set.
+    Caller must separately guard against concern words and price-intent phrases
+    to ensure those paths are not suppressed.
+    """
+    n = _norm_lower(text)
+    return any(phrase in n for phrase in _FAQ_OR_SOFT_CLOSE_PHRASES)
+
 
 def _is_caba_synonym(value: str) -> bool:
     """Return True if value (case-insensitive) is a known CABA synonym."""
@@ -1142,6 +1256,177 @@ class ConversationEngine:
         sent_id = self._send_text_to_wa(ctx, reply)
         return _out("replied", wa_message_id=sent_id)
 
+    # ── M20.6D.2B Routing gate ────────────────────────────────────────────
+
+    def _routing_gate(
+        self,
+        ctx: "_Context",
+        state: "WhatsAppThreadState",
+        pre_detected_vehicle: "VehicleMatch | None",
+        ai_input_messages: list[str],
+    ) -> "tuple[ConversationHandleOut | None, bool]":
+        """Deterministic routing gate that runs before _check_fallback_flow_triggers.
+
+        Returns (result, skip_fallback):
+          result is not None   → return it immediately.
+          result is None, skip_fallback=True  → go to AI, skip old fallback trigger.
+          result is None, skip_fallback=False → continue to _check_fallback_flow_triggers.
+
+        Priority order (spec M20.6D.2B.1):
+          1. Clearly outside coverage → deterministic coverage response.
+          2. Vehicle known + concern + zone unknown → concern-aware Location Flow.
+          3. FAQ / soft-close / service-info (not concern, not price) → AI.
+          4. Vehicle known + zone unknown (general) → standard Location Flow.
+             Covers price questions, scheduling, bare vehicle/location messages.
+          5. Vehicle unknown + price intent → Vehicle Flow.
+             Vehicle unknown + no price intent → AI.
+          6. Fall through to existing qualification behavior.
+        """
+        if state.last_stage not in (STAGE_QUALIFYING, None):
+            return None, False
+        if state.needs_human:
+            return None, False
+
+        combined = " ".join(ai_input_messages)
+
+        # Priority 1 — outside coverage
+        if _is_outside_coverage(combined):
+            return self._send_coverage_response(ctx, state), False
+
+        focus = self._focus_candidate(ctx)
+        vehicle_known = (
+            pre_detected_vehicle is not None and bool(pre_detected_vehicle.tipo_vehiculo)
+        ) or bool(focus and focus.tipo_vehiculo)
+        zone_known = bool(state.home_zone_group)
+
+        # Priority 2 — vehicle known + concern + zone missing → concern-aware Location Flow.
+        # Concern takes precedence over FAQ/soft-close; cannot be suppressed by the FAQ check.
+        if vehicle_known and not zone_known and not state.location_fallback_flow_sent:
+            if _has_vehicle_concern(combined):
+                result = self._dispatch_location_flow_direct(ctx, state, concern=True)
+                if result is not None:
+                    return result, False
+
+        # Priority 3 — FAQ / soft-close / service-info → AI (regardless of vehicle/zone state).
+        # Only fires when neither concern nor price intent is present.
+        # This carves out service questions and polite exits from the Location/Vehicle Flow paths.
+        if (
+            _is_general_faq_or_soft_close(combined)
+            and not _has_vehicle_concern(combined)
+            and not _wants_price_quote(combined)
+        ):
+            return None, True
+
+        # Priority 4 — vehicle known + zone missing → standard Location Flow (general case).
+        # Covers: price questions, scheduling queries, bare vehicle mentions, location mentions,
+        # and any other message that is not a FAQ, soft-close, concern, or outside-coverage.
+        # Preserves D.2B direct dispatch for the full "vehicle known + zone unknown" envelope.
+        if vehicle_known and not zone_known and not state.location_fallback_flow_sent:
+            result = self._dispatch_location_flow_direct(ctx, state, concern=False)
+            if result is not None:
+                return result, False
+
+        # Priority 5 — vehicle not resolved
+        if not vehicle_known:
+            if _wants_price_quote(combined) and not state.vehicle_fallback_flow_sent:
+                generic = _is_generic_vehicle_text(combined)
+                intro = _VEH_FLOW_BODY_GENERIC if generic else _VEH_FLOW_BODY_GARBLED
+                result = self._dispatch_vehicle_flow_direct(ctx, state, intro)
+                if result is not None:
+                    return result, False
+            # Unknown vehicle + no price intent → AI (skip old fallback trigger)
+            return None, True
+
+        return None, False
+
+    def _dispatch_vehicle_flow_direct(
+        self,
+        ctx: "_Context",
+        state: "WhatsAppThreadState",
+        intro: str,
+    ) -> "ConversationHandleOut | None":
+        """Dispatch the Vehicle Fallback Flow immediately, skipping the text step.
+
+        Returns None when no flow_id is configured (caller should fall through).
+        """
+        flow_id = (
+            getattr(self.settings, "whatsapp_vehicle_fallback_flow_id", "") or ""
+        ).strip()
+        if not flow_id:
+            return None
+        logger.info(
+            "M20 vehicle_flow_direct thread_id=%s flow_id=%s", ctx.thread.id, flow_id
+        )
+        if os.environ.get("OUTBOUND_ENABLED") != "true":
+            OutboundSafetyGate(self.db).attempt(
+                wa_id=ctx.contact.wa_id, thread_id=ctx.thread.id, text=intro,
+            )
+            self.db.commit()
+            return _out("blocked_dispatch", detail="OUTBOUND_GATE_BLOCKED_KILL_SWITCH")
+        state.vehicle_fallback_flow_sent = True
+        flow_token = secrets.token_urlsafe(24)
+        sent_id = self._send_flow_button(
+            ctx, intro, flow_token,
+            flow_id=flow_id, initial_screen="VEHICLE_DETAILS",
+        )
+        return _out("replied", wa_message_id=sent_id)
+
+    def _dispatch_location_flow_direct(
+        self,
+        ctx: "_Context",
+        state: "WhatsAppThreadState",
+        *,
+        concern: bool,
+    ) -> "ConversationHandleOut | None":
+        """Dispatch the Location Fallback Flow immediately, skipping the text step.
+
+        Returns None when no flow_id is configured (caller should fall through).
+        """
+        flow_id = (
+            getattr(self.settings, "whatsapp_location_fallback_flow_id", "") or ""
+        ).strip()
+        if not flow_id:
+            return None
+        body = _LOC_FLOW_BODY_CONCERN if concern else _LOC_FLOW_BODY_STANDARD
+        logger.info(
+            "M20 location_flow_direct thread_id=%s flow_id=%s concern=%s",
+            ctx.thread.id, flow_id, concern,
+        )
+        if os.environ.get("OUTBOUND_ENABLED") != "true":
+            OutboundSafetyGate(self.db).attempt(
+                wa_id=ctx.contact.wa_id, thread_id=ctx.thread.id, text=body,
+            )
+            self.db.commit()
+            return _out("blocked_dispatch", detail="OUTBOUND_GATE_BLOCKED_KILL_SWITCH")
+        state.location_fallback_flow_sent = True
+        flow_token = secrets.token_urlsafe(24)
+        sent_id = self._send_flow_button(
+            ctx, body, flow_token,
+            flow_id=flow_id, initial_screen="LOCATION_DETAILS",
+        )
+        return _out("replied", wa_message_id=sent_id)
+
+    def _send_coverage_response(
+        self,
+        ctx: "_Context",
+        state: "WhatsAppThreadState",
+    ) -> "ConversationHandleOut":
+        """Send the deterministic out-of-coverage response and set needs_human."""
+        state.needs_human = True
+        if ctx.lead:
+            ctx.lead.necesita_humano = True
+        logger.info("M20 coverage_response thread_id=%s", ctx.thread.id)
+        if os.environ.get("OUTBOUND_ENABLED") != "true":
+            OutboundSafetyGate(self.db).attempt(
+                wa_id=ctx.contact.wa_id,
+                thread_id=ctx.thread.id,
+                text=_COVERAGE_RESPONSE,
+            )
+            self.db.commit()
+            return _out("blocked_dispatch", detail="OUTBOUND_GATE_BLOCKED_KILL_SWITCH")
+        sent_id = self._send_text_to_wa(ctx, _COVERAGE_RESPONSE)
+        return _out("replied", wa_message_id=sent_id)
+
     def _check_fallback_flow_triggers(
         self,
         ctx: _Context,
@@ -1482,16 +1767,22 @@ class ConversationEngine:
         # ── Pre-AI deterministic price quote ──────────────────────────────
         real_price_quote = self._compute_price_quote(ctx, state)
 
-        # ── Qualification fallback Flow triggers ──────────────────────────
-        # Only active during QUALIFYING stage. After one failed chat clarification
-        # (tracked by *_clarification_sent flags), dispatch the appropriate Meta
-        # Flow if the Flow ID is configured. Never fires in QUOTED/SCHEDULING/etc.
+        # ── M20.6D.2B routing gate → then fallback Flow triggers ─────────────
+        # Gate runs first in QUALIFYING to direct the turn to:
+        #   A. Out-of-coverage response, B. Direct Flow, or C. AI (skipping old fallback).
+        # Only if gate returns (None, False) does the old two-step fallback trigger run.
         if state.last_stage in (STAGE_QUALIFYING, None) and not state.needs_human:
-            _fb_result = self._check_fallback_flow_triggers(
+            _gate_result, _skip_fallback = self._routing_gate(
                 ctx, state, pre_detected_vehicle, ai_input_messages
             )
-            if _fb_result is not None:
-                return _fb_result
+            if _gate_result is not None:
+                return _gate_result
+            if not _skip_fallback:
+                _fb_result = self._check_fallback_flow_triggers(
+                    ctx, state, pre_detected_vehicle, ai_input_messages
+                )
+                if _fb_result is not None:
+                    return _fb_result
 
         # ── Deterministic phone-call escalation ───────────────────────────
         # If the customer is asking to be called, escalate immediately and skip
@@ -2408,6 +2699,9 @@ REGLAS DE NEGOCIO:
 11. NUNCA uses "cliente" como nombre de persona. Si no sabés el nombre, salteá el nombre por completo — decí "Genial!" en lugar de "Genial, cliente!".
 12. En etapa SCHEDULING, NO menciones precio ni cotización. El cliente ya recibió la cotización. Solo pedí día y horario disponible.
 13. NUNCA digas que la revisión quedó confirmada, el turno está reservado, ni prometas enviar recordatorios. El turno se confirma solo cuando el cliente completa el formulario de datos. En SCHEDULING, tu única función es coordinar día y horario.
+14. La revisión se realiza en el lugar donde está el auto (revisión pre-compra a domicilio).
+15. La revisión suele durar aproximadamente una hora.
+16. Cuanto antes nos avise el cliente, mejor. Coordinamos según la disponibilidad de agenda.
 
 TIPOS DE VEHÍCULO VÁLIDOS: AUTO, SUV_4X4_DEPORTIVO, SUV/4x4, CLASICO, MOTO, ESCANEO_MOTOR
 
