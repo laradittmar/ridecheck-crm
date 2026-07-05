@@ -1526,5 +1526,317 @@ class TestRC16PriceWithKnownVehicleDirectFlow(unittest.TestCase):
         self.assertEqual(mock_urlopen.call_count, 0, "AI must not be called")
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# RC17 — Live Scenario 2 parity: Vehicle Flow response → direct Location Flow
+# ═══════════════════════════════════════════════════════════════════════════════
+class TestRC17VehicleFlowResponseToLocationFlow(unittest.TestCase):
+    """After a valid Vehicle Flow response with no zone known, the engine must
+    dispatch the Location Fallback Flow directly — not call AI or send a
+    plain-text locality question.  Fixes the gap found in M20.6D.4 Scenario 2.
+    """
+
+    def setUp(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db = _SessionLocal()
+        self.contact, self.thread, self.lead, self.state = _seed_fresh(self.db, "6D4RC17")
+        self.eng = _make_engine(self.db)
+        self.wa_id = self.contact.wa_id
+
+    def tearDown(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db.close()
+
+    @patch("urllib.request.urlopen")
+    def test_rc17_vehicle_flow_response_dispatches_location_flow_direct(self, mock_urlopen):
+        """Peugeot 208 AUTO 2019 Vehicle Flow response → standard Location Flow; no AI."""
+        mock_urlopen.side_effect = AssertionError(
+            "AI must not be called after Vehicle Flow response"
+        )
+        self.state.vehicle_fallback_flow_sent = True
+        self.state.last_processed_inbound_wa_message_id = "RC17_VEH_MSG"
+        self.db.commit()
+
+        flow_data = {
+            "tipo_vehiculo": "AUTO",
+            "marca": "Peugeot",
+            "modelo": "208",
+            "anio": "2019",
+        }
+        result = self.eng.handle(_flow_event(
+            self.thread.id, self.wa_id, "RC17_FLOW_RESP", flow_data, "tok-rc17",
+        ))
+        self.db.expire_all()
+        self.db.refresh(self.state)
+        from sqlalchemy import select as _sel
+        cands = self.db.execute(
+            _sel(WhatsAppThreadCandidate).where(
+                WhatsAppThreadCandidate.thread_id == self.thread.id)
+        ).scalars().all()
+        blocked = _get_blocked(self.db, self.thread.id)
+
+        # Candidate persists correctly
+        self.assertTrue(
+            any(c.tipo_vehiculo == "AUTO" and c.marca == "Peugeot"
+                and c.modelo == "208" and c.anio == 2019 for c in cands),
+            f"Candidate not found: {[(c.tipo_vehiculo, c.marca, c.modelo, c.anio) for c in cands]}",
+        )
+
+        # AI not called
+        self.assertEqual(mock_urlopen.call_count, 0, "AI must not be called")
+
+        # Location Flow dispatched (blocked — OUTBOUND_ENABLED not set)
+        self.assertEqual(result.action, "blocked_dispatch")
+        self.assertTrue(
+            any(_LOC_FLOW_BODY_STANDARD in t for t in blocked),
+            f"Standard Location Flow body expected: {blocked}",
+        )
+
+        # No plain-text locality question
+        plain = any(
+            ("¿en qué barrio" in t.lower() or "zona de buenos aires" in t.lower())
+            and _LOC_FLOW_BODY_STANDARD not in t
+            for t in blocked
+        )
+        self.assertFalse(plain, f"Must not send plain-text locality question: {blocked}")
+
+        # No price
+        self.assertFalse(
+            any("$" in t for t in blocked if _LOC_FLOW_BODY_STANDARD not in t),
+            "No invented price before location known",
+        )
+
+        # No booking
+        self.assertIsNone(self.state.flow_booking_token, "No booking token")
+
+        # Stage remains QUALIFYING
+        self.assertEqual(self.state.last_stage, "QUALIFYING",
+                         f"Stage must remain QUALIFYING: {self.state.last_stage}")
+
+        # needs_human = False
+        self.assertFalse(self.state.needs_human)
+
+        # location_clarification_sent not set
+        self.assertFalse(self.state.location_clarification_sent,
+                         "location_clarification_sent must not be set by direct dispatch")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RC18 — Outbound blocked: candidate persists, Location Flow recorded, flag stays False
+# ═══════════════════════════════════════════════════════════════════════════════
+class TestRC18OutboundBlockedSemantics(unittest.TestCase):
+    """With OUTBOUND_ENABLED unset, the Location Flow attempt is recorded as
+    blocked_dispatch; candidate data persists; location_fallback_flow_sent stays False.
+    """
+
+    def setUp(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db = _SessionLocal()
+        self.contact, self.thread, self.lead, self.state = _seed_fresh(self.db, "6D4RC18")
+        self.eng = _make_engine(self.db)
+        self.wa_id = self.contact.wa_id
+
+    def tearDown(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db.close()
+
+    @patch("urllib.request.urlopen")
+    def test_rc18_outbound_blocked_candidate_persists_flag_false(self, mock_urlopen):
+        """Blocked dispatch: candidate persists; Location Flow body in audit; flag stays False."""
+        mock_urlopen.side_effect = AssertionError("AI must not be called")
+        self.state.vehicle_fallback_flow_sent = True
+        self.state.last_processed_inbound_wa_message_id = "RC18_VEH_MSG"
+        self.db.commit()
+
+        flow_data = {
+            "tipo_vehiculo": "AUTO",
+            "marca": "Peugeot",
+            "modelo": "208",
+            "anio": "2019",
+        }
+        result = self.eng.handle(_flow_event(
+            self.thread.id, self.wa_id, "RC18_FLOW_RESP", flow_data, "tok-rc18",
+        ))
+        self.db.expire_all()
+        self.db.refresh(self.state)
+        from sqlalchemy import select as _sel
+        cands = self.db.execute(
+            _sel(WhatsAppThreadCandidate).where(
+                WhatsAppThreadCandidate.thread_id == self.thread.id)
+        ).scalars().all()
+        blocked = _get_blocked(self.db, self.thread.id)
+
+        # result is blocked_dispatch
+        self.assertEqual(result.action, "blocked_dispatch")
+
+        # Candidate persists
+        self.assertTrue(any(c.tipo_vehiculo == "AUTO" for c in cands),
+                        f"Candidate must persist: {[c.tipo_vehiculo for c in cands]}")
+
+        # Standard Location Flow body recorded in audit
+        self.assertTrue(
+            any(_LOC_FLOW_BODY_STANDARD in t for t in blocked),
+            f"Standard Location Flow body expected in blocked audit: {blocked}",
+        )
+
+        # AI not called
+        self.assertEqual(mock_urlopen.call_count, 0)
+
+        # location_fallback_flow_sent remains False when dispatch is blocked
+        self.assertFalse(
+            self.state.location_fallback_flow_sent,
+            "location_fallback_flow_sent must remain False when dispatch is blocked",
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RC19 — Successful delivery and duplicate replay prevention
+# ═══════════════════════════════════════════════════════════════════════════════
+class TestRC19SuccessfulDeliveryNoDuplicate(unittest.TestCase):
+    """With a mocked successful outbound send, location_fallback_flow_sent becomes True.
+    A replay of the same flow_response wa_message_id is caught by message dedup and
+    does not trigger a second Location Flow dispatch.
+    """
+
+    def setUp(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db = _SessionLocal()
+        self.contact, self.thread, self.lead, self.state = _seed_fresh(self.db, "6D4RC19")
+        self.eng = _make_engine(self.db)
+        self.wa_id = self.contact.wa_id
+
+    def tearDown(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db.close()
+
+    @patch("urllib.request.urlopen")
+    @patch(
+        "app.services.conversation_engine._send_whatsapp_cloud_flow",
+        return_value=("wa-rc19-flow-001", {}),
+    )
+    @patch("app.services.conversation_engine.reset_unanswered_alert", return_value=None)
+    def test_rc19_successful_delivery_sets_flag_and_dedup_blocks_replay(
+        self, _mock_reset_alert, mock_send_flow, mock_urlopen
+    ):
+        """Successful Location Flow send → flag True; replay same msg_id → skipped_dedup."""
+        mock_urlopen.side_effect = AssertionError("AI must not be called")
+        os.environ["OUTBOUND_ENABLED"] = "true"
+
+        self.state.vehicle_fallback_flow_sent = True
+        self.state.last_processed_inbound_wa_message_id = "RC19_VEH_MSG"
+        self.db.commit()
+
+        flow_data = {
+            "tipo_vehiculo": "AUTO",
+            "marca": "Peugeot",
+            "modelo": "208",
+            "anio": "2019",
+        }
+
+        # First submit: successful Location Flow delivery
+        result1 = self.eng.handle(_flow_event(
+            self.thread.id, self.wa_id, "RC19_FLOW_RESP", flow_data, "tok-rc19",
+        ))
+        self.db.expire_all()
+        self.db.refresh(self.state)
+
+        self.assertEqual(result1.action, "replied",
+                         f"Expected successful reply, got: {result1.action}")
+        self.assertTrue(
+            self.state.location_fallback_flow_sent,
+            "location_fallback_flow_sent must be True after successful delivery",
+        )
+        self.assertEqual(mock_send_flow.call_count, 1,
+                         "Exactly one Location Flow must be sent")
+
+        # Replay same wa_message_id → dedup catches it
+        result2 = self.eng.handle(_flow_event(
+            self.thread.id, self.wa_id, "RC19_FLOW_RESP", flow_data, "tok-rc19",
+        ))
+        self.assertEqual(result2.action, "skipped_dedup",
+                         f"Replay must be caught by dedup, got: {result2.action}")
+
+        # Still exactly one Location Flow sent
+        self.assertEqual(mock_send_flow.call_count, 1,
+                         "No second Location Flow must be sent on duplicate replay")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RC20 — Known zone preserved: Vehicle Flow response → quote (no Location Flow)
+# ═══════════════════════════════════════════════════════════════════════════════
+class TestRC20KnownZonePreserved(unittest.TestCase):
+    """When zone is already known (CABA/Palermo), a Vehicle Flow response with
+    AUTO/Peugeot/208/2019 must produce the deterministic quote ($130.000)
+    and advance the stage to QUOTED — no Location Flow sent.
+    """
+
+    def setUp(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db = _SessionLocal()
+        self.contact, self.thread, self.lead, self.state = _seed_fresh(self.db, "6D4RC20")
+        self.eng = _make_engine(self.db)
+        self.wa_id = self.contact.wa_id
+
+    def tearDown(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db.close()
+
+    @patch("urllib.request.urlopen")
+    def test_rc20_known_zone_produces_quote_not_location_flow(self, mock_urlopen):
+        """CABA/Palermo pre-seeded + Vehicle Flow response → $130.000 quote; stage QUOTED."""
+        mock_urlopen.side_effect = AssertionError("AI must not be called")
+
+        # Pre-seed zone on state
+        self.state.home_zone_group = "CABA"
+        self.state.home_zone_detail = "Palermo"
+        self.state.vehicle_fallback_flow_sent = True
+        self.state.last_processed_inbound_wa_message_id = "RC20_VEH_MSG"
+        self.db.commit()
+
+        flow_data = {
+            "tipo_vehiculo": "AUTO",
+            "marca": "Peugeot",
+            "modelo": "208",
+            "anio": "2019",
+        }
+        result = self.eng.handle(_flow_event(
+            self.thread.id, self.wa_id, "RC20_FLOW_RESP", flow_data, "tok-rc20",
+        ))
+        self.db.expire_all()
+        self.db.refresh(self.state)
+        self.db.refresh(self.lead)
+        blocked = _get_blocked(self.db, self.thread.id)
+
+        # Result is blocked_dispatch (outbound disabled, but quote text was attempted)
+        self.assertEqual(result.action, "blocked_dispatch")
+
+        # No Location Flow dispatched
+        self.assertFalse(
+            any(_LOC_FLOW_BODY_STANDARD in t for t in blocked),
+            f"Must NOT dispatch Location Flow when zone is already known: {blocked}",
+        )
+        self.assertFalse(
+            any(_LOC_FLOW_BODY_CONCERN in t for t in blocked),
+            f"Must NOT dispatch concern Location Flow: {blocked}",
+        )
+
+        # Quote text contains $130.000
+        quote_texts = [t for t in blocked if "$" in t]
+        self.assertTrue(
+            any("$130.000" in t for t in quote_texts),
+            f"Quote must be $130.000 (AUTO/CABA/Palermo): {quote_texts}",
+        )
+
+        # Stage advanced to QUOTED
+        self.assertEqual(self.state.last_stage, "QUOTED",
+                         f"Stage must be QUOTED: {self.state.last_stage}")
+
+        # Lead flag set
+        self.assertEqual(self.lead.flag, "PRESUPUESTO_ENVIADO",
+                         f"Lead flag must be PRESUPUESTO_ENVIADO: {self.lead.flag}")
+
+        # AI not called
+        self.assertEqual(mock_urlopen.call_count, 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

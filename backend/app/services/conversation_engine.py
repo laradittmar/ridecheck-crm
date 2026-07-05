@@ -1157,13 +1157,20 @@ class ConversationEngine:
             )
             lead.flag = "PRESUPUESTO_ENVIADO"
             state.last_stage = STAGE_QUOTED
-        else:
-            reply = (
-                f"¡Gracias! Ya registré el vehículo. "
-                "Para completar la cotización, ¿en qué barrio o zona de Buenos Aires está el auto?"
-            )
+            self.db.commit()
+            sent_id = self._send_text_to_wa(ctx, reply)
+            return _out("replied", wa_message_id=sent_id)
 
+        # Zone not yet known — dispatch Location Fallback Flow directly.
         self.db.commit()
+        result = self._dispatch_location_flow_direct(ctx, state, concern=False)
+        if result is not None:
+            return result
+        # Flow not configured: fall back to text prompt.
+        reply = (
+            "¡Gracias! Ya registré el vehículo. "
+            "Para completar la cotización, ¿en qué barrio o zona de Buenos Aires está el auto?"
+        )
         sent_id = self._send_text_to_wa(ctx, reply)
         return _out("replied", wa_message_id=sent_id)
 
