@@ -1072,6 +1072,42 @@ class ConversationEngine:
 
     # ── Qualification fallback Flows ─────────────────────────────────────
 
+    @staticmethod
+    def _build_quote_reply(
+        marca: "str | None",
+        modelo: "str | None",
+        location: "str | None",
+        precio_total: int,
+    ) -> str:
+        """Return the approved customer-facing quote copy.
+
+        Genial! La cotización para la revisión del {vehicle} en {location}
+        es de ${price}. Si te parece bien, podemos avanzar.
+        """
+        total = f"${precio_total:,.0f}".replace(",", ".")
+        vehicle = " ".join(
+            p for p in [(marca or "").strip(), (modelo or "").strip()] if p
+        ).strip() or None
+        if vehicle and location:
+            return (
+                f"Genial! La cotización para la revisión del {vehicle} en {location} "
+                f"es de {total}. Si te parece bien, podemos avanzar."
+            )
+        if vehicle:
+            return (
+                f"Genial! La cotización para la revisión del {vehicle} "
+                f"es de {total}. Si te parece bien, podemos avanzar."
+            )
+        if location:
+            return (
+                f"Genial! La cotización para la revisión en {location} "
+                f"es de {total}. Si te parece bien, podemos avanzar."
+            )
+        return (
+            f"Genial! La cotización para la revisión es de {total}. "
+            "Si te parece bien, podemos avanzar."
+        )
+
     def _process_vehicle_fallback_response(
         self,
         ctx: _Context,
@@ -1146,14 +1182,11 @@ class ConversationEngine:
 
         real_price_quote = self._compute_price_quote(ctx, state)
         if real_price_quote:
-            q = real_price_quote
-            total = f"${q.precio_total:,.0f}".replace(",", ".")
-            reply = (
-                f"¡Perfecto! Para el {marca} {modelo}".strip()
-                + f" el precio de la revisión es de {total} "
-                f"(base ${q.precio_base:,.0f}".replace(",", ".")
-                + f" + viáticos ${q.viaticos:,.0f})".replace(",", ".")
-                + ". ¿Cuándo te queda bien para hacerla?"
+            reply = self._build_quote_reply(
+                marca or None,
+                modelo or None,
+                state.home_zone_detail or None,
+                real_price_quote.precio_total,
             )
             lead.flag = "PRESUPUESTO_ENVIADO"
             state.last_stage = STAGE_QUOTED
@@ -1224,13 +1257,12 @@ class ConversationEngine:
 
         real_price_quote = self._compute_price_quote(ctx, state)
         if real_price_quote:
-            q = real_price_quote
-            total = f"${q.precio_total:,.0f}".replace(",", ".")
-            reply = (
-                f"¡Perfecto! El precio de la revisión es de {total} "
-                f"(base ${q.precio_base:,.0f}".replace(",", ".")
-                + f" + viáticos ${q.viaticos:,.0f})".replace(",", ".")
-                + ". ¿Cuándo te queda bien para hacerla?"
+            focus = self._focus_candidate(ctx)
+            reply = self._build_quote_reply(
+                (focus.marca or "").strip() or None if focus else None,
+                (focus.modelo or "").strip() or None if focus else None,
+                state.home_zone_detail or None,
+                real_price_quote.precio_total,
             )
             lead.flag = "PRESUPUESTO_ENVIADO"
             state.last_stage = STAGE_QUOTED

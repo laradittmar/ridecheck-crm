@@ -1838,5 +1838,350 @@ class TestRC20KnownZonePreserved(unittest.TestCase):
         self.assertEqual(mock_urlopen.call_count, 0)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# RC21 — D4R Scenario 2 quote copy: Vehicle Flow → Location Flow → approved quote
+# ═══════════════════════════════════════════════════════════════════════════════
+class TestRC21D4RScenario2QuoteCopy(unittest.TestCase):
+    """Full offline simulation of the D4R Scenario 2 sequence:
+    generic quote request → Vehicle Flow response → Location Flow response → quote.
+
+    The final quote must use the approved deterministic copy:
+        Genial! La cotización para la revisión del Peugeot 208 en Palermo es de $130.000.
+        Si te parece bien, podemos avanzar.
+    """
+
+    _EXPECTED_QUOTE = (
+        "Genial! La cotización para la revisión del Peugeot 208 en Palermo "
+        "es de $130.000. Si te parece bien, podemos avanzar."
+    )
+
+    def setUp(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db = _SessionLocal()
+        self.contact, self.thread, self.lead, self.state = _seed_fresh(self.db, "6D4QRC21")
+        self.eng = _make_engine(self.db)
+        self.wa_id = self.contact.wa_id
+
+    def tearDown(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db.close()
+
+    @patch("urllib.request.urlopen")
+    def test_rc21_vehicle_flow_then_location_flow_approved_quote(self, mock_urlopen):
+        """Vehicle Flow (Peugeot 208 AUTO 2019) + Location Flow (CABA/Palermo) → approved quote."""
+        mock_urlopen.side_effect = AssertionError("AI must not be called")
+
+        # ── Step 1: Vehicle Flow response, zone unknown → Location Flow dispatched ──
+        self.state.vehicle_fallback_flow_sent = True
+        self.state.last_processed_inbound_wa_message_id = "RC21_VEH_MSG"
+        self.db.commit()
+
+        veh_flow_data = {
+            "tipo_vehiculo": "AUTO",
+            "marca": "Peugeot",
+            "modelo": "208",
+            "anio": "2019",
+        }
+        result1 = self.eng.handle(_flow_event(
+            self.thread.id, self.wa_id, "RC21_VEH_FLOW", veh_flow_data, "tok-rc21-v",
+        ))
+        self.db.expire_all()
+        self.db.refresh(self.state)
+
+        # Vehicle Flow must dispatch Location Flow (outbound disabled → blocked_dispatch)
+        self.assertEqual(result1.action, "blocked_dispatch",
+                         f"Step 1 must dispatch Location Flow: {result1.action}")
+        self.assertTrue(
+            any(_LOC_FLOW_BODY_STANDARD in t for t in _get_blocked(self.db, self.thread.id)),
+            "Standard Location Flow body must appear in step 1",
+        )
+
+        # ── Step 2: Location Flow response → final quote ──────────────────────
+        self.state.location_fallback_flow_sent = True
+        self.state.last_processed_inbound_wa_message_id = "RC21_LOC_MSG"
+        self.db.commit()
+
+        loc_flow_data = {
+            "zona_general": "CABA",
+            "localidad": "Palermo",
+            "referencia_ubicacion": "",
+        }
+        result2 = self.eng.handle(_flow_event(
+            self.thread.id, self.wa_id, "RC21_LOC_FLOW", loc_flow_data, "tok-rc21-l",
+        ))
+        self.db.expire_all()
+        self.db.refresh(self.state)
+        self.db.refresh(self.lead)
+        blocked2 = _get_blocked(self.db, self.thread.id)
+        quote_texts = [t for t in blocked2 if "Genial" in t or "$" in t]
+
+        # Exact approved quote text
+        self.assertTrue(
+            any(t == self._EXPECTED_QUOTE for t in blocked2),
+            f"Exact approved quote expected:\n  WANT: {self._EXPECTED_QUOTE!r}\n  GOT:  {quote_texts}",
+        )
+
+        # No base/viáticos breakdown in customer message
+        self.assertFalse(
+            any("base" in t.lower() and "viáticos" in t.lower() for t in quote_texts),
+            f"Must not expose base/viáticos breakdown: {quote_texts}",
+        )
+
+        # No scheduling question in quote
+        self.assertFalse(
+            any("cuándo" in t.lower() or "qué día" in t.lower() or "horario" in t.lower()
+                for t in quote_texts),
+            f"Must not ask scheduling question in quote: {quote_texts}",
+        )
+
+        # No booking Flow
+        from app.models import ThreadRevision
+        rev = self.db.execute(
+            select(ThreadRevision).where(ThreadRevision.thread_id == self.thread.id)
+        ).scalars().first()
+        self.assertIsNone(rev, "No booking revision must exist after quote")
+
+        # Stage and flag
+        self.assertEqual(self.state.last_stage, "QUOTED",
+                         f"Stage must be QUOTED: {self.state.last_stage}")
+        self.assertEqual(self.lead.flag, "PRESUPUESTO_ENVIADO",
+                         f"Lead flag must be PRESUPUESTO_ENVIADO: {self.lead.flag}")
+        self.assertFalse(self.lead.necesita_humano, "needs_human must be False")
+
+        # AI not called throughout
+        self.assertEqual(mock_urlopen.call_count, 0, "AI must not be called in any step")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RC22 — Acceptance after deterministic quote enters SCHEDULING
+# ═══════════════════════════════════════════════════════════════════════════════
+class TestRC22AcceptanceAfterFlowQuote(unittest.TestCase):
+    """After receiving the RC21-style quote, client sends 'Sí, avancemos'.
+    Engine must: advance to SCHEDULING, reply with scheduling copy, no repeated price.
+    """
+
+    _EXPECTED_ACCEPTANCE_REPLY = "¡Perfecto! ¿Qué día y horario te viene mejor para la revisión?"
+
+    def setUp(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db = _SessionLocal()
+        self.contact, self.thread, self.lead, self.state = _seed_fresh(self.db, "6D4QRC22")
+        # Pre-seed state: already quoted (CABA/Palermo, Peugeot 208 AUTO)
+        _add_candidate(self.db, self.thread.id, "Peugeot", "208", "AUTO",
+                       zone_group="CABA", zone_detail="Palermo")
+        self.state.home_zone_group = "CABA"
+        self.state.home_zone_detail = "Palermo"
+        self.state.last_stage = "QUOTED"
+        self.lead.flag = "PRESUPUESTO_ENVIADO"
+        self.db.commit()
+        self.eng = _make_engine(self.db)
+        self.wa_id = self.contact.wa_id
+
+    def tearDown(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db.close()
+
+    @patch("urllib.request.urlopen")
+    def test_rc22_acceptance_advances_to_scheduling(self, mock_urlopen):
+        """'Sí, avancemos' after quote → SCHEDULING stage, approved scheduling copy, no price."""
+        mock_urlopen.side_effect = AssertionError("AI must not be called for clear acceptance")
+
+        result = self.eng.handle(_event(
+            self.thread.id, self.wa_id, "Sí, avancemos", "RC22_ACCEPT",
+        ))
+        self.db.expire_all()
+        self.db.refresh(self.state)
+        self.db.refresh(self.lead)
+        blocked = _get_blocked(self.db, self.thread.id)
+
+        # Stage advances to SCHEDULING
+        self.assertEqual(self.state.last_stage, "SCHEDULING",
+                         f"Stage must advance to SCHEDULING: {self.state.last_stage}")
+
+        # Exact approved acceptance/scheduling copy
+        self.assertTrue(
+            any(t == self._EXPECTED_ACCEPTANCE_REPLY for t in blocked),
+            f"Exact scheduling copy expected:\n  WANT: {self._EXPECTED_ACCEPTANCE_REPLY!r}\n  GOT:  {blocked}",
+        )
+
+        # No repeated price in acceptance reply
+        self.assertFalse(
+            any("$130" in t and t != self._EXPECTED_ACCEPTANCE_REPLY for t in blocked),
+            f"Must not repeat price in acceptance reply: {blocked}",
+        )
+
+        # Lead flag set to ACEPTADO
+        self.assertEqual(self.lead.flag, "ACEPTADO",
+                         f"Lead flag must be ACEPTADO: {self.lead.flag}")
+
+        # AI not called
+        self.assertEqual(mock_urlopen.call_count, 0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RC23 — Flow quote for Sur group-default: Ford Ranger → $170.000
+# ═══════════════════════════════════════════════════════════════════════════════
+class TestRC23SurGroupDefaultQuote(unittest.TestCase):
+    """Ford Ranger (SUV/4x4) + Location Flow response SUR/San Francisco Solano.
+    Zone resolves to Sur group-default (viáticos $30.000); base $140.000 → total $170.000.
+    """
+
+    _EXPECTED_QUOTE = (
+        "Genial! La cotización para la revisión del Ford Ranger en San Francisco Solano "
+        "es de $170.000. Si te parece bien, podemos avanzar."
+    )
+
+    def setUp(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db = _SessionLocal()
+        self.contact, self.thread, self.lead, self.state = _seed_fresh(self.db, "6D4QRC23")
+        # Ford Ranger is classified as SUV/4x4 for pricing (base $140.000)
+        _add_candidate(self.db, self.thread.id, "Ford", "Ranger", "SUV/4x4")
+        self.state.location_fallback_flow_sent = True
+        self.state.last_processed_inbound_wa_message_id = "RC23_PRE"
+        self.db.commit()
+        self.eng = _make_engine(self.db)
+        self.wa_id = self.contact.wa_id
+
+    def tearDown(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db.close()
+
+    @patch("urllib.request.urlopen")
+    def test_rc23_sur_group_default_ranger_quote(self, mock_urlopen):
+        """Location Flow SUR/San Francisco Solano → group-default viáticos → $170.000 approved copy."""
+        mock_urlopen.side_effect = AssertionError("AI must not be called")
+
+        loc_flow_data = {
+            "zona_general": "SUR",
+            "localidad": "San Francisco Solano",
+            "referencia_ubicacion": "",
+        }
+        result = self.eng.handle(_flow_event(
+            self.thread.id, self.wa_id, "RC23_LOC_FLOW", loc_flow_data, "tok-rc23",
+        ))
+        self.db.expire_all()
+        self.db.refresh(self.state)
+        self.db.refresh(self.lead)
+        blocked = _get_blocked(self.db, self.thread.id)
+        quote_texts = [t for t in blocked if "Genial" in t or "$" in t]
+
+        # Exact approved quote
+        self.assertTrue(
+            any(t == self._EXPECTED_QUOTE for t in blocked),
+            f"Exact approved quote expected:\n  WANT: {self._EXPECTED_QUOTE!r}\n  GOT:  {quote_texts}",
+        )
+
+        # No base/viáticos breakdown
+        self.assertFalse(
+            any("base" in t.lower() and "viáticos" in t.lower() for t in quote_texts),
+            f"Must not expose base/viáticos breakdown: {quote_texts}",
+        )
+
+        # No scheduling question
+        self.assertFalse(
+            any("cuándo" in t.lower() or "qué día" in t.lower() or "horario" in t.lower()
+                for t in quote_texts),
+            f"Must not ask scheduling question in quote: {quote_texts}",
+        )
+
+        # Stage QUOTED
+        self.assertEqual(self.state.last_stage, "QUOTED",
+                         f"Stage must be QUOTED: {self.state.last_stage}")
+
+        # AI not called
+        self.assertEqual(mock_urlopen.call_count, 0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RC24 — Flow quote for concern case: Ecosport → SUR/Quilmes → $190.000
+# ═══════════════════════════════════════════════════════════════════════════════
+class TestRC24ConcernCaseQuote(unittest.TestCase):
+    """Ecosport 2011 concern path: concern-aware Location Flow was already dispatched.
+    Location Flow response SUR/Quilmes → quote $190.000.
+    Base $140.000 (SUV/4x4) + viáticos $50.000 (Sur/Quilmes) = $190.000.
+    """
+
+    _EXPECTED_QUOTE = (
+        "Genial! La cotización para la revisión del Ford Ecosport en Quilmes "
+        "es de $190.000. Si te parece bien, podemos avanzar."
+    )
+
+    def setUp(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db = _SessionLocal()
+        self.contact, self.thread, self.lead, self.state = _seed_fresh(self.db, "6D4QRC24")
+        # Ecosport is classified as SUV/4x4 (base $140.000)
+        _add_candidate(self.db, self.thread.id, "Ford", "Ecosport", "SUV/4x4")
+        # Concern-aware Location Flow was previously dispatched
+        self.state.location_fallback_flow_sent = True
+        self.state.last_processed_inbound_wa_message_id = "RC24_PRE"
+        self.db.commit()
+        self.eng = _make_engine(self.db)
+        self.wa_id = self.contact.wa_id
+
+    def tearDown(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db.close()
+
+    @patch("urllib.request.urlopen")
+    def test_rc24_concern_path_quilmes_quote(self, mock_urlopen):
+        """Concern Location Flow response SUR/Quilmes → clean $190.000 quote, no diagnosis."""
+        mock_urlopen.side_effect = AssertionError("AI must not be called")
+
+        loc_flow_data = {
+            "zona_general": "SUR",
+            "localidad": "Quilmes",
+            "referencia_ubicacion": "",
+        }
+        result = self.eng.handle(_flow_event(
+            self.thread.id, self.wa_id, "RC24_LOC_FLOW", loc_flow_data, "tok-rc24",
+        ))
+        self.db.expire_all()
+        self.db.refresh(self.state)
+        self.db.refresh(self.lead)
+        blocked = _get_blocked(self.db, self.thread.id)
+        quote_texts = [t for t in blocked if "Genial" in t or "$" in t]
+
+        # Exact approved quote
+        self.assertTrue(
+            any(t == self._EXPECTED_QUOTE for t in blocked),
+            f"Exact approved quote expected:\n  WANT: {self._EXPECTED_QUOTE!r}\n  GOT:  {quote_texts}",
+        )
+
+        # Concern-aware Location Flow was dispatched before (state proof)
+        # location_fallback_flow_sent was True going in (set in setUp); consumed by handler
+        self.assertFalse(
+            self.state.location_fallback_flow_sent,
+            "location_fallback_flow_sent must be consumed (set to False) by the handler",
+        )
+
+        # No diagnosis or guarantee language in quote
+        self.assertFalse(
+            any("garantía" in t.lower() or "diagnóst" in t.lower() for t in quote_texts),
+            f"Must not include diagnosis/guarantee language in quote: {quote_texts}",
+        )
+
+        # No base/viáticos breakdown
+        self.assertFalse(
+            any("base" in t.lower() and "viáticos" in t.lower() for t in quote_texts),
+            f"Must not expose base/viáticos breakdown: {quote_texts}",
+        )
+
+        # No scheduling question
+        self.assertFalse(
+            any("cuándo" in t.lower() or "qué día" in t.lower() or "horario" in t.lower()
+                for t in quote_texts),
+            f"Must not ask scheduling question in quote: {quote_texts}",
+        )
+
+        # Stage QUOTED
+        self.assertEqual(self.state.last_stage, "QUOTED",
+                         f"Stage must be QUOTED: {self.state.last_stage}")
+
+        # AI not called
+        self.assertEqual(mock_urlopen.call_count, 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
