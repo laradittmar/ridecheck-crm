@@ -1,0 +1,4109 @@
+{
+  "version": "2.0",
+  "generated": "2026-07-10",
+  "sources": {
+    "ridecheck_reviewed": 181,
+    "argentina_2026_autos": 279,
+    "existing_catalog": 61
+  },
+  "stats": {
+    "total_vehicles": 311,
+    "deterministic_quote": 297,
+    "recognition_only": 14,
+    "auto": 143,
+    "suv": 154
+  },
+  "vehicles": [
+    {
+      "brand": "Volkswagen",
+      "model": "Suran",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "suran",
+        "vw suran",
+        "wv suran",
+        "volkswagen suran"
+      ],
+      "typo_aliases": [
+        {
+          "alias": "siran",
+          "canonical": "suran"
+        }
+      ]
+    },
+    {
+      "brand": "Peugeot",
+      "model": "206",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "206",
+        "peugeot 206"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Peugeot",
+      "model": "208",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "208",
+        "peugeot 208"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Toyota",
+      "model": "Etios",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "etios",
+        "toyota etios"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Volkswagen",
+      "model": "Polo",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "polo",
+        "vw polo",
+        "volkswagen polo"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Volkswagen",
+      "model": "Gol",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "gol",
+        "vw gol",
+        "volkswagen gol"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Chevrolet",
+      "model": "Onix",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "onix",
+        "chevrolet onix"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Ford",
+      "model": "Focus",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "focus",
+        "ford focus"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Honda",
+      "model": "Fit",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "fit",
+        "honda fit"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Toyota",
+      "model": "Corolla",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "corolla",
+        "toyota corolla"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Honda",
+      "model": "Civic",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "civic",
+        "honda civic"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Renault",
+      "model": "Sandero",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "sandero",
+        "renault sandero"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Fiat",
+      "model": "Cronos",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "cronos",
+        "fiat cronos"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Volkswagen",
+      "model": "Fox",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "fox",
+        "vw fox",
+        "volkswagen fox"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Volkswagen",
+      "model": "Voyage",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "voyage",
+        "vw voyage",
+        "volkswagen voyage"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Volkswagen",
+      "model": "Virtus",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "virtus",
+        "vw virtus",
+        "volkswagen virtus"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Volkswagen",
+      "model": "Bora",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "bora",
+        "vw bora",
+        "volkswagen bora"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Chevrolet",
+      "model": "Corsa",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "corsa",
+        "chevrolet corsa"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Chevrolet",
+      "model": "Prisma",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "prisma",
+        "chevrolet prisma"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Fiat",
+      "model": "Argo",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "argo",
+        "fiat argo"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Fiat",
+      "model": "Mobi",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "mobi",
+        "fiat mobi"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Renault",
+      "model": "Clio",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "clio",
+        "renault clio"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Nissan",
+      "model": "March",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "march",
+        "nissan march"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Nissan",
+      "model": "Versa",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "versa",
+        "nissan versa"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Ford",
+      "model": "Ka",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "ka",
+        "ford ka"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Ford",
+      "model": "Fiesta",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "fiesta",
+        "ford fiesta"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Toyota",
+      "model": "Yaris",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "yaris",
+        "toyota yaris"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Toyota",
+      "model": "Camry",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "camry",
+        "toyota camry"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Peugeot",
+      "model": "207",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "207",
+        "peugeot 207"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Peugeot",
+      "model": "308",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "308",
+        "peugeot 308"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Peugeot",
+      "model": "408",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "408",
+        "peugeot 408"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Citroën",
+      "model": "C3",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "c3",
+        "citroen c3"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Citroën",
+      "model": "C4",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "c4",
+        "citroen c4"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Volkswagen",
+      "model": "Taos",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "taos",
+        "vw taos",
+        "volkswagen taos"
+      ],
+      "typo_aliases": [
+        {
+          "alias": "volkswaguen taos",
+          "canonical": "volkswagen taos"
+        }
+      ]
+    },
+    {
+      "brand": "Mercedes-Benz",
+      "model": "GLB",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "glb",
+        "mercedes glb",
+        "mercedes benz glb"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Jeep",
+      "model": "Renegade",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "renegade",
+        "jeep renegade"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Jeep",
+      "model": "Compass",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "compass",
+        "jeep compass"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Ford",
+      "model": "Ecosport",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "ecosport",
+        "ford ecosport",
+        "eco sport",
+        "ford eco sport"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Toyota",
+      "model": "Hilux",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "hilux",
+        "toyota hilux"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Ford",
+      "model": "Ranger",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "ranger",
+        "ford ranger"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Volkswagen",
+      "model": "Amarok",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "amarok",
+        "vw amarok",
+        "volkswagen amarok"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Fiat",
+      "model": "Toro",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "toro",
+        "fiat toro"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Nissan",
+      "model": "Qashqai",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "qashqai",
+        "nissan qashqai"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Chevrolet",
+      "model": "Tracker",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "tracker",
+        "chevrolet tracker"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Renault",
+      "model": "Duster",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "duster",
+        "renault duster"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Chevrolet",
+      "model": "Captiva",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "captiva",
+        "chevrolet captiva",
+        "captiva 2017"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Chevrolet",
+      "model": "Spin",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "spin",
+        "chevrolet spin"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Toyota",
+      "model": "SW4",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "sw4",
+        "toyota sw4"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Chevrolet",
+      "model": "S10",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "s10",
+        "chevrolet s10"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Nissan",
+      "model": "Frontier",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "frontier",
+        "nissan frontier"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Renault",
+      "model": "Kangoo",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "kangoo",
+        "renault kangoo"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Peugeot",
+      "model": "Partner",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "partner",
+        "peugeot partner"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Citroën",
+      "model": "Berlingo",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "berlingo",
+        "citroen berlingo"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Volkswagen",
+      "model": "Saveiro",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "saveiro",
+        "vw saveiro",
+        "volkswagen saveiro"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Volkswagen",
+      "model": "Tiguan",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "tiguan",
+        "vw tiguan",
+        "volkswagen tiguan"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Renault",
+      "model": "Oroch",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "oroch",
+        "renault oroch"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Honda",
+      "model": "HR-V",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "hrv",
+        "hr v",
+        "honda hrv",
+        "honda hr v"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Honda",
+      "model": "CR-V",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "crv",
+        "cr v",
+        "honda crv",
+        "honda cr v"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Nissan",
+      "model": "Kicks",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "kicks",
+        "nissan kicks"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Peugeot",
+      "model": "3008",
+      "tipo_vehiculo": "SUV/4x4",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "3008",
+        "peugeot 3008"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Peugeot",
+      "model": "5008",
+      "tipo_vehiculo": "SUV/4x4",
+      "category_confidence": "high",
+      "category_source": "existing_catalog",
+      "recognition_only": false,
+      "aliases": [
+        "5008",
+        "peugeot 5008"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Alfa Romeo",
+      "model": "Giulia",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "giulia",
+        "alfa romeo giulia"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Alfa Romeo",
+      "model": "Stelvio",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "stelvio",
+        "alfa romeo stelvio"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Audi",
+      "model": "A1",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "a1",
+        "audi a1"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Audi",
+      "model": "A3",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "a3",
+        "audi a3"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Audi",
+      "model": "A4",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "a4",
+        "audi a4"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Audi",
+      "model": "A5",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "a5",
+        "audi a5"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Audi",
+      "model": "A6",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "a6",
+        "audi a6"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Audi",
+      "model": "Q2",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "q2",
+        "audi q2"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Audi",
+      "model": "Q3",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "q3",
+        "audi q3"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Audi",
+      "model": "Q5",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "q5",
+        "audi q5"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Audi",
+      "model": "Q7",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "q7",
+        "audi q7"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Audi",
+      "model": "RS3",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "rs3",
+        "audi rs3"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Audi",
+      "model": "S3",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "s3",
+        "audi s3"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Audi",
+      "model": "TT",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "tt",
+        "audi tt"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Audi",
+      "model": "Ttrs",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "ttrs",
+        "audi ttrs"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "BMW",
+      "model": "118i",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "118i",
+        "bmw 118i"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "BMW",
+      "model": "120i",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "120i",
+        "bmw 120i"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "BMW",
+      "model": "125i",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "125i",
+        "bmw 125i"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "BMW",
+      "model": "130i",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "130i",
+        "bmw 130i"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "BMW",
+      "model": "135",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "135",
+        "bmw 135"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "BMW",
+      "model": "320",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "320",
+        "bmw 320"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "BMW",
+      "model": "320i",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "320i",
+        "bmw 320i"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "BMW",
+      "model": "325i",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "325i",
+        "bmw 325i"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "BMW",
+      "model": "330ci",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "330ci",
+        "bmw 330ci"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "BMW",
+      "model": "430i",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "430i",
+        "bmw 430i"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "BMW",
+      "model": "440",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "440",
+        "bmw 440"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "BMW",
+      "model": "M3",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "m3",
+        "bmw m3"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "BMW",
+      "model": "M340i",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "m340i",
+        "bmw m340i"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "BMW",
+      "model": "Serie 1",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "serie 1",
+        "bmw serie 1"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "BMW",
+      "model": "Serie 2",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "serie 2",
+        "bmw serie 2"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "BMW",
+      "model": "Serie 3",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "serie 3",
+        "bmw serie 3"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "BMW",
+      "model": "Serie 4",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "serie 4",
+        "bmw serie 4"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "BMW",
+      "model": "Serie 5",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "serie 5",
+        "bmw serie 5"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "BMW",
+      "model": "X1",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "x1",
+        "bmw x1"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "BMW",
+      "model": "X4",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "x4",
+        "bmw x4"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "BMW",
+      "model": "X5",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "x5",
+        "bmw x5"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "BMW",
+      "model": "X6",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "x6",
+        "bmw x6"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Chery",
+      "model": "Arrizo 5",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "arrizo 5",
+        "chery arrizo 5"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Chery",
+      "model": "Arrizo 8",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "arrizo 8",
+        "chery arrizo 8"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Chery",
+      "model": "Tiggo 2",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "tiggo 2",
+        "chery tiggo 2"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Chery",
+      "model": "Tiggo 4",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "tiggo 4",
+        "chery tiggo 4"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Chery",
+      "model": "Tiggo 7",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "tiggo 7",
+        "chery tiggo 7"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Chery",
+      "model": "Tiggo 8",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "tiggo 8",
+        "chery tiggo 8"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Chevrolet",
+      "model": "Celta",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "celta",
+        "chevrolet celta"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Chevrolet",
+      "model": "Cruze",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "cruze",
+        "chevrolet cruze"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Chevrolet",
+      "model": "Equinox",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "equinox",
+        "chevrolet equinox"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Chevrolet",
+      "model": "Meriva",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "meriva",
+        "chevrolet meriva"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Chevrolet",
+      "model": "Sonic",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "sonic",
+        "chevrolet sonic"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Chevrolet",
+      "model": "Vectra",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "vectra",
+        "chevrolet vectra"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Citroën",
+      "model": "C4 Lounge",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "c4 lounge",
+        "citroen c4 lounge"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Citroën",
+      "model": "C-Elysee",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "c elysee",
+        "citroen c elysee"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Citroën",
+      "model": "C4 Cactus",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "c4 cactus",
+        "citroen c4 cactus",
+        "cactus",
+        "citroen cactus"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Citroën",
+      "model": "Ds3",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "citroen ds3"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "DS",
+      "model": "DS3",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "ds3",
+        "ds ds3"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "DS",
+      "model": "DS4",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "ds4",
+        "ds ds4"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "DS",
+      "model": "DS7",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "ds7",
+        "ds ds7"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Fiat",
+      "model": "500",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "fiat 500"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Fiat",
+      "model": "Fastback",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "fastback",
+        "fiat fastback"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Fiat",
+      "model": "Idea",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "idea",
+        "fiat idea"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Fiat",
+      "model": "Palio",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "palio",
+        "fiat palio"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Fiat",
+      "model": "Punto",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "punto",
+        "fiat punto"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Fiat",
+      "model": "Pulse",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "pulse",
+        "fiat pulse"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Fiat",
+      "model": "Siena",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "siena",
+        "fiat siena"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Fiat",
+      "model": "Uno",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "uno",
+        "fiat uno"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Ford",
+      "model": "CrossFox",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "crossfox",
+        "ford crossfox"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Ford",
+      "model": "Escort",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "escort",
+        "ford escort"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Ford",
+      "model": "Kuga",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "kuga",
+        "ford kuga"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Ford",
+      "model": "Maverick",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "maverick",
+        "ford maverick"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Ford",
+      "model": "Mondeo",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "mondeo",
+        "ford mondeo"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Ford",
+      "model": "Territory",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "territory",
+        "ford territory"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Honda",
+      "model": "Accord",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "accord",
+        "honda accord"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Honda",
+      "model": "City",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "honda city"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Hyundai",
+      "model": "Creta",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "creta",
+        "hyundai creta"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Hyundai",
+      "model": "Tucson",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "tucson",
+        "hyundai tucson"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Hyundai",
+      "model": "HB20",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "hb20",
+        "hyundai hb20"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Jeep",
+      "model": "Commander",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "commander",
+        "jeep commander"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Jeep",
+      "model": "Grand Cherokee",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "grand cherokee",
+        "jeep grand cherokee"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Jeep",
+      "model": "Patriot",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "patriot",
+        "jeep patriot"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Jeep",
+      "model": "Wrangler",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "wrangler",
+        "jeep wrangler"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Kia",
+      "model": "Rio",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "rio",
+        "kia rio"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Kia",
+      "model": "Soul",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "soul",
+        "kia soul"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Kia",
+      "model": "Sportage",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "sportage",
+        "kia sportage"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Mercedes-Benz",
+      "model": "A200",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "a200",
+        "mercedes a200",
+        "mercedes benz a200"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Mercedes-Benz",
+      "model": "A250",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "a250",
+        "mercedes a250",
+        "mercedes benz a250"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Mercedes-Benz",
+      "model": "B200",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "b200",
+        "mercedes b200",
+        "mercedes benz b200"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Mercedes-Benz",
+      "model": "C200",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "c200",
+        "mercedes c200",
+        "mercedes benz c200"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Mercedes-Benz",
+      "model": "C250",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "c250",
+        "mercedes c250",
+        "mercedes benz c250"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Mercedes-Benz",
+      "model": "C350",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "c350",
+        "mercedes c350",
+        "mercedes benz c350"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Mercedes-Benz",
+      "model": "CLA",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "cla",
+        "mercedes cla",
+        "mercedes benz cla"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Mercedes-Benz",
+      "model": "CLK",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "clk",
+        "mercedes clk",
+        "mercedes benz clk"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Mercedes-Benz",
+      "model": "Clase A",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "clase a",
+        "mercedes clase a",
+        "mercedes benz clase a"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Mercedes-Benz",
+      "model": "Clase B",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "clase b",
+        "mercedes clase b",
+        "mercedes benz clase b"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Mercedes-Benz",
+      "model": "Clase C",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "clase c",
+        "mercedes clase c",
+        "mercedes benz clase c"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Mercedes-Benz",
+      "model": "Clase E",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "clase e",
+        "mercedes clase e",
+        "mercedes benz clase e"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Mercedes-Benz",
+      "model": "E350",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "e350",
+        "mercedes e350",
+        "mercedes benz e350"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Mercedes-Benz",
+      "model": "GLA",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "gla",
+        "mercedes gla",
+        "mercedes benz gla"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Mercedes-Benz",
+      "model": "GLC",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "glc",
+        "mercedes glc",
+        "mercedes benz glc",
+        "glc300",
+        "mercedes glc300",
+        "mercedes benz glc300"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Mercedes-Benz",
+      "model": "GLE",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "gle",
+        "mercedes gle",
+        "mercedes benz gle",
+        "ml350",
+        "mercedes ml350"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Mercedes-Benz",
+      "model": "Clase G",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "clase g",
+        "mercedes clase g",
+        "mercedes benz clase g"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Mini",
+      "model": "Cooper",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "cooper",
+        "mini cooper"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Mini",
+      "model": "Countryman",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "countryman",
+        "mini countryman"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Mitsubishi",
+      "model": "Lancer",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "lancer",
+        "mitsubishi lancer"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Mitsubishi",
+      "model": "L200",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "l200",
+        "mitsubishi l200"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Mitsubishi",
+      "model": "Montero",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "montero",
+        "mitsubishi montero"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Mitsubishi",
+      "model": "Outlander",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "outlander",
+        "mitsubishi outlander"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Nissan",
+      "model": "Note",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "note",
+        "nissan note"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Nissan",
+      "model": "Sentra",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "sentra",
+        "nissan sentra"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Nissan",
+      "model": "Tiida",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "tiida",
+        "nissan tiida"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Nissan",
+      "model": "Murano",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "murano",
+        "nissan murano"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Nissan",
+      "model": "X-Trail",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "x trail",
+        "nissan x trail"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Peugeot",
+      "model": "307",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "307",
+        "peugeot 307"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Peugeot",
+      "model": "508",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "508",
+        "peugeot 508"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Peugeot",
+      "model": "208 GT",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "208 gt",
+        "peugeot 208 gt"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Porsche",
+      "model": "911",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "911",
+        "porsche 911"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Porsche",
+      "model": "Cayenne",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "cayenne",
+        "porsche cayenne"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Renault",
+      "model": "Fluence",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "fluence",
+        "renault fluence"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Renault",
+      "model": "Kwid",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "kwid",
+        "renault kwid"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Renault",
+      "model": "Logan",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "logan",
+        "renault logan"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Renault",
+      "model": "Megane",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "megane",
+        "renault megane"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Renault",
+      "model": "Scenic",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "scenic",
+        "renault scenic"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Renault",
+      "model": "Symbol",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "symbol",
+        "renault symbol"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Renault",
+      "model": "Captur",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "captur",
+        "renault captur"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Renault",
+      "model": "Koleos",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "koleos",
+        "renault koleos"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Renault",
+      "model": "Alaskan",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "alaskan",
+        "renault alaskan"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Subaru",
+      "model": "Impreza",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "impreza",
+        "subaru impreza"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Subaru",
+      "model": "WRX",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "wrx",
+        "subaru wrx"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Subaru",
+      "model": "Forester",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "forester",
+        "subaru forester"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Subaru",
+      "model": "Outback",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "outback",
+        "subaru outback"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Subaru",
+      "model": "XV",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "xv",
+        "subaru xv"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Suzuki",
+      "model": "Swift",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "swift",
+        "suzuki swift"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Suzuki",
+      "model": "Grand Vitara",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "grand vitara",
+        "suzuki grand vitara"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Suzuki",
+      "model": "Vitara",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "vitara",
+        "suzuki vitara"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Toyota",
+      "model": "Corolla Cross",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "corolla cross",
+        "toyota corolla cross"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Toyota",
+      "model": "RAV4",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "rav4",
+        "toyota rav4",
+        "rav 4",
+        "toyota rav 4"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Volkswagen",
+      "model": "Gol Trend",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "gol trend",
+        "vw gol trend",
+        "volkswagen gol trend"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Volkswagen",
+      "model": "Gol Power",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "gol power",
+        "vw gol power",
+        "volkswagen gol power"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Volkswagen",
+      "model": "Golf",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "golf",
+        "vw golf",
+        "volkswagen golf"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Volkswagen",
+      "model": "Golf GTI",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "golf gti",
+        "vw golf gti",
+        "volkswagen golf gti"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Volkswagen",
+      "model": "New Beetle",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "new beetle",
+        "vw new beetle",
+        "volkswagen new beetle"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Volkswagen",
+      "model": "Passat",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "passat",
+        "vw passat",
+        "volkswagen passat"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Volkswagen",
+      "model": "Scirocco",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "scirocco",
+        "vw scirocco",
+        "volkswagen scirocco"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Volkswagen",
+      "model": "Up",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "vw up",
+        "volkswagen up"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Volkswagen",
+      "model": "Vento",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "vento",
+        "vw vento",
+        "volkswagen vento"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Volkswagen",
+      "model": "Nivus",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "nivus",
+        "vw nivus",
+        "volkswagen nivus"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Volkswagen",
+      "model": "T-Cross",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": false,
+      "aliases": [
+        "t cross",
+        "t-cross",
+        "vw t cross",
+        "vw t-cross",
+        "volkswagen t cross",
+        "volkswagen t-cross"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Alfa Romeo",
+      "model": "Tonale",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "tonale",
+        "alfa romeo tonale"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Audi",
+      "model": "Q6",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "q6",
+        "audi q6"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Audi",
+      "model": "Q8",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "q8",
+        "audi q8"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Audi",
+      "model": "e-tron",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "e tron",
+        "audi e tron"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "BAIC",
+      "model": "BJ40",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "bj40",
+        "baic bj40"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "BAIC",
+      "model": "X55",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "baic x55"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "BAIC",
+      "model": "X7",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "baic x7"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "BMW",
+      "model": "X2",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "x2",
+        "bmw x2"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "BMW",
+      "model": "X3",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "x3",
+        "bmw x3"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "BMW",
+      "model": "X7",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "bmw x7"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "BMW",
+      "model": "iX",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "ix",
+        "bmw ix"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "BYD",
+      "model": "Atto 3",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "atto 3",
+        "byd atto 3"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "BYD",
+      "model": "Dolphin",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "dolphin",
+        "byd dolphin"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "BYD",
+      "model": "Dolphin Mini",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "dolphin mini",
+        "byd dolphin mini"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "BYD",
+      "model": "Seal",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "seal",
+        "byd seal"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "BYD",
+      "model": "Shark",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "shark",
+        "byd shark"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "BYD",
+      "model": "Song Pro",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "song pro",
+        "byd song pro"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Changan",
+      "model": "CS55",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "cs55",
+        "changan cs55"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Changan",
+      "model": "CS75",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "cs75",
+        "changan cs75"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Changan",
+      "model": "Hunter",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "changan hunter"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Chevrolet",
+      "model": "Montana",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "montana",
+        "chevrolet montana"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Chevrolet",
+      "model": "Onix Plus",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "onix plus",
+        "chevrolet onix plus"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Chevrolet",
+      "model": "Trailblazer",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "trailblazer",
+        "chevrolet trailblazer"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Citroën",
+      "model": "Basalt",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "basalt",
+        "citroen basalt"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Citroën",
+      "model": "C3 Aircross",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "c3 aircross",
+        "citroen c3 aircross"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Citroën",
+      "model": "C5 Aircross",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "c5 aircross",
+        "citroen c5 aircross"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Dodge",
+      "model": "Durango",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "durango",
+        "dodge durango"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Dodge",
+      "model": "Journey",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "journey",
+        "dodge journey"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Dodge",
+      "model": "Rampage",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "dodge rampage"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Fiat",
+      "model": "Qubo",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "qubo",
+        "fiat qubo"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Fiat",
+      "model": "Strada",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "strada",
+        "fiat strada"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Fiat",
+      "model": "Titano",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "titano",
+        "fiat titano"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Ford",
+      "model": "Bronco",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "bronco",
+        "ford bronco"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Ford",
+      "model": "Bronco Sport",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "bronco sport",
+        "ford bronco sport"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Ford",
+      "model": "F-150",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "f 150",
+        "ford f 150",
+        "f150",
+        "ford f150"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Ford",
+      "model": "Mustang",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "mustang",
+        "ford mustang"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Geely",
+      "model": "Coolray",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "coolray",
+        "geely coolray"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Geely",
+      "model": "Emgrand",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "emgrand",
+        "geely emgrand"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Geely",
+      "model": "Tugella",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "tugella",
+        "geely tugella"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Great Wall",
+      "model": "Tank 300",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "tank 300",
+        "great wall tank 300"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Great Wall",
+      "model": "Tank 500",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "tank 500",
+        "great wall tank 500"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Great Wall",
+      "model": "Wingle",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "wingle",
+        "great wall wingle"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Haval",
+      "model": "H6",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "h6",
+        "haval h6"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Haval",
+      "model": "H9",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "h9",
+        "haval h9"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Haval",
+      "model": "Jolion",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "jolion",
+        "haval jolion"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Honda",
+      "model": "WR-V",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "wr v",
+        "honda wr v"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Honda",
+      "model": "ZR-V",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "zr v",
+        "honda zr v"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Hyundai",
+      "model": "Kona",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "kona",
+        "hyundai kona"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Hyundai",
+      "model": "Santa Fe",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "santa fe",
+        "hyundai santa fe"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Jeep",
+      "model": "Gladiator",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "gladiator",
+        "jeep gladiator"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Kia",
+      "model": "Seltos",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "seltos",
+        "kia seltos"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Kia",
+      "model": "Sorento",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "sorento",
+        "kia sorento"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Kia",
+      "model": "K3",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "kia k3"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Kia",
+      "model": "K4",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "kia k4"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Land Rover",
+      "model": "Defender",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "defender",
+        "land rover defender"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Land Rover",
+      "model": "Discovery",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "discovery",
+        "land rover discovery"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Land Rover",
+      "model": "Range Rover",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "range rover",
+        "land rover range rover"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Land Rover",
+      "model": "Range Rover Evoque",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "range rover evoque",
+        "land rover range rover evoque",
+        "evoque"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Land Rover",
+      "model": "Range Rover Sport",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "range rover sport",
+        "land rover range rover sport"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Land Rover",
+      "model": "Range Rover Velar",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "range rover velar",
+        "land rover range rover velar"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Leapmotor",
+      "model": "C10",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "leapmotor c10"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Lexus",
+      "model": "IS",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "lexus is"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Lexus",
+      "model": "NX",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "lexus nx"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Lexus",
+      "model": "RX",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "lexus rx"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "MG",
+      "model": "MG ZS",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "mg zs"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "MG",
+      "model": "MG HS",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "mg hs"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "MG",
+      "model": "MG3",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "mg3",
+        "mg mg3"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "MG",
+      "model": "MG5",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "mg5",
+        "mg mg5"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Mini",
+      "model": "Clubman",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "clubman",
+        "mini clubman"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Mitsubishi",
+      "model": "Eclipse Cross",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "eclipse cross",
+        "mitsubishi eclipse cross"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Peugeot",
+      "model": "2008",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "peugeot 2008"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Peugeot",
+      "model": "Landtrek",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "landtrek",
+        "peugeot landtrek"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Porsche",
+      "model": "Macan",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "macan",
+        "porsche macan"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Porsche",
+      "model": "Panamera",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "panamera",
+        "porsche panamera"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Porsche",
+      "model": "Taycan",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "taycan",
+        "porsche taycan"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "RAM",
+      "model": "1500",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "ram 1500"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "RAM",
+      "model": "2500",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "ram 2500"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "RAM",
+      "model": "Rampage",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "ram rampage"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Renault",
+      "model": "Boreal",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "boreal",
+        "renault boreal"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Renault",
+      "model": "Niagara",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "niagara",
+        "renault niagara"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Renault",
+      "model": "Stepway",
+      "tipo_vehiculo": "AUTO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "stepway",
+        "renault stepway"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Suzuki",
+      "model": "Jimny",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "jimny",
+        "suzuki jimny"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Suzuki",
+      "model": "S-Cross",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "s cross",
+        "suzuki s cross"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Toyota",
+      "model": "Corolla Cross Hybrid",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "corolla cross hybrid",
+        "toyota corolla cross hybrid"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Toyota",
+      "model": "Land Cruiser",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "land cruiser",
+        "toyota land cruiser"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Toyota",
+      "model": "Yaris Cross",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "yaris cross",
+        "toyota yaris cross"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Volkswagen",
+      "model": "Tera",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "tera",
+        "vw tera",
+        "volkswagen tera"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Volvo",
+      "model": "XC40",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "xc40",
+        "volvo xc40"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Volvo",
+      "model": "XC60",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "xc60",
+        "volvo xc60"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Volvo",
+      "model": "XC90",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "xc90",
+        "volvo xc90"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Volvo",
+      "model": "EX30",
+      "tipo_vehiculo": "SUV_4X4_DEPORTIVO",
+      "category_confidence": "high",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": false,
+      "aliases": [
+        "ex30",
+        "volvo ex30"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "BYD",
+      "model": "Yuan Pro",
+      "tipo_vehiculo": "",
+      "category_confidence": "none",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": true,
+      "aliases": [
+        "yuan pro",
+        "byd yuan pro"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Chery",
+      "model": "Tiggo",
+      "tipo_vehiculo": "",
+      "category_confidence": "none",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": true,
+      "aliases": [
+        "chery tiggo"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Chevrolet",
+      "model": "500X",
+      "tipo_vehiculo": "",
+      "category_confidence": "none",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": true,
+      "aliases": [
+        "chevrolet 500x"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Chrysler",
+      "model": "Caravan",
+      "tipo_vehiculo": "",
+      "category_confidence": "none",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": true,
+      "aliases": [
+        "caravan",
+        "chrysler caravan"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Fiat",
+      "model": "Fiorino",
+      "tipo_vehiculo": "",
+      "category_confidence": "none",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": true,
+      "aliases": [
+        "fiorino",
+        "fiat fiorino"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Ford",
+      "model": "Transit",
+      "tipo_vehiculo": "",
+      "category_confidence": "none",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": true,
+      "aliases": [
+        "ford transit"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Hyundai",
+      "model": "Veracruz",
+      "tipo_vehiculo": "",
+      "category_confidence": "none",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": true,
+      "aliases": [
+        "veracruz",
+        "hyundai veracruz"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Jeep",
+      "model": "Cherokee",
+      "tipo_vehiculo": "",
+      "category_confidence": "none",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": true,
+      "aliases": [
+        "cherokee",
+        "jeep cherokee"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Kia",
+      "model": "Carnival",
+      "tipo_vehiculo": "",
+      "category_confidence": "none",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": true,
+      "aliases": [
+        "carnival",
+        "kia carnival"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Mercedes-Benz",
+      "model": "Sprinter",
+      "tipo_vehiculo": "",
+      "category_confidence": "none",
+      "category_source": "ridecheck_reviewed",
+      "recognition_only": true,
+      "aliases": [
+        "sprinter",
+        "mercedes sprinter"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Peugeot",
+      "model": "Boxer",
+      "tipo_vehiculo": "",
+      "category_confidence": "none",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": true,
+      "aliases": [
+        "peugeot boxer"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Peugeot",
+      "model": "Rifter",
+      "tipo_vehiculo": "",
+      "category_confidence": "none",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": true,
+      "aliases": [
+        "rifter",
+        "peugeot rifter"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Renault",
+      "model": "Master",
+      "tipo_vehiculo": "",
+      "category_confidence": "none",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": true,
+      "aliases": [
+        "renault master"
+      ],
+      "typo_aliases": []
+    },
+    {
+      "brand": "Toyota",
+      "model": "Hiace",
+      "tipo_vehiculo": "",
+      "category_confidence": "none",
+      "category_source": "argentina_2026_autos",
+      "recognition_only": true,
+      "aliases": [
+        "hiace",
+        "toyota hiace"
+      ],
+      "typo_aliases": []
+    }
+  ]
+}
