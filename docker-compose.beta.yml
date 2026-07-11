@@ -1,0 +1,41 @@
+# docker-compose.beta.yml — Closed-beta backend override for M20 vehicle catalog validation.
+#
+# Usage (always run from /opt/ridecheck-crm/ so .env is auto-loaded):
+#
+#   PREFLIGHT (outbound off):
+#     cd /opt/ridecheck-crm
+#     docker compose -f docker-compose.yml \
+#                    -f /opt/ridecheck-crm-release-candidate/docker-compose.beta.yml \
+#                    up -d --force-recreate backend
+#     docker compose up -d --force-recreate n8n
+#
+#   LIVE ACTIVATION (outbound on — only after APPROVE_D4V_R_LIVE):
+#     cd /opt/ridecheck-crm
+#     BETA_OUTBOUND_ENABLED=true \
+#     docker compose -f docker-compose.yml \
+#                    -f /opt/ridecheck-crm-release-candidate/docker-compose.beta.yml \
+#                    up -d --force-recreate backend
+#
+#   SHUTDOWN (outbound off):
+#     cd /opt/ridecheck-crm
+#     docker compose -f docker-compose.yml \
+#                    -f /opt/ridecheck-crm-release-candidate/docker-compose.beta.yml \
+#                    up -d --force-recreate backend
+#     docker compose stop n8n
+#
+# What this override does:
+#   - Pins backend to the validated RC image (never triggers a build)
+#   - Redirects DATABASE_URL to crm_test (never touches production crm)
+#   - Sets OUTBOUND_ENABLED=false by default (BETA_OUTBOUND_ENABLED=true required for live)
+#   - Restricts allowlist to the single closed-beta tester suffix ...8330
+#   - OPENAI_API_KEY and other secrets are inherited from base compose + /opt/ridecheck-crm/.env
+
+services:
+  backend:
+    image: ridecheck-crm-backend:m20.6d4v-ee21f6d
+    environment:
+      DATABASE_URL: postgresql+psycopg://crm:crm@postgres:5432/crm_test
+      OUTBOUND_ENABLED: "${BETA_OUTBOUND_ENABLED:-false}"
+      CLOSED_BETA_ALLOWED_WA_IDS: "5491153368330"
+      QUARANTINED_TEST_WA_IDS: ""
+      INTERNAL_BOOKING_EMAIL_TO: "ridecheckassistance@gmail.com"
