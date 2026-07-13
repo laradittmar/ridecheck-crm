@@ -339,7 +339,7 @@ class TestIsAcceptanceUnit(unittest.TestCase):
 # ── Test 5: Initial quote scenario (unchanged behavior) ───────────────────────
 
 class TestInitialQuoteUnchanged(unittest.TestCase):
-    """Verify the initial quote reply still includes price / viáticos / QUOTED stage."""
+    """Verify the initial quote reply uses approved copy: price, approved opening, stage=QUOTED."""
 
     def setUp(self):
         os.environ.pop("OUTBOUND_ENABLED", None)
@@ -353,7 +353,7 @@ class TestInitialQuoteUnchanged(unittest.TestCase):
 
     @patch("urllib.request.urlopen")
     def test_5_quote_reply_contains_price_and_stage_is_quoted(self, mock_urlopen):
-        """Initial quote: blocked text must contain $140.000, viáticos $0; stage=QUOTED."""
+        """Initial quote: approved copy with $140.000, no viáticos breakdown; stage=QUOTED."""
         mock_urlopen.return_value = _openai_quote_response()
 
         result = self.eng.handle(_make_event(
@@ -380,12 +380,14 @@ class TestInitialQuoteUnchanged(unittest.TestCase):
         self.assertEqual(self.state.home_zone_group, "Norte")
         self.assertEqual(self.state.home_zone_detail, "Benavidez")
 
-        # Blocked reply must contain the price and viáticos
+        # Blocked reply must use approved copy with price; no viáticos breakdown
         text = _blocked_text(self.db, self.thread.id)
         self.assertIn("140", text,
                       f"Expected price in blocked text, got: {text!r}")
-        self.assertIn("viático", text.lower(),
-                      f"Expected viáticos in blocked text, got: {text!r}")
+        self.assertIn("Genial", text,
+                      f"Expected approved opening in blocked text, got: {text!r}")
+        self.assertNotIn("viático", text.lower(),
+                         f"Must not expose viáticos breakdown in quote: {text!r}")
 
 
 # ── Tests 6–7: Acceptance scenarios (core fix) ───────────────────────────────

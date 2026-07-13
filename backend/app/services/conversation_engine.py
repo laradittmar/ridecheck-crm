@@ -1078,6 +1078,7 @@ class ConversationEngine:
         modelo: "str | None",
         location: "str | None",
         precio_total: int,
+        anio: "int | None" = None,
     ) -> str:
         """Return the approved customer-facing quote copy.
 
@@ -1086,7 +1087,11 @@ class ConversationEngine:
         """
         total = f"${precio_total:,.0f}".replace(",", ".")
         vehicle = " ".join(
-            p for p in [(marca or "").strip(), (modelo or "").strip()] if p
+            p for p in [
+                (marca or "").strip(),
+                (modelo or "").strip(),
+                str(anio) if anio else None,
+            ] if p
         ).strip() or None
         if vehicle and location:
             return (
@@ -1977,6 +1982,15 @@ class ConversationEngine:
             lead.flag = new_flag
             if new_flag == "PRESUPUESTO_ENVIADO":
                 state.last_stage = STAGE_QUOTED
+                if real_price_quote is not None and not state.needs_human:
+                    _q_focus = self._focus_candidate(ctx)
+                    decision["reply"] = self._build_quote_reply(
+                        (_q_focus.marca or "").strip() or None if _q_focus else None,
+                        (_q_focus.modelo or "").strip() or None if _q_focus else None,
+                        state.home_zone_detail or None,
+                        real_price_quote.precio_total,
+                        _q_focus.anio if _q_focus else None,
+                    )
             elif new_flag == "ACEPTADO":
                 state.last_stage = STAGE_SCHEDULING
 
@@ -2003,16 +2017,14 @@ class ConversationEngine:
             )
             lead.flag = "PRESUPUESTO_ENVIADO"
             state.last_stage = STAGE_QUOTED
-            ai_reply = str(decision.get("reply") or "")
-            total_str = f"${real_price_quote.precio_total:,.0f}".replace(",", ".")
-            # Inject price into reply when AI omitted it.
-            if str(real_price_quote.precio_total) not in ai_reply and total_str not in ai_reply:
-                decision["reply"] = (
-                    ai_reply
-                    + f"\n\nEl precio de la revisión es {total_str} "
-                    f"(base ${real_price_quote.precio_base:,.0f}".replace(",", ".")
-                    + f" + viáticos ${real_price_quote.viaticos:,.0f})".replace(",", ".")
-                )
+            _q_focus = self._focus_candidate(ctx)
+            decision["reply"] = self._build_quote_reply(
+                (_q_focus.marca or "").strip() or None if _q_focus else None,
+                (_q_focus.modelo or "").strip() or None if _q_focus else None,
+                state.home_zone_detail or None,
+                real_price_quote.precio_total,
+                _q_focus.anio if _q_focus else None,
+            )
 
         # Schedule check + flow when in SCHEDULING stage
         stage = state.last_stage

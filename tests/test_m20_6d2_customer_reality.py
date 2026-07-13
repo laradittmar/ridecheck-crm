@@ -104,6 +104,7 @@ _WA_BASE = "54000000001"  # distinct from M20.6D.1 test IDs to avoid collision
 # ── Zone rows (same subset as M20.6D.1 + Sur/NULL for SFS test) ───────────────
 _ZONE_ROWS = [
     ("CABA", None, 0), ("CABA", "CABA", 0), ("CABA", "Palermo", 0),
+    ("CABA", "Belgrano", 0),
     ("CABA", "Agronomía", 0), ("CABA", "Caballito", 0), ("CABA", "Villa del Parque", 0),
     ("Norte", None, 0), ("Norte", "Benavidez", 0), ("Norte", "San Isidro", 0),
     ("Sur", None, 30000),        # group-default: handles San Francisco Solano via Flow
@@ -2178,6 +2179,293 @@ class TestRC24ConcernCaseQuote(unittest.TestCase):
         # Stage QUOTED
         self.assertEqual(self.state.last_stage, "QUOTED",
                          f"Stage must be QUOTED: {self.state.last_stage}")
+
+        # AI not called
+        self.assertEqual(mock_urlopen.call_count, 0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RC25 — AI-path quote copy: Ford Focus 2019 / Palermo
+# ═══════════════════════════════════════════════════════════════════════════════
+class TestRC25AIPathQuoteFordFocusPalermo(unittest.TestCase):
+    """Live-replica V1: AI-path deterministic override must produce approved copy.
+
+    User sends vehicle+zone in one message (full data).  AI returns old-format
+    text.  The engine's deterministic override must replace it with the exact
+    approved copy including year.
+    """
+
+    _EXPECTED_QUOTE = (
+        "Genial! La cotización para la revisión del Ford Focus 2019 en Palermo "
+        "es de $130.000. Si te parece bien, podemos avanzar."
+    )
+
+    def setUp(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db = _SessionLocal()
+        self.contact, self.thread, self.lead, self.state = _seed_fresh(self.db, "6D4ARC25")
+        self.eng = _make_engine(self.db)
+        self.wa_id = self.contact.wa_id
+
+    def tearDown(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db.close()
+
+    @patch("urllib.request.urlopen")
+    def test_rc25_ai_path_ford_focus_2019_palermo(self, mock_urlopen):
+        """AI returns old-format reply; override enforces approved copy with year."""
+        mock_urlopen.return_value = _ai_resp(
+            "El costo de la revisión pre-compra para el Ford Focus 2019 en Palermo "
+            "es de $130.000. Si te interesa, podemos coordinar un día y horario para la inspección.",
+            lead_flag="PRESUPUESTO_ENVIADO",
+            candidate={"action": "create", "marca": "Ford", "modelo": "Focus",
+                       "tipo_vehiculo": "AUTO", "status": "current_focus"},
+        )
+        result = self.eng.handle(_event(
+            self.thread.id, self.wa_id,
+            "Tengo un Ford Focus 2019 en Palermo, cuánto sale?",
+            "RC25_MSG1",
+        ))
+        self.db.expire_all()
+        self.db.refresh(self.state)
+        self.db.refresh(self.lead)
+        blocked = _get_blocked(self.db, self.thread.id)
+
+        # Exact approved quote
+        self.assertTrue(
+            any(t == self._EXPECTED_QUOTE for t in blocked),
+            f"Exact approved quote expected:\n  WANT: {self._EXPECTED_QUOTE!r}\n  GOT:  {blocked}",
+        )
+
+        # No old scheduling copy
+        self.assertFalse(
+            any("coordinar un día y horario" in t for t in blocked),
+            f"Must not contain scheduling-invitation copy: {blocked}",
+        )
+        self.assertFalse(
+            any("qué día" in t.lower() for t in blocked),
+            f"Must not ask for day: {blocked}",
+        )
+        self.assertFalse(
+            any("cuándo" in t.lower() for t in blocked),
+            f"Must not ask when: {blocked}",
+        )
+
+        # No base/viáticos breakdown
+        self.assertFalse(
+            any("base" in t.lower() and "viáticos" in t.lower() for t in blocked),
+            f"Must not expose base/viáticos breakdown: {blocked}",
+        )
+
+        # No booking revision
+        from app.models import ThreadRevision
+        rev = self.db.execute(
+            select(ThreadRevision).where(ThreadRevision.thread_id == self.thread.id)
+        ).scalars().first()
+        self.assertIsNone(rev, "No booking revision must exist after quote")
+
+        # Stage and flag
+        self.assertEqual(self.state.last_stage, "QUOTED")
+        self.assertEqual(self.lead.flag, "PRESUPUESTO_ENVIADO")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RC26 — AI-path quote copy: Honda Fit 2018 / Belgrano
+# ═══════════════════════════════════════════════════════════════════════════════
+class TestRC26AIPathQuoteHondaFitBelgrano(unittest.TestCase):
+    """Live-replica V2 retry: Honda Fit 2018 Belgrano approved copy with year."""
+
+    _EXPECTED_QUOTE = (
+        "Genial! La cotización para la revisión del Honda Fit 2018 en Belgrano "
+        "es de $130.000. Si te parece bien, podemos avanzar."
+    )
+
+    def setUp(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db = _SessionLocal()
+        self.contact, self.thread, self.lead, self.state = _seed_fresh(self.db, "6D4ARC26")
+        self.eng = _make_engine(self.db)
+        self.wa_id = self.contact.wa_id
+
+    def tearDown(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db.close()
+
+    @patch("urllib.request.urlopen")
+    def test_rc26_ai_path_honda_fit_2018_belgrano(self, mock_urlopen):
+        """AI returns partial-match copy; override enforces approved copy with year."""
+        mock_urlopen.return_value = _ai_resp(
+            "Genial! La cotización para la revisión del Honda Fit 2018 en Belgrano "
+            "es de $130.000. Ahora, ¿qué día y horario te viene mejor para coordinar la inspección?",
+            lead_flag="PRESUPUESTO_ENVIADO",
+            candidate={"action": "create", "marca": "Honda", "modelo": "Fit",
+                       "tipo_vehiculo": "AUTO", "status": "current_focus"},
+        )
+        result = self.eng.handle(_event(
+            self.thread.id, self.wa_id,
+            "Quiero revisar un Honda Fit 2018 en Belgrano. Me pasás precio?",
+            "RC26_MSG1",
+        ))
+        self.db.expire_all()
+        self.db.refresh(self.state)
+        self.db.refresh(self.lead)
+        blocked = _get_blocked(self.db, self.thread.id)
+
+        # Exact approved quote
+        self.assertTrue(
+            any(t == self._EXPECTED_QUOTE for t in blocked),
+            f"Exact approved quote expected:\n  WANT: {self._EXPECTED_QUOTE!r}\n  GOT:  {blocked}",
+        )
+
+        # No scheduling question
+        self.assertFalse(
+            any("qué día" in t.lower() for t in blocked),
+            f"Must not ask for day: {blocked}",
+        )
+        self.assertFalse(
+            any("cuándo" in t.lower() for t in blocked),
+            f"Must not ask when: {blocked}",
+        )
+
+        # No base/viáticos breakdown
+        self.assertFalse(
+            any("base" in t.lower() and "viáticos" in t.lower() for t in blocked),
+            f"Must not expose base/viáticos breakdown: {blocked}",
+        )
+
+        # Stage and flag
+        self.assertEqual(self.state.last_stage, "QUOTED")
+        self.assertEqual(self.lead.flag, "PRESUPUESTO_ENVIADO")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RC27 — AI-path quote copy: Chevrolet Tracker 2020 / Palermo
+# ═══════════════════════════════════════════════════════════════════════════════
+class TestRC27AIPathQuoteTrackerPalermo(unittest.TestCase):
+    """Live-replica V3: Tracker model-only alias → SUV_4X4_DEPORTIVO → $140.000 approved copy."""
+
+    _EXPECTED_QUOTE = (
+        "Genial! La cotización para la revisión del Chevrolet Tracker 2020 en Palermo "
+        "es de $140.000. Si te parece bien, podemos avanzar."
+    )
+
+    def setUp(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db = _SessionLocal()
+        self.contact, self.thread, self.lead, self.state = _seed_fresh(self.db, "6D4ARC27")
+        self.eng = _make_engine(self.db)
+        self.wa_id = self.contact.wa_id
+
+    def tearDown(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db.close()
+
+    @patch("urllib.request.urlopen")
+    def test_rc27_ai_path_tracker_2020_palermo(self, mock_urlopen):
+        """AI returns old-format copy; override enforces approved copy with year."""
+        mock_urlopen.return_value = _ai_resp(
+            "La revisión de la Chevrolet Tracker 2020 en Palermo sale $140.000. "
+            "Si te interesa, podemos coordinar el día y horario para la inspección.",
+            lead_flag="PRESUPUESTO_ENVIADO",
+            candidate={"action": "create", "marca": "Chevrolet", "modelo": "Tracker",
+                       "tipo_vehiculo": "SUV_4X4_DEPORTIVO", "status": "current_focus"},
+        )
+        result = self.eng.handle(_event(
+            self.thread.id, self.wa_id,
+            "Cuánto sale revisar una Chevrolet Tracker 2020 en Palermo?",
+            "RC27_MSG1",
+        ))
+        self.db.expire_all()
+        self.db.refresh(self.state)
+        self.db.refresh(self.lead)
+        blocked = _get_blocked(self.db, self.thread.id)
+
+        # Exact approved quote
+        self.assertTrue(
+            any(t == self._EXPECTED_QUOTE for t in blocked),
+            f"Exact approved quote expected:\n  WANT: {self._EXPECTED_QUOTE!r}\n  GOT:  {blocked}",
+        )
+
+        # No old scheduling copy
+        self.assertFalse(
+            any("coordinar" in t and "horario" in t for t in blocked),
+            f"Must not contain scheduling-invitation copy: {blocked}",
+        )
+        self.assertFalse(
+            any("qué día" in t.lower() for t in blocked),
+            f"Must not ask for day: {blocked}",
+        )
+
+        # No base/viáticos breakdown
+        self.assertFalse(
+            any("base" in t.lower() and "viáticos" in t.lower() for t in blocked),
+            f"Must not expose base/viáticos breakdown: {blocked}",
+        )
+
+        # Stage and flag
+        self.assertEqual(self.state.last_stage, "QUOTED")
+        self.assertEqual(self.lead.flag, "PRESUPUESTO_ENVIADO")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RC28 — Acceptance after AI-path quote enters SCHEDULING
+# ═══════════════════════════════════════════════════════════════════════════════
+class TestRC28AcceptanceAfterAIPathQuote(unittest.TestCase):
+    """After an AI-path quote (RC25 scenario), 'Sí, avancemos' must advance to SCHEDULING."""
+
+    _EXPECTED_ACCEPTANCE_REPLY = "¡Perfecto! ¿Qué día y horario te viene mejor para la revisión?"
+
+    def setUp(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db = _SessionLocal()
+        self.contact, self.thread, self.lead, self.state = _seed_fresh(self.db, "6D4ARC28")
+        # Pre-seed: already QUOTED (Ford Focus 2019, Palermo)
+        _add_candidate(self.db, self.thread.id, "Ford", "Focus", "AUTO",
+                       zone_group="CABA", zone_detail="Palermo")
+        self.state.home_zone_group = "CABA"
+        self.state.home_zone_detail = "Palermo"
+        self.state.last_stage = "QUOTED"
+        self.lead.flag = "PRESUPUESTO_ENVIADO"
+        self.db.commit()
+        self.eng = _make_engine(self.db)
+        self.wa_id = self.contact.wa_id
+
+    def tearDown(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db.close()
+
+    @patch("urllib.request.urlopen")
+    def test_rc28_acceptance_advances_to_scheduling(self, mock_urlopen):
+        """'Sí, avancemos' after AI-path quote → SCHEDULING, approved scheduling copy."""
+        mock_urlopen.side_effect = AssertionError("AI must not be called for clear acceptance")
+
+        result = self.eng.handle(_event(
+            self.thread.id, self.wa_id, "Sí, avancemos", "RC28_ACCEPT",
+        ))
+        self.db.expire_all()
+        self.db.refresh(self.state)
+        self.db.refresh(self.lead)
+        blocked = _get_blocked(self.db, self.thread.id)
+
+        # Stage advances to SCHEDULING
+        self.assertEqual(self.state.last_stage, "SCHEDULING",
+                         f"Stage must advance to SCHEDULING: {self.state.last_stage}")
+
+        # Exact approved scheduling copy
+        self.assertTrue(
+            any(t == self._EXPECTED_ACCEPTANCE_REPLY for t in blocked),
+            f"Exact scheduling copy expected:\n  WANT: {self._EXPECTED_ACCEPTANCE_REPLY!r}\n  GOT:  {blocked}",
+        )
+
+        # No repeated quote
+        self.assertFalse(
+            any("$130" in t and t != self._EXPECTED_ACCEPTANCE_REPLY for t in blocked),
+            f"Must not repeat quote price in acceptance reply: {blocked}",
+        )
+
+        # Lead flag set to ACEPTADO
+        self.assertEqual(self.lead.flag, "ACEPTADO",
+                         f"Lead flag must be ACEPTADO: {self.lead.flag}")
 
         # AI not called
         self.assertEqual(mock_urlopen.call_count, 0)
