@@ -751,8 +751,9 @@ def _parse_scheduling_text(texts: list[str], today: date) -> tuple[str | None, s
     # ── Time extraction ───────────────────────────────────────────────────
     time_str: str | None = None
 
-    # "12hs", "12h", "9:30hs", "9:30h"  (most common Argentine pattern)
-    m = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*h(?:s|oras?)?\b", combined)
+    # "12hs", "12h", "12 ha", "9:30hs", "9:30h"  (most common Argentine patterns)
+    # "ha" is a common WhatsApp typo for "hs" (e.g. "20 ha" → 20:00)
+    m = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*h(?:s|oras?|a)?\b", combined)
     if m:
         h, mi = int(m.group(1)), int(m.group(2) or 0)
         if 0 <= h <= 23 and 0 <= mi <= 59:
@@ -2317,10 +2318,10 @@ class ConversationEngine:
 
             date_human = _format_date_human(preferred_day_iso, date.today())
             if all_slots:
-                # Sort nearest slots chronologically so reply is always in time order.
-                near = sorted(_nearest_slots(all_slots, preferred_time_obj.strftime("%H:%M")))
-                state.last_visible_slots = json.dumps(near)  # only what was shown
-                slot_list = ", ".join(near)
+                # Show all available slots (capped at 12) in chronological order.
+                shown = all_slots[:12]
+                state.last_visible_slots = json.dumps(shown)
+                slot_list = ", ".join(shown[:-1]) + f" o {shown[-1]}" if len(shown) >= 2 else shown[0]
                 msg = (
                     f"Para {date_human} a las {preferred_time_obj.strftime('%H:%M')} "
                     f"no tenemos disponibilidad. "
@@ -2426,7 +2427,7 @@ class ConversationEngine:
             period_label = "mañana"
             alt_label = "tarde"
         else:
-            display_slots = all_slots[:4]  # no period — cap at 4 for readability
+            display_slots = all_slots[:12]  # no period — show all reasonable slots
             period_label = None
             alt_label = None
 
@@ -2440,7 +2441,7 @@ class ConversationEngine:
                 msg = f"Para {date_human} tengo disponible: {slot_list}. ¿A qué hora te viene bien?"
         elif period_label and all_slots:
             # Requested period has no slots — offer the other period.
-            shown_all = all_slots[:4]
+            shown_all = all_slots[:12]
             state.last_visible_slots = json.dumps(shown_all)
             sl = ", ".join(shown_all[:-1]) + f" o {shown_all[-1]}" if len(shown_all) >= 2 else shown_all[0]
             msg = (

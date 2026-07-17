@@ -2471,5 +2471,319 @@ class TestRC28AcceptanceAfterAIPathQuote(unittest.TestCase):
         self.assertEqual(mock_urlopen.call_count, 0)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# RC29 — Scheduling UX: full slot visibility + time-typo normalization
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_SATURDAY_SLOTS = [
+    "09:00", "09:30", "10:00", "10:30", "12:00", "12:30",
+    "13:00", "13:30", "14:00",
+]
+_SATURDAY_SLOT_LIST = (
+    "09:00, 09:30, 10:00, 10:30, 12:00, 12:30, 13:00, 13:30 o 14:00"
+)
+
+def _seed_scheduling(db: Session, wa_suffix: str):
+    """Seed a lead already in SCHEDULING stage (Ford Focus 2010, CABA/Palermo, accepted)."""
+    contact, thread, lead, state = _seed_fresh(db, wa_suffix)
+    _add_candidate(db, thread.id, "Ford", "Focus", "AUTO",
+                   zone_group="CABA", zone_detail="Palermo")
+    lead.flag = "ACEPTADO"
+    state.last_stage = "SCHEDULING"
+    state.home_zone_group = "CABA"
+    state.home_zone_detail = "Palermo"
+    db.commit()
+    return contact, thread, lead, state
+
+
+def _patch_list_slots(mock_schedule, slots, closed=False):
+    """Configure _schedule.list_slots and check to return supplied slots."""
+    from datetime import date, time
+    from app.schemas.schedule import ScheduleSlotsOut, ScheduleCheckOut, ScheduleSlotOut
+    slots_out = ScheduleSlotsOut(
+        preferred_day=date.today(),
+        business_hours="cerrado" if closed else "abierto",
+        slots=slots,
+    )
+    mock_schedule.list_slots.return_value = slots_out
+    check_out = ScheduleCheckOut(
+        valid=False,
+        reasons=["slot_unavailable"] if not closed else ["cerrado"],
+        suggested_slots=slots[:5],
+        business_hours="cerrado" if closed else "abierto",
+        requested_slot=ScheduleSlotOut(start="20:00", end="21:00"),
+    )
+    mock_schedule.check.return_value = check_out
+    return slots_out, check_out
+
+
+class TestRC29FullSlotVisibility(unittest.TestCase):
+    """Day-only request shows all available slots up to cap (not just 4)."""
+
+    def setUp(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db = _SessionLocal()
+        self.contact, self.thread, self.lead, self.state = _seed_scheduling(
+            self.db, "6D5RC29A"
+        )
+        self.eng = _make_engine(self.db)
+        self.wa_id = self.contact.wa_id
+
+    def tearDown(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db.close()
+
+    @patch("urllib.request.urlopen")
+    def test_rc29_saturday_day_only_shows_all_slots(self, mock_urlopen):
+        """'Sábado tenes?' returns all 9 slots, not just the first 4."""
+        mock_urlopen.side_effect = AssertionError("AI must not be called for day-only scheduling")
+
+        with patch.object(self.eng, "_schedule") as mock_sched:
+            _patch_list_slots(mock_sched, _SATURDAY_SLOTS)
+            result = self.eng.handle(_event(
+                self.thread.id, self.wa_id, "Sábado tenes ?", "RC29A_SAT",
+            ))
+
+        self.db.expire_all()
+        self.db.refresh(self.state)
+        blocked = _get_blocked(self.db, self.thread.id)
+
+        self.assertIsNotNone(result, "Engine must return a result")
+        self.assertTrue(blocked, "A reply must be sent")
+        reply = blocked[0]
+
+        # All 9 slots must appear — none should be hidden
+        for slot in _SATURDAY_SLOTS:
+            self.assertIn(slot, reply,
+                          f"Slot {slot} must appear in reply. Got: {reply!r}")
+
+        # 13:00–14:00 specifically must NOT be hidden
+        for slot in ("13:00", "13:30", "14:00"):
+            self.assertIn(slot, reply,
+                          f"Afternoon slot {slot} was hidden — must be visible. Got: {reply!r}")
+
+        # Reply uses the full slot list
+        self.assertIn(_SATURDAY_SLOT_LIST, reply,
+                      f"Full slot list not in reply.\n  WANT: {_SATURDAY_SLOT_LIST!r}\n  GOT:  {reply!r}")
+
+        # Ends with scheduling question
+        self.assertIn("¿A qué hora", reply,
+                      f"Reply must ask for time preference. Got: {reply!r}")
+
+        # Slots stored for follow-up
+        self.assertIsNotNone(self.state.last_offered_slots,
+                             "last_offered_slots must be set after day-only request")
+        stored = json.loads(self.state.last_offered_slots)
+        self.assertListEqual(stored, _SATURDAY_SLOTS)
+
+
+class TestRC30TimeTypo20Ha(unittest.TestCase):
+    """'20 ha' is parsed as 20:00 and triggers an availability check, not a confirmation."""
+
+    def setUp(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db = _SessionLocal()
+        self.contact, self.thread, self.lead, self.state = _seed_scheduling(
+            self.db, "6D5RC30A"
+        )
+        # Simulate that Saturday was already requested (active_requested_date set)
+        from datetime import date, timedelta
+        today = date.today()
+        days_ahead = 5 - today.weekday()
+        if days_ahead <= 0:
+            days_ahead += 7
+        self.saturday = (today + timedelta(days=days_ahead)).isoformat()
+        self.state.active_requested_date = self.saturday
+        self.state.last_offered_slots = json.dumps(_SATURDAY_SLOTS)
+        self.state.last_visible_slots = json.dumps(_SATURDAY_SLOTS[:4])
+        self.db.commit()
+        self.eng = _make_engine(self.db)
+        self.wa_id = self.contact.wa_id
+
+    def tearDown(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db.close()
+
+    @patch("urllib.request.urlopen")
+    def test_rc30_20ha_triggers_availability_check_not_confirmation(self, mock_urlopen):
+        """'Okay 20 ha?' → 20:00 unavailable → shows all slots, no confirmation question."""
+        mock_urlopen.side_effect = AssertionError("AI must not be called for parseable time typo")
+
+        with patch.object(self.eng, "_schedule") as mock_sched:
+            from app.schemas.schedule import ScheduleCheckOut, ScheduleSlotOut
+            check_out_unavail = ScheduleCheckOut(
+                valid=False,
+                reasons=["slot_unavailable"],
+                suggested_slots=_SATURDAY_SLOTS[:5],
+                business_hours="abierto",
+                requested_slot=ScheduleSlotOut(start="20:00", end="21:00"),
+            )
+            mock_sched.check.return_value = check_out_unavail
+            _patch_list_slots(mock_sched, _SATURDAY_SLOTS)
+
+            result = self.eng.handle(_event(
+                self.thread.id, self.wa_id, "Okay 20 ha?", "RC30_20HA",
+            ))
+
+        self.db.expire_all()
+        blocked = _get_blocked(self.db, self.thread.id)
+
+        self.assertIsNotNone(result, "Engine must return a result")
+        self.assertTrue(blocked, "A reply must be sent")
+        reply = blocked[0]
+
+        # Must NOT ask for confirmation of 20:00
+        self.assertNotIn("¿te viene bien", reply.lower(),
+                         f"Must not ask confirmation for unavailable time. Got: {reply!r}")
+
+        # Must say 20:00 is unavailable
+        self.assertIn("20:00", reply,
+                      f"Reply must reference the requested 20:00. Got: {reply!r}")
+        self.assertIn("no tenemos disponibilidad", reply,
+                      f"Reply must state unavailability. Got: {reply!r}")
+
+        # Must show all available slots, including afternoon ones
+        for slot in _SATURDAY_SLOTS:
+            self.assertIn(slot, reply,
+                          f"Slot {slot} must appear in rejection reply. Got: {reply!r}")
+
+
+class TestRC31TimeTypo20Hs(unittest.TestCase):
+    """'20hs' is parsed as 20:00 and triggers an availability check with full slot list."""
+
+    def setUp(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db = _SessionLocal()
+        self.contact, self.thread, self.lead, self.state = _seed_scheduling(
+            self.db, "6D5RC31A"
+        )
+        from datetime import date, timedelta
+        today = date.today()
+        days_ahead = 5 - today.weekday()
+        if days_ahead <= 0:
+            days_ahead += 7
+        self.saturday = (today + timedelta(days=days_ahead)).isoformat()
+        self.state.active_requested_date = self.saturday
+        self.state.last_offered_slots = json.dumps(_SATURDAY_SLOTS)
+        self.state.last_visible_slots = json.dumps(_SATURDAY_SLOTS[:4])
+        self.db.commit()
+        self.eng = _make_engine(self.db)
+        self.wa_id = self.contact.wa_id
+
+    def tearDown(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db.close()
+
+    @patch("urllib.request.urlopen")
+    def test_rc31_20hs_shows_full_slot_list_on_rejection(self, mock_urlopen):
+        """'Si 20hs' → 20:00 unavailable → full slot list shown, no confirmation."""
+        mock_urlopen.side_effect = AssertionError("AI must not be called for parseable time")
+
+        with patch.object(self.eng, "_schedule") as mock_sched:
+            from app.schemas.schedule import ScheduleCheckOut, ScheduleSlotOut
+            check_out_unavail = ScheduleCheckOut(
+                valid=False,
+                reasons=["slot_unavailable"],
+                suggested_slots=_SATURDAY_SLOTS[:5],
+                business_hours="abierto",
+                requested_slot=ScheduleSlotOut(start="20:00", end="21:00"),
+            )
+            mock_sched.check.return_value = check_out_unavail
+            _patch_list_slots(mock_sched, _SATURDAY_SLOTS)
+
+            result = self.eng.handle(_event(
+                self.thread.id, self.wa_id, "Si 20hs", "RC31_20HS",
+            ))
+
+        self.db.expire_all()
+        blocked = _get_blocked(self.db, self.thread.id)
+
+        self.assertIsNotNone(result, "Engine must return a result")
+        self.assertTrue(blocked, "A reply must be sent")
+        reply = blocked[0]
+
+        # Must say unavailable
+        self.assertIn("no tenemos disponibilidad", reply,
+                      f"Reply must state unavailability. Got: {reply!r}")
+        self.assertIn("20:00", reply,
+                      f"Reply must reference 20:00. Got: {reply!r}")
+
+        # Must show all slots — NOT just the 3 nearest (13:00–14:00)
+        for slot in _SATURDAY_SLOTS:
+            self.assertIn(slot, reply,
+                          f"Slot {slot} missing from rejection reply. Got: {reply!r}")
+
+        # Full slot list string must appear
+        self.assertIn(_SATURDAY_SLOT_LIST, reply,
+                      f"Full slot list not in reply.\n  WANT: {_SATURDAY_SLOT_LIST!r}\n  GOT:  {reply!r}")
+
+        # Must NOT ask for 20:00 confirmation
+        self.assertNotIn("¿te viene bien", reply.lower(),
+                         f"Must not ask confirmation for unavailable time. Got: {reply!r}")
+
+
+class TestRC32AvailableTimeBooks(unittest.TestCase):
+    """Selecting an available slot (14:00) sends the booking Flow — no regression."""
+
+    def setUp(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db = _SessionLocal()
+        self.contact, self.thread, self.lead, self.state = _seed_scheduling(
+            self.db, "6D5RC32A"
+        )
+        from datetime import date, timedelta
+        today = date.today()
+        days_ahead = 5 - today.weekday()
+        if days_ahead <= 0:
+            days_ahead += 7
+        self.saturday = (today + timedelta(days=days_ahead)).isoformat()
+        self.state.active_requested_date = self.saturday
+        self.state.last_offered_slots = json.dumps(_SATURDAY_SLOTS)
+        self.state.last_visible_slots = json.dumps(_SATURDAY_SLOTS)
+        self.db.commit()
+        self.eng = _make_engine(self.db)
+        self.wa_id = self.contact.wa_id
+
+    def tearDown(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db.close()
+
+    @patch("urllib.request.urlopen")
+    def test_rc32_available_time_triggers_booking_flow(self, mock_urlopen):
+        """'14:00' on active Saturday → slot available → booking Flow sent."""
+        mock_urlopen.side_effect = AssertionError("AI must not be called for parseable time")
+
+        with patch.object(self.eng, "_schedule") as mock_sched:
+            from app.schemas.schedule import ScheduleCheckOut, ScheduleSlotOut
+            check_out_avail = ScheduleCheckOut(
+                valid=True,
+                reasons=[],
+                suggested_slots=[],
+                business_hours="abierto",
+                requested_slot=ScheduleSlotOut(start="14:00", end="15:00"),
+            )
+            mock_sched.check.return_value = check_out_avail
+
+            with patch.object(self.eng, "_send_flow_button", return_value="MSG_FLOW") as mock_flow:
+                result = self.eng.handle(_event(
+                    self.thread.id, self.wa_id, "14:00", "RC32_1400",
+                ))
+
+        self.db.expire_all()
+        self.db.refresh(self.state)
+
+        # Booking Flow must have been dispatched
+        self.assertTrue(
+            mock_flow.called or (result is not None and result.action == "flow_button_sent"),
+            f"Booking Flow must be sent for available slot. result={result}"
+        )
+
+        # No rejection message
+        blocked = _get_blocked(self.db, self.thread.id)
+        for msg in blocked:
+            self.assertNotIn("no tenemos disponibilidad", msg,
+                             f"Must not reject an available slot. Got: {msg!r}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
