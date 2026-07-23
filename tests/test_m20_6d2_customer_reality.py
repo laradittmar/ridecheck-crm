@@ -2785,5 +2785,265 @@ class TestRC32AvailableTimeBooks(unittest.TestCase):
                              f"Must not reject an available slot. Got: {msg!r}")
 
 
+_SATURDAY_SLOTS_WITH_1130 = [
+    "09:00", "09:30", "10:00", "10:30", "11:00", "11:30",
+    "12:00", "12:30", "13:00", "13:30", "14:00",
+]
+
+
+class TestRC33SingleDigitMinuteBooks(unittest.TestCase):
+    """'11:3' (abbreviated 11:30) is parsed deterministically — booking Flow sent."""
+
+    def setUp(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db = _SessionLocal()
+        self.contact, self.thread, self.lead, self.state = _seed_scheduling(
+            self.db, "6D5RC33A"
+        )
+        from datetime import date, timedelta
+        today = date.today()
+        days_ahead = 5 - today.weekday()
+        if days_ahead <= 0:
+            days_ahead += 7
+        self.saturday = (today + timedelta(days=days_ahead)).isoformat()
+        self.state.active_requested_date = self.saturday
+        self.state.last_offered_slots = json.dumps(_SATURDAY_SLOTS_WITH_1130)
+        self.state.last_visible_slots = json.dumps(_SATURDAY_SLOTS_WITH_1130)
+        self.db.commit()
+        self.eng = _make_engine(self.db)
+        self.wa_id = self.contact.wa_id
+
+    def tearDown(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db.close()
+
+    @patch("urllib.request.urlopen")
+    def test_rc33_abbreviated_1130_books_without_ai(self, mock_urlopen):
+        """'Okay 11:3 entonces' → parsed as 11:30 → booking Flow sent, AI not called."""
+        mock_urlopen.side_effect = AssertionError(
+            "AI must not be called — '11:3' must be parsed deterministically"
+        )
+
+        with patch.object(self.eng, "_schedule") as mock_sched:
+            from app.schemas.schedule import ScheduleCheckOut, ScheduleSlotOut
+            mock_sched.check.return_value = ScheduleCheckOut(
+                valid=True,
+                reasons=[],
+                suggested_slots=[],
+                business_hours="abierto",
+                requested_slot=ScheduleSlotOut(start="11:30", end="12:30"),
+            )
+            with patch.object(self.eng, "_send_flow_button", return_value="MSG_RC33") as mock_flow:
+                result = self.eng.handle(_event(
+                    self.thread.id, self.wa_id, "Okay 11:3 entonces", "RC33_1130",
+                ))
+
+        self.assertIsNotNone(result, "Engine must return a result")
+        self.assertTrue(
+            mock_flow.called or (result is not None and result.action == "flow_button_sent"),
+            f"Booking Flow must be sent for 11:30 slot. result={result}"
+        )
+
+        # Check was called — time was parsed and availability checked
+        self.assertTrue(mock_sched.check.called,
+                        "schedule.check must be called — time must have been parsed")
+
+        # Verify check was called with 11:30 (not some other time)
+        check_in = mock_sched.check.call_args[0][0]
+        self.assertEqual(check_in.preferred_time.hour, 11,
+                         f"check must use hour=11. Got: {check_in.preferred_time}")
+        self.assertEqual(check_in.preferred_time.minute, 30,
+                         f"check must use minute=30. Got: {check_in.preferred_time}")
+
+
+class TestRC34SingleDigitZeroMinuteBooks(unittest.TestCase):
+    """'9:0' (abbreviated 09:00) is parsed deterministically — booking Flow sent."""
+
+    def setUp(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db = _SessionLocal()
+        self.contact, self.thread, self.lead, self.state = _seed_scheduling(
+            self.db, "6D5RC34A"
+        )
+        from datetime import date, timedelta
+        today = date.today()
+        days_ahead = 5 - today.weekday()
+        if days_ahead <= 0:
+            days_ahead += 7
+        self.saturday = (today + timedelta(days=days_ahead)).isoformat()
+        self.state.active_requested_date = self.saturday
+        self.state.last_offered_slots = json.dumps(_SATURDAY_SLOTS)
+        self.state.last_visible_slots = json.dumps(_SATURDAY_SLOTS)
+        self.db.commit()
+        self.eng = _make_engine(self.db)
+        self.wa_id = self.contact.wa_id
+
+    def tearDown(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db.close()
+
+    @patch("urllib.request.urlopen")
+    def test_rc34_abbreviated_900_books_without_ai(self, mock_urlopen):
+        """'9:0' → parsed as 09:00 → booking Flow sent, AI not called."""
+        mock_urlopen.side_effect = AssertionError(
+            "AI must not be called — '9:0' must be parsed deterministically"
+        )
+
+        with patch.object(self.eng, "_schedule") as mock_sched:
+            from app.schemas.schedule import ScheduleCheckOut, ScheduleSlotOut
+            mock_sched.check.return_value = ScheduleCheckOut(
+                valid=True,
+                reasons=[],
+                suggested_slots=[],
+                business_hours="abierto",
+                requested_slot=ScheduleSlotOut(start="09:00", end="10:00"),
+            )
+            with patch.object(self.eng, "_send_flow_button", return_value="MSG_RC34") as mock_flow:
+                result = self.eng.handle(_event(
+                    self.thread.id, self.wa_id, "9:0", "RC34_900",
+                ))
+
+        self.assertIsNotNone(result, "Engine must return a result")
+        self.assertTrue(
+            mock_flow.called or (result is not None and result.action == "flow_button_sent"),
+            f"Booking Flow must be sent for 09:00 slot. result={result}"
+        )
+        self.assertTrue(mock_sched.check.called,
+                        "schedule.check must be called — time must have been parsed")
+
+
+class TestRC35RequoteSuppressionInScheduling(unittest.TestCase):
+    """AI outputs PRESUPUESTO_ENVIADO in SCHEDULING → flag blocked + reply suppressed."""
+
+    def setUp(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db = _SessionLocal()
+        self.contact, self.thread, self.lead, self.state = _seed_scheduling(
+            self.db, "6D5RC35A"
+        )
+        from datetime import date, timedelta
+        today = date.today()
+        days_ahead = 5 - today.weekday()
+        if days_ahead <= 0:
+            days_ahead += 7
+        self.saturday = (today + timedelta(days=days_ahead)).isoformat()
+        self.state.active_requested_date = self.saturday
+        self.state.last_offered_slots = json.dumps(_SATURDAY_SLOTS)
+        self.db.commit()
+        self.eng = _make_engine(self.db)
+        self.wa_id = self.contact.wa_id
+
+    def tearDown(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db.close()
+
+    @patch("urllib.request.urlopen")
+    def test_rc35_requote_flag_and_reply_suppressed_in_scheduling(self, mock_urlopen):
+        """AI tries to re-quote in SCHEDULING → flag stays ACEPTADO, reply not sent."""
+        re_quote_text = (
+            "Genial! La cotización para la revisión del Ford Focus en Palermo "
+            "es de $190.000. Si te parece bien, podemos avanzar."
+        )
+        mock_urlopen.return_value = _ai_resp(
+            re_quote_text,
+            lead_flag="PRESUPUESTO_ENVIADO",
+        )
+
+        with patch.object(self.eng, "_schedule") as mock_sched:
+            _patch_list_slots(mock_sched, _SATURDAY_SLOTS)
+            result = self.eng.handle(_event(
+                self.thread.id, self.wa_id, "me interesa", "RC35_REQUOTE",
+            ))
+
+        self.db.expire_all()
+        self.db.refresh(self.lead)
+
+        # Flag must not regress
+        self.assertEqual(self.lead.flag, "ACEPTADO",
+                         f"Flag must stay ACEPTADO — PRESUPUESTO_ENVIADO must be blocked. Got: {self.lead.flag!r}")
+
+        # Re-quote text must not appear in any outbound message
+        blocked = _get_blocked(self.db, self.thread.id)
+        for msg in blocked:
+            self.assertNotIn("190.000", msg,
+                             f"Re-quote price must not be sent in SCHEDULING. Got: {msg!r}")
+            self.assertNotIn("cotización", msg.lower(),
+                             f"Re-quote copy must not be sent in SCHEDULING. Got: {msg!r}")
+
+
+class TestRC36AiProposedTimeStoredForSiReply(unittest.TestCase):
+    """AI proposes a time → state.preferred_time stored → 'Sí' triggers block 4b → booking Flow."""
+
+    def setUp(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db = _SessionLocal()
+        self.contact, self.thread, self.lead, self.state = _seed_scheduling(
+            self.db, "6D5RC36A"
+        )
+        from datetime import date, timedelta
+        today = date.today()
+        days_ahead = 5 - today.weekday()
+        if days_ahead <= 0:
+            days_ahead += 7
+        self.saturday = (today + timedelta(days=days_ahead)).isoformat()
+        self.state.active_requested_date = self.saturday
+        self.state.last_offered_slots = json.dumps(_SATURDAY_SLOTS)
+        self.state.last_visible_slots = json.dumps(_SATURDAY_SLOTS)
+        # preferred_time explicitly NULL — this is the bug condition
+        self.state.preferred_time = None
+        self.db.commit()
+        self.eng = _make_engine(self.db)
+        self.wa_id = self.contact.wa_id
+
+    def tearDown(self):
+        os.environ.pop("OUTBOUND_ENABLED", None)
+        self.db.close()
+
+    @patch("urllib.request.urlopen")
+    def test_rc36_ai_proposed_time_stored_then_si_books(self, mock_urlopen):
+        """Turn 1: AI proposes 09:00 → preferred_time stored. Turn 2: 'Sí' → Flow sent."""
+        # ── Turn 1: AI proposes "a las 09:00" ────────────────────────────────
+        ai_proposal = "¿Te parece bien a las 09:00? Es el primer horario disponible."
+        mock_urlopen.return_value = _ai_resp(ai_proposal)
+
+        with patch.object(self.eng, "_schedule") as mock_sched:
+            _patch_list_slots(mock_sched, _SATURDAY_SLOTS)
+            self.eng.handle(_event(
+                self.thread.id, self.wa_id, "qué hora recomiendas?", "RC36_Q",
+            ))
+
+        self.db.expire_all()
+        self.db.refresh(self.state)
+
+        # preferred_time must now be "09:00" (stored from AI reply)
+        self.assertEqual(str(self.state.preferred_time), "09:00",
+                         f"preferred_time must be '09:00' after AI proposed it. Got: {self.state.preferred_time!r}")
+
+        # ── Turn 2: "Sí" → block 4b fires → booking Flow sent ────────────────
+        mock_urlopen.side_effect = AssertionError(
+            "AI must not be called for 'Sí' after preferred_time is stored"
+        )
+
+        with patch.object(self.eng, "_schedule") as mock_sched:
+            from app.schemas.schedule import ScheduleCheckOut, ScheduleSlotOut
+            mock_sched.check.return_value = ScheduleCheckOut(
+                valid=True,
+                reasons=[],
+                suggested_slots=[],
+                business_hours="abierto",
+                requested_slot=ScheduleSlotOut(start="09:00", end="10:00"),
+            )
+            with patch.object(self.eng, "_send_flow_button", return_value="MSG_RC36") as mock_flow:
+                result = self.eng.handle(_event(
+                    self.thread.id, self.wa_id, "Sí", "RC36_SI",
+                ))
+
+        self.assertIsNotNone(result, "Engine must return a result on 'Sí'")
+        self.assertTrue(
+            mock_flow.called or (result is not None and result.action == "flow_button_sent"),
+            f"Booking Flow must be sent after 'Sí' following AI time proposal. result={result}"
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

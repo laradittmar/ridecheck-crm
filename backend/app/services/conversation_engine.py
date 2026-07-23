@@ -768,10 +768,11 @@ def _parse_scheduling_text(texts: list[str], today: date) -> tuple[str | None, s
                 time_str = f"{h:02d}:{mi:02d}"
 
     if not time_str:
-        # Standalone "9:30" or "12:00"
-        m = re.search(r"\b(\d{1,2}):(\d{2})\b", combined)
+        # Standalone "9:30", "12:00", or abbreviated "11:3" (single digit = tens: 3→30).
+        m = re.search(r"\b(\d{1,2}):(\d{1,2})\b", combined)
         if m:
-            h, mi = int(m.group(1)), int(m.group(2))
+            h, mi_raw = int(m.group(1)), int(m.group(2))
+            mi = mi_raw * 10 if len(m.group(2)) == 1 else mi_raw
             if 0 <= h <= 23 and 0 <= mi <= 59:
                 time_str = f"{h:02d}:{mi:02d}"
 
@@ -1942,6 +1943,9 @@ class ConversationEngine:
                 state.last_stage, ctx.thread.id,
             )
             flag_accepted = False
+            # Also clear the AI's re-quote reply so it isn't sent verbatim.
+            # The post-AI SCHEDULING block will produce the correct scheduling response.
+            decision["reply"] = None
 
         # BUG-3 guard: never advance QUALIFYING → ACEPTADO without a deterministic quote.
         # Acceptance words ("dale", "sí") in QUALIFYING stage must not move to SCHEDULING
@@ -2047,6 +2051,19 @@ class ConversationEngine:
                     ctx.thread.id, pday,
                 )
                 return self._handle_day_only_request(ctx, state, pday)
+
+        # If the AI proposed a time in its reply (e.g., "¿Te parece bien las 11:30?"),
+        # store it in state.preferred_time so the next "Sí" triggers block 4b.
+        if stage == STAGE_SCHEDULING and not state.needs_human and not state.flow_booking_token:
+            ai_reply_text = decision.get("reply") or ""
+            if ai_reply_text and state.active_requested_date and not state.preferred_time:
+                _, ai_proposed_time = _parse_scheduling_text([ai_reply_text], date.today())
+                if ai_proposed_time:
+                    state.preferred_time = ai_proposed_time
+                    logger.info(
+                        "M20 stored AI-proposed time=%s in preferred_time thread_id=%s",
+                        ai_proposed_time, ctx.thread.id,
+                    )
 
         reply = str(decision.get("reply") or "")
         # BUG-2 guard: if AI invented a price and we have no deterministic quote, scrub it.
