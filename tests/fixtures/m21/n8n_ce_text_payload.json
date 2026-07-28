@@ -1,0 +1,14 @@
+{
+  "thread_id": 1,
+  "wa_message_id": "wamid.test.m21.text.001",
+  "wa_id": "5491100000099",
+  "message_type": "text",
+  "text": "Hola, quiero revisar un auto en Benavidez",
+  "recent_user_messages": [
+    "Hola, quiero revisar un auto en Benavidez"
+  ],
+  "unanswered_recent_user_messages": [
+    "Hola, quiero revisar un auto en Benavidez"
+  ],
+  "recent_outbound_replies": []
+}

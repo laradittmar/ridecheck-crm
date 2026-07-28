@@ -1,0 +1,13 @@
+{
+  "thread_id": 1,
+  "wa_message_id": "wamid.test.m21.flow.001",
+  "wa_id": "5491100000099",
+  "message_type": "flow_response",
+  "flow_response": {
+    "tipo_vehiculo": "SUV/4x4",
+    "marca": "Baic",
+    "modelo": "BJ30",
+    "anio": "2025"
+  },
+  "flow_token": "test-flow-token-sanitized-do-not-use-in-production"
+}
