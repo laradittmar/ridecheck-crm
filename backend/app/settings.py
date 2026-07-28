@@ -21,6 +21,7 @@ class Settings:
     resend_api_key: str = ""
     internal_booking_email_from: str = ""
     internal_booking_email_to: str = ""
+    internal_booking_email_reply_to: str = ""
     whatsapp_flow_id: str = ""
     whatsapp_website_flow_id: str = ""
     whatsapp_vehicle_fallback_flow_id: str = ""
@@ -83,7 +84,8 @@ def get_settings() -> Settings:
         smtp_from=_getenv("SMTP_FROM"),
         resend_api_key=_getenv("RESEND_API_KEY"),
         internal_booking_email_from=_getenv("INTERNAL_BOOKING_EMAIL_FROM", "notificaciones@ridecheck.ar"),
-        internal_booking_email_to=_getenv("INTERNAL_BOOKING_EMAIL_TO"),
+        internal_booking_email_to=_getenv("INTERNAL_BOOKING_EMAIL_TO", "ridecheckassistance@gmail.com"),
+        internal_booking_email_reply_to=_getenv("INTERNAL_BOOKING_EMAIL_REPLY_TO", "ridecheckassistance@gmail.com"),
         whatsapp_flow_id=_getenv("WHATSAPP_FLOW_ID"),
         whatsapp_website_flow_id=_getenv("WHATSAPP_WEBSITE_FLOW_ID"),
         whatsapp_vehicle_fallback_flow_id=_getenv("WHATSAPP_VEHICLE_FALLBACK_FLOW_ID"),

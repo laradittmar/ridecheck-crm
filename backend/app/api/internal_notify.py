@@ -113,6 +113,7 @@ def notify_booking(payload: NotifyBookingIn, db: Session = Depends(get_db)):
         api_key=settings.resend_api_key,
         from_email=settings.internal_booking_email_from,
         to_email=settings.internal_booking_email_to,
+        reply_to_email=settings.internal_booking_email_reply_to,
         lead_id=lead_id,
         revision_id=revision_id,
         buyer_name=     _field(payload.buyer_name),

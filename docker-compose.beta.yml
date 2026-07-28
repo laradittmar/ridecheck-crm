@@ -32,10 +32,11 @@
 
 services:
   backend:
-    image: ridecheck-crm-backend:m20.6d4v-ee21f6d
+    image: ridecheck-crm-backend:m20.6d5.2-093074a
     environment:
       DATABASE_URL: postgresql+psycopg://crm:crm@postgres:5432/crm_test
       OUTBOUND_ENABLED: "${BETA_OUTBOUND_ENABLED:-false}"
       CLOSED_BETA_ALLOWED_WA_IDS: "5491153368330"
       QUARANTINED_TEST_WA_IDS: ""
       INTERNAL_BOOKING_EMAIL_TO: "ridecheckassistance@gmail.com"
+      INTERNAL_BOOKING_EMAIL_REPLY_TO: "ridecheckassistance@gmail.com"

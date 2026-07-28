@@ -122,6 +122,7 @@ def send_booking_notification(
     api_key: str,
     from_email: str,
     to_email: str,
+    reply_to_email: str = "",
     lead_id: int | str,
     revision_id: int | str,
     buyer_name: str,
@@ -144,6 +145,7 @@ def send_booking_notification(
     precio_total: str,
 ) -> bool:
     """Send booking notification via Resend HTTPS API. Returns True on success, False on failure."""
+    reply_to_email = (reply_to_email or "").strip()
     if not api_key:
         logger.error("[M15.8] RESEND_API_KEY not set — email not sent for revision_id=%s", revision_id)
         return False
@@ -175,12 +177,15 @@ def send_booking_notification(
         precio_total=_fmt(precio_total),
     )
 
-    payload = json.dumps({
+    _payload: dict = {
         "from": from_email,
         "to": [to_email],
         "subject": subject,
         "html": html_body,
-    }).encode("utf-8")
+    }
+    if reply_to_email:
+        _payload["reply_to"] = reply_to_email
+    payload = json.dumps(_payload).encode("utf-8")
 
     req = urlrequest.Request(
         _RESEND_API_URL,
@@ -284,6 +289,7 @@ def send_scheduling_handoff_notification(
     api_key: str,
     from_email: str,
     to_email: str,
+    reply_to_email: str = "",
     lead_id: int | str,
     thread_id: int | str,
     revision_id: int | str,
@@ -298,7 +304,8 @@ def send_scheduling_handoff_notification(
     offered_slots: str,
     last_message: str,
 ) -> bool:
-    """Send a scheduling handoff alert to Julián via Resend. Returns True on success."""
+    """Send a scheduling handoff alert to the ops inbox via Resend. Returns True on success."""
+    reply_to_email = (reply_to_email or "").strip()
     if not api_key:
         logger.error("[M15.8] RESEND_API_KEY not set — handoff email not sent lead_id=%s", lead_id)
         return False
@@ -326,12 +333,15 @@ def send_scheduling_handoff_notification(
         last_message=_fmt(last_message),
     )
 
-    payload = json.dumps({
+    _payload: dict = {
         "from": from_email,
         "to": [to_email],
         "subject": subject,
         "html": html_body,
-    }).encode("utf-8")
+    }
+    if reply_to_email:
+        _payload["reply_to"] = reply_to_email
+    payload = json.dumps(_payload).encode("utf-8")
 
     req = urlrequest.Request(
         _RESEND_API_URL,
@@ -366,6 +376,7 @@ def send_human_review_notification(
     api_key: str,
     from_email: str,
     to_email: str,
+    reply_to_email: str = "",
     lead_id: int | str,
     thread_id: int | str,
     wa_id: str,
@@ -375,6 +386,7 @@ def send_human_review_notification(
     reason: str,
 ) -> bool:
     """Send an alert when a fallback Flow submit requires manual human review."""
+    reply_to_email = (reply_to_email or "").strip()
     if not api_key:
         logger.error("[M15.8] RESEND_API_KEY not set — human review email not sent lead_id=%s", lead_id)
         return False
@@ -420,12 +432,15 @@ def send_human_review_notification(
 </body>
 </html>"""
 
-    payload = json.dumps({
+    _payload: dict = {
         "from": from_email,
         "to": [to_email],
         "subject": subject,
         "html": html_body,
-    }).encode("utf-8")
+    }
+    if reply_to_email:
+        _payload["reply_to"] = reply_to_email
+    payload = json.dumps(_payload).encode("utf-8")
 
     req = urlrequest.Request(
         _RESEND_API_URL,

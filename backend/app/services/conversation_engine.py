@@ -2660,6 +2660,7 @@ class ConversationEngine:
             api_key=settings.resend_api_key,
             from_email=settings.internal_booking_email_from,
             to_email=settings.internal_booking_email_to,
+            reply_to_email=settings.internal_booking_email_reply_to,
             lead_id=lead.id,
             thread_id=ctx.thread.id,
             revision_id=thread_rev_id or "—",
@@ -3329,6 +3330,7 @@ Respondé SOLO con JSON válido:
             getattr(settings, "internal_booking_email_from", "")
             or "notificaciones@ridecheck.ar"
         ).strip()
+        reply_to_email = (getattr(settings, "internal_booking_email_reply_to", "") or "").strip()
         if not to_email:
             return
         lead = ctx.lead
@@ -3348,6 +3350,7 @@ Respondé SOLO con JSON válido:
                 api_key=settings.resend_api_key,
                 from_email=from_email,
                 to_email=to_email,
+                reply_to_email=reply_to_email,
                 lead_id=lead.id if lead else ctx.thread.lead_id or "?",
                 thread_id=ctx.thread.id,
                 wa_id=ctx.contact.wa_id,
@@ -3405,6 +3408,7 @@ Respondé SOLO con JSON válido:
             api_key=settings.resend_api_key,
             from_email=settings.internal_booking_email_from,
             to_email=settings.internal_booking_email_to,
+            reply_to_email=settings.internal_booking_email_reply_to,
             lead_id=lead_id,
             revision_id=crm_rev_id,
             buyer_name=_f(kwargs.get("buyer_name")),
