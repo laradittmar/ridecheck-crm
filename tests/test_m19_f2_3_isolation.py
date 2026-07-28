@@ -175,8 +175,9 @@ class TestFailClosedDatabaseConfig(unittest.TestCase):
     def test_4_db_module_raises_without_database_url(self):
         """app/db.py must raise RuntimeError before creating any engine when DATABASE_URL is absent."""
         env_backup = os.environ.pop("DATABASE_URL", None)
+        # Save the stub so we can restore it after re-importing the real module.
+        _saved_stub = sys.modules.get("app.db")
         try:
-            # Remove the module from sys.modules so it re-imports
             for mod_name in list(sys.modules.keys()):
                 if mod_name in ("app.db",):
                     del sys.modules[mod_name]
@@ -186,15 +187,18 @@ class TestFailClosedDatabaseConfig(unittest.TestCase):
         finally:
             if env_backup is not None:
                 os.environ["DATABASE_URL"] = env_backup
-            # Restore whatever was cached
+            # Remove the real module and restore the test stub.
             for mod_name in list(sys.modules.keys()):
                 if mod_name in ("app.db",):
                     del sys.modules[mod_name]
+            if _saved_stub is not None:
+                sys.modules["app.db"] = _saved_stub
 
     def test_5_db_module_raises_empty_database_url(self):
         """app/db.py must raise RuntimeError when DATABASE_URL is empty string."""
         env_backup = os.environ.pop("DATABASE_URL", None)
         os.environ["DATABASE_URL"] = ""
+        _saved_stub = sys.modules.get("app.db")
         try:
             for mod_name in list(sys.modules.keys()):
                 if mod_name == "app.db":
@@ -209,6 +213,8 @@ class TestFailClosedDatabaseConfig(unittest.TestCase):
             for mod_name in list(sys.modules.keys()):
                 if mod_name == "app.db":
                     del sys.modules[mod_name]
+            if _saved_stub is not None:
+                sys.modules["app.db"] = _saved_stub
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -162,10 +162,11 @@ class TestCalendarAppointmentsRender(unittest.TestCase):
         return lead
 
     def test_appointment_appears_in_day_view_for_correct_date(self):
-        """An appointment on 2026-05-30 at 10:00 must appear in the day view panel."""
-        rev = self._make_rev(date(2026, 5, 30), time(10, 0), "Ignacio")
+        """An appointment on today's date at 10:00 must appear in the day view panel."""
+        today = date.today()
+        rev = self._make_rev(today, time(10, 0), "Ignacio")
         lead = self._make_lead("Ignacio", "", rev)
-        html = _render(week="2026-05-25", leads=[lead])
+        html = _render(week=today.strftime("%Y-%m-%d"), leads=[lead])
         # Find the day view panel
         start = html.find('id="cal-view-day"')
         end = html.find('id="cal-view-week"')

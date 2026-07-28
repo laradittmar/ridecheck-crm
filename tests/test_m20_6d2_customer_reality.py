@@ -80,7 +80,7 @@ from app.models import (
     WhatsAppThread, WhatsAppThreadCandidate, WhatsAppThreadState,
 )
 
-Base.metadata.create_all(_engine)
+Lead.__table__.metadata.create_all(_engine)
 
 from app.repositories.pricing_repository import PricingRepository
 from app.schemas.conversation import ConversationHandleIn

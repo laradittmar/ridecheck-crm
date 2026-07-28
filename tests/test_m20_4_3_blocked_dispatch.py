@@ -109,7 +109,7 @@ from app.models import (
     WhatsAppThreadState,
 )
 
-Base.metadata.create_all(_engine)
+Lead.__table__.metadata.create_all(_engine)
 
 # ── Import units under test ───────────────────────────────────────────────────
 from app.repositories.pricing_repository import BasePriceRow
