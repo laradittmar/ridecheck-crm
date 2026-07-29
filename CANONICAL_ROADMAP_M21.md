@@ -61,8 +61,8 @@ Authoritative reference: `/opt/ridecheck-crm/forensics/M21_0_0_live_conversation
 ## M21.1 — Semantic Conversation Engine ← IN PROGRESS (APPROVED)
 
 **Dependency:** M21.0.1 + M21.0.2 complete ✓
-**Audit:** `/opt/ridecheck-crm/forensics/M21_1_0_semantic_engine_implementation_audit_20260729.md` (Sections S + T)
-**Implementation prompt:** `/opt/ridecheck-crm/forensics/M21_1_1_IMPLEMENTATION_PROMPT.md` (M21.1.0-B revision)
+**Audit:** `/opt/ridecheck-crm/forensics/M21_1_0_semantic_engine_implementation_audit_20260729.md` (Sections S + T + U)
+**Implementation prompt:** `/opt/ridecheck-crm/forensics/M21_1_1_IMPLEMENTATION_PROMPT.md` (M21.1.0-C revision — supersedes M21.1.0-B)
 
 ### Approved business rules
 
@@ -82,7 +82,7 @@ Authoritative reference: `/opt/ridecheck-crm/forensics/M21_0_0_live_conversation
 
 | ID | Feature | Scope | Tests | Status |
 |---|---|---|---|---|
-| M21.1.1 | Service Intent, Motorcycle Handoff & Unsupported-Service Gate | BR-1–BR-5; gate before lookup_vehicle/zone/pricing; all motorcycle entry points; handled=true under kill switch | SI-01–SI-28 | NOT STARTED |
+| M21.1.1 | Service Intent, Motorcycle Handoff & Unsupported-Service Gate | BR-1–BR-5; two-layer gate (Layer A all stages, Layer B QUALIFYING only); all motorcycle entry points; handled=true under kill switch for ALL gate branches; intent persistence via state.last_intent | SI-01–SI-28, SI-28b–SI-28g, SI-N1–SI-N4, SI-H1–SI-H4 (40+ cases) | NOT STARTED |
 | M21.1.2 | Vehicle Inspectability Constraint | BR-6 (desarmado), BR-7 (non-running clarification) | SC05 + BR-7 variant | NOT STARTED |
 | M21.1.3 | Location Semantic Roles & Candidate Persistence | Remove stale zone guard; zone → candidate; vehicle_location vs customer_origin | SC11–SC14, SC17 | NOT STARTED |
 | M21.1.4 | ASR Vehicle Normalization | `fuzzy_lookup_vehicle()` difflib; gap_threshold=0.15; make constraint | SC07–SC09 (corrected), SC18 | NOT STARTED |
@@ -100,6 +100,18 @@ Authoritative reference: `/opt/ridecheck-crm/forensics/M21_0_0_live_conversation
 - **handled=true under kill switch:** New action `"human_handoff_blocked"` added to HANDLED_ACTIONS ensures n8n legacy fallback cannot run after motorcycle handoff under kill switch
 - **Implementation order:** M21.1.5 (Field Evidence Resolver) precedes M21.1.6 (Long Voice) — evidence model must exist before AI prompt enhancement uses it
 - **Contextual classification:** Simple substring matching is insufficient; implementation must handle false positives for repair/transfer/F12 context patterns
+
+### Key contract corrections (M21.1.0-C, 2026-07-29)
+
+- **Two-layer gate architecture:** Layer A (motorcycle, all stages) inserts after evidence construction (~line 1633) before website form (~line 1634). Layer B (F12/transfer/repair/UNCERTAIN, QUALIFYING only) inserts at ~line 1779. A single gate at ~line 1779 is too late — QUOTED and SCHEDULING stage handlers fire before that point.
+- **Audio transcript evidence:** `current_turn_text` is built as the union of `unanswered_recent_user_messages` + `event.text` (deduplicated). Audio transcripts arrive as `event.text` and would be silently excluded from gate evidence in burst scenarios under the M21.1.0-B design.
+- **Confirmed intent persistence:** `state.last_intent` (String(30), already in schema at models.py:317, never used in CE) persists confirmed pre-purchase intent as `"PREPURCHASE_INSPECTION"`. Subsequent turns skip classification. No DB migration required.
+- **ALL gate branches handled under kill switch:** `"service_gate_blocked"` added to HANDLED_ACTIONS (alongside `"human_handoff_blocked"`). All F12/transfer/repair/UNCERTAIN boundary dispatches catch `OutboundBlockedError` via shared `_send_service_boundary()` helper. The n8n legacy fallback cannot run after ANY gate branch fires.
+- **Notification failure safety:** `_motorcycle_human_handoff` wraps `_send_fallback_human_review_notification` in try/except; logs and continues to WA send regardless. `needs_human=True` is committed before any send attempt.
+- **Entry points source-verified:** All six entry points re-verified from source line numbers. Vehicle Flow response already routes MOTO at line 1144 but uses wrong reason; must call `_motorcycle_human_handoff` explicitly before line 1144. AI-extracted MOTO guard belongs immediately before `_apply_candidate` call at ~line 1878.
+- **Test matrix expanded:** 40+ test cases (SI-01–SI-28, SI-28b–SI-28g, SI-N1–SI-N4, SI-H1–SI-H4)
+- **Image build context:** Must specify `./backend` as explicit build context argument
+- **Regression command:** Must use `set -o pipefail` to prevent pipe masking pytest exit code
 
 ---
 
@@ -195,5 +207,6 @@ Valid technical items not scheduled as standalone milestones. To be incorporated
 
 ---
 
-*Updated 2026-07-29 ART by M21.1.0-B — corrected gate contract, motorcycle wording, implementation order, and full M21.3–M21.6 scope*
+*Updated 2026-07-29 ART by M21.1.0-C — two-layer gate architecture, audio evidence fix, intent persistence, all-branch kill-switch handling, source-verified entry points*
+*M21.1.0-B corrections (gate placement, evidence source, BR-1 scope, motorcycle wording, implementation order) remain in effect*
 *Previous roadmaps superseded — do not use `CANONICAL_ROADMAP_M20_M21.md` or `PROPOSED_*` files*
