@@ -146,6 +146,9 @@ _PHONE_CALL_PATTERNS: tuple[re.Pattern, ...] = (
     re.compile(r'\bte\s+puedo\s+llam(?:ar|aste)\b', re.IGNORECASE),
     re.compile(r'\bquiero\s+llam(?:ar(?:te|los?)?\b)', re.IGNORECASE),
     re.compile(r'\bhac(?:er|emos)\s+una\s+llam(?:ada|ado)\b', re.IGNORECASE),
+    re.compile(r'\bhablar\s+con\s+(alguien|un\s+asesor|un\s+agente|alg[uú]n\s+asesor)\b', re.IGNORECASE),
+    re.compile(r'\bque\s+me\s+llam(?:en|e)\b', re.IGNORECASE),
+    re.compile(r'\bpued(?:en|an)\s+llam(?:ar(?:me|nos)?|arme)\b', re.IGNORECASE),
 )
 
 # Guard against AI asking the customer for price/cotización info when missing
@@ -178,6 +181,164 @@ _FALLBACK_WARM_HANDOFF = (
     "Gracias por completar el formulario. Un agente de Ridecheck "
     "te va a contactar a la brevedad para continuar con la cotización."
 )
+
+# ── M21.1.1 Service Intent Gate ───────────────────────────────────────────────
+# _PHONE_CALL_PATTERNS     — [EXISTING] line 142 — do not redefine
+# _is_phone_call_request() — [EXISTING] line 307 — do not redefine
+# _FALLBACK_WARM_HANDOFF   — [EXISTING] line 177 — do not redefine
+
+# Sentinel returned by the qualifying gate to signal FAQ bypass (checked with `is`).
+_GATE_FAQ_BYPASS = object()
+
+# Motorcycle/quad/UTV detection — applied to accent-normalized lowercase text.
+# Uses lookbehind/lookahead to enforce word boundaries with plural support.
+_MOTORCYCLE_PATTERN = re.compile(
+    r'(?<![a-z0-9])(motos?|motocicletas?|scooters?|ciclomotor(?:es)?|cuatriciclos?|quads?|atvs?|utvs?)(?![a-z0-9])',
+    re.IGNORECASE,
+)
+
+# Formulario 12 detection
+_F12_REQUEST_PHRASES: frozenset[str] = frozenset({
+    "formulario 12", "formulario doce", "formulario12",
+    "f 12", "formulario 12b",
+})
+_F12_PAST_CONTEXT: frozenset[str] = frozenset({
+    "ya hice el formulario", "ya tenia el formulario",
+    "ya tengo el formulario", "tengo el formulario hecho",
+    "ya hice un formulario",
+})
+# If past-context AND any of these signals coexist, the new request wins.
+_F12_NEW_REQUEST_SIGNALS: frozenset[str] = frozenset({
+    "pero necesito", "pero quiero", "pero ahora",
+    "y tambien", "y también", "necesito otro", "quiero otro",
+    "y ademas", "y además", "pero tambien", "pero también",
+    "ahora necesito",
+})
+
+# Transfer detection
+_TRANSFER_REQUEST_PATTERNS = [
+    r'\b(hacer|necesito|quiero|tramitar)\s+(la\s+)?transferencia\b',
+    r'\b(hagan|gestionen|tramiten|encarguen)\s+(la\s+)?transferencia\b',
+    r'\btramitaci[oó]n\b',
+    r'\btramitar\b',
+    r'\bcambio\s+de\s+titular\b',
+    r'\bgesti[oó]n\s+de\s+(papeles|documentos|documentaci[oó]n)\b',
+    r'\b(gestoria|gestor[íi]a)\b',
+]
+# Payment-method or future-step exclusions; can be overridden by explicit request.
+_TRANSFER_EXCLUSIONS: frozenset[str] = frozenset({
+    "pagar por transferencia", "pago por transferencia",
+    "transferencia bancaria", "hago la transferencia",
+    "despues de la revision", "después de la revisión",
+    "una vez que revisen", "cuando me lo revisen",
+})
+_EXPLICIT_RIDECHECK_TRANSFER_PATTERNS = [
+    r'\bque\s+ustedes\s+(hagan|gestionen|tramiten|encarguen)\b',
+    r'\bque\s+(lo|la)\s+(gestionen|tramiten|encarguen)\b',
+    r'\bnecesito\s+que\s+ustedes\s+.{0,40}(transferencia|tramite|papeles)\b',
+    r'\bquiero\s+que\s+ustedes\s+.{0,40}(transferencia|tramite|papeles)\b',
+]
+
+# Repair detection
+_REPAIR_REQUEST_PATTERNS = [
+    r'\b(reparar|arreglar)\s+(el\s+)?(auto|coche|veh[íi]culo|motor|frenos?)\b',
+    r'\b(quiero|necesito|pueden)\s+(que\s+)?(lo\s+)?(arreglen|reparen|arregles|repares)\b',
+    r'\bnecesito\s+que\s+(\w+\s+)?(arreglen|reparen|arregles|repares)\b',
+    r'\breparaci[oó]n\s+mec[aá]nica\b',
+    r'\bservicio\s+mec[aá]nico\b',
+    r'\bdiagn[oó]stico\s+mec[aá]nico\b',
+    r'\btaller\s+mec[aá]nico\b',
+]
+# Inspection context: suppresses repair match unconditionally.
+_REPAIR_EXCLUSIONS_INSPECTION: frozenset[str] = frozenset({
+    "revisar antes de comprar",
+    "inspeccion antes de comprar", "inspección antes de comprar",
+    "revision precompra", "revisión precompra",
+    "quiero que lo revisen antes",
+})
+# Third-party mechanic context: suppresses unless an explicit RideCheck request coexists.
+_REPAIR_EXCLUSIONS_MECHANIC: frozenset[str] = frozenset({
+    "mi mecanico", "mi mecánico",
+    "el mecanico", "el mecánico",
+    "tu mecanico", "tu mecánico",
+    "un mecanico", "un mecánico",
+})
+# Explicit RideCheck-directed repair: checked first; return True immediately.
+_EXPLICIT_RIDECHECK_REPAIR_PATTERNS = [
+    r'\b(quiero|necesito)\s+que\s+(me\s+)?(lo|la)\s+(arreglen|reparen|arregles|repares)\b',
+    r'\bpero\s+necesito\s+que\s+(\w+\s+)?(arreglen|reparen|arregles|repares)\b',
+    r'\bnecesito\s+que\s+ustedes\s+(arreglen|reparen)\b',
+    r'\bquiero\s+que\s+ustedes\s+(arreglen|reparen)\b',
+    r'\bque\s+(me\s+lo\s+|me\s+la\s+)?(arreglen|reparen)\b',
+]
+
+# Pre-purchase intent signals
+_PREPURCHASE_SIGNALS: frozenset[str] = frozenset({
+    "revision precompra", "revisión precompra",
+    "revision pre-compra", "revisión pre-compra",
+    "revision pre compra", "revisión pre compra",
+    "inspeccion precompra", "inspección precompra",
+    "inspeccion pre-compra", "inspección pre-compra",
+    "revisar antes de comprar", "revisarlo antes de comprar",
+    "verificar antes de comprar",
+    "ver el estado antes de comprar",
+    "inspeccionar antes de comprar",
+    "quiero revisar el auto antes",
+    "revisar el auto antes de",
+    "antes de comprarlo",
+    "antes de señarlo", "antes de adquirirlo",
+    "cuanto sale revisar", "cuánto sale revisar",
+    "cotizar una revision", "cotizar una revisión",
+    "cotizar la revision", "cotizar la revisión",
+    "hacer una revision", "hacer una revisión",
+    "necesito una inspeccion", "necesito una inspección",
+})
+
+# FAQ / greeting / informational patterns (applied to accent-normalized text).
+_FAQ_PATTERNS = [
+    r'\bqu[eé]\s+incluye\b',
+    r'\bqu[eé]\s+cubre\b',
+    r'\bqu[eé]\s+revisan\b',
+    r'\bcu[aá]nto\s+(tarda|demora|dura|tiempo)\b',
+    r'\btengo\s+que\s+estar\s+presente\b',
+    r'\btrabajan?\s+(los\s+)?(s[aá]bados?|domingos?|fin\s+de\s+semana)\b',
+    r'\bc[oó]mo\s+se\s+entrega\b',
+    r'\bqu[eé]\s+es\s+ridecheck\b',
+    r'\bc[oó]mo\s+funciona\b',
+    r'\bd[oó]nde\s+atienden\b',
+    r'\bsalen?\s+a\s+domicilio\b',
+    r'\bvan\s+al\s+lugar\b',
+    r'\bqu[eé]\s+verifican\b',
+    r'\bcosto\s+del\s+servicio\b',
+    r'^(hola|buenas?|buen\s+d[ií]a|buenos\s+d[ií]as|buenas\s+tardes|buenas\s+noches)[,\s!.]*$',
+    r'^(hola[,\s]+)?quer[ií]a\s+(hacer|hacer\s+una)\s+consulta',
+    r'\bconsulta\b',
+]
+
+# Reply constants
+_PHONE_CALL_HANDOFF_REPLY = (
+    "¡Claro! Un agente de Ridecheck te va a contactar a la brevedad. "
+    "Si preferís agilizarlo, también podés escribirnos a info@ridecheck.ar."
+)
+_F12_BOUNDARY_REPLY = (
+    "Nosotros realizamos revisiones precompra; no gestionamos el Formulario 12."
+)
+_TRANSFER_BOUNDARY_REPLY = (
+    "Nos especializamos en revisiones pre-compra de vehículos. "
+    "Para trámites de transferencia o gestión documental, "
+    "te recomendamos consultar con una gestoría."
+)
+_REPAIR_BOUNDARY_REPLY = (
+    "Nosotros hacemos inspecciones pre-compra de vehículos. "
+    "¿Estás pensando en comprar un auto y querés que lo revisemos antes?"
+)
+_UNCERTAIN_SERVICE_REPLY = (
+    "¡Hola! Somos Ridecheck y nos especializamos en revisiones pre-compra de autos. "
+    "¿Estás pensando en comprar un vehículo y querés que lo revisemos antes de decidir?"
+)
+
+# Persisted intent token (22 chars, fits String(30) in WhatsAppThreadState.last_intent).
+_INTENT_PREPURCHASE = "PREPURCHASE_INSPECTION"
 
 # ── M20.6D.2B Routing gate constants ─────────────────────────────────────────
 
@@ -1130,6 +1291,8 @@ class ConversationEngine:
         assert lead is not None
 
         tipo = (flow_data.get("tipo_vehiculo") or "").strip().upper()
+        if tipo == "MOTO" or self._is_motorcycle_enquiry(tipo):
+            return self._motorcycle_human_handoff(ctx, state)
         marca = (flow_data.get("marca") or "").strip()
         modelo = (flow_data.get("modelo") or "").strip()
         anio_raw = flow_data.get("anio")
@@ -1620,16 +1783,46 @@ class ConversationEngine:
             state.last_stage = STAGE_QUALIFYING
             self.db.commit()
 
-        # ── Ráfaga: use unanswered messages as primary input ──────────────
-        # If n8n provided unanswered messages, respond to all of them together.
-        # This is the core of the ráfaga (burst) solution.
-        if event.unanswered_recent_user_messages:
-            ai_input_messages = event.unanswered_recent_user_messages
-        elif event.text:
-            ai_input_messages = [event.text]
-        else:
+        # ── M21.1.1: Current-turn evidence construction ───────────────────
+        # Audio transcripts arrive as event.text (DB text=NULL); must be
+        # included even when unanswered_recent_user_messages is non-empty.
+        _current_evidence: list[str] = list(event.unanswered_recent_user_messages or [])
+        if event.text and event.text not in _current_evidence:
+            _current_evidence.append(event.text)
+
+        if not _current_evidence:
             logger.info("M18 no text content thread_id=%s — ignored", ctx.thread.id)
             return _out("skipped_dedup", detail="no_text")
+
+        current_turn_text = " ".join(_current_evidence)
+
+        # Preserve existing ráfaga behavior for all downstream handlers.
+        if event.unanswered_recent_user_messages:
+            ai_input_messages = event.unanswered_recent_user_messages
+        else:
+            ai_input_messages = _current_evidence
+
+        # ── M21.1.1 Layer A: Motorcycle pre-gate (all stages) ─────────────
+        if self._is_motorcycle_enquiry(current_turn_text):
+            return self._motorcycle_human_handoff(ctx, state)
+
+        # ── M21.1.1 Layer B: Phone-call/human-request pre-gate (all stages)
+        # Uses existing module-level _is_phone_call_request (line 307).
+        # Motorcycle (Layer A) has higher priority and is checked first.
+        if _is_phone_call_request(_current_evidence):
+            return self._handle_phone_call_escalation(ctx, state)
+
+        # ── M21.1.1 Layer C: Explicit unsupported-service pre-gate (all stages)
+        # F12/transfer/repair boundaries fire before QUOTED/SCHEDULING handlers.
+        _svc_out = self._handle_explicit_service_gate(ctx, current_turn_text)
+        if _svc_out is not None:
+            return _svc_out
+
+        # ── M21.1.1 Layer D: FAQ bypass (all stages) ──────────────────────
+        # Informational unless the same message also contains a pre-purchase signal.
+        _text_norm_d = self._norm_text(current_turn_text)
+        if self._detect_general_information(_text_norm_d) and not self._detect_prepurchase_signal(_text_norm_d):
+            return self._handle_general_information_ai(ctx, event, ai_input_messages)
 
         # ── Website form from wa.me prefilled link (pre-AI) ─────────────
         # Detect the structured form message before any other state-based checks.
@@ -1776,6 +1969,15 @@ class ConversationEngine:
                 # Day only (or day + period like "mañana a la tarde") — list available slots.
                 return self._handle_day_only_request(ctx, state, sched_day_iso, period=period)
 
+        # ── M21.1.1 Layer F: QUALIFYING intent gate (QUALIFYING/None only) ──
+        # F12/transfer/repair handled by all-stage Layer C above.
+        # FAQ bypass handled by all-stage Layer D above.
+        # This gate covers: pre-purchase signal, persisted intent, UNCERTAIN.
+        if state.last_stage in (STAGE_QUALIFYING, None) and not state.needs_human:
+            _intent_out = self._handle_qualifying_intent(ctx, state, current_turn_text)
+            if _intent_out is not None:
+                return _intent_out
+
         # ── Deterministic vehicle catalog lookup (pre-AI) ─────────────────
         # Search across all recent messages (not just current burst) so a
         # vehicle name from a prior turn is still recognised.
@@ -1830,20 +2032,11 @@ class ConversationEngine:
                 if _fb_result is not None:
                     return _fb_result
 
-        # ── Deterministic phone-call escalation ───────────────────────────
-        # If the customer is asking to be called, escalate immediately and skip
-        # AI — avoids the AI promising a call that never happens.
+        # ── Deterministic phone-call escalation (dedup-safe fallback) ────────
+        # Layer B handles all-stage phone-call detection above.
+        # This is a safety net in case of routing edge cases after the AI path.
         if _is_phone_call_request(ai_input_messages):
-            logger.info("M18 phone-call escalation thread_id=%s", ctx.thread.id)
-            state.needs_human = True
-            if ctx.lead:
-                ctx.lead.necesita_humano = True
-            reply = (
-                "¡Claro! Un agente de Ridecheck te va a contactar a la brevedad. "
-                "Si preferís agilizarlo, también podés escribirnos a info@ridecheck.ar."
-            )
-            sent_id = self._send_text_to_wa(ctx, reply)
-            return _out("replied", wa_message_id=sent_id)
+            return self._handle_phone_call_escalation(ctx, state)
 
         messages_for_ai = self._build_ai_messages(
             ctx, event, ai_input_messages,
@@ -1875,7 +2068,13 @@ class ConversationEngine:
         # Candidate updates
         _focus_before = self._focus_candidate(ctx)
         _focus_before_tipo = _focus_before.tipo_vehiculo if _focus_before else None
-        self._apply_candidate(ctx, decision.get("candidate") or {})
+        _cand_data = decision.get("candidate") or {}
+        if (
+            _cand_data.get("tipo_vehiculo", "").upper() == "MOTO"
+            and _cand_data.get("action") in ("create", "update")
+        ):
+            return self._motorcycle_human_handoff(ctx, state)
+        self._apply_candidate(ctx, _cand_data)
 
         # ── Catalog enforcement (post-AI) ─────────────────────────────────
         # If catalog found a vehicle, override the candidate's tipo_vehiculo
@@ -2080,6 +2279,236 @@ class ConversationEngine:
         sent_id = self._send_text_to_wa(ctx, reply)
         return _out("replied", wa_message_id=sent_id)
 
+    # ── M21.1.1 Service Intent Gate helpers ───────────────────────────────
+
+    def _norm_text(self, text: str) -> str:
+        """NFD-normalize, lowercase, strip accent marks."""
+        n = unicodedata.normalize("NFD", text.lower())
+        return "".join(c for c in n if unicodedata.category(c) != "Mn")
+
+    def _is_motorcycle_enquiry(self, text: str) -> bool:
+        """Word-boundary, accent-insensitive match for motorcycle/quad/UTV terms with plural forms."""
+        norm = self._norm_text(text)
+        return bool(_MOTORCYCLE_PATTERN.search(norm))
+
+    def _detect_f12_request(self, text_norm: str) -> bool:
+        """True when text requests Formulario 12. Mixed past+new context: new request wins."""
+        f12_phrase_found = any(
+            self._norm_text(phrase) in text_norm
+            for phrase in _F12_REQUEST_PHRASES
+        )
+        if not f12_phrase_found:
+            return False
+
+        for past_phrase in _F12_PAST_CONTEXT:
+            if self._norm_text(past_phrase) in text_norm:
+                for signal in _F12_NEW_REQUEST_SIGNALS:
+                    if self._norm_text(signal) in text_norm:
+                        return True
+                return False
+
+        return True
+
+    def _detect_transfer_request(self, text_norm: str) -> bool:
+        """Clause-aware transfer detection. Exclusions suppressed by explicit RideCheck request."""
+        transfer_found = any(
+            re.search(pattern, text_norm, re.IGNORECASE)
+            for pattern in _TRANSFER_REQUEST_PATTERNS
+        )
+        if not transfer_found:
+            return False
+
+        for excl in _TRANSFER_EXCLUSIONS:
+            if self._norm_text(excl) in text_norm:
+                if any(
+                    re.search(pat, text_norm, re.IGNORECASE)
+                    for pat in _EXPLICIT_RIDECHECK_TRANSFER_PATTERNS
+                ):
+                    return True
+                return False
+
+        return True
+
+    def _detect_repair_request(self, text_norm: str) -> bool:
+        """Clause-aware repair detection. Explicit RideCheck-directed patterns checked first."""
+        if any(
+            re.search(pat, text_norm, re.IGNORECASE)
+            for pat in _EXPLICIT_RIDECHECK_REPAIR_PATTERNS
+        ):
+            return True
+
+        repair_found = any(
+            re.search(pattern, text_norm, re.IGNORECASE)
+            for pattern in _REPAIR_REQUEST_PATTERNS
+        )
+        if not repair_found:
+            return False
+
+        for excl in _REPAIR_EXCLUSIONS_INSPECTION:
+            if self._norm_text(excl) in text_norm:
+                return False
+
+        for excl in _REPAIR_EXCLUSIONS_MECHANIC:
+            if self._norm_text(excl) in text_norm:
+                return False
+
+        return True
+
+    def _detect_prepurchase_signal(self, text_norm: str) -> bool:
+        """True if text contains an explicit pre-purchase intent signal."""
+        return any(
+            self._norm_text(signal) in text_norm
+            for signal in _PREPURCHASE_SIGNALS
+        )
+
+    def _detect_general_information(self, text_norm: str) -> bool:
+        """True if text is a greeting, FAQ, or conversational question about RideCheck."""
+        return any(
+            re.search(pattern, text_norm, re.IGNORECASE)
+            for pattern in _FAQ_PATTERNS
+        )
+
+    def _motorcycle_human_handoff(
+        self,
+        ctx: "_Context",
+        state: "WhatsAppThreadState",
+    ) -> "ConversationHandleOut":
+        """Centralized motorcycle/quad/UTV human handoff. All entry points call this."""
+        state.needs_human = True
+        if ctx.lead:
+            ctx.lead.necesita_humano = True
+        self.db.commit()
+
+        try:
+            self._send_fallback_human_review_notification(
+                ctx, state, reason="motorcycle_enquiry"
+            )
+        except Exception as exc:
+            logger.error(
+                "M21.1.1 motorcycle notification failed thread_id=%s: %s",
+                ctx.thread.id, exc,
+            )
+
+        try:
+            sent_id = self._send_text_to_wa(ctx, _FALLBACK_WARM_HANDOFF)
+            return _out("replied", wa_message_id=sent_id)
+        except OutboundBlockedError:
+            self.db.commit()
+            return _out("human_handoff_blocked", detail="motorcycle_enquiry_kill_switch")
+
+    def _handle_phone_call_escalation(
+        self,
+        ctx: "_Context",
+        state: "WhatsAppThreadState",
+    ) -> "ConversationHandleOut":
+        """Centralized phone-call/human-agent escalation handler."""
+        logger.info("M18 phone-call escalation thread_id=%s", ctx.thread.id)
+        state.needs_human = True
+        if ctx.lead:
+            ctx.lead.necesita_humano = True
+        self.db.commit()
+
+        try:
+            sent_id = self._send_text_to_wa(ctx, _PHONE_CALL_HANDOFF_REPLY)
+            return _out("replied", wa_message_id=sent_id)
+        except OutboundBlockedError:
+            self.db.commit()
+            return _out("human_handoff_blocked", detail="phone_call_kill_switch")
+
+    def _send_service_boundary(
+        self,
+        ctx: "_Context",
+        reply: str,
+    ) -> "ConversationHandleOut":
+        """Send a boundary or clarification reply with no state mutation."""
+        try:
+            sent_id = self._send_text_to_wa(ctx, reply)
+            return _out("replied", wa_message_id=sent_id)
+        except OutboundBlockedError:
+            self.db.commit()
+            return _out("service_gate_blocked", detail="outbound_disabled")
+
+    def _handle_explicit_service_gate(
+        self,
+        ctx: "_Context",
+        current_turn_text: str,
+    ) -> "ConversationHandleOut | None":
+        """Layer C: explicit unsupported-service gate (all stages).
+
+        Returns a boundary response for F12/transfer/repair, or None to continue.
+        Motorcycle and phone-call are handled by Layers A and B (higher priority).
+        """
+        text_norm = self._norm_text(current_turn_text)
+
+        if self._detect_f12_request(text_norm):
+            return self._send_service_boundary(ctx, _F12_BOUNDARY_REPLY)
+
+        if self._detect_transfer_request(text_norm):
+            return self._send_service_boundary(ctx, _TRANSFER_BOUNDARY_REPLY)
+
+        if self._detect_repair_request(text_norm):
+            return self._send_service_boundary(ctx, _REPAIR_BOUNDARY_REPLY)
+
+        return None
+
+    def _handle_qualifying_intent(
+        self,
+        ctx: "_Context",
+        state: "WhatsAppThreadState",
+        current_turn_text: str,
+    ) -> "ConversationHandleOut | None":
+        """Layer F: QUALIFYING intent gate (QUALIFYING/None only).
+
+        F12/transfer/repair handled by all-stage Layer C.
+        FAQ bypass handled by all-stage Layer D.
+        Returns a response for UNCERTAIN turns, or None when intent is confirmed.
+        """
+        text_norm = self._norm_text(current_turn_text)
+
+        if self._detect_prepurchase_signal(text_norm):
+            state.last_intent = _INTENT_PREPURCHASE
+            self.db.commit()
+            return None
+
+        if state.last_intent == _INTENT_PREPURCHASE:
+            return None
+
+        return self._send_service_boundary(ctx, _UNCERTAIN_SERVICE_REPLY)
+
+    def _handle_general_information_ai(
+        self,
+        ctx: "_Context",
+        event: "ConversationHandleIn",
+        ai_input_messages: "list[str]",
+    ) -> "ConversationHandleOut":
+        """Handle FAQ/greeting/informational messages using the AI pipeline.
+
+        Reads only decision['reply']. Does not call _apply_candidate, _apply_extracted,
+        or mutate lead.flag or state.needs_human. Does not set state.last_intent.
+        """
+        if ctx.lead is None:
+            return self._send_service_boundary(ctx, _UNCERTAIN_SERVICE_REPLY)
+
+        messages = self._build_ai_messages(ctx, event, ai_input_messages)
+
+        try:
+            ai_raw = self._call_openai(messages)
+            decision = json.loads(ai_raw)
+        except Exception as exc:
+            logger.warning(
+                "M21.1.1 FAQ AI call failed thread_id=%s: %s", ctx.thread.id, exc
+            )
+            decision = {"reply": "Disculpá la demora, ya te ayudamos."}
+
+        reply = decision.get("reply") or ""
+        if reply:
+            try:
+                sent_id = self._send_text_to_wa(ctx, reply)
+                return _out("replied", wa_message_id=sent_id)
+            except OutboundBlockedError:
+                return _out("service_gate_blocked", detail="faq_kill_switch")
+        return _out("skipped_dedup", detail="faq_no_reply")
+
     # ── Deterministic QUOTED acceptance ───────────────────────────────────
 
     def _handle_quoted_acceptance(
@@ -2156,6 +2585,10 @@ class ConversationEngine:
         if not tipo_vehiculo and form_data.get("submitted_tipo"):
             tipo_vehiculo = _normalize_submitted_tipo(form_data["submitted_tipo"])
         tipo_vehiculo = tipo_vehiculo or "AUTO"
+
+        if tipo_vehiculo.upper() == "MOTO":
+            return self._motorcycle_human_handoff(ctx, state)
+        state.last_intent = _INTENT_PREPURCHASE  # website form = confirmed pre-purchase intent
 
         # ── Create candidate ──────────────────────────────────────────────
         self._apply_candidate(ctx, {

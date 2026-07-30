@@ -3,7 +3,12 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 # Actions that mean the engine fully owned the turn (n8n should stop)
-HANDLED_ACTIONS = frozenset({"replied", "flow_button_sent", "booking_created", "skipped_human", "skipped_dedup"})
+HANDLED_ACTIONS = frozenset({
+    "replied", "flow_button_sent", "booking_created",
+    "skipped_human", "skipped_dedup",
+    "human_handoff_blocked",   # M21.1.1: motorcycle/phone-call under kill switch
+    "service_gate_blocked",    # M21.1.1: F12/transfer/repair/uncertain/FAQ under kill switch
+})
 
 
 class ConversationHandleIn(BaseModel):
