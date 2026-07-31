@@ -883,11 +883,15 @@ class TestNotificationFailure(unittest.TestCase):
         eng2.db = MagicMock()
         # _handle_qualifying_intent respects not state.needs_human in _process_text Layer F
         # (it is guarded by `not state.needs_human`)
-        intent_result = eng._handle_qualifying_intent(eng._make_ctx_dummy() if hasattr(eng, '_make_ctx_dummy') else types.SimpleNamespace(lead=_make_lead(), thread=types.SimpleNamespace(id=1)), state, "Ford Ka 2019")
-        # When needs_human=True, Layer F guard prevents calling _handle_qualifying_intent
-        # (the guard in _process_text is `not state.needs_human`). Just verify intent gate
-        # handles "Ford Ka 2019" with no last_intent → UNCERTAIN.
-        # But this runs the intent gate ignoring needs_human (since it's a direct call).
+        # M21.1.1-R1: Use a phrase with no vehicle, no inspection signal, no context.
+        # "Ford Ka 2019" is now a catalog hit → passes through Layer F (R1 change).
+        # Use a bare ambiguous phrase to verify UNCERTAIN is still returned for zero-signal input.
+        ctx_dummy = types.SimpleNamespace(
+            lead=_make_lead(), thread=types.SimpleNamespace(id=1), candidates=[],
+        )
+        with patch("app.services.conversation_engine.lookup_vehicle", return_value=None):
+            intent_result = eng._handle_qualifying_intent(ctx_dummy, state, "quiero saber algo")
+        # No inspection signal → Layer F returns UNCERTAIN (not None)
         self.assertIsNotNone(intent_result)
 
 
@@ -1474,6 +1478,194 @@ class TestMotorcyclePluralForms(unittest.TestCase):
 
     def test_cuatriciclos_plural(self):
         self._assert_moto("Son cuatriciclos para campo")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# R1-01–R1-17: M21.1.1-R1 Primary Inspection Flow Restore
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestR1PrimaryInspectionFlowRestore(unittest.TestCase):
+    """M21.1.1-R1: Validates the 9-step Layer F _handle_qualifying_intent logic."""
+
+    # ── Steps 1-2: Explicit inspection request / pre-purchase signal ──────────
+
+    def test_r1_01_explicit_inspection_request_sets_intent(self):
+        """R1-01: Explicit inspection 'Quiero que revisen el auto' → step 1 sets intent → AI called."""
+        eng, result, state, _ = _run(text="Quiero que revisen el auto")
+        _assert_handled(self, result, "replied")
+        self.assertEqual(state.last_intent, _INTENT_PREPURCHASE)
+        self.assertEqual(eng._call_openai.call_count, 1)
+
+    def test_r1_02_explicit_inspection_request_hacer_revision(self):
+        """R1-02: 'Necesito hacer una revisión del vehículo' → step 1 sets intent → AI called."""
+        eng, result, state, _ = _run(text="Necesito hacer una revisión del vehículo")
+        _assert_handled(self, result, "replied")
+        self.assertEqual(state.last_intent, _INTENT_PREPURCHASE)
+        self.assertEqual(eng._call_openai.call_count, 1)
+
+    def test_r1_03_new_prepurchase_signal_estoy_por_comprar(self):
+        """R1-03: 'Estoy por comprar el auto' → R1 prepurchase signal → step 2 sets intent → AI called."""
+        eng, result, state, _ = _run(text="Estoy por comprar el auto")
+        _assert_handled(self, result, "replied")
+        self.assertEqual(state.last_intent, _INTENT_PREPURCHASE)
+        self.assertEqual(eng._call_openai.call_count, 1)
+
+    # ── Step 3: FAQ / soft-close phrases (pass-through, intent not set) ───────
+
+    def test_r1_04_soft_close_gracias_passes_through(self):
+        """R1-04: 'Gracias' → soft-close step 3 → pass-through without setting intent → AI called."""
+        eng, result, state, _ = _run(text="Gracias")
+        _assert_handled(self, result, "replied")
+        self.assertIsNone(state.last_intent, "Step 3 must not set last_intent")
+        self.assertEqual(eng._call_openai.call_count, 1)
+
+    def test_r1_05_soft_close_los_tengo_en_cuenta(self):
+        """R1-05: 'Los tengo en cuenta' → soft-close step 3 → pass-through → AI called."""
+        eng, result, state, _ = _run(text="Los tengo en cuenta")
+        _assert_handled(self, result, "replied")
+        self.assertIsNone(state.last_intent)
+        self.assertEqual(eng._call_openai.call_count, 1)
+
+    def test_r1_09_me_pasas_info_soft_close(self):
+        """R1-09: '¿Me pasás info?' → soft-close step 3 (R1 addition) → pass-through → AI called."""
+        eng, result, state, _ = _run(text="¿Me pasás info?")
+        _assert_handled(self, result, "replied")
+        self.assertIsNone(state.last_intent)
+        self.assertEqual(eng._call_openai.call_count, 1)
+
+    # ── Step 4: Vehicle catalog hit ────────────────────────────────────────────
+
+    def test_r1_06_vehicle_catalog_hit_passes_through(self):
+        """R1-06: Recognized vehicle name → step 4 catalog hit → pass-through → AI called."""
+        _mock_v = types.SimpleNamespace(
+            matched_alias="Ford Ranger",
+            tipo_vehiculo="AUTO",
+            confidence=0.9,
+        )
+        eng = _make_engine()
+        state = _make_state()
+        ctx = _make_ctx(state=state, lead=_make_lead())
+        event = _make_event(text="Ford Ranger 2020")
+        with patch("app.services.conversation_engine.lookup_vehicle", return_value=_mock_v):
+            result = eng._process_text(ctx, event)
+        _assert_handled(self, result, "replied")
+        self.assertIsNone(state.last_intent)
+        self.assertEqual(eng._call_openai.call_count, 1)
+
+    # ── Step 5: Vehicle-location phrase ("está en/por X") ─────────────────────
+
+    def test_r1_07_vehicle_location_phrase_passes_through(self):
+        """R1-07: 'El auto está en Palermo' → vehicle-location step 5 → pass-through → AI called."""
+        eng, result, state, _ = _run(text="El auto está en Palermo")
+        _assert_handled(self, result, "replied")
+        self.assertIsNone(state.last_intent)
+        self.assertEqual(eng._call_openai.call_count, 1)
+
+    # ── Step 6: Price question ─────────────────────────────────────────────────
+
+    def test_r1_08_price_question_passes_through(self):
+        """R1-08: '¿Cuánto sale la revisión?' → price question step 6 → pass-through → AI called."""
+        eng, result, state, _ = _run(text="¿Cuánto sale la revisión?")
+        _assert_handled(self, result, "replied")
+        self.assertIsNone(state.last_intent)
+        self.assertEqual(eng._call_openai.call_count, 1)
+
+    # ── Step 7: Prior persisted intent ────────────────────────────────────────
+
+    def test_r1_10_persisted_intent_passes_through(self):
+        """R1-10: last_intent=PREPURCHASE_INSPECTION from prior turn → step 7 → pass-through → AI called."""
+        eng, result, state, _ = _run(
+            text="Está bien, dale",
+            last_intent=_INTENT_PREPURCHASE,
+        )
+        _assert_handled(self, result, "replied")
+        self.assertEqual(state.last_intent, _INTENT_PREPURCHASE)
+        self.assertEqual(eng._call_openai.call_count, 1)
+
+    # ── Step 8: Established inspection context ────────────────────────────────
+
+    def test_r1_11_established_context_via_candidate(self):
+        """R1-11: Non-moto candidate in ctx → step 8 established context → AI called."""
+        eng = _make_engine()
+        state = _make_state()
+        ctx = _make_ctx(state=state, lead=_make_lead())
+        ctx.candidates = [types.SimpleNamespace(tipo_vehiculo="AUTO")]
+        event = _make_event(text="Perfecto")
+        with patch("app.services.conversation_engine.lookup_vehicle", return_value=None):
+            result = eng._process_text(ctx, event)
+        _assert_handled(self, result, "replied")
+        self.assertEqual(eng._call_openai.call_count, 1)
+
+    def test_r1_17_established_context_via_clarification_flag(self):
+        """R1-17: location_clarification_sent=True → step 8 established context → AI called."""
+        eng = _make_engine()
+        state = _make_state(location_clarification_sent=True)
+        ctx = _make_ctx(state=state, lead=_make_lead())
+        event = _make_event(text="A ver qué fechas tienen")
+        with patch("app.services.conversation_engine.lookup_vehicle", return_value=None):
+            result = eng._process_text(ctx, event)
+        _assert_handled(self, result, "replied")
+        self.assertEqual(eng._call_openai.call_count, 1)
+
+    # ── Step 9: Negative controls — UNCERTAIN fires ───────────────────────────
+
+    def test_r1_12_negative_no_signals_uncertain(self):
+        """R1-12: No qualifying signal → step 9 UNCERTAIN → _UNCERTAIN_SERVICE_REPLY sent; AI NOT called."""
+        eng, result, state, _ = _run(text="A ver qué hago")
+        _assert_handled(self, result, "replied")
+        self.assertEqual(eng._call_openai.call_count, 0, "AI must not be called on UNCERTAIN")
+        self.assertEqual(
+            eng._send_text_to_wa.call_args[0][1],
+            _UNCERTAIN_SERVICE_REPLY,
+            "Must send _UNCERTAIN_SERVICE_REPLY",
+        )
+
+    def test_r1_13_negative_no_signals_uncertain_v2(self):
+        """R1-13: Generic hesitation text → step 9 UNCERTAIN → AI NOT called."""
+        eng, result, state, _ = _run(text="Déjame pensarlo")
+        _assert_handled(self, result, "replied")
+        self.assertEqual(eng._call_openai.call_count, 0)
+        self.assertEqual(eng._send_text_to_wa.call_args[0][1], _UNCERTAIN_SERVICE_REPLY)
+
+    # ── Kill switch + R1 pass-through conditions ──────────────────────────────
+
+    def test_r1_14_kill_switch_explicit_inspection_ai_path(self):
+        """R1-14: Kill switch + explicit inspection → gate passes → AI called → OutboundBlockedError."""
+        eng = _make_engine(send_raises=True)
+        state = _make_state()
+        ctx = _make_ctx(state=state, lead=_make_lead())
+        event = _make_event(text="Quiero que revisen el auto")
+        with patch("app.services.conversation_engine.lookup_vehicle", return_value=None):
+            with self.assertRaises(OutboundBlockedError):
+                eng._process_text(ctx, event)
+        self.assertEqual(eng._call_openai.call_count, 1, "AI must be called before kill switch fires")
+
+    def test_r1_15_kill_switch_catalog_hit_ai_path(self):
+        """R1-15: Kill switch + vehicle catalog hit → gate passes → AI called → OutboundBlockedError."""
+        _mock_v = types.SimpleNamespace(
+            matched_alias="Honda Fit",
+            tipo_vehiculo="AUTO",
+            confidence=0.9,
+        )
+        eng = _make_engine(send_raises=True)
+        state = _make_state()
+        ctx = _make_ctx(state=state, lead=_make_lead())
+        event = _make_event(text="Honda Fit 2018")
+        with patch("app.services.conversation_engine.lookup_vehicle", return_value=_mock_v):
+            with self.assertRaises(OutboundBlockedError):
+                eng._process_text(ctx, event)
+        self.assertEqual(eng._call_openai.call_count, 1)
+
+    def test_r1_16_kill_switch_price_question_ai_path(self):
+        """R1-16: Kill switch + price question → gate passes → AI called → OutboundBlockedError."""
+        eng = _make_engine(send_raises=True)
+        state = _make_state()
+        ctx = _make_ctx(state=state, lead=_make_lead())
+        event = _make_event(text="¿Cuánto sale la revisión?")
+        with patch("app.services.conversation_engine.lookup_vehicle", return_value=None):
+            with self.assertRaises(OutboundBlockedError):
+                eng._process_text(ctx, event)
+        self.assertEqual(eng._call_openai.call_count, 1)
 
 
 if __name__ == "__main__":

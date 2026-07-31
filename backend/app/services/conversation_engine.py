@@ -292,6 +292,13 @@ _PREPURCHASE_SIGNALS: frozenset[str] = frozenset({
     "cotizar la revision", "cotizar la revisión",
     "hacer una revision", "hacer una revisión",
     "necesito una inspeccion", "necesito una inspección",
+    # M21.1.1-R1: Argentine Spanish pre-purchase phrasings
+    "estoy por comprar",
+    "estoy pensando en comprar",
+    "por comprar el auto",
+    "por comprar el vehiculo",
+    "quiero comprar el auto",
+    "quiero comprar un auto",
 })
 
 # FAQ / greeting / informational patterns (applied to accent-normalized text).
@@ -314,6 +321,32 @@ _FAQ_PATTERNS = [
     r'^(hola[,\s]+)?quer[ií]a\s+(hacer|hacer\s+una)\s+consulta',
     r'\bconsulta\b',
 ]
+
+# M21.1.1-R1: Inspection request patterns for Layer F pass-through.
+# Applied to accent-normalized, lowercase text.
+_INSPECTION_REQUEST_PATTERNS: tuple[re.Pattern, ...] = (
+    re.compile(r'\b(quiero|necesito|quisiera)\s+que\s+(me\s+)?revis[ae]n\b', re.IGNORECASE),
+    re.compile(r'\b(quiero|necesito|quisiera)\s+revis[ae]r\s+(un[ao]?|el|la)\b', re.IGNORECASE),
+    re.compile(r'\b(quiero|necesito|quisiera)\s+(hacer\s+(una\s+)?)?revisi[oó]n\b', re.IGNORECASE),
+    re.compile(r'\b(quiero|necesito|quisiera)\s+(una|la)\s+(inspecci[oó]n|revisi[oó]n)\b', re.IGNORECASE),
+    re.compile(r'\bcoordinar\s+(una|la)\s+revisi[oó]n\b', re.IGNORECASE),
+    re.compile(r'\bme\s+inter[eé]sa\s+coordinar\b', re.IGNORECASE),
+)
+
+# M21.1.1-R1: Vehicle-location phrase patterns ("está en/por X", "se encuentra en").
+_VEHICLE_LOCATION_PATTERNS: tuple[re.Pattern, ...] = (
+    re.compile(r'\best[aá]\s+(en|por|cerca\s+de)\b', re.IGNORECASE),
+    re.compile(r'\bse\s+encuentra\s+(en|por)\b', re.IGNORECASE),
+    re.compile(r'\bqueda\s+(en|por)\b', re.IGNORECASE),
+    re.compile(r'\bubicado\s+(en|cerca\s+de)\b', re.IGNORECASE),
+)
+
+# M21.1.1-R1: Price question patterns for Layer F pass-through.
+_PRICE_QUESTION_PATTERNS: tuple[re.Pattern, ...] = (
+    re.compile(r'\bcu[aá]nto\s+(sale|cuesta|vale|cobran|es)\b', re.IGNORECASE),
+    re.compile(r'\bcotizaci[oó]n\b', re.IGNORECASE),
+    re.compile(r'\bme\s+pas[aá]s?\s+(precio|cotizaci[oó]n|presupuesto)\b', re.IGNORECASE),
+)
 
 # Reply constants
 _PHONE_CALL_HANDOFF_REPLY = (
@@ -415,6 +448,8 @@ _FAQ_OR_SOFT_CLOSE_PHRASES: frozenset[str] = frozenset({
     "te aviso",
     "por ahora no",
     "mas adelante",
+    # M21.1.1-R1: Argentine info-request pass-through ("¿Me pasás info?")
+    "me pasas info",
 })
 
 
@@ -1819,9 +1854,15 @@ class ConversationEngine:
             return _svc_out
 
         # ── M21.1.1 Layer D: FAQ bypass (all stages) ──────────────────────
-        # Informational unless the same message also contains a pre-purchase signal.
+        # Informational unless the same message also contains a pre-purchase signal,
+        # or unless a specific vehicle is recognized (those need the full AI path to
+        # create the candidate and deliver a commercial reply).
         _text_norm_d = self._norm_text(current_turn_text)
-        if self._detect_general_information(_text_norm_d) and not self._detect_prepurchase_signal(_text_norm_d):
+        if (
+            self._detect_general_information(_text_norm_d)
+            and not self._detect_prepurchase_signal(_text_norm_d)
+            and lookup_vehicle(current_turn_text) is None
+        ):
             return self._handle_general_information_ai(ctx, event, ai_input_messages)
 
         # ── Website form from wa.me prefilled link (pre-AI) ─────────────
@@ -2368,6 +2409,46 @@ class ConversationEngine:
             for pattern in _FAQ_PATTERNS
         )
 
+    # ── M21.1.1-R1: Layer F extended detection helpers ────────────────────
+
+    def _detect_explicit_inspection_request(self, text_norm: str) -> bool:
+        """True when text contains an explicit request to book or coordinate a revision."""
+        return any(p.search(text_norm) for p in _INSPECTION_REQUEST_PATTERNS)
+
+    def _detect_vehicle_location_phrase(self, text_norm: str) -> bool:
+        """True when text contains a vehicle-location phrase ('está en/por X')."""
+        return any(p.search(text_norm) for p in _VEHICLE_LOCATION_PATTERNS)
+
+    def _detect_price_question(self, text_norm: str) -> bool:
+        """True when text asks for a price or quote ('¿cuánto sale?', 'cotización')."""
+        return any(p.search(text_norm) for p in _PRICE_QUESTION_PATTERNS)
+
+    def _has_established_inspection_context(
+        self,
+        ctx: "_Context",
+        state: "WhatsAppThreadState",
+    ) -> bool:
+        """True when prior turns established an inspection context for this thread.
+
+        Covers: a recognized non-moto candidate, any delivery-confirmation flag,
+        or an already-resolved zone group.
+        """
+        if ctx.candidates and any(
+            c.tipo_vehiculo and c.tipo_vehiculo.upper() not in ("MOTO", "MOTOCICLETA")
+            for c in ctx.candidates
+        ):
+            return True
+        if (
+            state.location_clarification_sent
+            or state.vehicle_clarification_sent
+            or state.vehicle_fallback_flow_sent
+            or state.location_fallback_flow_sent
+        ):
+            return True
+        if state.home_zone_group:
+            return True
+        return False
+
     def _motorcycle_human_handoff(
         self,
         ctx: "_Context",
@@ -2462,17 +2543,57 @@ class ConversationEngine:
         F12/transfer/repair handled by all-stage Layer C.
         FAQ bypass handled by all-stage Layer D.
         Returns a response for UNCERTAIN turns, or None when intent is confirmed.
+
+        M21.1.1-R1: Nine-step pass-through order (first match wins):
+          1. Explicit inspection request → set intent, continue
+          2. Pre-purchase signal (expanded) → set intent, continue
+          3. FAQ / soft-close phrase → continue (no intent change)
+          4. Vehicle catalog hit → continue (no intent change)
+          5. Vehicle-location phrase ("está en/por X") → continue
+          6. Price question → continue
+          7. Prior confirmed intent → continue
+          8. Established inspection context (candidate or state flags) → continue
+          9. No signal → UNCERTAIN clarification reply
         """
         text_norm = self._norm_text(current_turn_text)
 
+        # 1. Explicit inspection request → set intent, continue to full AI path
+        if self._detect_explicit_inspection_request(text_norm):
+            state.last_intent = _INTENT_PREPURCHASE
+            self.db.commit()
+            return None
+
+        # 2. Pre-purchase signal → set intent, continue
         if self._detect_prepurchase_signal(text_norm):
             state.last_intent = _INTENT_PREPURCHASE
             self.db.commit()
             return None
 
+        # 3. FAQ / soft-close → continue without changing intent
+        if _is_general_faq_or_soft_close(current_turn_text):
+            return None
+
+        # 4. Specific vehicle recognized → structured commercial request → continue
+        if lookup_vehicle(current_turn_text) is not None:
+            return None
+
+        # 5. Vehicle-location phrase ("está en/por X") → continue
+        if self._detect_vehicle_location_phrase(text_norm):
+            return None
+
+        # 6. Price question ("¿cuánto sale?", "cotización") → continue
+        if self._detect_price_question(text_norm):
+            return None
+
+        # 7. Prior confirmed intent persisted from earlier turn → continue
         if state.last_intent == _INTENT_PREPURCHASE:
             return None
 
+        # 8. Established inspection context (non-moto candidate or delivery flags) → continue
+        if self._has_established_inspection_context(ctx, state):
+            return None
+
+        # 9. No inspection service signal found → UNCERTAIN clarification
         return self._send_service_boundary(ctx, _UNCERTAIN_SERVICE_REPLY)
 
     def _handle_general_information_ai(
@@ -2506,6 +2627,7 @@ class ConversationEngine:
                 sent_id = self._send_text_to_wa(ctx, reply)
                 return _out("replied", wa_message_id=sent_id)
             except OutboundBlockedError:
+                self.db.commit()
                 return _out("service_gate_blocked", detail="faq_kill_switch")
         return _out("skipped_dedup", detail="faq_no_reply")
 
