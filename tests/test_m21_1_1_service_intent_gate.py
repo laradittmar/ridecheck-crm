@@ -1564,10 +1564,11 @@ class TestR1PrimaryInspectionFlowRestore(unittest.TestCase):
     # ── Step 6: Price question ─────────────────────────────────────────────────
 
     def test_r1_08_price_question_passes_through(self):
-        """R1-08: '¿Cuánto sale la revisión?' → price question step 6 → pass-through → AI called."""
+        """R1-08: '¿Cuánto sale la revisión?' → inspection-specific price step 6 → intent set → AI called.
+        M21.1.1-R2: step 6 now sets last_intent=PREPURCHASE_INSPECTION (was None in R1)."""
         eng, result, state, _ = _run(text="¿Cuánto sale la revisión?")
         _assert_handled(self, result, "replied")
-        self.assertIsNone(state.last_intent)
+        self.assertEqual(state.last_intent, _INTENT_PREPURCHASE, "Step 6 must set last_intent in R2")
         self.assertEqual(eng._call_openai.call_count, 1)
 
     # ── Step 7: Prior persisted intent ────────────────────────────────────────
@@ -1597,7 +1598,9 @@ class TestR1PrimaryInspectionFlowRestore(unittest.TestCase):
         self.assertEqual(eng._call_openai.call_count, 1)
 
     def test_r1_17_established_context_via_clarification_flag(self):
-        """R1-17: location_clarification_sent=True → step 8 established context → AI called."""
+        """R1-17 (updated M21.1.1-R2): location_clarification_sent=True alone is INSUFFICIENT.
+        R2 narrows step 8 to non-moto candidate only; flag conditions were removed.
+        This test documents the R2 regression of the original R1-17 pass-through behavior."""
         eng = _make_engine()
         state = _make_state(location_clarification_sent=True)
         ctx = _make_ctx(state=state, lead=_make_lead())
@@ -1605,7 +1608,8 @@ class TestR1PrimaryInspectionFlowRestore(unittest.TestCase):
         with patch("app.services.conversation_engine.lookup_vehicle", return_value=None):
             result = eng._process_text(ctx, event)
         _assert_handled(self, result, "replied")
-        self.assertEqual(eng._call_openai.call_count, 1)
+        self.assertEqual(eng._call_openai.call_count, 0, "Flag alone must not bypass UNCERTAIN in R2")
+        self.assertEqual(eng._send_text_to_wa.call_args[0][1], _UNCERTAIN_SERVICE_REPLY)
 
     # ── Step 9: Negative controls — UNCERTAIN fires ───────────────────────────
 
@@ -1665,6 +1669,138 @@ class TestR1PrimaryInspectionFlowRestore(unittest.TestCase):
         with patch("app.services.conversation_engine.lookup_vehicle", return_value=None):
             with self.assertRaises(OutboundBlockedError):
                 eng._process_text(ctx, event)
+        self.assertEqual(eng._call_openai.call_count, 1)
+
+
+class TestR2OptInBoundaryRestore(unittest.TestCase):
+    """M21.1.1-R2: Verify opt-in boundary tightening — fresh-thread bare values → UNCERTAIN;
+    only strong signals pass Layer F."""
+
+    # ── UNCERTAIN: bare values on fresh thread ────────────────────────────────
+
+    def test_r2_01_bare_vehicle_name_uncertain(self):
+        """R2-01: Bare vehicle name with no catalog hit → step 9 UNCERTAIN.
+        (In production, catalog hit fires step 4 and passes; unit test mocks lookup=None.)"""
+        eng, result, state, _ = _run(text="Ford Ranger 2020")
+        _assert_handled(self, result, "replied")
+        self.assertEqual(eng._call_openai.call_count, 0, "Bare uncatalogued vehicle must not reach AI")
+        self.assertEqual(eng._send_text_to_wa.call_args[0][1], _UNCERTAIN_SERVICE_REPLY)
+
+    def test_r2_02_bare_location_uncertain(self):
+        """R2-02: Bare zone name 'Palermo' → no signal → step 9 UNCERTAIN."""
+        eng, result, state, _ = _run(text="Palermo")
+        _assert_handled(self, result, "replied")
+        self.assertEqual(eng._call_openai.call_count, 0)
+        self.assertEqual(eng._send_text_to_wa.call_args[0][1], _UNCERTAIN_SERVICE_REPLY)
+
+    def test_r2_03_vehicle_location_phrase_passes_via_step5_rc02_constraint(self):
+        """R2-03: 'El auto está en Palermo' → step 5 vehicle-location phrase → passes → AI called.
+        NOTE: R2 spec targeted UNCERTAIN for this text, but RC02 requires step 5 to fire for
+        'Está por Palermo'-style phrases. Strict enforcement deferred pending RC02 resolution."""
+        eng, result, state, _ = _run(text="El auto está en Palermo")
+        _assert_handled(self, result, "replied")
+        self.assertEqual(eng._call_openai.call_count, 1)
+        self.assertIsNone(state.last_intent, "Step 5 must not set last_intent")
+
+    def test_r2_04_bare_price_question_uncertain(self):
+        """R2-04: Bare '¿Cuánto sale?' → narrow step 6 requires 'revisión/inspección' → UNCERTAIN."""
+        eng, result, state, _ = _run(text="¿Cuánto sale?")
+        _assert_handled(self, result, "replied")
+        self.assertEqual(eng._call_openai.call_count, 0, "Bare price question must not reach AI")
+        self.assertEqual(eng._send_text_to_wa.call_args[0][1], _UNCERTAIN_SERVICE_REPLY)
+
+    # ── Pass-through: strong signals ─────────────────────────────────────────
+
+    def test_r2_05_inspection_price_question_sets_intent(self):
+        """R2-05: '¿Cuánto sale la revisión?' → step 6 inspection-specific price → intent set → AI called."""
+        eng, result, state, _ = _run(text="¿Cuánto sale la revisión?")
+        _assert_handled(self, result, "replied")
+        self.assertEqual(state.last_intent, _INTENT_PREPURCHASE, "Step 6 must set last_intent")
+        self.assertEqual(eng._call_openai.call_count, 1)
+
+    def test_r2_06_quiero_cotizar_passes_step1(self):
+        """R2-06: 'Quiero cotizar un auto' → R2 addition to _INSPECTION_REQUEST_PATTERNS → step 1 → intent set."""
+        eng, result, state, _ = _run(text="Quiero cotizar un auto")
+        _assert_handled(self, result, "replied")
+        self.assertEqual(state.last_intent, _INTENT_PREPURCHASE)
+        self.assertEqual(eng._call_openai.call_count, 1)
+
+    def test_r2_07_greeting_with_price_passes_step3(self):
+        """R2-07: 'Hola, cuánto sale?' → step 3 opening-greeting pass-through → Layer F passes → AI called.
+        The routing gate (not Layer F) handles the price signal. RC47a confirmed via M20 suite."""
+        eng, result, state, _ = _run(text="Hola, cuánto sale?")
+        _assert_handled(self, result, "replied")
+        self.assertIsNone(state.last_intent, "Greeting pass-through must not set last_intent")
+        self.assertEqual(eng._call_openai.call_count, 1)
+
+    def test_r2_08_non_moto_candidate_passes_step8(self):
+        """R2-08: Non-moto candidate in ctx + bare continuation text → step 8 → AI called."""
+        eng = _make_engine()
+        state = _make_state()
+        ctx = _make_ctx(state=state, lead=_make_lead())
+        ctx.candidates = [types.SimpleNamespace(tipo_vehiculo="AUTO")]
+        event = _make_event(text="A ver cómo sigue")
+        with patch("app.services.conversation_engine.lookup_vehicle", return_value=None):
+            result = eng._process_text(ctx, event)
+        _assert_handled(self, result, "replied")
+        self.assertEqual(eng._call_openai.call_count, 1)
+
+    # ── Narrowed step 8: flags and zone alone are INSUFFICIENT ───────────────
+
+    def test_r2_09_home_zone_group_alone_insufficient(self):
+        """R2-09: home_zone_group set + no candidate + bare text → step 9 UNCERTAIN.
+        R2 removes home_zone_group from step 8; zone alone is not proof of inspection intent."""
+        eng = _make_engine()
+        state = _make_state(home_zone_group="sur")
+        ctx = _make_ctx(state=state, lead=_make_lead())
+        event = _make_event(text="Perfecto")
+        with patch("app.services.conversation_engine.lookup_vehicle", return_value=None):
+            result = eng._process_text(ctx, event)
+        _assert_handled(self, result, "replied")
+        self.assertEqual(eng._call_openai.call_count, 0, "home_zone_group alone must not bypass UNCERTAIN")
+        self.assertEqual(eng._send_text_to_wa.call_args[0][1], _UNCERTAIN_SERVICE_REPLY)
+
+    def test_r2_10_clarification_flag_alone_insufficient(self):
+        """R2-10: location_clarification_sent=True + no candidate + bare text → step 9 UNCERTAIN.
+        R2 removes clarification flags from step 8; flag alone is not proof of inspection intent."""
+        eng = _make_engine()
+        state = _make_state(location_clarification_sent=True)
+        ctx = _make_ctx(state=state, lead=_make_lead())
+        event = _make_event(text="A ver qué fechas tienen")
+        with patch("app.services.conversation_engine.lookup_vehicle", return_value=None):
+            result = eng._process_text(ctx, event)
+        _assert_handled(self, result, "replied")
+        self.assertEqual(eng._call_openai.call_count, 0, "Clarification flag alone must not bypass UNCERTAIN")
+        self.assertEqual(eng._send_text_to_wa.call_args[0][1], _UNCERTAIN_SERVICE_REPLY)
+
+    # ── BR-1 exception: vehicle + FAQ cannot be blocked ──────────────────────
+
+    def test_r2_11_faq_with_vehicle_passes_br1_exception(self):
+        """R2-11: 'Es un Focus 2019, ¿qué revisan?' → Layer D bypassed (vehicle hit) → Layer F step 3
+        (FAQ 'que revisan') → pass-through → AI called. BR-1 exception: RC14 requires vehicle+FAQ → AI,
+        so UNCERTAIN enforcement cannot apply here. last_intent remains None (step 3, not step 1)."""
+        _mock_v = types.SimpleNamespace(matched_alias="Ford Focus", tipo_vehiculo="AUTO", confidence=0.9)
+        eng = _make_engine()
+        state = _make_state()
+        ctx = _make_ctx(state=state, lead=_make_lead())
+        event = _make_event(text="Es un Focus 2019, ¿qué revisan?")
+        with patch("app.services.conversation_engine.lookup_vehicle", return_value=_mock_v):
+            result = eng._process_text(ctx, event)
+        _assert_handled(self, result, "replied")
+        self.assertIsNone(state.last_intent, "Step 3 FAQ pass-through must not set last_intent")
+        self.assertEqual(eng._call_openai.call_count, 1)
+
+    def test_r2_12_explicit_inspection_with_vehicle_passes_step1(self):
+        """R2-12: 'Quiero revisar un Focus 2019' → step 1 explicit inspection → intent set → AI called."""
+        _mock_v = types.SimpleNamespace(matched_alias="Ford Focus", tipo_vehiculo="AUTO", confidence=0.9)
+        eng = _make_engine()
+        state = _make_state()
+        ctx = _make_ctx(state=state, lead=_make_lead())
+        event = _make_event(text="Quiero revisar un Focus 2019")
+        with patch("app.services.conversation_engine.lookup_vehicle", return_value=_mock_v):
+            result = eng._process_text(ctx, event)
+        _assert_handled(self, result, "replied")
+        self.assertEqual(state.last_intent, _INTENT_PREPURCHASE)
         self.assertEqual(eng._call_openai.call_count, 1)
 
 
