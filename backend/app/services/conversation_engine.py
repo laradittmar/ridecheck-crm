@@ -343,13 +343,12 @@ _VEHICLE_LOCATION_PATTERNS: tuple[re.Pattern, ...] = (
     re.compile(r'\bubicado\s+(en|cerca\s+de)\b', re.IGNORECASE),
 )
 
-# M21.1.1-R2: Narrow to inspection-specific price questions only.
-# Bare "¿cuánto sale?" / "cotización" / "precio" without inspection context → UNCERTAIN.
+# BR-1 Rows 3–4: inspection-specific and generic price questions establish intent on fresh threads.
 _PRICE_QUESTION_PATTERNS: tuple[re.Pattern, ...] = (
-    re.compile(r'\bcu[aá]nto\s+(sale|cuesta|vale|cobran|es)\s+(la|el|una?)?\s*(revisi[oó]n|inspecci[oó]n|check)\b', re.IGNORECASE),
-    re.compile(r'\bcotizaci[oó]n\s+(de\s+)?(la|una?)?\s*(revisi[oó]n|inspecci[oó]n)\b', re.IGNORECASE),
-    re.compile(r'\bme\s+pas[aá]s?\s+(el\s+)?(precio|cotizaci[oó]n|presupuesto)\s+(de\s+)?(la|una?)\s*(revisi[oó]n|inspecci[oó]n)\b', re.IGNORECASE),
-    re.compile(r'\bprecio\s+(de\s+)?(la|una?)?\s*(revisi[oó]n|inspecci[oó]n)\b', re.IGNORECASE),
+    re.compile(r'\bcu[aá]nto\s+(sale|cuesta|vale|cobran|es)\b', re.IGNORECASE),
+    re.compile(r'\bcotizaci[oó]n\b', re.IGNORECASE),
+    re.compile(r'\bme\s+pas[aá]s?\s+(precio|cotizaci[oó]n|presupuesto)\b', re.IGNORECASE),
+    re.compile(r'\bprecio\b', re.IGNORECASE),
 )
 
 # Reply constants
@@ -455,10 +454,6 @@ _FAQ_OR_SOFT_CLOSE_PHRASES: frozenset[str] = frozenset({
     # M21.1.1-R1: Argentine info-request pass-through ("¿Me pasás info?")
     "me pasas info",
 })
-
-# M21.1.1-R2: Opening greeting — "Hola, cuánto sale?" must pass Layer F step 3 so the
-# routing gate can handle the price signal, not Layer F UNCERTAIN.
-_GREETING_PATTERN: re.Pattern = re.compile(r'^(hola|buenas?)\b', re.IGNORECASE)
 
 
 def _norm_lower(s: str) -> str:
@@ -2436,16 +2431,22 @@ class ConversationEngine:
         ctx: "_Context",
         state: "WhatsAppThreadState",
     ) -> bool:
-        """True when a confirmed non-moto candidate exists for this thread.
+        """True when thread has confirmed inspection provenance (BR-1 §6).
 
-        M21.1.1-R2: Removed flag/zone conditions (location_clarification_sent,
-        vehicle_clarification_sent, home_zone_group, etc.) — they are insufficient
-        proof of inspection intent on a fresh turn and caused over-permissive
-        pass-through. Only a persisted non-moto candidate is accepted.
+        Valid provenance: non-moto candidate from accepted flow, or a
+        clarification Flow sent because of an accepted message.
+        home_zone_group is supporting state only — not provenance.
         """
         if ctx.candidates and any(
             c.tipo_vehiculo and c.tipo_vehiculo.upper() not in ("MOTO", "MOTOCICLETA")
             for c in ctx.candidates
+        ):
+            return True
+        if (
+            state.location_clarification_sent
+            or state.vehicle_clarification_sent
+            or state.vehicle_fallback_flow_sent
+            or state.location_fallback_flow_sent
         ):
             return True
         return False
@@ -2570,19 +2571,23 @@ class ConversationEngine:
             self.db.commit()
             return None
 
-        # 3. FAQ / soft-close / opening greeting → continue without changing intent
-        # Greeting check: "Hola, cuánto sale?" must pass to routing gate, not UNCERTAIN.
-        if _is_general_faq_or_soft_close(current_turn_text) or _GREETING_PATTERN.match(
-            _norm_lower(current_turn_text)
-        ):
+        # 3. FAQ / soft-close → continue; if a specific vehicle is also present, set intent (BR-1 Row 16)
+        if _is_general_faq_or_soft_close(current_turn_text):
+            if lookup_vehicle(current_turn_text) is not None:
+                state.last_intent = _INTENT_PREPURCHASE
+                self.db.commit()
             return None
 
-        # 4. Specific vehicle recognized → structured commercial request → continue
+        # 4. Specific vehicle recognized → CONTINUE_SET (BR-1 Row 5)
         if lookup_vehicle(current_turn_text) is not None:
+            state.last_intent = _INTENT_PREPURCHASE
+            self.db.commit()
             return None
 
-        # 5. Vehicle-location phrase ("está en/por X") → continue
+        # 5. Vehicle-location phrase ("está en/por X") → CONTINUE_SET (BR-1 Rows 7–9)
         if self._detect_vehicle_location_phrase(text_norm):
+            state.last_intent = _INTENT_PREPURCHASE
+            self.db.commit()
             return None
 
         # 6. Inspection-specific price question ("¿cuánto sale la revisión?") → set intent, continue

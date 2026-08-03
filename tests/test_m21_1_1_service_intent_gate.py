@@ -1536,7 +1536,7 @@ class TestR1PrimaryInspectionFlowRestore(unittest.TestCase):
     # ── Step 4: Vehicle catalog hit ────────────────────────────────────────────
 
     def test_r1_06_vehicle_catalog_hit_passes_through(self):
-        """R1-06: Recognized vehicle name → step 4 catalog hit → pass-through → AI called."""
+        """R1-06: Recognized vehicle name → step 4 catalog hit → CONTINUE_SET → intent set → AI called (BR-1 Row 5)."""
         _mock_v = types.SimpleNamespace(
             matched_alias="Ford Ranger",
             tipo_vehiculo="AUTO",
@@ -1549,16 +1549,16 @@ class TestR1PrimaryInspectionFlowRestore(unittest.TestCase):
         with patch("app.services.conversation_engine.lookup_vehicle", return_value=_mock_v):
             result = eng._process_text(ctx, event)
         _assert_handled(self, result, "replied")
-        self.assertIsNone(state.last_intent)
+        self.assertEqual(state.last_intent, _INTENT_PREPURCHASE, "Step 4 catalog hit must set last_intent")
         self.assertEqual(eng._call_openai.call_count, 1)
 
     # ── Step 5: Vehicle-location phrase ("está en/por X") ─────────────────────
 
     def test_r1_07_vehicle_location_phrase_passes_through(self):
-        """R1-07: 'El auto está en Palermo' → vehicle-location step 5 → pass-through → AI called."""
+        """R1-07: 'El auto está en Palermo' → step 5 vehicle-location → CONTINUE_SET → intent set → AI called (BR-1 Row 7)."""
         eng, result, state, _ = _run(text="El auto está en Palermo")
         _assert_handled(self, result, "replied")
-        self.assertIsNone(state.last_intent)
+        self.assertEqual(state.last_intent, _INTENT_PREPURCHASE, "Step 5 vehicle-location must set last_intent")
         self.assertEqual(eng._call_openai.call_count, 1)
 
     # ── Step 6: Price question ─────────────────────────────────────────────────
@@ -1598,9 +1598,8 @@ class TestR1PrimaryInspectionFlowRestore(unittest.TestCase):
         self.assertEqual(eng._call_openai.call_count, 1)
 
     def test_r1_17_established_context_via_clarification_flag(self):
-        """R1-17 (updated M21.1.1-R2): location_clarification_sent=True alone is INSUFFICIENT.
-        R2 narrows step 8 to non-moto candidate only; flag conditions were removed.
-        This test documents the R2 regression of the original R1-17 pass-through behavior."""
+        """R1-17: location_clarification_sent=True → step 8 established context → AI called (BR-1 §6).
+        Clarification Flows sent because of an accepted message are valid provenance."""
         eng = _make_engine()
         state = _make_state(location_clarification_sent=True)
         ctx = _make_ctx(state=state, lead=_make_lead())
@@ -1608,8 +1607,7 @@ class TestR1PrimaryInspectionFlowRestore(unittest.TestCase):
         with patch("app.services.conversation_engine.lookup_vehicle", return_value=None):
             result = eng._process_text(ctx, event)
         _assert_handled(self, result, "replied")
-        self.assertEqual(eng._call_openai.call_count, 0, "Flag alone must not bypass UNCERTAIN in R2")
-        self.assertEqual(eng._send_text_to_wa.call_args[0][1], _UNCERTAIN_SERVICE_REPLY)
+        self.assertEqual(eng._call_openai.call_count, 1, "Clarification flag is valid provenance per BR-1 §6")
 
     # ── Step 9: Negative controls — UNCERTAIN fires ───────────────────────────
 
@@ -1678,13 +1676,18 @@ class TestR2OptInBoundaryRestore(unittest.TestCase):
 
     # ── UNCERTAIN: bare values on fresh thread ────────────────────────────────
 
-    def test_r2_01_bare_vehicle_name_uncertain(self):
-        """R2-01: Bare vehicle name with no catalog hit → step 9 UNCERTAIN.
-        (In production, catalog hit fires step 4 and passes; unit test mocks lookup=None.)"""
-        eng, result, state, _ = _run(text="Ford Ranger 2020")
+    def test_r2_01_bare_vehicle_name_sets_intent(self):
+        """R2-01: Bare vehicle name with catalog hit → step 4 CONTINUE_SET → last_intent set → AI called (BR-1 Row 5)."""
+        _mock_v = types.SimpleNamespace(matched_alias="Ford Ranger", tipo_vehiculo="AUTO", confidence=0.9)
+        eng = _make_engine()
+        state = _make_state()
+        ctx = _make_ctx(state=state, lead=_make_lead())
+        event = _make_event(text="Ford Ranger 2020")
+        with patch("app.services.conversation_engine.lookup_vehicle", return_value=_mock_v):
+            result = eng._process_text(ctx, event)
         _assert_handled(self, result, "replied")
-        self.assertEqual(eng._call_openai.call_count, 0, "Bare uncatalogued vehicle must not reach AI")
-        self.assertEqual(eng._send_text_to_wa.call_args[0][1], _UNCERTAIN_SERVICE_REPLY)
+        self.assertEqual(state.last_intent, _INTENT_PREPURCHASE, "Catalog hit must set last_intent")
+        self.assertEqual(eng._call_openai.call_count, 1)
 
     def test_r2_02_bare_location_uncertain(self):
         """R2-02: Bare zone name 'Palermo' → no signal → step 9 UNCERTAIN."""
@@ -1693,21 +1696,19 @@ class TestR2OptInBoundaryRestore(unittest.TestCase):
         self.assertEqual(eng._call_openai.call_count, 0)
         self.assertEqual(eng._send_text_to_wa.call_args[0][1], _UNCERTAIN_SERVICE_REPLY)
 
-    def test_r2_03_vehicle_location_phrase_passes_via_step5_rc02_constraint(self):
-        """R2-03: 'El auto está en Palermo' → step 5 vehicle-location phrase → passes → AI called.
-        NOTE: R2 spec targeted UNCERTAIN for this text, but RC02 requires step 5 to fire for
-        'Está por Palermo'-style phrases. Strict enforcement deferred pending RC02 resolution."""
+    def test_r2_03_vehicle_location_phrase_passes_via_step5(self):
+        """R2-03: 'El auto está en Palermo' → step 5 vehicle-location → CONTINUE_SET → intent set → AI called (BR-1 Row 7)."""
         eng, result, state, _ = _run(text="El auto está en Palermo")
         _assert_handled(self, result, "replied")
         self.assertEqual(eng._call_openai.call_count, 1)
-        self.assertIsNone(state.last_intent, "Step 5 must not set last_intent")
+        self.assertEqual(state.last_intent, _INTENT_PREPURCHASE, "Step 5 vehicle-location must set last_intent")
 
-    def test_r2_04_bare_price_question_uncertain(self):
-        """R2-04: Bare '¿Cuánto sale?' → narrow step 6 requires 'revisión/inspección' → UNCERTAIN."""
+    def test_r2_04_bare_price_question_sets_intent(self):
+        """R2-04: '¿Cuánto sale?' → step 6 broad price → CONTINUE_SET → intent set → AI called (BR-1 Row 4)."""
         eng, result, state, _ = _run(text="¿Cuánto sale?")
         _assert_handled(self, result, "replied")
-        self.assertEqual(eng._call_openai.call_count, 0, "Bare price question must not reach AI")
-        self.assertEqual(eng._send_text_to_wa.call_args[0][1], _UNCERTAIN_SERVICE_REPLY)
+        self.assertEqual(state.last_intent, _INTENT_PREPURCHASE, "Broad price must set last_intent")
+        self.assertEqual(eng._call_openai.call_count, 1)
 
     # ── Pass-through: strong signals ─────────────────────────────────────────
 
@@ -1725,12 +1726,11 @@ class TestR2OptInBoundaryRestore(unittest.TestCase):
         self.assertEqual(state.last_intent, _INTENT_PREPURCHASE)
         self.assertEqual(eng._call_openai.call_count, 1)
 
-    def test_r2_07_greeting_with_price_passes_step3(self):
-        """R2-07: 'Hola, cuánto sale?' → step 3 opening-greeting pass-through → Layer F passes → AI called.
-        The routing gate (not Layer F) handles the price signal. RC47a confirmed via M20 suite."""
+    def test_r2_07_greeting_with_price_sets_intent(self):
+        """R2-07: 'Hola, cuánto sale?' → step 6 broad price → CONTINUE_SET → intent set → AI called (BR-1 Row 4)."""
         eng, result, state, _ = _run(text="Hola, cuánto sale?")
         _assert_handled(self, result, "replied")
-        self.assertIsNone(state.last_intent, "Greeting pass-through must not set last_intent")
+        self.assertEqual(state.last_intent, _INTENT_PREPURCHASE, "Price signal in greeting must set last_intent")
         self.assertEqual(eng._call_openai.call_count, 1)
 
     def test_r2_08_non_moto_candidate_passes_step8(self):
@@ -1760,9 +1760,9 @@ class TestR2OptInBoundaryRestore(unittest.TestCase):
         self.assertEqual(eng._call_openai.call_count, 0, "home_zone_group alone must not bypass UNCERTAIN")
         self.assertEqual(eng._send_text_to_wa.call_args[0][1], _UNCERTAIN_SERVICE_REPLY)
 
-    def test_r2_10_clarification_flag_alone_insufficient(self):
-        """R2-10: location_clarification_sent=True + no candidate + bare text → step 9 UNCERTAIN.
-        R2 removes clarification flags from step 8; flag alone is not proof of inspection intent."""
+    def test_r2_10_clarification_flag_is_provenance(self):
+        """R2-10: location_clarification_sent=True → step 8 established context → AI called (BR-1 §6).
+        Clarification Flows sent because of an accepted message are valid provenance."""
         eng = _make_engine()
         state = _make_state(location_clarification_sent=True)
         ctx = _make_ctx(state=state, lead=_make_lead())
@@ -1770,15 +1770,12 @@ class TestR2OptInBoundaryRestore(unittest.TestCase):
         with patch("app.services.conversation_engine.lookup_vehicle", return_value=None):
             result = eng._process_text(ctx, event)
         _assert_handled(self, result, "replied")
-        self.assertEqual(eng._call_openai.call_count, 0, "Clarification flag alone must not bypass UNCERTAIN")
-        self.assertEqual(eng._send_text_to_wa.call_args[0][1], _UNCERTAIN_SERVICE_REPLY)
+        self.assertEqual(eng._call_openai.call_count, 1, "Clarification flag is valid provenance per BR-1 §6")
 
     # ── BR-1 exception: vehicle + FAQ cannot be blocked ──────────────────────
 
-    def test_r2_11_faq_with_vehicle_passes_br1_exception(self):
-        """R2-11: 'Es un Focus 2019, ¿qué revisan?' → Layer D bypassed (vehicle hit) → Layer F step 3
-        (FAQ 'que revisan') → pass-through → AI called. BR-1 exception: RC14 requires vehicle+FAQ → AI,
-        so UNCERTAIN enforcement cannot apply here. last_intent remains None (step 3, not step 1)."""
+    def test_r2_11_faq_with_vehicle_sets_intent(self):
+        """R2-11: 'Es un Focus 2019, ¿qué revisan?' → step 3 FAQ+vehicle → FAQ_WITH_CONTEXT → intent set → AI called (BR-1 Row 16)."""
         _mock_v = types.SimpleNamespace(matched_alias="Ford Focus", tipo_vehiculo="AUTO", confidence=0.9)
         eng = _make_engine()
         state = _make_state()
@@ -1787,7 +1784,7 @@ class TestR2OptInBoundaryRestore(unittest.TestCase):
         with patch("app.services.conversation_engine.lookup_vehicle", return_value=_mock_v):
             result = eng._process_text(ctx, event)
         _assert_handled(self, result, "replied")
-        self.assertIsNone(state.last_intent, "Step 3 FAQ pass-through must not set last_intent")
+        self.assertEqual(state.last_intent, _INTENT_PREPURCHASE, "FAQ+vehicle must set last_intent per BR-1 Row 16")
         self.assertEqual(eng._call_openai.call_count, 1)
 
     def test_r2_12_explicit_inspection_with_vehicle_passes_step1(self):
