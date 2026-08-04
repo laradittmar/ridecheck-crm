@@ -373,6 +373,63 @@ _UNCERTAIN_SERVICE_REPLY = (
     "¿Estás pensando en comprar un vehículo y querés que lo revisemos antes de decidir?"
 )
 
+# ── M21.1.2 Vehicle inspectability — approved customer copy ──────────────────
+_INSPECTABILITY_DISASSEMBLED_REPLY = (
+    "Para poder hacer la revisión, el vehículo tiene que estar armado y accesible. "
+    "Si está desarmado, no podemos inspeccionarlo correctamente."
+)
+_INSPECTABILITY_NONRUNNING_CLARIFY = (
+    "¿El vehículo está armado y se puede acceder normalmente al motor, interior, "
+    "ruedas y parte inferior, aunque no arranque?"
+)
+
+# ── M21.1.2 Detection pattern lists ──────────────────────────────────────────
+_INSPECTABILITY_DISASSEMBLED_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r'\bdesarmad[oa]\b', re.IGNORECASE),
+    re.compile(r'\bdesmontad[oa]\b', re.IGNORECASE),
+    re.compile(r'\bsin\s+motor\b', re.IGNORECASE),
+    re.compile(r'\bmotor\s+afuera\b', re.IGNORECASE),
+    re.compile(r'\bmotor\s+desmontado\b', re.IGNORECASE),
+    re.compile(r'\bsin\s+ruedas?\b', re.IGNORECASE),
+    re.compile(r'\bpartes?\s+sueltas?\b', re.IGNORECASE),
+    re.compile(r'\bpiezas?\s+desmontadas?\b', re.IGNORECASE),
+]
+_INSPECTABILITY_NONRUNNING_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r'\bno\s+arranca\b', re.IGNORECASE),
+    re.compile(r'\bno\s+enciende\b', re.IGNORECASE),
+    re.compile(r'\bno\s+prende\b', re.IGNORECASE),
+    re.compile(r'\bbater[ií]a\s+muerta\b', re.IGNORECASE),
+    re.compile(r'\best[aá]\s+parad[oa]\b', re.IGNORECASE),
+    re.compile(r'\bno\s+funciona\b', re.IGNORECASE),
+    re.compile(r'\bno\s+est[aá]\s+andando\b', re.IGNORECASE),
+    re.compile(r'\bhay\s+que\s+empujarlo\b', re.IGNORECASE),
+    re.compile(r'\bhay\s+que\s+remolcarlo\b', re.IGNORECASE),
+]
+_INSPECTABILITY_ASSEMBLED_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r'\best[aá]\s+armad[oa]\b', re.IGNORECASE),
+    re.compile(r'\best[aá]\s+complet[oa]\b', re.IGNORECASE),
+    re.compile(r'\bse\s+puede\s+revisar\b', re.IGNORECASE),
+    re.compile(r'\bse\s+puede\s+acceder\b', re.IGNORECASE),
+    re.compile(r'\bse\s+puede\s+abrir\b', re.IGNORECASE),
+    re.compile(r'\bse\s+puede\s+levantar\b', re.IGNORECASE),
+    re.compile(r'\btiene\s+todas?\s+las\s+ruedas?\b', re.IGNORECASE),
+    re.compile(r'\bel\s+motor\s+est[aá]\s+puest[oa]\b', re.IGNORECASE),
+    re.compile(r'\best[aá]\s+accesible\b', re.IGNORECASE),
+]
+_INSPECTABILITY_HISTORICAL_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r'\bestaba\b', re.IGNORECASE),
+    re.compile(r'\bestuvo\b', re.IGNORECASE),
+    re.compile(r'\bantes\b', re.IGNORECASE),
+    re.compile(r'\bsi\s+estuviera\b', re.IGNORECASE),
+    re.compile(r'\bhipot[eé]ticamente\b', re.IGNORECASE),
+]
+_INSPECTABILITY_ACCESS_BARRIER_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r'\bno\s+tenemos?\s+las?\s+llaves?\b', re.IGNORECASE),
+    re.compile(r'\bsin\s+llaves?\b', re.IGNORECASE),
+    re.compile(r'\bno\s+(nos?|te|le)\s+dejan\b', re.IGNORECASE),
+    re.compile(r'\bno\s+s[eé]\s+si\s+(nos?|te|le)\s+dejan\b', re.IGNORECASE),
+]
+
 # Persisted intent token (22 chars, fits String(30) in WhatsAppThreadState.last_intent).
 _INTENT_PREPURCHASE = "PREPURCHASE_INSPECTION"
 
@@ -507,6 +564,28 @@ def _is_phone_call_request(messages: list[str]) -> bool:
     """Return True if any message contains a phone-call request pattern."""
     combined = " ".join(messages)
     return any(p.search(combined) for p in _PHONE_CALL_PATTERNS)
+
+
+# ── M21.1.2 Vehicle inspectability detection functions ───────────────────────
+
+def _detect_disassembled_vehicle(text: str) -> bool:
+    return any(p.search(text) for p in _INSPECTABILITY_DISASSEMBLED_PATTERNS)
+
+
+def _detect_non_running_vehicle(text: str) -> bool:
+    return any(p.search(text) for p in _INSPECTABILITY_NONRUNNING_PATTERNS)
+
+
+def _detect_assembled_accessible_confirmation(text: str) -> bool:
+    return any(p.search(text) for p in _INSPECTABILITY_ASSEMBLED_PATTERNS)
+
+
+def _detect_historical_or_hypothetical_context(text: str) -> bool:
+    return any(p.search(text) for p in _INSPECTABILITY_HISTORICAL_PATTERNS)
+
+
+def _detect_access_barrier(text: str) -> bool:
+    return any(p.search(text) for p in _INSPECTABILITY_ACCESS_BARRIER_PATTERNS)
 
 
 def _extract_year_from_text(text: str) -> int | None:
@@ -2022,6 +2101,13 @@ class ConversationEngine:
             if _intent_out is not None:
                 return _intent_out
 
+        # ── M21.1.2 Layer G: Vehicle inspectability gate (all stages) ─────
+        # After BR-1; before candidate/zone/pricing/scheduling/revision/Flow.
+        # Motorcycle (Layer A) takes precedence and is checked before this gate.
+        _insp_out = self._handle_vehicle_inspectability_gate(ctx, state, current_turn_text)
+        if _insp_out is not None:
+            return _insp_out
+
         # ── Deterministic vehicle catalog lookup (pre-AI) ─────────────────
         # Search across all recent messages (not just current burst) so a
         # vehicle name from a prior turn is still recognised.
@@ -2510,6 +2596,74 @@ class ConversationEngine:
         except OutboundBlockedError:
             self.db.commit()
             return _out("service_gate_blocked", detail="outbound_disabled")
+
+    def _send_inspectability_reply(
+        self,
+        ctx: "_Context",
+        reply: str,
+    ) -> "ConversationHandleOut":
+        """Send an inspectability boundary or clarification reply with no state mutation."""
+        try:
+            sent_id = self._send_text_to_wa(ctx, reply)
+            return _out("replied", wa_message_id=sent_id)
+        except OutboundBlockedError:
+            self.db.commit()
+            return _out("inspectability_gate_blocked", detail="outbound_disabled")
+
+    def _handle_vehicle_inspectability_gate(
+        self,
+        ctx: "_Context",
+        state: "WhatsAppThreadState",
+        current_turn_text: str,
+    ) -> "ConversationHandleOut | None":
+        """M21.1.2 Layer G: vehicle inspectability gate.
+
+        Position: after BR-1 intent qualification (Layer F), before candidate/zone/
+        pricing/scheduling/revision/Flow processing. Motorcycle (Layer A) wins.
+
+        Returns a reply for disassembled boundary, accessibility clarification, or
+        access barrier. Returns None to continue normally.
+        """
+        is_assembled = _detect_assembled_accessible_confirmation(current_turn_text)
+        is_disassembled = _detect_disassembled_vehicle(current_turn_text)
+        is_non_running = _detect_non_running_vehicle(current_turn_text)
+        is_historical = _detect_historical_or_hypothetical_context(current_turn_text)
+        has_access_barrier = _detect_access_barrier(current_turn_text)
+
+        # BR-I6: true contradiction (assembled AND disassembled, not historical) → clarify
+        if is_assembled and is_disassembled and not is_historical:
+            logger.info("M21.1.2 inspectability contradiction thread_id=%s", ctx.thread.id)
+            return self._send_inspectability_reply(ctx, _INSPECTABILITY_NONRUNNING_CLARIFY)
+
+        # BR-I4: assembled but access-blocked → clarify
+        if is_assembled and has_access_barrier:
+            logger.info("M21.1.2 inspectability access_barrier thread_id=%s", ctx.thread.id)
+            return self._send_inspectability_reply(ctx, _INSPECTABILITY_NONRUNNING_CLARIFY)
+
+        # BR-I3: assembled and accessible (no contradiction, no access barrier) → continue
+        if is_assembled:
+            return None
+
+        # BR-I1: current disassembly (not historical) → boundary
+        if is_disassembled and not is_historical:
+            logger.info("M21.1.2 inspectability disassembled thread_id=%s", ctx.thread.id)
+            return self._send_inspectability_reply(ctx, _INSPECTABILITY_DISASSEMBLED_REPLY)
+
+        # BR-I5: historical/hypothetical disassembly → continue
+        if is_disassembled:
+            return None
+
+        # BR-I2: non-running only → clarification
+        if is_non_running:
+            logger.info("M21.1.2 inspectability non_running thread_id=%s", ctx.thread.id)
+            return self._send_inspectability_reply(ctx, _INSPECTABILITY_NONRUNNING_CLARIFY)
+
+        # BR-I4: access barrier without assembled confirmation → clarify
+        if has_access_barrier:
+            logger.info("M21.1.2 inspectability access_barrier_only thread_id=%s", ctx.thread.id)
+            return self._send_inspectability_reply(ctx, _INSPECTABILITY_NONRUNNING_CLARIFY)
+
+        return None
 
     def _handle_explicit_service_gate(
         self,

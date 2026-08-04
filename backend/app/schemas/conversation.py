@@ -6,8 +6,9 @@ from pydantic import BaseModel, Field
 HANDLED_ACTIONS = frozenset({
     "replied", "flow_button_sent", "booking_created",
     "skipped_human", "skipped_dedup",
-    "human_handoff_blocked",   # M21.1.1: motorcycle/phone-call under kill switch
-    "service_gate_blocked",    # M21.1.1: F12/transfer/repair/uncertain/FAQ under kill switch
+    "human_handoff_blocked",        # M21.1.1: motorcycle/phone-call under kill switch
+    "service_gate_blocked",         # M21.1.1: F12/transfer/repair/uncertain/FAQ under kill switch
+    "inspectability_gate_blocked",  # M21.1.2: vehicle inspectability gate under kill switch
 })
 
 
