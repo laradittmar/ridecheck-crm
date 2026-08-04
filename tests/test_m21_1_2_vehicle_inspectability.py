@@ -770,5 +770,255 @@ class TestBehavioralGuards(unittest.TestCase):
         _assert_disassembled_boundary(self, eng, result)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# M21.1.2-FV Phase 2 — Precedence tests (QUOTED and SCHEDULING stage)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# These tests use messages that combine an acceptance/scheduling signal with
+# an inspectability signal.  Layer G must intercept the turn BEFORE any QUOTED
+# or SCHEDULING handler runs.
+#
+# Observable proxies:
+#   _try_schedule_and_flow.call_count == 0  → scheduling handler not called
+#   _handle_quoted_acceptance.call_count == 0  → quoted acceptance not called
+#   lead.flag unchanged  → no commercial flag mutation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _run_with_extras(text, state_kwargs=None, lead_kwargs=None):
+    """Like _run but also mocks _handle_quoted_acceptance and returns lead."""
+    eng = _make_engine()
+    eng._handle_quoted_acceptance = MagicMock(return_value=MagicMock(action="replied", handled=True))
+    eng._handle_scheduling_escalation = MagicMock(return_value=None)
+    state = _make_state(**(state_kwargs or {}))
+    lead = _make_lead(**(lead_kwargs or {}))
+    ctx = _make_ctx(state=state, lead=lead)
+    event = _make_event(text=text)
+    with patch("app.services.conversation_engine.lookup_vehicle", return_value=None):
+        result = eng._process_text(ctx, event)
+    return eng, result, state, lead
+
+
+class TestFVP1QuotedAcceptanceWithDisassembled(unittest.TestCase):
+    """P1: Stage=QUOTED, 'Sí, acepto, pero ahora me dicen que tiene el motor afuera.'
+    Require: disassembled boundary; _handle_quoted_acceptance NOT called;
+    no accepted flag; no scheduling mutation; no pricing.
+    """
+
+    def test_p1_disassembled_boundary(self):
+        eng, result, state, lead = _run_with_extras(
+            "Sí, acepto, pero ahora me dicen que tiene el motor afuera.",
+            state_kwargs={"last_stage": STAGE_QUOTED, "last_intent": _INTENT_PREPURCHASE},
+        )
+        _assert_disassembled_boundary(self, eng, result)
+
+    def test_p1_quoted_acceptance_not_called(self):
+        eng, result, state, lead = _run_with_extras(
+            "Sí, acepto, pero ahora me dicen que tiene el motor afuera.",
+            state_kwargs={"last_stage": STAGE_QUOTED, "last_intent": _INTENT_PREPURCHASE},
+        )
+        self.assertEqual(eng._handle_quoted_acceptance.call_count, 0,
+                         "P1: _handle_quoted_acceptance must not fire")
+
+    def test_p1_no_accepted_flag(self):
+        eng, result, state, lead = _run_with_extras(
+            "Sí, acepto, pero ahora me dicen que tiene el motor afuera.",
+            state_kwargs={"last_stage": STAGE_QUOTED, "last_intent": _INTENT_PREPURCHASE},
+            lead_kwargs={"flag": "PRESUPUESTANDO"},
+        )
+        self.assertNotEqual(lead.flag, "ACEPTADO", "P1: lead.flag must not become ACEPTADO")
+
+    def test_p1_no_scheduling_mutation(self):
+        eng, result, state, lead = _run_with_extras(
+            "Sí, acepto, pero ahora me dicen que tiene el motor afuera.",
+            state_kwargs={"last_stage": STAGE_QUOTED, "last_intent": _INTENT_PREPURCHASE},
+        )
+        self.assertEqual(eng._try_schedule_and_flow.call_count, 0,
+                         "P1: scheduling must not be attempted")
+
+    def test_p1_no_pricing(self):
+        eng, result, state, lead = _run_with_extras(
+            "Sí, acepto, pero ahora me dicen que tiene el motor afuera.",
+            state_kwargs={"last_stage": STAGE_QUOTED, "last_intent": _INTENT_PREPURCHASE},
+        )
+        self.assertEqual(eng._compute_price_quote.call_count, 0,
+                         "P1: pricing must not run")
+
+
+class TestFVP1bQuotedDateWithDisassembled(unittest.TestCase):
+    """P1b: Stage=QUOTED, 'El miércoles a las 10, pero el motor está afuera.'
+    Disassembled gate must fire BEFORE QUOTED date handler can mutate lead.flag.
+    """
+
+    def test_p1b_disassembled_boundary(self):
+        eng, result, state, lead = _run_with_extras(
+            "El miércoles a las 10, pero el motor está afuera.",
+            state_kwargs={"last_stage": STAGE_QUOTED, "last_intent": _INTENT_PREPURCHASE},
+            lead_kwargs={"flag": "PRESUPUESTANDO"},
+        )
+        _assert_disassembled_boundary(self, eng, result)
+
+    def test_p1b_lead_flag_not_mutated(self):
+        eng, result, state, lead = _run_with_extras(
+            "El miércoles a las 10, pero el motor está afuera.",
+            state_kwargs={"last_stage": STAGE_QUOTED, "last_intent": _INTENT_PREPURCHASE},
+            lead_kwargs={"flag": "PRESUPUESTANDO"},
+        )
+        self.assertEqual(lead.flag, "PRESUPUESTANDO",
+                         "P1b: lead.flag must not mutate to ACEPTADO on disassembled boundary")
+
+    def test_p1b_no_scheduling_attempt(self):
+        eng, result, state, lead = _run_with_extras(
+            "El miércoles a las 10, pero el motor está afuera.",
+            state_kwargs={"last_stage": STAGE_QUOTED, "last_intent": _INTENT_PREPURCHASE},
+        )
+        self.assertEqual(eng._try_schedule_and_flow.call_count, 0,
+                         "P1b: scheduling must not be attempted")
+
+
+class TestFVP2QuotedAcceptanceWithNonRunning(unittest.TestCase):
+    """P2: Stage=QUOTED, 'Sí, acepto, pero el auto no arranca.'
+    Require: inspectability clarification; _handle_quoted_acceptance NOT called.
+    """
+
+    def test_p2_clarification(self):
+        eng, result, state, lead = _run_with_extras(
+            "Sí, acepto, pero el auto no arranca.",
+            state_kwargs={"last_stage": STAGE_QUOTED, "last_intent": _INTENT_PREPURCHASE},
+        )
+        _assert_clarify(self, eng, result)
+
+    def test_p2_quoted_acceptance_not_called(self):
+        eng, result, state, lead = _run_with_extras(
+            "Sí, acepto, pero el auto no arranca.",
+            state_kwargs={"last_stage": STAGE_QUOTED, "last_intent": _INTENT_PREPURCHASE},
+        )
+        self.assertEqual(eng._handle_quoted_acceptance.call_count, 0,
+                         "P2: _handle_quoted_acceptance must not fire")
+
+
+class TestFVP3SchedulingWithDisassembled(unittest.TestCase):
+    """P3: Stage=SCHEDULING, 'El miércoles a las 10, pero ahora me dicen que está desarmado.'
+    Require: disassembled boundary; scheduling handler NOT called; no booking or Flow.
+    """
+
+    def test_p3_disassembled_boundary(self):
+        eng, result, state, lead = _run_with_extras(
+            "El miércoles a las 10, pero ahora me dicen que está desarmado.",
+            state_kwargs={"last_stage": STAGE_SCHEDULING, "last_intent": _INTENT_PREPURCHASE},
+        )
+        _assert_disassembled_boundary(self, eng, result)
+
+    def test_p3_scheduling_handler_not_called(self):
+        eng, result, state, lead = _run_with_extras(
+            "El miércoles a las 10, pero ahora me dicen que está desarmado.",
+            state_kwargs={"last_stage": STAGE_SCHEDULING, "last_intent": _INTENT_PREPURCHASE},
+        )
+        self.assertEqual(eng._try_schedule_and_flow.call_count, 0,
+                         "P3: scheduling must not be attempted before inspectability gate blocks")
+
+    def test_p3_no_flow(self):
+        eng, result, state, lead = _run_with_extras(
+            "El miércoles a las 10, pero ahora me dicen que está desarmado.",
+            state_kwargs={"last_stage": STAGE_SCHEDULING, "last_intent": _INTENT_PREPURCHASE},
+        )
+        self.assertEqual(result.action, "replied")
+        sent_text = eng._send_text_to_wa.call_args[0][1]
+        self.assertEqual(sent_text, _INSPECTABILITY_DISASSEMBLED_REPLY)
+
+
+class TestFVP4SchedulingWithNonRunning(unittest.TestCase):
+    """P4: Stage=SCHEDULING, 'El miércoles a las 10, pero no arranca.'
+    Require: inspectability clarification; scheduling handler NOT called.
+    """
+
+    def test_p4_clarification(self):
+        eng, result, state, lead = _run_with_extras(
+            "El miércoles a las 10, pero no arranca.",
+            state_kwargs={"last_stage": STAGE_SCHEDULING, "last_intent": _INTENT_PREPURCHASE},
+        )
+        _assert_clarify(self, eng, result)
+
+    def test_p4_scheduling_handler_not_called(self):
+        eng, result, state, lead = _run_with_extras(
+            "El miércoles a las 10, pero no arranca.",
+            state_kwargs={"last_stage": STAGE_SCHEDULING, "last_intent": _INTENT_PREPURCHASE},
+        )
+        self.assertEqual(eng._try_schedule_and_flow.call_count, 0,
+                         "P4: scheduling must not be attempted before inspectability gate blocks")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# M21.1.2-FV Phase 3 — Repeated non-running idempotency
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestFVPhase3NonRunningIdempotency(unittest.TestCase):
+    """Phase 3: multi-turn non-running clarification behavior.
+
+    Turn 1: 'No arranca.' → one clarification.
+    Turn 2 (same state): 'No arranca.' → document behavior.
+    Turn 1 + Turn 2 assembly confirmation: continue without repeating.
+
+    NOTE: Without a new schema field (inspectability_clarification_sent),
+    the engine cannot distinguish Turn 2 from Turn 1. This class documents
+    the limitation and verifies the assembled-confirmation exit path.
+    """
+
+    def test_turn1_no_arranca_sends_clarification(self):
+        """Turn 1: 'No arranca.' → inspectability clarification sent."""
+        eng, result, state = _run(
+            "No arranca.",
+            state_kwargs={"last_intent": _INTENT_PREPURCHASE},
+        )
+        _assert_clarify(self, eng, result)
+
+    def test_turn1_no_state_mutation(self):
+        """Turn 1 clarification must not mutate any commercial state."""
+        eng, result, state = _run(
+            "No arranca.",
+            state_kwargs={"last_intent": _INTENT_PREPURCHASE},
+        )
+        self.assertFalse(state.needs_human, "Turn 1: needs_human must not be set")
+        self.assertEqual(eng._create_candidate_from_catalog.call_count, 0)
+        self.assertEqual(eng._routing_gate.call_count, 0)
+
+    def test_turn2_assembly_confirmation_continues(self):
+        """Turn 1 'No arranca.' → Turn 2 'Sí, está armado y accesible.' → continue.
+
+        This is the primary idempotency exit: once the user confirms assembly,
+        the gate passes and does NOT repeat the clarification.
+        State at Turn 2: same as after Turn 1 (no persistent flags set).
+        """
+        eng, result, state = _run(
+            "Sí, está armado y accesible.",
+            state_kwargs={"last_intent": _INTENT_PREPURCHASE},
+        )
+        _assert_continue(self, eng)
+        sent_texts = [call[0][1] for call in eng._send_text_to_wa.call_args_list]
+        self.assertNotIn(_INSPECTABILITY_NONRUNNING_CLARIFY, sent_texts,
+                         "After assembly confirmed, clarification must not be sent again")
+
+    def test_turn2_repeat_no_arranca_behavior(self):
+        """Turn 2 with unchanged state: documents current behavior.
+
+        Without a new schema field (inspectability_clarification_sent: bool),
+        the engine cannot distinguish this from Turn 1. Both turns send the
+        same clarification. This is an acknowledged limitation — the fix
+        requires a schema migration that must be approved separately.
+
+        This test documents the behavior rather than asserting a loop-prevention
+        that is not yet implemented. Assertion: clarification is still sent
+        (not an error reply, not an infinite loop trigger within this turn).
+        """
+        eng, result, state = _run(
+            "No arranca.",
+            state_kwargs={"last_intent": _INTENT_PREPURCHASE},
+        )
+        # Clarification IS sent (same as Turn 1 — current known behavior)
+        _assert_clarify(self, eng, result)
+        # No commercial mutation on either turn
+        self.assertEqual(eng._call_openai.call_count, 0)
+        self.assertEqual(eng._create_candidate_from_catalog.call_count, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

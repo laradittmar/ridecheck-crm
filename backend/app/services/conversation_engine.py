@@ -388,7 +388,7 @@ _INSPECTABILITY_DISASSEMBLED_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r'\bdesarmad[oa]\b', re.IGNORECASE),
     re.compile(r'\bdesmontad[oa]\b', re.IGNORECASE),
     re.compile(r'\bsin\s+motor\b', re.IGNORECASE),
-    re.compile(r'\bmotor\s+afuera\b', re.IGNORECASE),
+    re.compile(r'\bmotor\s+(?:est[aá]\s+)?afuera\b', re.IGNORECASE),
     re.compile(r'\bmotor\s+desmontado\b', re.IGNORECASE),
     re.compile(r'\bsin\s+ruedas?\b', re.IGNORECASE),
     re.compile(r'\bpartes?\s+sueltas?\b', re.IGNORECASE),
@@ -1947,6 +1947,17 @@ class ConversationEngine:
         ):
             return self._handle_general_information_ai(ctx, event, ai_input_messages)
 
+        # ── M21.1.2 Layer G: Vehicle inspectability gate (all stages) ─────
+        # After FAQ bypass (Layer D); before website-form, QUOTED acceptance,
+        # QUOTED date proposal, SCHEDULING, BR-1, and all downstream mutation.
+        # Motorcycle (Layer A) takes absolute precedence over this gate.
+        # A pure hypothetical FAQ ('¿Qué pasa si estuviera desarmado?') is
+        # either intercepted by Layer D above, or passes here via the
+        # historical-context detector (is_historical=True → returns None).
+        _insp_out = self._handle_vehicle_inspectability_gate(ctx, state, current_turn_text)
+        if _insp_out is not None:
+            return _insp_out
+
         # ── Website form from wa.me prefilled link (pre-AI) ─────────────
         # Detect the structured form message before any other state-based checks.
         # The form contains vehicle, zone, and submitted price from the website.
@@ -2100,13 +2111,6 @@ class ConversationEngine:
             _intent_out = self._handle_qualifying_intent(ctx, state, current_turn_text)
             if _intent_out is not None:
                 return _intent_out
-
-        # ── M21.1.2 Layer G: Vehicle inspectability gate (all stages) ─────
-        # After BR-1; before candidate/zone/pricing/scheduling/revision/Flow.
-        # Motorcycle (Layer A) takes precedence and is checked before this gate.
-        _insp_out = self._handle_vehicle_inspectability_gate(ctx, state, current_turn_text)
-        if _insp_out is not None:
-            return _insp_out
 
         # ── Deterministic vehicle catalog lookup (pre-AI) ─────────────────
         # Search across all recent messages (not just current burst) so a
