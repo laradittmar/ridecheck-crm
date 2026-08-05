@@ -114,6 +114,7 @@ def _make_state(**kwargs):
         location_clarification_sent=False,
         vehicle_fallback_flow_sent=False,
         location_fallback_flow_sent=False,
+        inspectability_clarification_sent=False,
     )
     for k, v in kwargs.items():
         setattr(ns, k, v)

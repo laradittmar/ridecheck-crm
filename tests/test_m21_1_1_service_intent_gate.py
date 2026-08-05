@@ -106,6 +106,7 @@ def _make_state(**kw) -> types.SimpleNamespace:
         location_clarification_sent=False,
         vehicle_fallback_flow_sent=False,
         location_fallback_flow_sent=False,
+        inspectability_clarification_sent=False,
         last_processed_inbound_wa_message_id=None,
     )
     for k, v in kw.items():

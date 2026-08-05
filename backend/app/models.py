@@ -335,6 +335,7 @@ class WhatsAppThreadState(Base):
     location_clarification_sent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     vehicle_fallback_flow_sent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     location_fallback_flow_sent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    inspectability_clarification_sent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     unanswered_alert_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     quote_followup_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     buscando_followup_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)

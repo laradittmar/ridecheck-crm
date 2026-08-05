@@ -100,6 +100,7 @@ def _make_state(**kw) -> types.SimpleNamespace:
         location_clarification_sent=False,
         vehicle_fallback_flow_sent=False,
         location_fallback_flow_sent=False,
+        inspectability_clarification_sent=False,
         last_processed_inbound_wa_message_id=None,
     )
     for k, v in kw.items():
@@ -954,13 +955,10 @@ class TestFVP4SchedulingWithNonRunning(unittest.TestCase):
 class TestFVPhase3NonRunningIdempotency(unittest.TestCase):
     """Phase 3: multi-turn non-running clarification behavior.
 
-    Turn 1: 'No arranca.' → one clarification.
-    Turn 2 (same state): 'No arranca.' → document behavior.
-    Turn 1 + Turn 2 assembly confirmation: continue without repeating.
+    Turn 1: 'No arranca.' → one clarification, inspectability_clarification_sent=True.
+    Turn 2 + assembly confirmation: continue without repeating.
 
-    NOTE: Without a new schema field (inspectability_clarification_sent),
-    the engine cannot distinguish Turn 2 from Turn 1. This class documents
-    the limitation and verifies the assembled-confirmation exit path.
+    Full multi-turn repetition prevention is tested in TestR1* classes below.
     """
 
     def test_turn1_no_arranca_sends_clarification(self):
@@ -997,27 +995,282 @@ class TestFVPhase3NonRunningIdempotency(unittest.TestCase):
         self.assertNotIn(_INSPECTABILITY_NONRUNNING_CLARIFY, sent_texts,
                          "After assembly confirmed, clarification must not be sent again")
 
-    def test_turn2_repeat_no_arranca_behavior(self):
-        """Turn 2 with unchanged state: documents current behavior.
-
-        Without a new schema field (inspectability_clarification_sent: bool),
-        the engine cannot distinguish this from Turn 1. Both turns send the
-        same clarification. This is an acknowledged limitation — the fix
-        requires a schema migration that must be approved separately.
-
-        This test documents the behavior rather than asserting a loop-prevention
-        that is not yet implemented. Assertion: clarification is still sent
-        (not an error reply, not an infinite loop trigger within this turn).
-        """
+    def test_turn1_sets_inspectability_clarification_sent(self):
+        """Turn 1 'No arranca.' sets inspectability_clarification_sent=True."""
         eng, result, state = _run(
             "No arranca.",
             state_kwargs={"last_intent": _INTENT_PREPURCHASE},
         )
-        # Clarification IS sent (same as Turn 1 — current known behavior)
         _assert_clarify(self, eng, result)
-        # No commercial mutation on either turn
+        self.assertTrue(state.inspectability_clarification_sent,
+                        "Turn 1 must persist inspectability_clarification_sent=True")
+        # No commercial mutation
         self.assertEqual(eng._call_openai.call_count, 0)
         self.assertEqual(eng._create_candidate_from_catalog.call_count, 0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# M21.1.2-R1 — Persist inspectability clarification and prevent repetition loop
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Multi-turn tests. State is a SimpleNamespace shared between turns;
+# mutations from Turn 1 are visible to Turn 2 via the same object.
+#
+# _run_turn(text, state) — run one turn with an existing state object.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _run_turn(text: str, state: types.SimpleNamespace, *, kill_switch: bool = False) -> tuple:
+    """Run a single _process_text turn with a pre-existing state object.
+
+    Returns (eng, result).  State is mutated in-place.
+    """
+    eng = _make_engine()
+    if kill_switch:
+        eng._send_text_to_wa = MagicMock(side_effect=OutboundBlockedError(
+            sender_path="test", kind="text", to_wa_id="5491199999999"
+        ))
+    ctx = _make_ctx(state=state)
+    event = _make_event(text=text)
+    with patch("app.services.conversation_engine.lookup_vehicle", return_value=None):
+        result = eng._process_text(ctx, event)
+    return eng, result
+
+
+# ─── R1-01 ────────────────────────────────────────────────────────────────────
+
+class TestR101FirstClarificationPersisted(unittest.TestCase):
+    """R1-01: Turn 1 'No arranca.' → clarification sent once and field=True."""
+
+    def setUp(self):
+        self.state = _make_state(last_intent=_INTENT_PREPURCHASE)
+        self.eng, self.result = _run_turn("No arranca.", self.state)
+
+    def test_r1_01_clarification_sent(self):
+        _assert_clarify(self, self.eng, self.result)
+
+    def test_r1_01_field_set_true(self):
+        self.assertTrue(self.state.inspectability_clarification_sent,
+                        "R1-01: inspectability_clarification_sent must be True after first clarification")
+
+    def test_r1_01_needs_human_false(self):
+        self.assertFalse(self.state.needs_human, "R1-01: needs_human must not be set on Turn 1")
+
+    def test_r1_01_zero_commercial_mutation(self):
+        _assert_zero_commercial_mutation(self, self.eng)
+
+
+# ─── R1-02 ────────────────────────────────────────────────────────────────────
+
+class TestR102RepeatedNonRunningEscalates(unittest.TestCase):
+    """R1-02: Turn 1 'No arranca.' → Turn 2 'No arranca.'
+    Clarification not repeated; needs_human=True; warm handoff once; zero commercial mutation.
+    """
+
+    def setUp(self):
+        self.state = _make_state(last_intent=_INTENT_PREPURCHASE)
+        # Turn 1
+        self.eng1, _ = _run_turn("No arranca.", self.state)
+        self.assertTrue(self.state.inspectability_clarification_sent,
+                        "Precondition: field must be True after Turn 1")
+        # Turn 2
+        self.eng2, self.result2 = _run_turn("No arranca.", self.state)
+
+    def test_r1_02_clarification_not_repeated(self):
+        sent_texts = [call[0][1] for call in self.eng2._send_text_to_wa.call_args_list]
+        self.assertNotIn(_INSPECTABILITY_NONRUNNING_CLARIFY, sent_texts,
+                         "R1-02: clarification must not be repeated on Turn 2")
+
+    def test_r1_02_warm_handoff_sent_once(self):
+        sent_texts = [call[0][1] for call in self.eng2._send_text_to_wa.call_args_list]
+        self.assertEqual(sent_texts.count(_FALLBACK_WARM_HANDOFF), 1,
+                         "R1-02: warm handoff must be sent exactly once on Turn 2")
+
+    def test_r1_02_needs_human_true(self):
+        self.assertTrue(self.state.needs_human, "R1-02: needs_human must be True after Turn 2 escalation")
+
+    def test_r1_02_result_handled(self):
+        self.assertIn(self.result2.action, HANDLED_ACTIONS,
+                      "R1-02: result must be in HANDLED_ACTIONS")
+
+    def test_r1_02_zero_commercial_mutation(self):
+        _assert_zero_commercial_mutation(self, self.eng2)
+
+    def test_r1_02_kill_switch_handled(self):
+        """Under kill switch Turn 2 still returns a handled action."""
+        state = _make_state(last_intent=_INTENT_PREPURCHASE,
+                            inspectability_clarification_sent=True)
+        _, result = _run_turn("No arranca.", state, kill_switch=True)
+        self.assertEqual(result.action, "inspectability_gate_blocked",
+                         "R1-02 kill switch: must return inspectability_gate_blocked")
+        self.assertTrue(result.handled, "R1-02 kill switch: handled must be True")
+        self.assertTrue(state.needs_human, "R1-02 kill switch: needs_human must be set")
+
+
+# ─── R1-03 ────────────────────────────────────────────────────────────────────
+
+class TestR103AmbiguousSecondTurnEscalates(unittest.TestCase):
+    """R1-03: Turn 1 'No arranca.' → Turn 2 'No sé.' → human escalation."""
+
+    def setUp(self):
+        self.state = _make_state(last_intent=_INTENT_PREPURCHASE)
+        _run_turn("No arranca.", self.state)
+        self.eng2, self.result2 = _run_turn("No sé.", self.state)
+
+    def test_r1_03_human_escalation(self):
+        self.assertTrue(self.state.needs_human, "R1-03: needs_human must be True after ambiguous Turn 2")
+
+    def test_r1_03_warm_handoff_sent(self):
+        sent_texts = [call[0][1] for call in self.eng2._send_text_to_wa.call_args_list]
+        self.assertIn(_FALLBACK_WARM_HANDOFF, sent_texts, "R1-03: warm handoff must be sent")
+
+    def test_r1_03_clarification_not_sent(self):
+        sent_texts = [call[0][1] for call in self.eng2._send_text_to_wa.call_args_list]
+        self.assertNotIn(_INSPECTABILITY_NONRUNNING_CLARIFY, sent_texts,
+                         "R1-03: clarification must not be repeated")
+
+    def test_r1_03_zero_commercial_mutation(self):
+        _assert_zero_commercial_mutation(self, self.eng2)
+
+
+# ─── R1-04 ────────────────────────────────────────────────────────────────────
+
+class TestR104AssemblyConfirmationResumesFlow(unittest.TestCase):
+    """R1-04: Turn 1 'No arranca.' → Turn 2 'Sí, está armado y accesible.'
+    Field reset to False; needs_human=False; normal continuation; no clarification.
+    """
+
+    def setUp(self):
+        self.state = _make_state(last_intent=_INTENT_PREPURCHASE)
+        _run_turn("No arranca.", self.state)
+        self.assertEqual(self.state.inspectability_clarification_sent, True,
+                         "Precondition: field True after Turn 1")
+        self.eng2, self.result2 = _run_turn("Sí, está armado y accesible.", self.state)
+
+    def test_r1_04_field_reset_false(self):
+        self.assertFalse(self.state.inspectability_clarification_sent,
+                         "R1-04: field must be reset to False after assembly confirmation")
+
+    def test_r1_04_needs_human_false(self):
+        self.assertFalse(self.state.needs_human, "R1-04: needs_human must not be set")
+
+    def test_r1_04_normal_continuation(self):
+        self.assertEqual(self.eng2._call_openai.call_count, 1,
+                         "R1-04: AI must be reached on assembly confirmation")
+
+    def test_r1_04_clarification_not_repeated(self):
+        sent_texts = [call[0][1] for call in self.eng2._send_text_to_wa.call_args_list]
+        self.assertNotIn(_INSPECTABILITY_NONRUNNING_CLARIFY, sent_texts,
+                         "R1-04: clarification must not be sent on assembly confirmation turn")
+
+
+# ─── R1-05 ────────────────────────────────────────────────────────────────────
+
+class TestR105DisassembledFollowUpBoundary(unittest.TestCase):
+    """R1-05: Turn 1 'No arranca.' → Turn 2 'Tiene el motor afuera.'
+    Deterministic disassembled boundary; no human escalation.
+    """
+
+    def setUp(self):
+        self.state = _make_state(last_intent=_INTENT_PREPURCHASE)
+        _run_turn("No arranca.", self.state)
+        self.eng2, self.result2 = _run_turn("Tiene el motor afuera.", self.state)
+
+    def test_r1_05_disassembled_boundary(self):
+        _assert_disassembled_boundary(self, self.eng2, self.result2)
+
+    def test_r1_05_no_human_escalation(self):
+        sent_texts = [call[0][1] for call in self.eng2._send_text_to_wa.call_args_list]
+        self.assertNotIn(_FALLBACK_WARM_HANDOFF, sent_texts,
+                         "R1-05: must not escalate to human on disassembled evidence")
+
+    def test_r1_05_zero_commercial_mutation(self):
+        _assert_zero_commercial_mutation(self, self.eng2)
+
+    def test_r1_05_field_cleared(self):
+        self.assertFalse(self.state.inspectability_clarification_sent,
+                         "R1-05: field must be cleared on disassembled boundary")
+
+
+# ─── R1-06 ────────────────────────────────────────────────────────────────────
+
+class TestR106DedupPreventsRepeat(unittest.TestCase):
+    """R1-06: Repeated Turn 1 must not create duplicate clarification, handoff, candidate, or Flow.
+
+    Note: the wa_message_id dedup check lives in ConversationEngine.handle() (not _process_text),
+    so it is not exercisable here.  These tests verify the complementary invariant:
+    inspectability_clarification_sent=True (state left by Turn 1) prevents a duplicate
+    clarification from any subsequent call to _process_text, regardless of the message ID.
+    """
+
+    def test_r1_06_field_true_prevents_duplicate_clarification(self):
+        """With field=True (post-Turn-1 state), 'No arranca.' escalates, not re-clarifies."""
+        state = _make_state(
+            last_intent=_INTENT_PREPURCHASE,
+            inspectability_clarification_sent=True,
+        )
+        eng, result = _run_turn("No arranca.", state)
+        sent_texts = [call[0][1] for call in eng._send_text_to_wa.call_args_list]
+        self.assertNotIn(_INSPECTABILITY_NONRUNNING_CLARIFY, sent_texts,
+                         "R1-06: clarification must not be repeated when field=True")
+        self.assertIn(_FALLBACK_WARM_HANDOFF, sent_texts,
+                      "R1-06: warm handoff must be sent instead")
+
+    def test_r1_06_field_true_no_commercial_mutation(self):
+        """No candidate/zone/pricing/AI mutation when field=True and 'No arranca.' arrives."""
+        state = _make_state(
+            last_intent=_INTENT_PREPURCHASE,
+            inspectability_clarification_sent=True,
+        )
+        eng, result = _run_turn("No arranca.", state)
+        _assert_zero_commercial_mutation(self, eng)
+
+    def test_r1_06_field_true_no_candidate_creation(self):
+        state = _make_state(
+            last_intent=_INTENT_PREPURCHASE,
+            inspectability_clarification_sent=True,
+        )
+        eng, result = _run_turn("No arranca.", state)
+        self.assertEqual(eng._create_candidate_from_catalog.call_count, 0)
+        self.assertEqual(eng._call_openai.call_count, 0)
+
+
+# ─── R1-07 / R1-08 ────────────────────────────────────────────────────────────
+
+class TestR107R108Migration(unittest.TestCase):
+    """R1-07: Migration default is False. R1-08: Column present after schema creation."""
+
+    def test_r1_07_make_state_default_false(self):
+        """_make_state() initialises inspectability_clarification_sent=False."""
+        state = _make_state()
+        self.assertFalse(state.inspectability_clarification_sent,
+                         "R1-07: inspectability_clarification_sent must default to False")
+
+    def test_r1_07_model_column_declared(self):
+        """WhatsAppThreadState declares inspectability_clarification_sent."""
+        from app.models import WhatsAppThreadState
+        self.assertTrue(
+            hasattr(WhatsAppThreadState, "inspectability_clarification_sent"),
+            "R1-07: WhatsAppThreadState must declare inspectability_clarification_sent",
+        )
+
+    def test_r1_07_model_column_not_nullable(self):
+        """Column is NOT NULL with default False."""
+        from app.models import WhatsAppThreadState
+        col = WhatsAppThreadState.__table__.c["inspectability_clarification_sent"]
+        self.assertFalse(col.nullable, "R1-07: column must be NOT NULL")
+
+    def test_r1_08_column_present_in_schema(self):
+        """Column exists in the SQLite in-memory schema (simulates upgrade)."""
+        import sqlalchemy as sa
+        from app.models import Base
+        engine = sa.create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        with engine.connect() as conn:
+            cols = {row[1] for row in conn.execute(
+                sa.text("PRAGMA table_info(whatsapp_thread_states)")
+            ).fetchall()}
+        self.assertIn("inspectability_clarification_sent", cols,
+                      "R1-08: column must be present after schema creation (upgrade)")
 
 
 if __name__ == "__main__":

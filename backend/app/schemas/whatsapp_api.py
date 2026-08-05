@@ -82,6 +82,7 @@ class WhatsAppThreadStateRead(BaseModel):
     location_clarification_sent: bool = False
     vehicle_fallback_flow_sent: bool = False
     location_fallback_flow_sent: bool = False
+    inspectability_clarification_sent: bool = False
     created_at: datetime | None = None
     updated_at: datetime | None = None
 

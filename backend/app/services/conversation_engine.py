@@ -2614,6 +2614,20 @@ class ConversationEngine:
             self.db.commit()
             return _out("inspectability_gate_blocked", detail="outbound_disabled")
 
+    def _escalate_inspectability_to_human(
+        self,
+        ctx: "_Context",
+        state: "WhatsAppThreadState",
+    ) -> "ConversationHandleOut":
+        """M21.1.2-R1: Second unresolved inspectability turn → warm human handoff."""
+        state.needs_human = True
+        try:
+            sent_id = self._send_text_to_wa(ctx, _FALLBACK_WARM_HANDOFF)
+            return _out("replied", wa_message_id=sent_id)
+        except OutboundBlockedError:
+            self.db.commit()
+            return _out("inspectability_gate_blocked", detail="escalation_kill_switch")
+
     def _handle_vehicle_inspectability_gate(
         self,
         ctx: "_Context",
@@ -2622,12 +2636,18 @@ class ConversationEngine:
     ) -> "ConversationHandleOut | None":
         """M21.1.2 Layer G: vehicle inspectability gate.
 
-        Position: after BR-1 intent qualification (Layer F), before candidate/zone/
-        pricing/scheduling/revision/Flow processing. Motorcycle (Layer A) wins.
+        Position: after FAQ bypass (Layer D), before website-form, QUOTED acceptance,
+        QUOTED date proposal, SCHEDULING, BR-1, and all downstream mutation.
+        Motorcycle (Layer A) takes absolute precedence.
 
-        Returns a reply for disassembled boundary, accessibility clarification, or
-        access barrier. Returns None to continue normally.
+        R1 persistence: inspectability_clarification_sent tracks whether a clarification
+        has been sent. On the second unresolved non-running turn, escalates to warm
+        human handoff rather than repeating the clarification.
         """
+        # Preserve existing needs_human short-circuit — do not duplicate handoffs
+        if state.needs_human:
+            return None
+
         is_assembled = _detect_assembled_accessible_confirmation(current_turn_text)
         is_disassembled = _detect_disassembled_vehicle(current_turn_text)
         is_non_running = _detect_non_running_vehicle(current_turn_text)
@@ -2639,17 +2659,19 @@ class ConversationEngine:
             logger.info("M21.1.2 inspectability contradiction thread_id=%s", ctx.thread.id)
             return self._send_inspectability_reply(ctx, _INSPECTABILITY_NONRUNNING_CLARIFY)
 
-        # BR-I4: assembled but access-blocked → clarify
+        # BR-I4a: assembled but access-blocked → clarify
         if is_assembled and has_access_barrier:
             logger.info("M21.1.2 inspectability access_barrier thread_id=%s", ctx.thread.id)
             return self._send_inspectability_reply(ctx, _INSPECTABILITY_NONRUNNING_CLARIFY)
 
-        # BR-I3: assembled and accessible (no contradiction, no access barrier) → continue
+        # BR-I3: assembled and accessible (no contradiction, no access barrier) → clear field, continue
         if is_assembled:
+            state.inspectability_clarification_sent = False  # R1-C: reset on positive confirmation
             return None
 
-        # BR-I1: current disassembly (not historical) → boundary
+        # BR-I1: current disassembly (not historical) → boundary, clear field
         if is_disassembled and not is_historical:
+            state.inspectability_clarification_sent = False  # R1-D: clear on disassembled evidence
             logger.info("M21.1.2 inspectability disassembled thread_id=%s", ctx.thread.id)
             return self._send_inspectability_reply(ctx, _INSPECTABILITY_DISASSEMBLED_REPLY)
 
@@ -2657,13 +2679,21 @@ class ConversationEngine:
         if is_disassembled:
             return None
 
-        # BR-I2: non-running only → clarification
+        # R1-B: second unresolved turn → human escalation.
+        # Must precede BR-I2/BR-I4b so repeated non-running escalates instead of re-clarifying.
+        if state.inspectability_clarification_sent:
+            logger.info("M21.1.2 inspectability repeated_unresolved thread_id=%s", ctx.thread.id)
+            return self._escalate_inspectability_to_human(ctx, state)
+
+        # BR-I2: non-running only → first clarification, persist flag
         if is_non_running:
+            state.inspectability_clarification_sent = True  # R1-A: persist first clarification
             logger.info("M21.1.2 inspectability non_running thread_id=%s", ctx.thread.id)
             return self._send_inspectability_reply(ctx, _INSPECTABILITY_NONRUNNING_CLARIFY)
 
-        # BR-I4: access barrier without assembled confirmation → clarify
+        # BR-I4b: access barrier without assembled confirmation → first clarification, persist flag
         if has_access_barrier:
+            state.inspectability_clarification_sent = True  # R1-A: persist first clarification
             logger.info("M21.1.2 inspectability access_barrier_only thread_id=%s", ctx.thread.id)
             return self._send_inspectability_reply(ctx, _INSPECTABILITY_NONRUNNING_CLARIFY)
 
