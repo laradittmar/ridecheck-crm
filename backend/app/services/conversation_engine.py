@@ -430,6 +430,69 @@ _INSPECTABILITY_ACCESS_BARRIER_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r'\bno\s+s[eé]\s+si\s+(nos?|te|le)\s+dejan\b', re.IGNORECASE),
 ]
 
+# ── M21.1.3 Location role inference ──────────────────────────────────────────
+
+_LOCATION_CONTRADICTION_CLARIFICATION = (
+    "¿Dónde está físicamente el auto para hacer la revisión?"
+)
+
+# Explicit vehicle-location clauses. Each pattern has exactly one capture group
+# for the locality text (1–4 words). The 7th pattern captures alternative-location
+# continuations ("o puede ser X") which, combined with uncertainty markers, signals
+# a same-turn contradiction (SC17).
+_VEHICLE_LOCATION_CLAUSE_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(
+        r'\bel\s+(?:auto|veh[ií]culo|coche|m[oó]vil)\s+(?:ahora\s+)?'
+        r'est[aá](?:\s+ubicad[ao])?\s+en\s+((?:\w+\s*){1,4})',
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r'\best[aá]\s+para\s+revisar\s+en\s+((?:\w+\s*){1,4})',
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r'\bla\s+revisi[oó]n\s+ser[ií]a\s+en\s+((?:\w+\s*){1,4})',
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r'\bhay\s+que\s+verlo\s+en\s+((?:\w+\s*){1,4})',
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r'\blo\s+tienen\s+en\s+((?:\w+\s*){1,4})',
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r'\best[aá]\s+ubicad[ao]\s+en\s+((?:\w+\s*){1,4})',
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r'\bo\s+puede\s+(?:ser|estar)\s+(?:en\s+)?((?:\w+\s*){1,3})',
+        re.IGNORECASE,
+    ),
+]
+
+# Customer-origin language. These phrases describe where the CUSTOMER is,
+# not where the vehicle is for inspection (LR-2).
+_CUSTOMER_ORIGIN_RE = re.compile(
+    r'\b(?:soy\s+de|vivo\s+en|estoy\s+en|vengo\s+de|me\s+encuentro\s+en)\b',
+    re.IGNORECASE,
+)
+
+# Uncertainty markers that, combined with two distinct vehicle-location zones,
+# signal a same-turn contradiction (SC17 / LR-8).
+_LOCATION_UNCERTAINTY_RE = re.compile(
+    r'\b(?:o\s+puede\s+(?:ser|estar)|no\s+s[eé]|no\s+estoy\s+segur[ao]|'
+    r'tal\s+vez|quiz[aá]s)\b',
+    re.IGNORECASE,
+)
+
+
+def _has_customer_origin_clause(text: str) -> bool:
+    """True when text contains explicit customer-origin language (LR-2)."""
+    return bool(_CUSTOMER_ORIGIN_RE.search(text))
+
+
 # Persisted intent token (22 chars, fits String(30) in WhatsAppThreadState.last_intent).
 _INTENT_PREPURCHASE = "PREPURCHASE_INSPECTION"
 
@@ -1623,7 +1686,7 @@ class ConversationEngine:
         vehicle_known = (
             pre_detected_vehicle is not None and bool(pre_detected_vehicle.tipo_vehiculo)
         ) or bool(focus and focus.tipo_vehiculo)
-        zone_known = bool(state.home_zone_group)
+        zone_known = bool(state.home_zone_group or (focus and focus.zone_group))
 
         # Priority 2 — vehicle known + concern + zone missing → concern-aware Location Flow.
         # Concern takes precedence over FAQ/soft-close; cannot be suppressed by the FAQ check.
@@ -1773,7 +1836,7 @@ class ConversationEngine:
             pre_detected_vehicle is not None
             and bool(pre_detected_vehicle.tipo_vehiculo)
         ) or bool(focus and focus.tipo_vehiculo)
-        zone_known = bool(state.home_zone_group)
+        zone_known = bool(state.home_zone_group or (focus and focus.zone_group))
 
         # ── Vehicle fallback (takes priority over location) ───────────────
         if not vehicle_known:
@@ -2131,17 +2194,39 @@ class ConversationEngine:
                     ctx, state, pre_detected_vehicle, source_text=all_recent_text
                 )
 
-        # ── Pre-AI zone detection ──────────────────────────────────────────
-        # Look up zone in DB from text so zone_group is deterministic (not
-        # guessed) before the AI runs. Also populates state.home_zone_group.
-        # Also re-run when detail is set but zone_group is still None (zone was
-        # captured by AI but never resolved to a viaticos group).
-        if not state.home_zone_detail or not state.home_zone_group:
-            zone_hit = self._extract_zone_from_text(all_recent_text)
-            if zone_hit:
-                state.home_zone_detail = zone_hit.zone_detail
-                if zone_hit.zone_group:
-                    state.home_zone_group = zone_hit.zone_group
+        # ── M21.1.3: Role-aware zone detection ────────────────────────────
+        # Replaces the stale-zone guard. Uses current-turn text only (not
+        # all_recent_text) to avoid picking up prior-turn zone mentions.
+        # Vehicle-location evidence → candidate only (LR-3, LR-6).
+        # Customer-origin language → no zone mutation (LR-2).
+        # SC17 contradiction → clarification, full early return (LR-8).
+        _vehicle_location_written = False
+        _vlzones = self._extract_vehicle_location_zones(current_turn_text)
+        if len(_vlzones) >= 2 and _LOCATION_UNCERTAINTY_RE.search(current_turn_text):
+            # SC17: same-turn contradiction — clarify, no zone mutation
+            return self._handle_location_contradiction(ctx, state)
+        if _vlzones:
+            # Explicit vehicle-location evidence → write to candidate only (LR-3)
+            _vzone = _vlzones[0]
+            _fc = self._focus_candidate(ctx)
+            if _fc:
+                _fc.zone_group = _vzone.zone_group
+                _fc.zone_detail = _vzone.zone_detail
+            _vehicle_location_written = True
+        elif not _has_customer_origin_clause(current_turn_text):
+            # No vehicle clause, no strong origin signal → bare locality or no info.
+            # Preserve existing detection for thread state (location flow compatibility),
+            # and write to candidate if it lacks zone (SC14: bare locality in context).
+            if not state.home_zone_detail or not state.home_zone_group:
+                _zh = self._extract_zone_from_text(current_turn_text)
+                if _zh:
+                    state.home_zone_detail = _zh.zone_detail
+                    if _zh.zone_group:
+                        state.home_zone_group = _zh.zone_group
+                    _fc2 = self._focus_candidate(ctx)
+                    if _fc2 and not _fc2.zone_group:
+                        _fc2.zone_group = _zh.zone_group
+                        _fc2.zone_detail = _zh.zone_detail
 
         # Normalise zone_group when detail is known but group is still blank.
         self._normalize_zone_from_db(ctx, state)
@@ -2194,7 +2279,9 @@ class ConversationEngine:
 
         # Apply extracted data to thread state
         extracted = decision.get("extracted") or {}
+        _state_zone_before_ai = (state.home_zone_group, state.home_zone_detail)
         self._apply_extracted(ctx, state, extracted)
+        _ai_set_zone = (state.home_zone_group, state.home_zone_detail) != _state_zone_before_ai
 
         # Normalise zone_group again in case AI extracted a zone_detail.
         self._normalize_zone_from_db(ctx, state)
@@ -2237,7 +2324,10 @@ class ConversationEngine:
             )
             lead.flag = "PRESUPUESTANDO"
             state.last_stage = STAGE_QUALIFYING
-        if focus_after:
+        # Sync thread state → candidate only when zone was set THIS turn (by the
+        # pre-AI bare-locality path or by AI extraction). Never copy stale thread
+        # zone that was set in a prior turn (LR-6/LR-7).
+        if focus_after and not _vehicle_location_written and _ai_set_zone:
             if state.home_zone_group and not focus_after.zone_group:
                 focus_after.zone_group = state.home_zone_group
             if state.home_zone_detail and not focus_after.zone_detail:
@@ -2627,6 +2717,42 @@ class ConversationEngine:
         except OutboundBlockedError:
             self.db.commit()
             return _out("inspectability_gate_blocked", detail="escalation_kill_switch")
+
+    def _extract_vehicle_location_zones(self, text: str) -> list:
+        """M21.1.3: Return resolved zones from explicit vehicle-location clauses in text.
+
+        Each pattern in _VEHICLE_LOCATION_CLAUSE_PATTERNS captures a locality
+        substring; that substring is passed to _extract_zone_from_text for DB
+        resolution. Results are deduplicated by zone_detail.
+        """
+        seen: set[str | None] = set()
+        results = []
+        for pattern in _VEHICLE_LOCATION_CLAUSE_PATTERNS:
+            for m in pattern.finditer(text):
+                locality = m.group(1).strip()
+                if not locality:
+                    continue
+                zone = self._extract_zone_from_text(locality)
+                if zone and zone.zone_detail not in seen:
+                    seen.add(zone.zone_detail)
+                    results.append(zone)
+        return results
+
+    def _handle_location_contradiction(
+        self,
+        ctx: "_Context",
+        state: "WhatsAppThreadState",
+    ) -> "ConversationHandleOut":
+        """M21.1.3: SC17 — same-turn contradictory vehicle locations → clarification.
+
+        No candidate zone mutation, no pricing, no scheduling, no Flow dispatch.
+        """
+        try:
+            sent_id = self._send_text_to_wa(ctx, _LOCATION_CONTRADICTION_CLARIFICATION)
+            return _out("replied", wa_message_id=sent_id)
+        except OutboundBlockedError:
+            self.db.commit()
+            return _out("location_contradiction_blocked", detail="outbound_disabled")
 
     def _handle_vehicle_inspectability_gate(
         self,
@@ -3776,14 +3902,17 @@ Respondé SOLO con JSON válido:
         source_text: str = "",
     ) -> None:
         anio = _extract_year_from_text(source_text) if source_text else None
+        # M21.1.3 LR-7: do not inherit stale thread zone — candidate starts empty.
+        # Vehicle-location evidence from the current turn is written to the candidate
+        # by the role-aware zone detection block that follows this call in _process_text.
         candidate = WhatsAppThreadCandidate(
             thread_id=ctx.thread.id,
             marca=match.marca,
             modelo=match.modelo,
             tipo_vehiculo=match.tipo_vehiculo,
             anio=anio,
-            zone_group=state.home_zone_group if state else None,
-            zone_detail=state.home_zone_detail if state else None,
+            zone_group=None,
+            zone_detail=None,
             status="current_focus",
         )
         self.db.add(candidate)
@@ -3974,16 +4103,18 @@ Respondé SOLO con JSON válido:
         focus = self._focus_candidate(ctx)
         if not focus or not focus.tipo_vehiculo:
             return None
-        if not (state.home_zone_group or state.home_zone_detail):
+        # M21.1.3 LR-1: candidate zone is authoritative; thread state is fallback only.
+        zone_group = (focus.zone_group or "") or (state.home_zone_group or "")
+        zone_detail = (focus.zone_detail or "") or (state.home_zone_detail or "")
+        if not (zone_group or zone_detail):
             return None
         try:
             q = self._pricing.quote(
                 db=self.db,
                 tipo_vehiculo=focus.tipo_vehiculo,
-                zone_group=state.home_zone_group or "",
-                zone_detail=state.home_zone_detail or "",
+                zone_group=zone_group,
+                zone_detail=zone_detail,
             )
-            # Back-fill zone_group on state if the pricing lookup resolved it.
             if not state.home_zone_group and q.zone_group:
                 state.home_zone_group = q.zone_group
             return q

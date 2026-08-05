@@ -8,7 +8,8 @@ HANDLED_ACTIONS = frozenset({
     "skipped_human", "skipped_dedup",
     "human_handoff_blocked",        # M21.1.1: motorcycle/phone-call under kill switch
     "service_gate_blocked",         # M21.1.1: F12/transfer/repair/uncertain/FAQ under kill switch
-    "inspectability_gate_blocked",  # M21.1.2: vehicle inspectability gate under kill switch
+    "inspectability_gate_blocked",   # M21.1.2: vehicle inspectability gate under kill switch
+    "location_contradiction_blocked", # M21.1.3: SC17 contradiction under kill switch
 })
 
 
