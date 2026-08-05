@@ -2680,7 +2680,7 @@ class ConversationEngine:
             return None
 
         # R1-B: second unresolved turn → human escalation.
-        # Must precede BR-I2/BR-I4b so repeated non-running escalates instead of re-clarifying.
+        # Checked before non-running/access-barrier so repetition escalates instead of re-clarifying.
         if state.inspectability_clarification_sent:
             logger.info("M21.1.2 inspectability repeated_unresolved thread_id=%s", ctx.thread.id)
             return self._escalate_inspectability_to_human(ctx, state)
