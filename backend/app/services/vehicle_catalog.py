@@ -13,6 +13,7 @@ import json
 import re
 import unicodedata
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from pathlib import Path
 
 
@@ -89,6 +90,135 @@ _KEY_RE: dict[str, re.Pattern] = {
     k: re.compile(r"(?:^|\s)" + re.escape(k) + r"(?:\s|$)")
     for k in _SORTED_KEYS
 }
+
+
+@dataclass(frozen=True)
+class FuzzyLookupResult:
+    """Result of fuzzy_lookup_vehicle()."""
+    outcome: str          # "AUTO_ACCEPT" | "CONFIRM" | "UNRESOLVED"
+    hit: VehicleMatch | None
+    score: float
+    second_hit: VehicleMatch | None
+    second_score: float
+    gap: float
+    make_constrained: bool
+
+
+# ── Fuzzy lookup constants ─────────────────────────────────────────────────────
+_HIGH_THRESHOLD: float = 0.87
+_MEDIUM_THRESHOLD: float = 0.70
+_GAP_THRESHOLD: float = 0.15
+
+# Sorted longest-first so multi-word brands ("alfa romeo") beat shorter ones.
+_BRAND_NORMS: list[tuple[str, str]] = sorted(
+    [
+        (_norm(entry["marca"]), entry["marca"])
+        for entry in _CAT.values()
+        if entry.get("marca")
+    ],
+    key=lambda x: len(x[0]),
+    reverse=True,
+)
+# Deduplicate while preserving order.
+_seen_brands: set[str] = set()
+_BRAND_NORMS_DEDUP: list[tuple[str, str]] = []
+for _nb, _ob in _BRAND_NORMS:
+    if _nb not in _seen_brands:
+        _seen_brands.add(_nb)
+        _BRAND_NORMS_DEDUP.append((_nb, _ob))
+_BRAND_NORMS = _BRAND_NORMS_DEDUP
+del _seen_brands, _BRAND_NORMS_DEDUP, _nb, _ob
+
+# Pre-build a mapping from normalized(brand + model) → catalog entry for O(1) lookup.
+_FULL_FORM_TO_ENTRY: dict[str, dict] = {}
+_FULL_FORM_ORDER: list[str] = []
+for _key in _SORTED_KEYS:
+    _entry = _CAT[_key]
+    _nfull = _norm(f"{_entry['marca']} {_entry['modelo']}")
+    if _nfull not in _FULL_FORM_TO_ENTRY:
+        _FULL_FORM_TO_ENTRY[_nfull] = _entry
+        _FULL_FORM_ORDER.append(_nfull)
+del _key, _entry, _nfull
+
+
+def _detect_make(normalized_text: str) -> tuple[str | None, bool]:
+    """Return (original_brand, constrained) if exactly one known brand is found."""
+    matches: list[str] = []
+    for nbrand, brand in _BRAND_NORMS:
+        pattern = r"(?:^|\s)" + re.escape(nbrand) + r"(?:\s|$)"
+        if re.search(pattern, normalized_text):
+            matches.append(brand)
+    if len(matches) == 1:
+        return matches[0], True
+    return None, False
+
+
+def _entry_to_match(entry: dict) -> VehicleMatch:
+    return VehicleMatch(
+        marca=entry["marca"],
+        modelo=entry["modelo"],
+        tipo_vehiculo=entry.get("t", ""),
+        confidence="high",
+        matched_alias=_norm(f"{entry['marca']} {entry['modelo']}"),
+        recognition_only=entry.get("recognition_only", False),
+    )
+
+
+def fuzzy_lookup_vehicle(text: str) -> FuzzyLookupResult:
+    """Conservative fuzzy vehicle lookup using SequenceMatcher.
+
+    Exact lookup (lookup_vehicle) must always be called first (VN-1).
+    Call this function only on exact miss (VN-2).
+    Uses current-turn text only (VN-3).
+
+    Returns FuzzyLookupResult with outcome AUTO_ACCEPT | CONFIRM | UNRESOLVED.
+    """
+    _unresolved = FuzzyLookupResult("UNRESOLVED", None, 0.0, None, 0.0, 0.0, False)
+
+    n = _norm(text)
+    if not n:
+        return _unresolved
+
+    # Short-token protection (VN-10): 1-2 char inputs are always UNRESOLVED.
+    if len(n) <= 2:
+        return _unresolved
+
+    detected_make, make_constrained = _detect_make(n)
+
+    # Build candidate forms, optionally filtered by make.
+    candidates: list[tuple[str, dict]] = []
+    for nfull, entry in _FULL_FORM_TO_ENTRY.items():
+        if make_constrained and entry["marca"] != detected_make:
+            continue
+        candidates.append((nfull, entry))
+
+    if not candidates:
+        return FuzzyLookupResult("UNRESOLVED", None, 0.0, None, 0.0, 0.0, make_constrained)
+
+    # Score all candidate forms.
+    scored = sorted(
+        [(SequenceMatcher(None, n, form).ratio(), form, entry)
+         for form, entry in candidates],
+        key=lambda x: x[0],
+        reverse=True,
+    )
+
+    s1, _f1, entry1 = scored[0]
+    s2, _f2, entry2 = scored[1] if len(scored) > 1 else (0.0, "", {})
+    gap = s1 - s2
+
+    if s1 < _MEDIUM_THRESHOLD:
+        return FuzzyLookupResult("UNRESOLVED", None, s1, None, s2, gap, make_constrained)
+
+    hit = _entry_to_match(entry1)
+    second_hit = _entry_to_match(entry2) if entry2 else None
+
+    if s1 >= _HIGH_THRESHOLD and gap >= _GAP_THRESHOLD:
+        outcome = "AUTO_ACCEPT"
+    else:
+        outcome = "CONFIRM"
+
+    return FuzzyLookupResult(outcome, hit, s1, second_hit, s2, gap, make_constrained)
 
 
 def lookup_vehicle(text: str) -> VehicleMatch | None:

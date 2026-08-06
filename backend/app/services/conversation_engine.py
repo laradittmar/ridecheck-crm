@@ -57,7 +57,9 @@ from ..schemas.schedule import ScheduleCheckIn
 from ..services.pricing import PricingNotFoundError, PricingQuote, PricingService
 from ..services.schedule import ScheduleService
 from ..services.unanswered_alert import reset_unanswered_alert
-from ..services.vehicle_catalog import VehicleMatch, lookup_vehicle
+from ..services.vehicle_catalog import (
+    VehicleMatch, lookup_vehicle, fuzzy_lookup_vehicle, FuzzyLookupResult,
+)
 from ..services.outbound_guard import OutboundBlockedError
 from ..services.outbound_safety_gate import GateOutcome, OutboundSafetyGate
 from ..settings import Settings
@@ -491,6 +493,24 @@ _LOCATION_UNCERTAINTY_RE = re.compile(
 def _has_customer_origin_clause(text: str) -> bool:
     """True when text contains explicit customer-origin language (LR-2)."""
     return bool(_CUSTOMER_ORIGIN_RE.search(text))
+
+
+# ── M21.1.4: ASR fuzzy vehicle confirmation ───────────────────────────────────
+_FUZZY_CONFIRMATION_TEMPLATE = "¿Es un {marca} {modelo}?"
+
+_FUZZY_ACCEPTANCE_RE = re.compile(
+    r'\b(?:s[íi]|s[íi]\s+es|exacto|correcto|eso\s+es|es\s+ese|efectivamente|'
+    r'confirm[oa]|dale|ok)\b',
+    re.IGNORECASE,
+)
+_FUZZY_REJECTION_RE = re.compile(
+    r'\b(?:no(?:\s+es|\s+era|\s+ese)?|nada\s+que\s+ver|incorrecto|equivocado)\b',
+    re.IGNORECASE,
+)
+_FUZZY_ASK_VEHICLE_REPLY = (
+    "Para cotizarte la revisión necesito saber qué vehículo tenés. "
+    "¿Me podés indicar la marca y el modelo?"
+)
 
 
 # Persisted intent token (22 chars, fits String(30) in WhatsAppThreadState.last_intent).
@@ -2166,18 +2186,51 @@ class ConversationEngine:
                 # Day only (or day + period like "mañana a la tarde") — list available slots.
                 return self._handle_day_only_request(ctx, state, sched_day_iso, period=period)
 
-        # ── M21.1.1 Layer F: QUALIFYING intent gate (QUALIFYING/None only) ──
-        # F12/transfer/repair handled by all-stage Layer C above.
-        # FAQ bypass handled by all-stage Layer D above.
-        # This gate covers: pre-purchase signal, persisted intent, UNCERTAIN.
-        if state.last_stage in (STAGE_QUALIFYING, None) and not state.needs_human:
-            _intent_out = self._handle_qualifying_intent(ctx, state, current_turn_text)
-            if _intent_out is not None:
-                return _intent_out
+        # ── M21.1.4: Pending fuzzy confirmation handler ───────────────────
+        # Intercepts the turn when a CONFIRM vehicle proposal is outstanding.
+        # Must run after all higher-priority gates (motorcycle, inspectability,
+        # scheduling) so those gates always win. Must run before vehicle detection
+        # so an exact current-turn vehicle can clear the pending proposal.
+        if getattr(state, "pending_fuzzy_catalog_key", None) and not state.needs_human:
+            _exact_now = lookup_vehicle(current_turn_text)
+            if _exact_now:
+                # User supplied an exact vehicle — clear pending, fall through
+                state.pending_fuzzy_catalog_key = None
+            elif _FUZZY_ACCEPTANCE_RE.search(current_turn_text):
+                # User confirmed — create candidate from stored key
+                _pending_match = self._resolve_fuzzy_key(state.pending_fuzzy_catalog_key)
+                state.pending_fuzzy_catalog_key = None
+                if _pending_match and not ctx.candidates:
+                    self._create_candidate_from_catalog(
+                        ctx, state, _pending_match, source_text=current_turn_text
+                    )
+                # continue normal qualification — fall through
+            elif _FUZZY_REJECTION_RE.search(current_turn_text):
+                # User rejected — clear proposal, ask for make/model
+                state.pending_fuzzy_catalog_key = None
+                self.db.commit()
+                try:
+                    sent_id = self._send_text_to_wa(ctx, _FUZZY_ASK_VEHICLE_REPLY)
+                    return _out("replied", wa_message_id=sent_id)
+                except OutboundBlockedError:
+                    return _out("vehicle_fuzzy_blocked", detail="outbound_disabled")
+            else:
+                # Ambiguous follow-up — re-ask the same confirmation question
+                _parts = state.pending_fuzzy_catalog_key.split("||", 1)
+                _pq = _FUZZY_CONFIRMATION_TEMPLATE.format(
+                    marca=_parts[0], modelo=_parts[1] if len(_parts) > 1 else "",
+                )
+                try:
+                    sent_id = self._send_text_to_wa(ctx, _pq)
+                    return _out("replied", wa_message_id=sent_id)
+                except OutboundBlockedError:
+                    return _out("vehicle_fuzzy_blocked", detail="outbound_disabled")
 
         # ── Deterministic vehicle catalog lookup (pre-AI) ─────────────────
         # Search across all recent messages (not just current burst) so a
         # vehicle name from a prior turn is still recognised.
+        # Runs BEFORE the Layer F intent gate so that vehicle evidence (exact
+        # or fuzzy AUTO_ACCEPT) can set last_intent and let the gate pass.
         all_recent_text = " ".join(
             list(event.recent_user_messages or []) + list(ai_input_messages)
         )
@@ -2188,11 +2241,57 @@ class ConversationEngine:
                 ctx.thread.id, pre_detected_vehicle.matched_alias,
                 pre_detected_vehicle.tipo_vehiculo, pre_detected_vehicle.confidence,
             )
+            # Exact match clears any stale fuzzy pending proposal (VN-1, req 6).
+            if getattr(state, "pending_fuzzy_catalog_key", None):
+                state.pending_fuzzy_catalog_key = None
             # Proactively create a candidate when catalog fires but none exists yet.
             if not ctx.candidates:
                 self._create_candidate_from_catalog(
                     ctx, state, pre_detected_vehicle, source_text=all_recent_text
                 )
+        else:
+            # ── M21.1.4: Fuzzy lookup on exact miss (VN-2, VN-3) ─────────
+            # Only when: no exact match, no needs_human, no pending proposal,
+            # and no existing focused candidate to protect (VN-13).
+            _pending = getattr(state, "pending_fuzzy_catalog_key", None)
+            if not _pending and not state.needs_human and not ctx.candidates:
+                _fuzzy = fuzzy_lookup_vehicle(current_turn_text)
+                if _fuzzy.outcome == "AUTO_ACCEPT":
+                    logger.info(
+                        "M21.1.4 fuzzy AUTO_ACCEPT thread_id=%s hit=%s score=%.3f gap=%.3f",
+                        ctx.thread.id,
+                        f"{_fuzzy.hit.marca} {_fuzzy.hit.modelo}" if _fuzzy.hit else "?",
+                        _fuzzy.score, _fuzzy.gap,
+                    )
+                    # Set intent so Layer F gate passes (check 7).
+                    state.last_intent = _INTENT_PREPURCHASE
+                    self._create_candidate_from_catalog(
+                        ctx, state, _fuzzy.hit, source_text=current_turn_text
+                    )
+                    pre_detected_vehicle = _fuzzy.hit
+                elif _fuzzy.outcome == "CONFIRM":
+                    # On established PREPURCHASE conversations the AI has full context
+                    # and can handle vehicle clarification. Only interrupt with a
+                    # confirmation question on fresh/unestablished threads (VN-3).
+                    if state.last_intent != _INTENT_PREPURCHASE:
+                        logger.info(
+                            "M21.1.4 fuzzy CONFIRM thread_id=%s hit=%s score=%.3f gap=%.3f",
+                            ctx.thread.id,
+                            f"{_fuzzy.hit.marca} {_fuzzy.hit.modelo}" if _fuzzy.hit else "?",
+                            _fuzzy.score, _fuzzy.gap,
+                        )
+                        return self._handle_fuzzy_confirm(ctx, state, _fuzzy)
+                    # fall through to AI when intent already established
+                # UNRESOLVED: fall through to existing unknown-vehicle path
+
+        # ── M21.1.1 Layer F: QUALIFYING intent gate (QUALIFYING/None only) ──
+        # F12/transfer/repair handled by all-stage Layer C above.
+        # FAQ bypass handled by all-stage Layer D above.
+        # This gate covers: pre-purchase signal, persisted intent, UNCERTAIN.
+        if state.last_stage in (STAGE_QUALIFYING, None) and not state.needs_human:
+            _intent_out = self._handle_qualifying_intent(ctx, state, current_turn_text)
+            if _intent_out is not None:
+                return _intent_out
 
         # ── M21.1.3: Role-aware zone detection ────────────────────────────
         # Replaces the stale-zone guard. Uses current-turn text only (not
@@ -2753,6 +2852,48 @@ class ConversationEngine:
         except OutboundBlockedError:
             self.db.commit()
             return _out("location_contradiction_blocked", detail="outbound_disabled")
+
+    # ── M21.1.4: ASR fuzzy confirmation ───────────────────────────────────────
+
+    def _resolve_fuzzy_key(self, key: str) -> "VehicleMatch | None":
+        """Resolve 'Marca||Modelo' back to a VehicleMatch from the live catalog.
+
+        Returns None when the key does not map to a known catalog entry.
+        """
+        if not key or "||" not in key:
+            return None
+        marca, modelo = key.split("||", 1)
+        from ..services.vehicle_catalog import _FULL_FORM_TO_ENTRY, _norm, _entry_to_match
+        nfull = _norm(f"{marca} {modelo}")
+        entry = _FULL_FORM_TO_ENTRY.get(nfull)
+        if entry:
+            return _entry_to_match(entry)
+        return None
+
+    def _handle_fuzzy_confirm(
+        self,
+        ctx: "_Context",
+        state: "WhatsAppThreadState",
+        result: "FuzzyLookupResult",
+    ) -> "ConversationHandleOut":
+        """M21.1.4: CONFIRM outcome — store pending key, send confirmation question.
+
+        No candidate created, no pricing, no scheduling, no Flow (VN-12).
+        Kill-switch: returns vehicle_fuzzy_blocked when outbound is disabled (VN-14).
+        """
+        if result.hit is None:
+            return _out("replied", wa_message_id=None)
+        question = _FUZZY_CONFIRMATION_TEMPLATE.format(
+            marca=result.hit.marca, modelo=result.hit.modelo,
+        )
+        try:
+            sent_id = self._send_text_to_wa(ctx, question)
+        except OutboundBlockedError:
+            self.db.commit()
+            return _out("vehicle_fuzzy_blocked", detail="outbound_disabled")
+        state.pending_fuzzy_catalog_key = f"{result.hit.marca}||{result.hit.modelo}"
+        self.db.commit()
+        return _out("replied", wa_message_id=sent_id)
 
     def _handle_vehicle_inspectability_gate(
         self,

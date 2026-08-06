@@ -302,12 +302,16 @@ class TestBR1Row5BareVehicle(unittest.TestCase):
         eng, result, state = _run("Ford Ranger 2020", lookup_vehicle_return=_mock_v)
         _assert_continue_set(self, eng, result, state)
 
-    def test_row5_no_catalog_hit_uncertain(self):
-        """Without a catalog hit, bare text has no detectable signal → UNCERTAIN.
-        Known gap: bare location/vehicle names without catalog match cannot be
-        classified by Layer F alone. See docs/BR1_intent_gate.md §4 Row 6 note."""
+    def test_row5_no_catalog_hit_fuzzy_confirm(self):
+        """M21.1.4 closes the known gap: on exact miss, fuzzy normalization fires
+        BEFORE Layer F, returning CONFIRM ("¿Es un Ford Ranger?") rather than the
+        former UNCERTAIN. AI is not called; a confirmation question is sent.
+        (Previously 'test_row5_no_catalog_hit_uncertain'; gap closed 2026-08-06.)"""
         eng, result, state = _run("Ford Ranger 2020", lookup_vehicle_return=None)
-        _assert_uncertain(self, eng, result)
+        self.assertEqual(result.action, "replied")
+        self.assertIn(result.action, HANDLED_ACTIONS)
+        self.assertEqual(eng._call_openai.call_count, 0, "fuzzy CONFIRM must not call AI")
+        self.assertEqual(eng._send_text_to_wa.call_args[0][1], "¿Es un Ford Ranger?")
 
 
 # ── Row 6: Bare location ─────────────────────────────────────────────────────
