@@ -192,10 +192,12 @@ def _make_engine(send_raises=False, ai_response=None) -> ConversationEngine:
 
 
 def _run(text=None, unanswered=None, stage=STAGE_QUALIFYING, needs_human=False,
-         last_intent=None, send_raises=False, ai_response=None, lead_kwargs=None):
+         last_intent=None, send_raises=False, ai_response=None, lead_kwargs=None,
+         state_kwargs=None):
     """Run _process_text with mocked engine. Returns (eng, result, state, lead)."""
     eng = _make_engine(send_raises=send_raises, ai_response=ai_response)
-    state = _make_state(last_stage=stage, needs_human=needs_human, last_intent=last_intent)
+    state = _make_state(last_stage=stage, needs_human=needs_human, last_intent=last_intent,
+                        **(state_kwargs or {}))
     lead = _make_lead(**(lead_kwargs or {}))
     ctx = _make_ctx(state=state, lead=lead)
     event = _make_event(text=text, unanswered=unanswered)
@@ -929,10 +931,12 @@ class TestHistoricalContext(unittest.TestCase):
         self.assertEqual(state.last_intent, _INTENT_PREPURCHASE)
 
     def test_si_h3_confirmed_intent_turn2_no_reclassification(self):
-        """SI-H3: Turn 1 confirms PREPURCHASE. Turn 2: 'Ford Ka 2019' → fast-path; AI called; no re-ask."""
+        """SI-H3: Turn 1 confirms PREPURCHASE. Turn 2: 'Ford Ka 2019' → fast-path; AI called; no re-ask.
+        current_focus_candidate_id=1 models the candidate created in Turn 1 (M21.1.4-FV guard fix)."""
         eng, result, state, _ = _run(
             text="Ford Ka 2019",
             last_intent=_INTENT_PREPURCHASE,
+            state_kwargs={"current_focus_candidate_id": 1},
         )
         _assert_handled(self, result, "replied")
         # UNCERTAIN reply must NOT be sent
@@ -1069,10 +1073,12 @@ class TestPersistedIntentOverride(unittest.TestCase):
         self.assertEqual(eng._call_openai.call_count, 0)
 
     def test_si_pi4_confirmed_intent_ford_ka_commercial_steps(self):
-        """SI-PI4: last_intent=PREPURCHASE + 'Ford Ka 2019' → Step 6 fast-path; AI called."""
+        """SI-PI4: last_intent=PREPURCHASE + 'Ford Ka 2019' → Step 6 fast-path; AI called.
+        current_focus_candidate_id=1 models the candidate from the prior qualifying turn (M21.1.4-FV guard fix)."""
         eng, result, state, _ = _run(
             text="Ford Ka 2019",
             last_intent=_INTENT_PREPURCHASE,
+            state_kwargs={"current_focus_candidate_id": 1},
         )
         _assert_handled(self, result, "replied")
         if eng._send_text_to_wa.called:

@@ -713,5 +713,81 @@ class TestExactLookupAlwaysWins(unittest.TestCase):
             fuzz_mock.assert_not_called()
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase 4 — Established-intent guard validation (M21.1.4-FV)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_INTENT_PREPURCHASE = "PREPURCHASE_INSPECTION"
+
+
+class TestEstablishedIntentGuard(unittest.TestCase):
+    """E1–E3: validate that the CONFIRM guard protects candidate context, not all
+    PREPURCHASE threads.  The guard was narrowed in M21.1.4-FV from
+    'last_intent != PREPURCHASE' to 'has existing candidate context'.
+    """
+
+    def test_e1_prepurchase_no_candidate_ford_ksl_confirms(self):
+        """E1: last_intent=PREPURCHASE_INSPECTION, no focused candidate, 'ford ksl'.
+        Expected: CONFIRM fired; '¿Es un Ford Ka?' sent; pending key set; no candidate."""
+        eng = _make_engine()
+        state = _make_state(
+            last_intent=_INTENT_PREPURCHASE,
+            current_focus_candidate_id=None,  # no prior candidate
+        )
+        ctx = _make_ctx(state=state, candidates=[])
+        event = _make_event("ford ksl")
+        with patch("app.services.conversation_engine.lookup_vehicle", return_value=None):
+            result = eng._process_text(ctx, event)
+        self.assertEqual(result.action, "replied")
+        self.assertIn(result.action, HANDLED_ACTIONS)
+        self.assertEqual(eng._call_openai.call_count, 0, "E1: fuzzy CONFIRM must not call AI")
+        self.assertEqual(
+            eng._send_text_to_wa.call_args[0][1], "¿Es un Ford Ka?",
+            "E1: must send exact CONFIRM question",
+        )
+        self.assertEqual(state.pending_fuzzy_catalog_key, "Ford||Ka", "E1: pending key must be set")
+        self.assertEqual(ctx.candidates, [], "E1: no candidate created before confirmation")
+
+    def test_e2_prepurchase_focused_candidate_fuzzy_blocked(self):
+        """E2: last_intent=PREPURCHASE_INSPECTION, focused candidate exists, unrelated text.
+        Expected: existing candidate unchanged; VN-13 blocks fuzzy; AI handles turn."""
+        cand = _make_candidate(marca="Ford", modelo="Ka", anio=2019)
+        eng = _make_engine()
+        state = _make_state(
+            last_intent=_INTENT_PREPURCHASE,
+            current_focus_candidate_id=cand.id,
+        )
+        ctx = _make_ctx(state=state, candidates=[cand])
+        event = _make_event("algo raro qsx plm")
+        with (
+            patch("app.services.conversation_engine.lookup_vehicle", return_value=None),
+            patch("app.services.conversation_engine.fuzzy_lookup_vehicle") as fuzz_mock,
+        ):
+            eng._process_text(ctx, event)
+        fuzz_mock.assert_not_called()  # VN-13: fuzzy blocked when candidate exists
+        self.assertIsNone(state.pending_fuzzy_catalog_key)
+
+    def test_e3_prepurchase_focused_candidate_explicit_correction_no_fuzzy(self):
+        """E3: last_intent=PREPURCHASE_INSPECTION, focused candidate, explicit correction text.
+        Expected: fuzzy must not silently replace the candidate (VN-13 blocks fuzzy)."""
+        cand = _make_candidate(marca="Ford", modelo="Ka", anio=2019)
+        eng = _make_engine()
+        state = _make_state(
+            last_intent=_INTENT_PREPURCHASE,
+            current_focus_candidate_id=cand.id,
+        )
+        ctx = _make_ctx(state=state, candidates=[cand])
+        event = _make_event("No, en realidad es un Ford Kuga")
+        with (
+            patch("app.services.conversation_engine.lookup_vehicle", return_value=None),
+            patch("app.services.conversation_engine.fuzzy_lookup_vehicle") as fuzz_mock,
+        ):
+            eng._process_text(ctx, event)
+        fuzz_mock.assert_not_called()  # VN-13: candidates present → fuzzy never runs
+        # Candidate itself must not have been silently overwritten by fuzzy
+        self.assertEqual(ctx.candidates[0].marca, "Ford")
+        self.assertEqual(ctx.candidates[0].modelo, "Ka")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

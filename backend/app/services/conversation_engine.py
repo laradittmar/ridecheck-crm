@@ -2270,10 +2270,16 @@ class ConversationEngine:
                     )
                     pre_detected_vehicle = _fuzzy.hit
                 elif _fuzzy.outcome == "CONFIRM":
-                    # On established PREPURCHASE conversations the AI has full context
-                    # and can handle vehicle clarification. Only interrupt with a
-                    # confirmation question on fresh/unestablished threads (VN-3).
-                    if state.last_intent != _INTENT_PREPURCHASE:
+                    # Fire CONFIRM only when there is no existing focused candidate to
+                    # protect. An established thread has either a candidate in ctx.candidates
+                    # or a non-None current_focus_candidate_id set by a prior turn.
+                    # Threads that carry last_intent but have no candidate yet (e.g. a
+                    # PREPURCHASE thread whose vehicle was garbled by ASR before any
+                    # candidate was created) should still receive the confirmation question.
+                    _has_candidate_ctx = bool(ctx.candidates) or bool(
+                        getattr(state, "current_focus_candidate_id", None)
+                    )
+                    if not _has_candidate_ctx:
                         logger.info(
                             "M21.1.4 fuzzy CONFIRM thread_id=%s hit=%s score=%.3f gap=%.3f",
                             ctx.thread.id,
@@ -2281,7 +2287,7 @@ class ConversationEngine:
                             _fuzzy.score, _fuzzy.gap,
                         )
                         return self._handle_fuzzy_confirm(ctx, state, _fuzzy)
-                    # fall through to AI when intent already established
+                    # fall through to AI when established candidate context exists
                 # UNRESOLVED: fall through to existing unknown-vehicle path
 
         # ── M21.1.1 Layer F: QUALIFYING intent gate (QUALIFYING/None only) ──
