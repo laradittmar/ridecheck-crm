@@ -60,7 +60,18 @@ from ..services.unanswered_alert import reset_unanswered_alert
 from ..services.vehicle_catalog import (
     VehicleMatch, lookup_vehicle, fuzzy_lookup_vehicle, FuzzyLookupResult,
 )
-from ..services.field_evidence import resolve_field_evidence
+from ..services.field_evidence import (
+    resolve_field_evidence,
+    INSP_ASSEMBLED_ACCESSIBLE,
+    INSP_DISASSEMBLED_BLOCKED,
+    INSP_UNRESOLVED_NON_RUNNING,
+)
+from ..services.narrative_schema import (
+    DEFERRED_RESPONSE_ES,
+    NarrativeInterpretation,
+    parse_narrative_interpretation,
+    narrative_needs_ai,
+)
 from ..services.outbound_guard import OutboundBlockedError
 from ..services.outbound_safety_gate import GateOutcome, OutboundSafetyGate
 from ..settings import Settings
@@ -2369,15 +2380,23 @@ class ConversationEngine:
         if _is_phone_call_request(ai_input_messages):
             return self._handle_phone_call_escalation(ctx, state)
 
+        # M21.1.6: determine whether narrative AI adds value for this turn (NU-14)
+        _snap_pre = resolve_field_evidence(ctx, state)
+        _use_narrative = narrative_needs_ai(_snap_pre, current_turn_text)
+        _narr: NarrativeInterpretation | None = None
+
         messages_for_ai = self._build_ai_messages(
             ctx, event, ai_input_messages,
             pre_detected_vehicle=pre_detected_vehicle,
             real_price_quote=real_price_quote,
+            include_narrative=_use_narrative,
         )
 
         try:
             ai_raw = self._call_openai(messages_for_ai)
             decision = json.loads(ai_raw)
+            if _use_narrative:
+                _narr = parse_narrative_interpretation(decision)
         except Exception as exc:
             logger.warning("M18 AI call failed thread_id=%s: %s", ctx.thread.id, exc)
             decision = {
@@ -2388,6 +2407,11 @@ class ConversationEngine:
                 "extracted": {},
                 "candidate": {"action": "none"},
             }
+
+        # M21.1.6 deferred-interest intercept (NU-6, NU-7): must run before any
+        # commercial mutation. Only fires when no active vehicle overrides deferred signal.
+        if _narr is not None and _narr.is_effectively_deferred():
+            return self._handle_deferred_interest(ctx, state), True
 
         # Apply extracted data to thread state
         extracted = decision.get("extracted") or {}
@@ -2415,6 +2439,11 @@ class ConversationEngine:
         # not already filled (AI may have added year / version details).
         if pre_detected_vehicle:
             self._enforce_catalog_vehicle(ctx, pre_detected_vehicle)
+
+        # M21.1.6 — apply validated narrative facts (NU-9: deterministic gates remain
+        # authoritative; narrative only updates state when evidence is active/confirmed).
+        if _narr is not None:
+            self._apply_narrative_interpretation(ctx, state, _narr)
 
         # Sync state zone onto focus candidate when candidate fields are blank.
         focus_after = self._focus_candidate(ctx)
@@ -3719,6 +3748,7 @@ class ConversationEngine:
         ai_input_messages: list[str],
         pre_detected_vehicle: VehicleMatch | None = None,
         real_price_quote: "PricingQuote | None" = None,
+        include_narrative: bool = False,
     ) -> list[dict]:
         lead = ctx.lead
         assert lead is not None
@@ -3760,6 +3790,37 @@ class ConversationEngine:
             rafaga_note = f"(el cliente envió {len(ai_input_messages)} mensajes seguidos — respondé a todos juntos)"
         else:
             rafaga_note = ""
+
+        # Narrative interpretation block (NU-14: only included when narrative AI adds value)
+        narrative_block = ""
+        narrative_json_fields = ""
+        if include_narrative:
+            narrative_block = """
+
+INTERPRETACIÓN NARRATIVA — completá estos campos en el JSON:
+Interpretá el significado del MENSAJE COMPLETO, no palabras sueltas. Distinguí hechos actuales de históricos, hipotéticos o corregidos.
+
+- "deferred_interest": true SOLO si el mensaje en su conjunto significa "todavía estoy buscando / no estoy listo / ya les aviso" Y no hay ningún vehículo concreto en la consulta actual.
+- "vehicle_make_model": {"value": "Marca Modelo", "status": "CONFIRMED|LIKELY|UNCERTAIN|SUPERSEDED|HISTORICAL|HYPOTHETICAL|ABSENT"} — vehículo ACTUAL. Si fue corregido ("no, es un..."), usá el corregido como CONFIRMED y el previo como SUPERSEDED.
+- "vehicle_year": {"value": 2019, "status": "CONFIRMED|UNCERTAIN|..."} — año del vehículo actual.
+- "vehicle_location": {"value": "Palermo", "status": "CONFIRMED|..."} — dónde ESTÁ el auto (no dónde vive el cliente).
+- "customer_origin": {"value": "La Plata", "status": "CONFIRMED|..."} — dónde vive el CLIENTE (diferente de vehicle_location).
+- "inspectability": {"value": "ASSEMBLED_ACCESSIBLE|DISASSEMBLED_BLOCKED|UNRESOLVED_NON_RUNNING", "status": "CONFIRMED|HYPOTHETICAL|..."} — estado físico para la revisión. Solo CONFIRMED si el cliente lo afirma explícitamente. HYPOTHETICAL para preguntas hipotéticas.
+- "asks_price": true si pregunta por precio/cotización.
+- "asks_faq": true si pregunta cómo funciona el servicio.
+- "asks_schedule": true si quiere coordinar fecha/horario.
+
+Ejemplos: "Hola estoy buscando un auto, agendé esto para cuando decida" → deferred_interest: true | "Pensaba comprar un Focus pero al final es un Corolla 2020" → vehicle_make_model: {value: "Toyota Corolla", status: "CONFIRMED"} | "vivo en La Plata pero el auto está en Palermo" → customer_origin: {value: "La Plata"}, vehicle_location: {value: "Palermo"} | "Es un Ford Ka... no, perdón, es un Ford Kuga" → vehicle_make_model: {value: "Ford Kuga", status: "CONFIRMED"}"""
+            narrative_json_fields = """
+  "deferred_interest": false,
+  "vehicle_make_model": null,
+  "vehicle_year": null,
+  "vehicle_location": null,
+  "customer_origin": null,
+  "inspectability": null,
+  "asks_price": false,
+  "asks_faq": false,
+  "asks_schedule": false,"""
 
         # Pre-detected vehicle block (injected when catalog matched)
         detected_vehicle_block = ""
@@ -3807,14 +3868,14 @@ REGLAS DE NEGOCIO:
 15. La revisión suele durar aproximadamente una hora.
 16. Cuanto antes nos avise el cliente, mejor. Coordinamos según la disponibilidad de agenda.
 
-TIPOS DE VEHÍCULO VÁLIDOS: AUTO, SUV_4X4_DEPORTIVO, SUV/4x4, CLASICO, MOTO, ESCANEO_MOTOR
+TIPOS DE VEHÍCULO VÁLIDOS: AUTO, SUV_4X4_DEPORTIVO, SUV/4x4, CLASICO, MOTO, ESCANEO_MOTOR{narrative_block}
 
 Respondé SOLO con JSON válido:
 {{
   "intent": "GREETING|QUALIFYING|QUOTE_SENT|ACCEPTANCE|SCHEDULING|OBJECTION|ESCALATE|OTHER",
   "reply": "texto en español",
   "lead_flag": null,
-  "needs_human": false,
+  "needs_human": false,{narrative_json_fields}
   "extracted": {{
     "customer_name": null,
     "zone_detail": null,
@@ -3943,6 +4004,42 @@ Respondé SOLO con JSON válido:
             if c.status == "current_focus":
                 return c
         return ctx.candidates[0] if ctx.candidates else None
+
+    def _handle_deferred_interest(
+        self, ctx: "_Context", state: "WhatsAppThreadState"
+    ) -> "ConversationHandleOut":
+        """NU-6: send approved deferred-interest copy; no commercial mutation."""
+        return self._send_text(ctx, state, DEFERRED_RESPONSE_ES)
+
+    def _apply_narrative_interpretation(
+        self,
+        ctx: "_Context",
+        state: "WhatsAppThreadState",
+        narr: "NarrativeInterpretation",
+    ) -> None:
+        """Apply active narrative facts to thread state after deterministic validation.
+
+        NU-9: deterministic gates remain authoritative — this method only updates
+        state when narrative evidence is CONFIRMED/LIKELY and the field is not
+        already set by a higher-priority source (catalog, Flow, candidate).
+        NU-16 safety: called only when narr is not None; failures are swallowed.
+        """
+        try:
+            # Inspectability: resolve pending clarification if narrative confirms state
+            if narr.inspectability and narr.inspectability.is_active():
+                val = narr.inspectability.value
+                if val == INSP_ASSEMBLED_ACCESSIBLE:
+                    # Vehicle confirmed accessible — clear any pending clarification flag
+                    state.inspectability_clarification_sent = False
+                elif val in (INSP_DISASSEMBLED_BLOCKED, INSP_UNRESOLVED_NON_RUNNING):
+                    # Confirmed blocked/non-running — flag as needing clarification
+                    if not state.inspectability_clarification_sent:
+                        state.inspectability_clarification_sent = True
+        except Exception as exc:
+            logger.warning(
+                "M21.1.6 narrative application error thread_id=%s: %s",
+                ctx.thread.id, exc,
+            )
 
     def _apply_extracted(self, ctx: _Context, state: WhatsAppThreadState, extracted: dict) -> None:
         if extracted.get("customer_name"):
