@@ -60,6 +60,7 @@ from ..services.unanswered_alert import reset_unanswered_alert
 from ..services.vehicle_catalog import (
     VehicleMatch, lookup_vehicle, fuzzy_lookup_vehicle, FuzzyLookupResult,
 )
+from ..services.field_evidence import resolve_field_evidence
 from ..services.outbound_guard import OutboundBlockedError
 from ..services.outbound_safety_gate import GateOutcome, OutboundSafetyGate
 from ..settings import Settings
@@ -1702,11 +1703,15 @@ class ConversationEngine:
         if _is_outside_coverage(combined):
             return self._send_coverage_response(ctx, state), False
 
-        focus = self._focus_candidate(ctx)
-        vehicle_known = (
-            pre_detected_vehicle is not None and bool(pre_detected_vehicle.tipo_vehiculo)
-        ) or bool(focus and focus.tipo_vehiculo)
-        zone_known = bool(state.home_zone_group or (focus and focus.zone_group))
+        _snap = resolve_field_evidence(ctx, state)
+        # pre_detected_vehicle covers the case where no candidate was created yet (e.g.
+        # direct-call tests). In normal CE flow a candidate already exists at this point
+        # and snap.vehicle_known() picks it up from the focused candidate.
+        vehicle_known = _snap.vehicle_known() or bool(
+            pre_detected_vehicle is not None
+            and getattr(pre_detected_vehicle, "tipo_vehiculo", None)
+        )
+        zone_known = _snap.location_known()
 
         # Priority 2 — vehicle known + concern + zone missing → concern-aware Location Flow.
         # Concern takes precedence over FAQ/soft-close; cannot be suppressed by the FAQ check.
@@ -1849,14 +1854,16 @@ class ConversationEngine:
         unresolved in ANY state, location check is skipped entirely so the two
         paths never interleave. Returns None to continue normal AI processing.
         """
-        focus = self._focus_candidate(ctx)
+        _snap = resolve_field_evidence(ctx, state)
         # Require tipo_vehiculo to be explicitly set — a brand-only catalog hit that
         # resolves marca but leaves tipo_vehiculo empty must NOT block the flow trigger.
-        vehicle_known = (
+        # pre_detected_vehicle covers the case where no candidate was created yet (e.g.
+        # existing candidates list was non-empty so CE skipped _create_candidate_from_catalog).
+        vehicle_known = _snap.vehicle_known() or bool(
             pre_detected_vehicle is not None
-            and bool(pre_detected_vehicle.tipo_vehiculo)
-        ) or bool(focus and focus.tipo_vehiculo)
-        zone_known = bool(state.home_zone_group or (focus and focus.zone_group))
+            and getattr(pre_detected_vehicle, "tipo_vehiculo", None)
+        )
+        zone_known = _snap.location_known()
 
         # ── Vehicle fallback (takes priority over location) ───────────────
         if not vehicle_known:
