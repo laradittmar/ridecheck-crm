@@ -4009,7 +4009,7 @@ Respondé SOLO con JSON válido:
         self, ctx: "_Context", state: "WhatsAppThreadState"
     ) -> "ConversationHandleOut":
         """NU-6: send approved deferred-interest copy; no commercial mutation."""
-        return self._send_text(ctx, state, DEFERRED_RESPONSE_ES)
+        return self._send_service_boundary(ctx, DEFERRED_RESPONSE_ES)
 
     def _apply_narrative_interpretation(
         self,
