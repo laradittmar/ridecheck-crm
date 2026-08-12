@@ -365,6 +365,24 @@ _PRICE_QUESTION_PATTERNS: tuple[re.Pattern, ...] = (
     re.compile(r'\bprecio\b', re.IGNORECASE),
 )
 
+# M21.2: Layer F deferred-interest pass-through patterns (step 8.5).
+# Applied to raw current_turn_text (case-insensitive). These capture the semantic
+# category "not ready yet / will let you know" WITHOUT listing literal client phrases.
+# Steps 1–4 already fire for messages with an active vehicle or explicit inspection
+# request, so this step only applies to messages with no commercial signal.
+_DEFERRED_INTEREST_PATTERNS: tuple[re.Pattern, ...] = (
+    # Notification intent — any person: "aviso", "te aviso", "les aviso", "aviso cuando"
+    re.compile(r'\baviso\b', re.IGNORECASE),
+    # Temporal deferral: "cuando tenga/encuentre/decida/consiga/vea"
+    re.compile(r'\bcuando\s+(tenga|encuentre|decida|consiga|vea)\b', re.IGNORECASE),
+    # Active search without present vehicle: "estoy buscando"
+    re.compile(r'\bestoy\s+buscando\b', re.IGNORECASE),
+    # Explicit not-yet state: "todavía no tengo" / "todavia no tengo"
+    re.compile(r'\btodav[ií]a\s+no\b', re.IGNORECASE),
+    # "por ahora estoy" (deferred-search framing)
+    re.compile(r'\bpor\s+ahora\s+estoy\b', re.IGNORECASE),
+)
+
 # Reply constants
 _PHONE_CALL_HANDOFF_REPLY = (
     "¡Claro! Un agente de Ridecheck te va a contactar a la brevedad. "
@@ -3099,6 +3117,13 @@ class ConversationEngine:
 
         # 8. Established inspection context (non-moto candidate or delivery flags) → continue
         if self._has_established_inspection_context(ctx, state):
+            return None
+
+        # 8.5. Deferred-interest signal → pass to AI+narrative so M21.1.6 can classify
+        # and respond with DEFERRED_RESPONSE_ES. Steps 1–4 already handle messages that
+        # carry an active vehicle or explicit inspection request; this step only fires
+        # when none of those signals are present (pure soft-close / not-ready messages).
+        if any(p.search(current_turn_text) for p in _DEFERRED_INTEREST_PATTERNS):
             return None
 
         # 9. No inspection service signal found → UNCERTAIN clarification
