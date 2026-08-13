@@ -255,11 +255,21 @@ def lookup_vehicle(text: str) -> VehicleMatch | None:
     Returns confidence="high" for direct matches, "medium" for typo variants.
     Returns recognition_only=True when the vehicle is known but has no
     deterministic pricing category — caller must not quote without confirmation.
+
+    Brand-contradiction guard: when exactly one brand is explicitly present in the
+    text and it differs from the matched alias's brand, the alias is skipped.
+    Prevents "honda ranger" → Ford Ranger, "ford civic" → Honda Civic, etc.
+    Model-only inputs ("ranger", "civic") are unaffected because _detect_make
+    returns make_constrained=False when no brand is present.
     """
     n = _norm(text)
+    detected_make, make_constrained = _detect_make(n)
+
     for key in _SORTED_KEYS:
         if _KEY_RE[key].search(n) or n == key:
             entry = _CAT[key]
+            if make_constrained and entry["marca"] != detected_make:
+                continue
             is_typo = "typo" in entry
             return VehicleMatch(
                 marca=entry["marca"],
