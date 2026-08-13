@@ -164,6 +164,28 @@ def _entry_to_match(entry: dict) -> VehicleMatch:
     )
 
 
+def _best_ngram_score(n: str, form: str) -> float:
+    """Best SequenceMatcher ratio between form and any same-length word window in n.
+
+    Handles the case where a vehicle name is embedded in a longer message that
+    includes year/location tokens — e.g. "ford ksl 2019 en palermo" contains the
+    2-word window "ford ksl" which scores 0.80 against "ford ka" (CONFIRM), while
+    the full-text score of 0.45 would be UNRESOLVED.
+    """
+    words_n = n.split()
+    words_f = form.split()
+    k = len(words_f)
+    if not words_n or not words_f or k > len(words_n):
+        return 0.0
+    best = 0.0
+    for i in range(len(words_n) - k + 1):
+        window = " ".join(words_n[i : i + k])
+        r = SequenceMatcher(None, window, form).ratio()
+        if r > best:
+            best = r
+    return best
+
+
 def fuzzy_lookup_vehicle(text: str) -> FuzzyLookupResult:
     """Conservative fuzzy vehicle lookup using SequenceMatcher.
 
@@ -195,9 +217,14 @@ def fuzzy_lookup_vehicle(text: str) -> FuzzyLookupResult:
     if not candidates:
         return FuzzyLookupResult("UNRESOLVED", None, 0.0, None, 0.0, 0.0, make_constrained)
 
-    # Score all candidate forms.
+    # Score all candidate forms — take the better of the full-text score and the
+    # best same-length word-window score.  The window score handles messages where
+    # a vehicle name is followed by a year or location ("ford ksl 2019 en palermo").
     scored = sorted(
-        [(SequenceMatcher(None, n, form).ratio(), form, entry)
+        [(max(
+              SequenceMatcher(None, n, form).ratio(),
+              _best_ngram_score(n, form),
+          ), form, entry)
          for form, entry in candidates],
         key=lambda x: x[0],
         reverse=True,
