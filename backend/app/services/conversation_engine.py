@@ -2230,20 +2230,41 @@ class ConversationEngine:
         if getattr(state, "pending_fuzzy_catalog_key", None) and not state.needs_human:
             _exact_now = lookup_vehicle(current_turn_text)
             if _exact_now:
-                # User supplied an exact vehicle — clear pending, fall through
+                # User supplied an exact vehicle — clear pending (both fields), fall through
                 state.pending_fuzzy_catalog_key = None
+                state.pending_turn_evidence_text = None
             elif _FUZZY_ACCEPTANCE_RE.search(current_turn_text):
-                # User confirmed — create candidate from stored key
+                # M21.2: User confirmed — create candidate from stored key, replay
+                # year/zone from the originating burst (pending_turn_evidence_text).
                 _pending_match = self._resolve_fuzzy_key(state.pending_fuzzy_catalog_key)
+                _pending_text = getattr(state, "pending_turn_evidence_text", None) or ""
                 state.pending_fuzzy_catalog_key = None
+                state.pending_turn_evidence_text = None
                 if _pending_match and not ctx.candidates:
+                    # Use originating burst as source_text → year extracted correctly.
                     self._create_candidate_from_catalog(
-                        ctx, state, _pending_match, source_text=current_turn_text
+                        ctx, state, _pending_match, source_text=_pending_text or current_turn_text
                     )
+                    # Replay zone detection on originating burst before routing gate.
+                    # allow_contradiction_return=False: contradiction in stored text →
+                    # skip silently, do not generate a new outbound message.
+                    if _pending_text:
+                        self._apply_zone_from_text(
+                            ctx, state, _pending_text, allow_contradiction_return=False
+                        )
+                        self._normalize_zone_from_db(ctx, state)
+                        logger.info(
+                            "M21.2 fuzzy acceptance evidence replay thread_id=%s "
+                            "pending_text=%r zone_group=%s anio=%s",
+                            ctx.thread.id, _pending_text[:60],
+                            (ctx.candidates[0].zone_group if ctx.candidates else None),
+                            (ctx.candidates[0].anio if ctx.candidates else None),
+                        )
                 # continue normal qualification — fall through
             elif _FUZZY_REJECTION_RE.search(current_turn_text):
-                # User rejected — clear proposal, ask for make/model
+                # User rejected — clear both pending fields, ask for make/model
                 state.pending_fuzzy_catalog_key = None
+                state.pending_turn_evidence_text = None
                 self.db.commit()
                 try:
                     sent_id = self._send_text_to_wa(ctx, _FUZZY_ASK_VEHICLE_REPLY)
@@ -2251,7 +2272,8 @@ class ConversationEngine:
                 except OutboundBlockedError:
                     return _out("vehicle_fuzzy_blocked", detail="outbound_disabled")
             else:
-                # Ambiguous follow-up — re-ask the same confirmation question
+                # Ambiguous follow-up — re-ask the same confirmation question.
+                # pending_turn_evidence_text is preserved until acceptance or rejection.
                 _parts = state.pending_fuzzy_catalog_key.split("||", 1)
                 _pq = _FUZZY_CONFIRMATION_TEMPLATE.format(
                     marca=_parts[0], modelo=_parts[1] if len(_parts) > 1 else "",
@@ -2280,6 +2302,7 @@ class ConversationEngine:
             # Exact match clears any stale fuzzy pending proposal (VN-1, req 6).
             if getattr(state, "pending_fuzzy_catalog_key", None):
                 state.pending_fuzzy_catalog_key = None
+                state.pending_turn_evidence_text = None
             # Proactively create a candidate when catalog fires but none exists yet.
             if not ctx.candidates:
                 self._create_candidate_from_catalog(
@@ -2322,7 +2345,7 @@ class ConversationEngine:
                             f"{_fuzzy.hit.marca} {_fuzzy.hit.modelo}" if _fuzzy.hit else "?",
                             _fuzzy.score, _fuzzy.gap,
                         )
-                        return self._handle_fuzzy_confirm(ctx, state, _fuzzy)
+                        return self._handle_fuzzy_confirm(ctx, state, _fuzzy, current_turn_text)
                     # fall through to AI when established candidate context exists
                 # UNRESOLVED: fall through to existing unknown-vehicle path
 
@@ -2336,38 +2359,13 @@ class ConversationEngine:
                 return _intent_out
 
         # ── M21.1.3: Role-aware zone detection ────────────────────────────
-        # Replaces the stale-zone guard. Uses current-turn text only (not
-        # all_recent_text) to avoid picking up prior-turn zone mentions.
-        # Vehicle-location evidence → candidate only (LR-3, LR-6).
-        # Customer-origin language → no zone mutation (LR-2).
-        # SC17 contradiction → clarification, full early return (LR-8).
-        _vehicle_location_written = False
-        _vlzones = self._extract_vehicle_location_zones(current_turn_text)
-        if len(_vlzones) >= 2 and _LOCATION_UNCERTAINTY_RE.search(current_turn_text):
-            # SC17: same-turn contradiction — clarify, no zone mutation
-            return self._handle_location_contradiction(ctx, state)
-        if _vlzones:
-            # Explicit vehicle-location evidence → write to candidate only (LR-3)
-            _vzone = _vlzones[0]
-            _fc = self._focus_candidate(ctx)
-            if _fc:
-                _fc.zone_group = _vzone.zone_group
-                _fc.zone_detail = _vzone.zone_detail
-            _vehicle_location_written = True
-        elif not _has_customer_origin_clause(current_turn_text):
-            # No vehicle clause, no strong origin signal → bare locality or no info.
-            # Preserve existing detection for thread state (location flow compatibility),
-            # and write to candidate if it lacks zone (SC14: bare locality in context).
-            if not state.home_zone_detail or not state.home_zone_group:
-                _zh = self._extract_zone_from_text(current_turn_text)
-                if _zh:
-                    state.home_zone_detail = _zh.zone_detail
-                    if _zh.zone_group:
-                        state.home_zone_group = _zh.zone_group
-                    _fc2 = self._focus_candidate(ctx)
-                    if _fc2 and not _fc2.zone_group:
-                        _fc2.zone_group = _zh.zone_group
-                        _fc2.zone_detail = _zh.zone_detail
+        # Uses current-turn text only (not all_recent_text) to avoid picking
+        # up prior-turn zone mentions.  Shared helper enforces LR-2/LR-3/SC17.
+        _zone_early, _vehicle_location_written = self._apply_zone_from_text(
+            ctx, state, current_turn_text, allow_contradiction_return=True,
+        )
+        if _zone_early is not None:
+            return _zone_early
 
         # Normalise zone_group when detail is known but group is still blank.
         self._normalize_zone_from_db(ctx, state)
@@ -2913,6 +2911,64 @@ class ConversationEngine:
             self.db.commit()
             return _out("location_contradiction_blocked", detail="outbound_disabled")
 
+    def _apply_zone_from_text(
+        self,
+        ctx: "_Context",
+        state: "WhatsAppThreadState",
+        text: str,
+        allow_contradiction_return: bool = True,
+    ) -> "tuple[ConversationHandleOut | None, bool]":
+        """M21.1.3 / M21.2: Apply zone evidence from text to state and/or focus candidate.
+
+        Shared helper used by both:
+          - Normal current-turn zone handling (_process_text zone block).
+          - Fuzzy-acceptance stored-turn replay (_apply_pending_turn_evidence).
+
+        Preserves LR-2 customer-origin separation, LR-3 explicit vehicle-location
+        authority, SC17 contradiction behavior, and bare-locality fallback semantics.
+
+        Args:
+            text: text to extract zone from.
+            allow_contradiction_return: when True (normal path), an SC17 contradiction
+                returns a ConversationHandleOut to the caller.  When False (replay of
+                a stored turn), contradiction silently skips zone extraction instead of
+                generating a new outbound message.
+
+        Returns:
+            (early_return, vehicle_location_written).
+            If early_return is not None the caller must return it immediately.
+        """
+        _vehicle_location_written = False
+        _vlzones = self._extract_vehicle_location_zones(text)
+        if len(_vlzones) >= 2 and _LOCATION_UNCERTAINTY_RE.search(text):
+            if allow_contradiction_return:
+                return self._handle_location_contradiction(ctx, state), False
+            # Contradiction in stored TURN 1 text — skip zone extraction silently.
+            return None, False
+        if _vlzones:
+            # Explicit vehicle-location evidence → write to candidate only (LR-3)
+            _vzone = _vlzones[0]
+            _fc = self._focus_candidate(ctx)
+            if _fc:
+                _fc.zone_group = _vzone.zone_group
+                _fc.zone_detail = _vzone.zone_detail
+            _vehicle_location_written = True
+        elif not _has_customer_origin_clause(text):
+            # No vehicle clause, no strong origin signal → bare locality or no info.
+            # Preserve existing detection for thread state (location flow compatibility),
+            # and write to candidate if it lacks zone (SC14: bare locality in context).
+            if not state.home_zone_detail or not state.home_zone_group:
+                _zh = self._extract_zone_from_text(text)
+                if _zh:
+                    state.home_zone_detail = _zh.zone_detail
+                    if _zh.zone_group:
+                        state.home_zone_group = _zh.zone_group
+                    _fc2 = self._focus_candidate(ctx)
+                    if _fc2 and not _fc2.zone_group:
+                        _fc2.zone_group = _zh.zone_group
+                        _fc2.zone_detail = _zh.zone_detail
+        return None, _vehicle_location_written
+
     # ── M21.1.4: ASR fuzzy confirmation ───────────────────────────────────────
 
     def _resolve_fuzzy_key(self, key: str) -> "VehicleMatch | None":
@@ -2935,8 +2991,13 @@ class ConversationEngine:
         ctx: "_Context",
         state: "WhatsAppThreadState",
         result: "FuzzyLookupResult",
+        current_turn_text: str = "",
     ) -> "ConversationHandleOut":
-        """M21.1.4: CONFIRM outcome — store pending key, send confirmation question.
+        """M21.1.4 / M21.2: CONFIRM outcome — store pending key + originating burst text.
+
+        Stores pending_fuzzy_catalog_key ("Marca||Modelo") for vehicle identity and
+        pending_turn_evidence_text (raw current_turn_text) so year and zone can be
+        re-extracted from the exact originating burst on acceptance (Design D).
 
         No candidate created, no pricing, no scheduling, no Flow (VN-12).
         Kill-switch: returns vehicle_fuzzy_blocked when outbound is disabled (VN-14).
@@ -2952,6 +3013,8 @@ class ConversationEngine:
             self.db.commit()
             return _out("vehicle_fuzzy_blocked", detail="outbound_disabled")
         state.pending_fuzzy_catalog_key = f"{result.hit.marca}||{result.hit.modelo}"
+        # M21.2: store the originating burst so year/zone can be replayed on acceptance.
+        state.pending_turn_evidence_text = current_turn_text or None
         self.db.commit()
         return _out("replied", wa_message_id=sent_id)
 

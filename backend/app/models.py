@@ -337,6 +337,7 @@ class WhatsAppThreadState(Base):
     location_fallback_flow_sent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     inspectability_clarification_sent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     pending_fuzzy_catalog_key: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)  # M21.1.4: "{marca}||{modelo}" or NULL
+    pending_turn_evidence_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # M21.2: raw current_turn_text from the CONFIRM turn; cleared atomically with pending_fuzzy_catalog_key
     unanswered_alert_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     quote_followup_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     buscando_followup_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
