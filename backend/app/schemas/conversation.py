@@ -11,6 +11,10 @@ HANDLED_ACTIONS = frozenset({
     "inspectability_gate_blocked",   # M21.1.2: vehicle inspectability gate under kill switch
     "location_contradiction_blocked", # M21.1.3: SC17 contradiction under kill switch
     "vehicle_fuzzy_blocked",          # M21.1.4: fuzzy confirmation blocked by kill switch
+    # M21.2.8: CE crash returns action="error"; handled=True kills n8n legacy AI fallback.
+    # Semantics: CE retains ownership of the event; n8n must not fall back to another engine.
+    # Does NOT imply customer received a reply. DB rollback still executes; error metadata preserved.
+    "error",
 })
 
 
