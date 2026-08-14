@@ -2474,7 +2474,7 @@ class ConversationEngine:
         _focus_before_tipo = _focus_before.tipo_vehiculo if _focus_before else None
         _cand_data = decision.get("candidate") or {}
         if (
-            _cand_data.get("tipo_vehiculo", "").upper() == "MOTO"
+            (_cand_data.get("tipo_vehiculo") or "").upper() == "MOTO"
             and _cand_data.get("action") in ("create", "update")
         ):
             return self._motorcycle_human_handoff(ctx, state)
