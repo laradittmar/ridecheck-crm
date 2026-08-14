@@ -582,17 +582,24 @@ class TestBlockedDispatchRegression(unittest.TestCase):
         self.assertEqual(r.detail, "OUTBOUND_GATE_BLOCKED_KILL_SWITCH")
 
     def test_6b_out_helper_existing_actions_unchanged(self):
-        """_out() for pre-existing actions must behave as before."""
+        """_out() for pre-existing actions must behave as expected.
+
+        M21.2.8: "error" was added to HANDLED_ACTIONS so that CE crash
+        returns handled=True, terminating n8n before any legacy AI fallback.
+        Semantics: handled=True means CE retains ownership; n8n must not
+        fall back to another engine. Does NOT imply a customer reply was sent.
+        """
         from app.services.conversation_engine import _out
         # "replied" → ok=True, handled=True
         r = _out("replied", wa_message_id="wamid.X")
         self.assertTrue(r.ok)
         self.assertTrue(r.handled)
         self.assertEqual(r.wa_message_id, "wamid.X")
-        # "error" → ok=False, handled=False
+        # "error" → ok=False, handled=True (M21.2.8: CE crash terminates n8n)
         r = _out("error", detail="internal_error")
         self.assertFalse(r.ok)
-        self.assertFalse(r.handled)
+        self.assertTrue(r.handled)  # transport containment: CE retains ownership on crash
+        self.assertEqual(r.detail, "internal_error")
         # "skipped_dedup" → ok=True, handled=True
         r = _out("skipped_dedup")
         self.assertTrue(r.ok)
