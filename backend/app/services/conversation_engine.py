@@ -2085,6 +2085,37 @@ class ConversationEngine:
             if _form_data:
                 return self._handle_website_form(ctx, state, _form_data)
 
+        # ── Deterministic price re-query (pre-AI) ────────────────────────
+        # Customer asks the price again while already in QUOTED or SCHEDULING.
+        # Restate the authoritative deterministic quote WITHOUT changing any
+        # commercial state (lead.flag, last_stage).  Must run before the QUOTED
+        # acceptance check so a price question is never mis-classified as acceptance.
+        # When deterministic price is unavailable, falls through to normal handling.
+        if (
+            state.last_stage in (STAGE_QUOTED, STAGE_SCHEDULING)
+            and not state.needs_human
+            and self._detect_price_question(
+                self._norm_text(" ".join(ai_input_messages))
+            )
+        ):
+            _requery_quote = self._compute_price_quote(ctx, state)
+            if _requery_quote is not None:
+                _rq_focus = self._focus_candidate(ctx)
+                _requery_reply = self._build_quote_reply(
+                    (_rq_focus.marca or "").strip() or None if _rq_focus else None,
+                    (_rq_focus.modelo or "").strip() or None if _rq_focus else None,
+                    state.home_zone_detail or None,
+                    _requery_quote.precio_total,
+                    _rq_focus.anio if _rq_focus else None,
+                )
+                logger.info(
+                    "M21.2 price restatement stage=%s thread_id=%s total=%s",
+                    state.last_stage, ctx.thread.id, _requery_quote.precio_total,
+                )
+                sent_id = self._send_text_to_wa(ctx, _requery_reply)
+                return _out("replied", wa_message_id=sent_id)
+            # Price unavailable — fall through without inventing an amount.
+
         # ── Deterministic QUOTED acceptance (pre-AI) ─────────────────────
         # When the client is in QUOTED stage and sends a clear acceptance word,
         # skip the AI entirely: set flag=ACEPTADO, stage=SCHEDULING, and ask
