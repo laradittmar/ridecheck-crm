@@ -2527,41 +2527,49 @@ class ConversationEngine:
             # The post-AI SCHEDULING block will produce the correct scheduling response.
             decision["reply"] = None
 
-        # BUG-3 guard: never advance QUALIFYING → ACEPTADO without a deterministic quote.
-        # Acceptance words ("dale", "sí") in QUALIFYING stage must not move to SCHEDULING
-        # when we have no confirmed price — they could be accepting a hallucinated amount.
+        # BUG-3 guard: QUALIFYING → ACEPTADO is never a valid direct transition.
+        # The canonical sequence is: QUALIFYING → QUOTED (quote sent) → SCHEDULING
+        # (customer explicitly accepts a quote they have already received).
+        # A valid deterministic price is NOT customer acceptance — the customer must
+        # see the quote first, then confirm it in a later turn.
+        # When price IS available: the deterministic override below will send the quote
+        # and commit PRESUPUESTO_ENVIADO / QUOTED; no reply is set here.
+        # When price is unavailable: prompt for the missing vehicle/zone data.
         if (
             flag_accepted
             and new_flag == "ACEPTADO"
             and state.last_stage in (STAGE_QUALIFYING, None)
-            and real_price_quote is None
         ):
             logger.warning(
-                "M18 blocking ACEPTADO in QUALIFYING — no deterministic quote thread_id=%s",
+                "M18 blocking ACEPTADO in QUALIFYING — quote not yet sent thread_id=%s",
                 ctx.thread.id,
             )
             flag_accepted = False
-            focus_c = self._focus_candidate(ctx)
-            if state.home_zone_group and not state.home_zone_detail:
-                decision["reply"] = (
-                    f"¿En qué barrio de {state.home_zone_group} está el auto? "
-                    "Así te paso el valor exacto."
-                )
-            elif not (focus_c and focus_c.tipo_vehiculo):
-                decision["reply"] = (
-                    "Para avanzar necesito saber qué tipo de vehículo es. "
-                    "¿Es un auto, SUV u otro tipo?"
-                )
-            elif not (state.home_zone_group or state.home_zone_detail):
-                decision["reply"] = (
-                    "Para avanzar necesito saber en qué zona está el auto. "
-                    "¿Me podés indicar el barrio?"
-                )
-            else:
-                decision["reply"] = (
-                    "Antes de avanzar necesito confirmar el precio. "
-                    "Falta información de la zona o el vehículo."
-                )
+            if real_price_quote is None:
+                # Price unavailable — prompt for the missing data that would unlock pricing.
+                focus_c = self._focus_candidate(ctx)
+                if state.home_zone_group and not state.home_zone_detail:
+                    decision["reply"] = (
+                        f"¿En qué barrio de {state.home_zone_group} está el auto? "
+                        "Así te paso el valor exacto."
+                    )
+                elif not (focus_c and focus_c.tipo_vehiculo):
+                    decision["reply"] = (
+                        "Para avanzar necesito saber qué tipo de vehículo es. "
+                        "¿Es un auto, SUV u otro tipo?"
+                    )
+                elif not (state.home_zone_group or state.home_zone_detail):
+                    decision["reply"] = (
+                        "Para avanzar necesito saber en qué zona está el auto. "
+                        "¿Me podés indicar el barrio?"
+                    )
+                else:
+                    decision["reply"] = (
+                        "Antes de avanzar necesito confirmar el precio. "
+                        "Falta información de la zona o el vehículo."
+                    )
+            # When real_price_quote is not None: deterministic override below sends the
+            # quote and commits PRESUPUESTO_ENVIADO / QUOTED. No reply set here.
 
         if flag_accepted and new_flag != lead.flag:
             lead.flag = new_flag
