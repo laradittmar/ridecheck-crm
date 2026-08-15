@@ -2985,12 +2985,18 @@ class ConversationEngine:
             # Contradiction in stored TURN 1 text — skip zone extraction silently.
             return None, False
         if _vlzones:
-            # Explicit vehicle-location evidence → write to candidate only (LR-3)
+            # Explicit vehicle-location evidence → candidate (LR-3) or pre-candidate fallback.
             _vzone = _vlzones[0]
             _fc = self._focus_candidate(ctx)
             if _fc:
                 _fc.zone_group = _vzone.zone_group
                 _fc.zone_detail = _vzone.zone_detail
+            else:
+                # No candidate yet: buffer in thread-level fallback so the candidate
+                # inherits it on creation.  Only vehicle-location evidence (not
+                # customer-origin) reaches this branch (LR-2/LR-3 preserved).
+                state.home_zone_group = _vzone.zone_group
+                state.home_zone_detail = _vzone.zone_detail
             _vehicle_location_written = True
         elif not _has_customer_origin_clause(text):
             # No vehicle clause, no strong origin signal → bare locality or no info.
@@ -4216,6 +4222,11 @@ Respondé SOLO con JSON válido:
             candidate = WhatsAppThreadCandidate(thread_id=ctx.thread.id, status=status, **fields)
             self.db.add(candidate)
             self.db.flush()
+            # Inherit pre-candidate vehicle-location fallback when AI didn't supply zone.
+            if state and not candidate.zone_group and state.home_zone_group:
+                candidate.zone_group = state.home_zone_group
+            if state and not candidate.zone_detail and state.home_zone_detail:
+                candidate.zone_detail = state.home_zone_detail
             if status == "current_focus" and state:
                 for c in ctx.candidates:
                     if c.status == "current_focus":
@@ -4280,17 +4291,21 @@ Respondé SOLO con JSON válido:
         source_text: str = "",
     ) -> None:
         anio = _extract_year_from_text(source_text) if source_text else None
-        # M21.1.3 LR-7: do not inherit stale thread zone — candidate starts empty.
-        # Vehicle-location evidence from the current turn is written to the candidate
-        # by the role-aware zone detection block that follows this call in _process_text.
+        # M21.1.3 LR-7 (updated): inherit pre-candidate vehicle-location fallback from
+        # state.home_zone_* when set — these fields now buffer explicit vehicle-location
+        # evidence accumulated before a candidate existed.  This is distinct from a
+        # stale residential zone.  Current-turn zone detection (which follows this call
+        # in _process_text) remains authoritative and may still overwrite.
+        _init_zone_group = state.home_zone_group if state else None
+        _init_zone_detail = state.home_zone_detail if state else None
         candidate = WhatsAppThreadCandidate(
             thread_id=ctx.thread.id,
             marca=match.marca,
             modelo=match.modelo,
             tipo_vehiculo=match.tipo_vehiculo,
             anio=anio,
-            zone_group=None,
-            zone_detail=None,
+            zone_group=_init_zone_group,
+            zone_detail=_init_zone_detail,
             status="current_focus",
         )
         self.db.add(candidate)
