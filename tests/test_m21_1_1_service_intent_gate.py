@@ -57,6 +57,7 @@ from app.services.conversation_engine import (  # noqa: E402
     ConversationEngine,
     _F12_BOUNDARY_REPLY,
     _FALLBACK_WARM_HANDOFF,
+    _MOTORCYCLE_HANDOFF_REPLY,
     _INTENT_PREPURCHASE,
     _PHONE_CALL_HANDOFF_REPLY,
     _REPAIR_BOUNDARY_REPLY,
@@ -661,7 +662,11 @@ class TestMotorcycleLayerA(unittest.TestCase):
         self.assertTrue(state.needs_human)
         self.assertTrue(eng._send_fallback_human_review_notification.called)
         self.assertEqual(
-            eng._send_text_to_wa.call_args[0][1], _FALLBACK_WARM_HANDOFF
+            eng._send_text_to_wa.call_args[0][1], _MOTORCYCLE_HANDOFF_REPLY
+        )
+        self.assertNotIn(
+            "completar el formulario",
+            eng._send_text_to_wa.call_args[0][1],
         )
         self.assertEqual(eng._call_openai.call_count, 0)
 
@@ -695,8 +700,9 @@ class TestMotorcycleLayerA(unittest.TestCase):
             text="Necesito el formulario 12 de una moto desarmada"
         )
         self._assert_motorcycle_handoff(eng, result, state)
-        # F12 boundary must NOT be sent
-        self.assertEqual(eng._send_text_to_wa.call_args[0][1], _FALLBACK_WARM_HANDOFF)
+        # F12 boundary must NOT be sent; motorcycle reply must be used
+        self.assertEqual(eng._send_text_to_wa.call_args[0][1], _MOTORCYCLE_HANDOFF_REPLY)
+        self.assertNotEqual(eng._send_text_to_wa.call_args[0][1], _F12_BOUNDARY_REPLY)
 
     def test_si19_audio_transcript_moto(self):
         """SI-19: Audio text='tengo una moto', unanswered=[] → Layer A fires."""
@@ -726,7 +732,8 @@ class TestMotorcycleLayerA(unittest.TestCase):
         result = eng._process_vehicle_fallback_response(ctx, state, flow_data)
         _assert_handled(self, result, "replied")
         self.assertTrue(state.needs_human)
-        self.assertEqual(eng._send_text_to_wa.call_args[0][1], _FALLBACK_WARM_HANDOFF)
+        self.assertEqual(eng._send_text_to_wa.call_args[0][1], _MOTORCYCLE_HANDOFF_REPLY)
+        self.assertNotIn("completar el formulario", eng._send_text_to_wa.call_args[0][1])
         self.assertEqual(eng._apply_candidate.call_count, 0)
 
     def test_si22_ai_extracts_moto_candidate_guard(self):
@@ -763,7 +770,8 @@ class TestMotorcycleLayerA(unittest.TestCase):
                 result = eng._handle_website_form(ctx, state, form_data)
         _assert_handled(self, result, "replied")
         self.assertTrue(state.needs_human)
-        self.assertEqual(eng._send_text_to_wa.call_args[0][1], _FALLBACK_WARM_HANDOFF)
+        self.assertEqual(eng._send_text_to_wa.call_args[0][1], _MOTORCYCLE_HANDOFF_REPLY)
+        self.assertNotIn("completar el formulario", eng._send_text_to_wa.call_args[0][1])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -954,7 +962,8 @@ class TestHistoricalContext(unittest.TestCase):
         )
         _assert_handled(self, result, "replied")
         self.assertTrue(state.needs_human)
-        self.assertEqual(eng._send_text_to_wa.call_args[0][1], _FALLBACK_WARM_HANDOFF)
+        self.assertEqual(eng._send_text_to_wa.call_args[0][1], _MOTORCYCLE_HANDOFF_REPLY)
+        self.assertNotIn("completar el formulario", eng._send_text_to_wa.call_args[0][1])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1095,7 +1104,7 @@ class TestPersistedIntentOverride(unittest.TestCase):
         )
         _assert_handled(self, result, "replied")
         self.assertTrue(state.needs_human)
-        self.assertEqual(eng._send_text_to_wa.call_args[0][1], _FALLBACK_WARM_HANDOFF)
+        self.assertEqual(eng._send_text_to_wa.call_args[0][1], _MOTORCYCLE_HANDOFF_REPLY)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1156,8 +1165,9 @@ class TestPhoneCallAllStages(unittest.TestCase):
         )
         _assert_handled(self, result, "replied")
         self.assertTrue(state.needs_human)
-        # Warm handoff (motorcycle), not phone-call reply
-        self.assertEqual(eng._send_text_to_wa.call_args[0][1], _FALLBACK_WARM_HANDOFF)
+        # Motorcycle-specific handoff (not phone-call reply, not generic form copy)
+        self.assertEqual(eng._send_text_to_wa.call_args[0][1], _MOTORCYCLE_HANDOFF_REPLY)
+        self.assertNotIn("completar el formulario", eng._send_text_to_wa.call_args[0][1])
         self.assertTrue(eng._send_fallback_human_review_notification.called)
 
 

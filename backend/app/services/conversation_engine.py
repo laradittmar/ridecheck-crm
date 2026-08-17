@@ -196,6 +196,14 @@ _FALLBACK_WARM_HANDOFF = (
     "te va a contactar a la brevedad para continuar con la cotización."
 )
 
+# Motorcycle/quad/UTV manual handoff — no form involved; must not reference
+# form completion.  Distinct from _FALLBACK_WARM_HANDOFF which follows an
+# actual Flow submission.
+_MOTORCYCLE_HANDOFF_REPLY = (
+    "Las motos las revisamos de forma manual. "
+    "Un asesor de Ridecheck se va a contactar con vos para continuar."
+)
+
 # ── M21.1.1 Service Intent Gate ───────────────────────────────────────────────
 # _PHONE_CALL_PATTERNS     — [EXISTING] line 142 — do not redefine
 # _is_phone_call_request() — [EXISTING] line 307 — do not redefine
@@ -2849,7 +2857,7 @@ class ConversationEngine:
             )
 
         try:
-            sent_id = self._send_text_to_wa(ctx, _FALLBACK_WARM_HANDOFF)
+            sent_id = self._send_text_to_wa(ctx, _MOTORCYCLE_HANDOFF_REPLY)
             return _out("replied", wa_message_id=sent_id)
         except OutboundBlockedError:
             self.db.commit()
