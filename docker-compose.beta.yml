@@ -32,7 +32,7 @@
 
 services:
   backend:
-    image: ridecheck-crm-backend:m21.2.10-5f1394b
+    image: ridecheck-crm-backend:m21.2.11-6aa4d38
     environment:
       DATABASE_URL: postgresql+psycopg://crm:crm@postgres:5432/crm_test
       OUTBOUND_ENABLED: "${BETA_OUTBOUND_ENABLED:-false}"
