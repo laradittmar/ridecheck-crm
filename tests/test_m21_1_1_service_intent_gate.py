@@ -159,6 +159,9 @@ def _make_engine(send_raises=False, ai_response=None) -> ConversationEngine:
     eng.settings.openai_api_key = "sk-fake"
     eng.settings.openai_chat_model = "gpt-4o-mini"
     eng.settings.backend_url = "http://localhost:8000"
+    # Explicitly empty so motorcycle tests exercise the fallback plain-text path.
+    # Tests that want the Flow path must set a non-empty value and mock _send_flow_button.
+    eng.settings.whatsapp_manual_handoff_flow_id = ""
 
     if send_raises:
         eng._send_text_to_wa = MagicMock(side_effect=OutboundBlockedError(

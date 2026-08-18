@@ -134,6 +134,9 @@ def _make_engine(focus_candidate=None) -> ConversationEngine:
     eng.settings.openai_api_key = "sk-fake"
     eng.settings.openai_chat_model = "gpt-4o-mini"
     eng.settings.backend_url = "http://localhost:8000"
+    # Explicitly empty so MH tests exercise the fallback plain-text path.
+    # MF tests (test_m21_2_mf_motorcycle_flow.py) test the Flow-based path.
+    eng.settings.whatsapp_manual_handoff_flow_id = ""
     eng._send_text_to_wa = MagicMock(return_value="mock-wa-id")
     eng._send_fallback_human_review_notification = MagicMock()
     eng._call_openai = MagicMock(return_value='{"reply":"ok","candidate":{"action":"none"},"extracted":{},"lead_flag":null,"needs_human":false}')

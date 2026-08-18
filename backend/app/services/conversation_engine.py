@@ -198,11 +198,28 @@ _FALLBACK_WARM_HANDOFF = (
 
 # Motorcycle/quad/UTV manual handoff — no form involved; must not reference
 # form completion.  Distinct from _FALLBACK_WARM_HANDOFF which follows an
-# actual Flow submission.
+# actual Flow submission.  Used as fallback when WHATSAPP_MANUAL_HANDOFF_FLOW_ID
+# is not configured.
 _MOTORCYCLE_HANDOFF_REPLY = (
     "Las motos las revisamos de forma manual. "
     "Un asesor de Ridecheck se va a contactar con vos para continuar."
 )
+
+# M21.2 Motorcycle contact-data Flow — Turn 1 intro text (body of the Flow button).
+# Sent when WHATSAPP_MANUAL_HANDOFF_FLOW_ID is configured.
+_MOTORCYCLE_CONTACT_INTRO = (
+    "Perfecto, para avanzar necesito que completes estos datos."
+)
+
+# M21.2 Motorcycle contact-data Flow — reply after successful Flow submission.
+_MOTORCYCLE_ADVISOR_REPLY = (
+    "A la brevedad uno de nuestros asesores se estará contactando con vos."
+)
+
+# Prefix for flow_booking_token when a motorcycle manual-handoff contact Flow is pending.
+# _process_flow_response uses this prefix to route to _process_motorcycle_contact_response
+# BEFORE the booking-flow handler.  Must not clash with booking tokens (no prefix there).
+_MOTO_HANDOFF_TOKEN_PREFIX = "moto-handoff-"
 
 # ── M21.1.1 Service Intent Gate ───────────────────────────────────────────────
 # _PHONE_CALL_PATTERNS     — [EXISTING] line 142 — do not redefine
@@ -1295,6 +1312,12 @@ class ConversationEngine:
         state = ctx.state
         assert state is not None
 
+        # M21.2: Motorcycle manual-handoff contact flow — detect by token prefix.
+        # Checked FIRST so a moto-handoff response is never mis-routed to the
+        # booking handler (which would create a revision and set AGENDADO).
+        if (state.flow_booking_token or "").startswith(_MOTO_HANDOFF_TOKEN_PREFIX):
+            return self._process_motorcycle_contact_response(ctx, state, flow_data)
+
         # Route to qualification fallback handlers BEFORE booking flow processing.
         # Detection is by distinctive payload keys, not by token.
         if "tipo_vehiculo" in flow_data:
@@ -1530,7 +1553,11 @@ class ConversationEngine:
 
         tipo = (flow_data.get("tipo_vehiculo") or "").strip().upper()
         if tipo == "MOTO" or self._is_motorcycle_enquiry(tipo):
-            return self._motorcycle_human_handoff(ctx, state)
+            return self._motorcycle_human_handoff(
+                ctx, state,
+                marca=(flow_data.get("marca") or "").strip() or None,
+                modelo=(flow_data.get("modelo") or "").strip() or None,
+            )
         marca = (flow_data.get("marca") or "").strip()
         modelo = (flow_data.get("modelo") or "").strip()
         anio_raw = flow_data.get("anio")
@@ -2048,7 +2075,7 @@ class ConversationEngine:
 
         # ── M21.1.1 Layer A: Motorcycle pre-gate (all stages) ─────────────
         if self._is_motorcycle_enquiry(current_turn_text):
-            return self._motorcycle_human_handoff(ctx, state)
+            return self._motorcycle_human_handoff(ctx, state, source_text=current_turn_text)
 
         # ── M21.1.1 Layer B: Phone-call/human-request pre-gate (all stages)
         # Uses existing module-level _is_phone_call_request (line 307).
@@ -2485,7 +2512,7 @@ class ConversationEngine:
             (_cand_data.get("tipo_vehiculo") or "").upper() == "MOTO"
             and _cand_data.get("action") in ("create", "update")
         ):
-            return self._motorcycle_human_handoff(ctx, state)
+            return self._motorcycle_human_handoff(ctx, state)  # AI path: no source_text
         self._apply_candidate(ctx, _cand_data)
 
         # ── Catalog enforcement (post-AI) ─────────────────────────────────
@@ -2839,11 +2866,185 @@ class ConversationEngine:
         self,
         ctx: "_Context",
         state: "WhatsAppThreadState",
+        source_text: str = "",
+        marca: "str | None" = None,
+        modelo: "str | None" = None,
     ) -> "ConversationHandleOut":
-        """Centralized motorcycle/quad/UTV human handoff. All entry points call this."""
+        """Motorcycle/quad/UTV inquiry handler.
+
+        When WHATSAPP_MANUAL_HANDOFF_FLOW_ID is configured (preferred path):
+          Turn 1: creates a MOTO candidate, stores a pending token, and dispatches
+          the contact-data WhatsApp Flow.  does NOT set needs_human yet — that
+          happens in _process_motorcycle_contact_response after the Flow reply.
+
+        Fallback (Flow not configured):
+          Immediate plain-text handoff; sets needs_human=True immediately.
+        """
+        flow_id = (getattr(self.settings, "whatsapp_manual_handoff_flow_id", "") or "").strip()
+
+        if not flow_id:
+            # ── Fallback: Flow not configured — immediate plain-text handoff ───
+            state.needs_human = True
+            if ctx.lead:
+                ctx.lead.necesita_humano = True
+            self.db.commit()
+            try:
+                self._send_fallback_human_review_notification(
+                    ctx, state, reason="motorcycle_enquiry"
+                )
+            except Exception as exc:
+                logger.error(
+                    "M21.1.1 motorcycle notification failed thread_id=%s: %s",
+                    ctx.thread.id, exc,
+                )
+            try:
+                sent_id = self._send_text_to_wa(ctx, _MOTORCYCLE_HANDOFF_REPLY)
+                return _out("replied", wa_message_id=sent_id)
+            except OutboundBlockedError:
+                self.db.commit()
+                return _out("human_handoff_blocked", detail="motorcycle_enquiry_kill_switch")
+
+        # ── Flow path: collect contact data before setting needs_human ────────
+
+        # Extract make/model from source_text if not already provided
+        if not marca and not modelo and source_text:
+            marca, modelo = self._extract_motorcycle_make_model(source_text)
+
+        # Create a 'mentioned' MOTO candidate to preserve vehicle evidence
+        from app.models import WhatsAppThreadCandidate
+        moto_cand = WhatsAppThreadCandidate(
+            thread_id=ctx.thread.id,
+            tipo_vehiculo="MOTO",
+            marca=marca or None,
+            modelo=modelo or None,
+            status="mentioned",
+            source_text=(source_text or f"moto:{marca or ''} {modelo or ''}").strip(),
+        )
+        self.db.add(moto_cand)
+        self.db.flush()
+
+        # Token signals pending motorcycle contact Flow — keeps _process_flow_response
+        # routing working without setting needs_human prematurely.
+        flow_token = f"{_MOTO_HANDOFF_TOKEN_PREFIX}{ctx.thread.id}-{int(_time.time())}"
+        state.flow_booking_token = flow_token
+        self.db.commit()
+
+        try:
+            sent_id = self._send_flow_button(
+                ctx, _MOTORCYCLE_CONTACT_INTRO, flow_token,
+                flow_id=flow_id, initial_screen="CONTACT_DATA",
+            )
+            return _out("flow_button_sent", wa_message_id=sent_id)
+        except OutboundBlockedError:
+            # Roll back pending token on kill-switch
+            state.flow_booking_token = None
+            self.db.commit()
+            return _out("human_handoff_blocked", detail="motorcycle_enquiry_kill_switch")
+
+    def _extract_motorcycle_make_model(
+        self, text: str
+    ) -> "tuple[str | None, str | None]":
+        """Conservative extraction of make/model from a motorcycle enquiry.
+
+        Only returns tokens that start with an uppercase letter or look like a
+        vehicle model code (e.g. CB500, PCX, R6).  Returns (None, None) rather
+        than guessing when tokens are ambiguous.
+        """
+        # Find motorcycle keyword in original text (case-insensitive)
+        km = re.search(
+            r'(?<![a-z0-9])'
+            r'(motos?|motocicletas?|scooters?|ciclomotor(?:es)?|cuatriciclos?|quads?|atvs?|utvs?)'
+            r'(?![a-z0-9])',
+            text, re.IGNORECASE,
+        )
+        if not km:
+            return None, None
+
+        after = text[km.end():].strip()
+        tokens = after.split()
+
+        _STOPWORDS = frozenset({
+            "de", "del", "el", "la", "los", "las", "un", "una", "unos", "unas",
+            "en", "y", "o", "para", "que", "con", "por", "como", "está", "esta",
+            "no", "si", "se", "al", "a", "es", "son", "tiene", "tienen",
+            "quiero", "revisar", "tengo", "quisiera", "quería",
+        })
+
+        make: "str | None" = None
+        model: "str | None" = None
+
+        for tok in tokens[:5]:
+            clean = re.sub(r'[^\w\-]', '', tok)
+            if not clean:
+                continue
+            lower = clean.lower()
+            if lower in _STOPWORDS:
+                if make is None:
+                    continue  # skip leading stopwords before make
+                break  # stopword after make ends the search
+            # Accept: starts with uppercase, OR is all-caps+digit model code (CB500, PCX)
+            if re.match(r'^[A-Z]', clean) or re.match(r'^[A-Z0-9]{2,}$', clean.upper()):
+                if make is None:
+                    make = clean
+                elif model is None:
+                    model = clean
+                    break
+            else:
+                # Non-stopword, non-identifier — ambiguous; stop if we already have make
+                if make is not None:
+                    break
+
+        return make, model
+
+    def _process_motorcycle_contact_response(
+        self,
+        ctx: "_Context",
+        state: "WhatsAppThreadState",
+        flow_data: dict,
+    ) -> "ConversationHandleOut":
+        """Handle the contact-data Flow response for a motorcycle manual handoff.
+
+        Persists client data into the Lead, preserves MOTO candidate evidence,
+        sets needs_human=True, and sends the advisor confirmation reply.
+        """
+        lead = ctx.lead
+        assert lead is not None
+
+        # Consume the pending motorcycle handoff token
+        state.flow_booking_token = None
+
+        # Parse contact fields from flow — only nombre_apellido and email expected
+        full_name = (flow_data.get("nombre_apellido") or "").strip()
+        buyer_email = (flow_data.get("email") or "").strip() or None
+        name_parts = full_name.split() if full_name else []
+        buyer_first = name_parts[0] if name_parts else ""
+        buyer_last = " ".join(name_parts[1:]) if len(name_parts) > 1 else ""
+
+        # Update Lead — never overwrite existing values; never touch telefono
+        if buyer_first and not lead.nombre:
+            lead.nombre = buyer_first
+        if buyer_last and not lead.apellido:
+            lead.apellido = buyer_last
+        if buyer_email and not lead.email:
+            lead.email = buyer_email
+
+        # Find MOTO candidate to confirm motorcycle evidence was preserved
+        moto_cand = next(
+            (c for c in ctx.candidates if (c.tipo_vehiculo or "").upper() == "MOTO"),
+            None,
+        )
+        logger.info(
+            "M21.2 motorcycle_contact_response thread_id=%s moto_cand_id=%s marca=%s modelo=%s",
+            ctx.thread.id,
+            moto_cand.id if moto_cand else None,
+            moto_cand.marca if moto_cand else None,
+            moto_cand.modelo if moto_cand else None,
+        )
+
+        # Human handoff — set AFTER persisting all data
+        lead.necesita_humano = True
         state.needs_human = True
-        if ctx.lead:
-            ctx.lead.necesita_humano = True
+
         self.db.commit()
 
         try:
@@ -2852,16 +3053,12 @@ class ConversationEngine:
             )
         except Exception as exc:
             logger.error(
-                "M21.1.1 motorcycle notification failed thread_id=%s: %s",
+                "M21.2 motorcycle_contact_response notification failed thread_id=%s: %s",
                 ctx.thread.id, exc,
             )
 
-        try:
-            sent_id = self._send_text_to_wa(ctx, _MOTORCYCLE_HANDOFF_REPLY)
-            return _out("replied", wa_message_id=sent_id)
-        except OutboundBlockedError:
-            self.db.commit()
-            return _out("human_handoff_blocked", detail="motorcycle_enquiry_kill_switch")
+        sent_id = self._send_text_to_wa(ctx, _MOTORCYCLE_ADVISOR_REPLY)
+        return _out("replied", wa_message_id=sent_id)
 
     def _handle_phone_call_escalation(
         self,
@@ -3358,7 +3555,7 @@ class ConversationEngine:
         tipo_vehiculo = tipo_vehiculo or "AUTO"
 
         if tipo_vehiculo.upper() == "MOTO":
-            return self._motorcycle_human_handoff(ctx, state)
+            return self._motorcycle_human_handoff(ctx, state, marca=marca, modelo=modelo)
         state.last_intent = _INTENT_PREPURCHASE  # website form = confirmed pre-purchase intent
 
         # ── Create candidate ──────────────────────────────────────────────

@@ -3887,6 +3887,7 @@ class TestWebsiteFlowSelection(unittest.TestCase):
 
         eng._send_flow_button = fake_send_flow
         eng.settings = MagicMock()
+        eng.settings.whatsapp_manual_handoff_flow_id = ""
         eng.settings.whatsapp_flow_id = "generic-flow-123"
         eng.settings.whatsapp_website_flow_id = "website-flow-456"
 
@@ -3916,6 +3917,7 @@ class TestWebsiteFlowSelection(unittest.TestCase):
 
         eng._send_flow_button = fake_send_flow
         eng.settings = MagicMock()
+        eng.settings.whatsapp_manual_handoff_flow_id = ""
         eng.settings.whatsapp_flow_id = "generic-flow-123"
         eng.settings.whatsapp_website_flow_id = "website-flow-456"
 
@@ -3942,6 +3944,7 @@ class TestWebsiteFlowSelection(unittest.TestCase):
         texts_sent: list[str] = []
         eng._send_text_to_wa = lambda ctx, txt: texts_sent.append(txt) or "id"
         eng.settings = MagicMock()
+        eng.settings.whatsapp_manual_handoff_flow_id = ""
         eng.settings.whatsapp_flow_id = "generic-flow-123"
         eng.settings.whatsapp_website_flow_id = ""  # not configured
 
@@ -3971,6 +3974,7 @@ class TestWebsiteFlowSelection(unittest.TestCase):
         texts_sent: list[str] = []
         eng._send_text_to_wa = lambda ctx, txt: texts_sent.append(txt) or "id"
         eng.settings = MagicMock()
+        eng.settings.whatsapp_manual_handoff_flow_id = ""
         eng.settings.whatsapp_flow_id = ""  # not configured
         eng.settings.whatsapp_website_flow_id = ""
 
@@ -4232,6 +4236,7 @@ class TestWebsiteFlowInitialScreen(unittest.TestCase):
         eng = _make_engine()
         eng._schedule = self._make_svc(valid=True)
         eng.settings = MagicMock()
+        eng.settings.whatsapp_manual_handoff_flow_id = ""
         eng.settings.whatsapp_flow_id = "generic-111"
         eng.settings.whatsapp_website_flow_id = "website-222"
 
@@ -4278,6 +4283,7 @@ class TestWebsiteFlowInitialScreen(unittest.TestCase):
         eng = _make_engine()
         eng._schedule = self._make_svc(valid=True)
         eng.settings = MagicMock()
+        eng.settings.whatsapp_manual_handoff_flow_id = ""
         eng.settings.whatsapp_flow_id = "generic-111"
         eng.settings.whatsapp_website_flow_id = "website-222"
 
@@ -4307,6 +4313,7 @@ class TestWebsiteFlowInitialScreen(unittest.TestCase):
         eng = _make_engine()
         eng._schedule = self._make_svc(valid=True)
         eng.settings = MagicMock()
+        eng.settings.whatsapp_manual_handoff_flow_id = ""
         eng.settings.whatsapp_flow_id = "generic-111"
         eng.settings.whatsapp_website_flow_id = "website-222"
 
@@ -4332,6 +4339,7 @@ class TestWebsiteFlowInitialScreen(unittest.TestCase):
         from unittest.mock import patch, MagicMock
         eng = _make_engine()
         eng.settings = MagicMock()
+        eng.settings.whatsapp_manual_handoff_flow_id = ""
         eng.settings.whatsapp_flow_id = "generic-111"
         eng.db.add = lambda x: None
         eng.db.commit = lambda: None
@@ -4572,6 +4580,7 @@ class TestCheckFallbackFlowTriggers(unittest.TestCase):
         from unittest.mock import MagicMock
         eng = _make_engine()
         eng.settings = MagicMock()
+        eng.settings.whatsapp_manual_handoff_flow_id = ""
         eng.settings.whatsapp_vehicle_fallback_flow_id = vehicle_id
         eng.settings.whatsapp_location_fallback_flow_id = location_id
         eng.db.commit = lambda: None
@@ -5070,6 +5079,7 @@ class TestBookingFlowUnchanged(unittest.TestCase):
         from unittest.mock import MagicMock
         eng = _make_engine()
         eng.settings = MagicMock()
+        eng.settings.whatsapp_manual_handoff_flow_id = ""
         eng.settings.whatsapp_flow_id = "generic-999"
         eng.settings.whatsapp_website_flow_id = "website-888"
         eng.settings.whatsapp_vehicle_fallback_flow_id = "veh-111"
@@ -5104,6 +5114,7 @@ class TestBookingFlowUnchanged(unittest.TestCase):
         from unittest.mock import MagicMock
         eng = _make_engine()
         eng.settings = MagicMock()
+        eng.settings.whatsapp_manual_handoff_flow_id = ""
         eng.settings.whatsapp_flow_id = "generic-999"
         eng.settings.whatsapp_website_flow_id = "website-888"
         eng.settings.whatsapp_vehicle_fallback_flow_id = "veh-111"
@@ -5147,6 +5158,7 @@ class TestFallbackFlowInitialScreens(unittest.TestCase):
         from unittest.mock import MagicMock
         eng = _make_engine()
         eng.settings = MagicMock()
+        eng.settings.whatsapp_manual_handoff_flow_id = ""
         eng.settings.whatsapp_vehicle_fallback_flow_id = vehicle_id
         eng.settings.whatsapp_location_fallback_flow_id = location_id
         eng.settings.whatsapp_flow_id = generic_id
@@ -5585,6 +5597,7 @@ class TestProdRegressionVehicleFlowTrigger(unittest.TestCase):
         from unittest.mock import MagicMock
         eng = _make_engine()
         eng.settings = MagicMock()
+        eng.settings.whatsapp_manual_handoff_flow_id = ""
         eng.settings.whatsapp_vehicle_fallback_flow_id = vehicle_id
         eng.settings.whatsapp_location_fallback_flow_id = location_id
         eng.db.commit = lambda: None
@@ -5827,6 +5840,7 @@ class TestProdRegressionLocationWording(unittest.TestCase):
         from unittest.mock import MagicMock
         eng = _make_engine()
         eng.settings = MagicMock()
+        eng.settings.whatsapp_manual_handoff_flow_id = ""
         eng.settings.whatsapp_vehicle_fallback_flow_id = "veh-id"
         eng.settings.whatsapp_location_fallback_flow_id = "loc-id"
         eng.db.commit = lambda: None
