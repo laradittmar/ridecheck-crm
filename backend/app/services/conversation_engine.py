@@ -198,15 +198,15 @@ _FALLBACK_WARM_HANDOFF = (
 
 # Motorcycle/quad/UTV manual handoff — no form involved; must not reference
 # form completion.  Distinct from _FALLBACK_WARM_HANDOFF which follows an
-# actual Flow submission.  Used as fallback when WHATSAPP_MANUAL_HANDOFF_FLOW_ID
-# is not configured.
+# actual Flow submission.  Used as fallback when WHATSAPP_FLOW_ID (CLIENT DATA
+# FLOW) is not configured.
 _MOTORCYCLE_HANDOFF_REPLY = (
     "Las motos las revisamos de forma manual. "
     "Un asesor de Ridecheck se va a contactar con vos para continuar."
 )
 
 # M21.2 Motorcycle contact-data Flow — Turn 1 intro text (body of the Flow button).
-# Sent when WHATSAPP_MANUAL_HANDOFF_FLOW_ID is configured.
+# Sent when WHATSAPP_FLOW_ID (CLIENT DATA FLOW) is configured.
 _MOTORCYCLE_CONTACT_INTRO = (
     "Perfecto, para avanzar necesito que completes estos datos."
 )
@@ -1312,9 +1312,10 @@ class ConversationEngine:
         state = ctx.state
         assert state is not None
 
-        # M21.2: Motorcycle manual-handoff contact flow — detect by token prefix.
-        # Checked FIRST so a moto-handoff response is never mis-routed to the
-        # booking handler (which would create a revision and set AGENDADO).
+        # M21.2: Motorcycle contact flow — detect by token prefix BEFORE booking handler.
+        # Both paths use the same WHATSAPP_FLOW_ID (CLIENT DATA FLOW); the token prefix
+        # is the only discriminator. Checked first so a motorcycle response is never
+        # mis-routed to the booking handler (which creates a revision and sets AGENDADO).
         if (state.flow_booking_token or "").startswith(_MOTO_HANDOFF_TOKEN_PREFIX):
             return self._process_motorcycle_contact_response(ctx, state, flow_data)
 
@@ -2872,15 +2873,15 @@ class ConversationEngine:
     ) -> "ConversationHandleOut":
         """Motorcycle/quad/UTV inquiry handler.
 
-        When WHATSAPP_MANUAL_HANDOFF_FLOW_ID is configured (preferred path):
+        When WHATSAPP_FLOW_ID (CLIENT DATA FLOW) is configured (preferred path):
           Turn 1: creates a MOTO candidate, stores a pending token, and dispatches
-          the contact-data WhatsApp Flow.  does NOT set needs_human yet — that
-          happens in _process_motorcycle_contact_response after the Flow reply.
+          the existing client-data WhatsApp Flow.  Does NOT set needs_human yet —
+          that happens in _process_motorcycle_contact_response after the Flow reply.
 
-        Fallback (Flow not configured):
+        Fallback (WHATSAPP_FLOW_ID not configured):
           Immediate plain-text handoff; sets needs_human=True immediately.
         """
-        flow_id = (getattr(self.settings, "whatsapp_manual_handoff_flow_id", "") or "").strip()
+        flow_id = (getattr(self.settings, "whatsapp_flow_id", "") or "").strip()
 
         if not flow_id:
             # ── Fallback: Flow not configured — immediate plain-text handoff ───
@@ -2932,7 +2933,7 @@ class ConversationEngine:
         try:
             sent_id = self._send_flow_button(
                 ctx, _MOTORCYCLE_CONTACT_INTRO, flow_token,
-                flow_id=flow_id, initial_screen="CONTACT_DATA",
+                flow_id=flow_id, initial_screen="MAIN",
             )
             return _out("flow_button_sent", wa_message_id=sent_id)
         except OutboundBlockedError:
@@ -3013,9 +3014,11 @@ class ConversationEngine:
         # Consume the pending motorcycle handoff token
         state.flow_booking_token = None
 
-        # Parse contact fields from flow — only nombre_apellido and email expected
+        # Parse contact fields using same mapping as existing CLIENT DATA FLOW (MAIN screen).
+        # telefono is intentionally skipped — WA phone is the authoritative contact identifier.
         full_name = (flow_data.get("nombre_apellido") or "").strip()
         buyer_email = (flow_data.get("email") or "").strip() or None
+        canal = (flow_data.get("como_llego") or "").strip() or None
         name_parts = full_name.split() if full_name else []
         buyer_first = name_parts[0] if name_parts else ""
         buyer_last = " ".join(name_parts[1:]) if len(name_parts) > 1 else ""
@@ -3027,6 +3030,8 @@ class ConversationEngine:
             lead.apellido = buyer_last
         if buyer_email and not lead.email:
             lead.email = buyer_email
+        if canal and not getattr(lead, "canal", None):
+            lead.canal = canal
 
         # Find MOTO candidate to confirm motorcycle evidence was preserved
         moto_cand = next(

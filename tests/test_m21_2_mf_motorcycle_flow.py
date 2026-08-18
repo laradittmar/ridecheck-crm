@@ -93,7 +93,7 @@ def _make_state(**kw) -> types.SimpleNamespace:
 def _make_lead(**kw) -> types.SimpleNamespace:
     ns = types.SimpleNamespace(
         id=27, flag=None, estado="CONSULTA_NUEVA",
-        nombre=None, apellido=None, email=None,
+        nombre=None, apellido=None, email=None, canal=None,
         telefono="5491153368330", necesita_humano=False,
     )
     for k, v in kw.items():
@@ -153,8 +153,8 @@ def _make_engine(focus_candidate=None) -> ConversationEngine:
     eng.settings.openai_api_key = "sk-fake"
     eng.settings.openai_chat_model = "gpt-4o-mini"
     eng.settings.backend_url = "http://localhost:8000"
-    # Enable Flow-based path
-    eng.settings.whatsapp_manual_handoff_flow_id = _TEST_FLOW_ID
+    # Activate Flow-based motorcycle path via existing CLIENT DATA FLOW
+    eng.settings.whatsapp_flow_id = _TEST_FLOW_ID
 
     eng._send_text_to_wa = MagicMock(return_value="mock-wa-id")
     eng._send_flow_button = MagicMock(return_value="mock-flow-wa-id")
@@ -347,10 +347,80 @@ class TestMF03FlowResponse(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MF04 — Phone preservation
+# MF04 — Same client-data Flow from its OTHER existing caller stays on booking path
 # ══════════════════════════════════════════════════════════════════════════════
 
-class TestMF04PhonePreservation(unittest.TestCase):
+class TestMF04OtherCallerUnchanged(unittest.TestCase):
+
+    def test_mf04_booking_response_routes_to_booking_handler(self):
+        """MF04: Booking flow response (no moto-handoff token) routes to booking handler."""
+        eng = _make_engine()
+        eng._send_booking_notification = MagicMock()
+        # Regular booking token — no moto-handoff prefix
+        state = _make_state(
+            flow_booking_token="415-9999999",
+            last_stage="SCHEDULING",
+            preferred_day="2026-08-20",
+            preferred_time="10:00",
+            home_zone_group="CABA",
+            home_zone_detail="Palermo",
+        )
+        lead = _make_lead()
+        focus = _make_candidate(tipo_vehiculo="AUTO", zone_group="CABA", zone_detail="Palermo")
+        ctx = _make_ctx(state=state, lead=lead, candidates=[focus])
+        eng._focus_candidate = MagicMock(return_value=focus)
+
+        # Client-data flow payload identical to what WHATSAPP_FLOW_ID sends for a booking
+        flow_data = {
+            "nombre_apellido": "Ana García",
+            "telefono": "1155554444",
+            "email": "ana@example.com",
+            "como_llego": "Instagram",
+        }
+        result = eng._process_flow_response(ctx, flow_data, flow_token="415-9999999")
+
+        # Routed to booking handler — motorcycle advisor reply must NOT be sent
+        self.assertEqual(result.action, "booking_created",
+                         "Non-moto token must route to booking handler")
+        if eng._send_text_to_wa.called:
+            sent = eng._send_text_to_wa.call_args[0][1]
+            self.assertNotEqual(sent, _MOTORCYCLE_ADVISOR_REPLY,
+                                "Booking path must not send motorcycle advisor reply")
+
+        # motorcycle_enquiry reason must not appear in notifications
+        for c in eng._send_fallback_human_review_notification.call_args_list:
+            reason = c[1].get("reason") or (c[0][2] if len(c[0]) > 2 else "")
+            self.assertNotEqual(reason, "motorcycle_enquiry",
+                                "motorcycle_enquiry notification must not fire on booking path")
+
+    def test_mf04_moto_token_does_not_bleed_into_booking_path(self):
+        """MF04: Only moto-handoff- prefix routes to motorcycle handler."""
+        eng = _make_engine()
+        eng._send_booking_notification = MagicMock()
+        # Booking token that starts with a prefix NOT equal to moto-handoff-
+        state = _make_state(
+            flow_booking_token="415-regular-booking-token",
+            last_stage="SCHEDULING",
+            preferred_day="2026-08-25",
+            preferred_time="11:00",
+            home_zone_group="GBA_NORTE",
+        )
+        lead = _make_lead()
+        focus = _make_candidate(tipo_vehiculo="AUTO")
+        ctx = _make_ctx(state=state, lead=lead, candidates=[focus])
+        eng._focus_candidate = MagicMock(return_value=focus)
+
+        result = eng._process_flow_response(
+            ctx, {"nombre_apellido": "Pedro"}, flow_token="415-regular-booking-token"
+        )
+        self.assertEqual(result.action, "booking_created")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MF06 — Phone preservation
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestMF06PhonePreservation(unittest.TestCase):
 
     def test_mf04_wa_phone_not_overwritten(self):
         """MF04: WA phone preserved; Flow response cannot overwrite telefono."""

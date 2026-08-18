@@ -160,7 +160,7 @@ def _make_engine(ai_response=None) -> ConversationEngine:
     eng.settings.openai_api_key = "sk-fake"
     eng.settings.openai_chat_model = "gpt-4o-mini"
     eng.settings.backend_url = "http://localhost:8000"
-    eng.settings.whatsapp_manual_handoff_flow_id = ""
+    eng.settings.whatsapp_flow_id = ""
     eng._send_text_to_wa = MagicMock(return_value="mock-wa-id")
     eng._send_fallback_human_review_notification = MagicMock()
     eng._call_openai = MagicMock(return_value=ai_response or _DEFAULT_AI_RAW)

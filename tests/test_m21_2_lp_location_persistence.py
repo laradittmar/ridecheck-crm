@@ -133,7 +133,6 @@ def _engine(zone_fn=None) -> ConversationEngine:
     eng = ConversationEngine.__new__(ConversationEngine)
     eng.db = MagicMock()
     eng.settings = MagicMock()
-    eng.settings.whatsapp_manual_handoff_flow_id = ""
     eng.settings.openai_api_key = "sk-fake"
     eng.settings.openai_chat_model = "gpt-4o-mini"
     eng.settings.backend_url = "http://localhost:8000"

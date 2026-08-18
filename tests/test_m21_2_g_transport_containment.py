@@ -6,8 +6,15 @@ ARCHITECTURAL FINDING (from forensic inspection of routes/whatsapp.py and n8n DB
   - Meta status events (sent/delivered/read/failed) are processed by the backend
     webhook handler (routes/whatsapp.py:485-555) and are NEVER forwarded to n8n.
   - _post_n8n_event() is only called inside the `messages` loop (line 195).
-  - The n8n `IF - Has Thread ID? (Status Guard)` node provides defense-in-depth
-    for any malformed payloads that lack thread_id.
+  - The n8n conversational guard is implemented as two nodes in sequence:
+      1. "Normalize Conversational Payload Guard" (Code node) — computes guardPassed boolean:
+           isConversational = event=="inbound_message" OR message_type in {"audio","image"}
+           hasThreadId = thread_id not null/undefined/empty
+           guardPassed = isConversational AND hasThreadId
+      2. "IF - Has Thread ID? (Status Guard)" (IF node) — checks $json.guardPassed == true
+         (boolean.true operator, same format as IF-Engine-Handled?). This replaces the
+         previous compound IF condition which crashed on n8n's operator registry for
+         notEmpty/notEqual against the IF node typeVersion 2 in this n8n build.
   - All 15 real n8n executions in the captured DB show identical shape:
     {event: "inbound_message", text, thread_id, wa_id, wa_message_id}
   - Exec 1287 = LIVE04 crash message: one n8n execution, one CE call, CE crashed,
@@ -24,7 +31,7 @@ WHAT THESE TESTS COVER:
 
 Tests TR02-TR05, TR09-TR11 are covered by:
   (a) backend code inspection (routes/whatsapp.py: status events not forwarded)
-  (b) n8n workflow static proof (IF-Has-Thread-ID node inserted, false branch disconnected)
+  (b) n8n workflow static proof (Code+IF guard nodes inserted, false branch disconnected)
   (c) The n8n captured execution data (all payloads are inbound_message shape)
 These tests cannot be expressed as pure CE unit tests without an n8n test harness.
 """
@@ -319,27 +326,63 @@ class TestStatusEventPayloadShape(unittest.TestCase):
             self.assertGreater(payload["thread_id"], 0, "thread_id must be positive integer")
 
     def test_status_guard_condition_logic(self):
-        """IF - Has Thread ID? condition: notEmpty(thread_id) → true = continue, false = terminal.
+        """IF - Has Thread ID? compound condition (M21.2.8 Option B).
 
-        Simulates the n8n node condition: body.thread_id must be notEmpty.
-        Valid inbound messages: thread_id is a positive integer → true → continue.
-        Hypothetical status payload (if it reached n8n): no thread_id → false → terminal.
+        Guard logic (n8n combinator=and):
+          (body.event == "inbound_message"
+           OR body.message_type == "audio"
+           OR body.message_type == "image")
+          AND body.thread_id notEmpty
+
+        Text passes: event="inbound_message" + thread_id → true → Get AI Status
+        Audio passes: message_type="audio" + thread_id → true → Get AI Status
+        Image passes: message_type="image" + thread_id → true → Get AI Status
+        Flow: takes IF-Is-Flow-Response? true branch, never reaches this guard
+        Unknown: no matching event/message_type → false → TERMINAL
         """
         def _guard_evaluates_true(body: dict) -> bool:
-            """Simulate: $json.body.thread_id notEmpty."""
-            val = body.get("thread_id")
-            return val is not None and val != "" and val != 0
+            """Simulate compound condition:
+            (event=="inbound_message" OR message_type in {"audio","image"}) AND thread_id notEmpty
+            """
+            event = body.get("event")
+            msg_type = body.get("message_type")
+            thread_id = body.get("thread_id")
+            conv_type_ok = (
+                event == "inbound_message"
+                or msg_type == "audio"
+                or msg_type == "image"
+            )
+            thread_ok = thread_id is not None and thread_id != "" and thread_id != 0
+            return conv_type_ok and thread_ok
 
-        # All valid inbound shapes pass the guard
-        self.assertTrue(_guard_evaluates_true({"thread_id": 415}))
-        self.assertTrue(_guard_evaluates_true({"thread_id": 1}))
+        # Text inbound (all 15 captured production payloads have this shape)
+        self.assertTrue(_guard_evaluates_true(
+            {"event": "inbound_message", "thread_id": 415}))
 
-        # Missing or null thread_id: guard blocks
-        self.assertFalse(_guard_evaluates_true({"thread_id": None}))
+        # Audio inbound (no event field, only message_type)
+        self.assertTrue(_guard_evaluates_true(
+            {"message_type": "audio", "thread_id": 415}))
+
+        # Image inbound (no event field, only message_type)
+        self.assertTrue(_guard_evaluates_true(
+            {"message_type": "image", "thread_id": 415}))
+
+        # Missing thread_id: guard blocks regardless of conv type
+        self.assertFalse(_guard_evaluates_true(
+            {"event": "inbound_message", "thread_id": None}))
+        self.assertFalse(_guard_evaluates_true(
+            {"message_type": "audio", "thread_id": None}))
         self.assertFalse(_guard_evaluates_true({}))
 
-        # Zero thread_id: guard blocks (thread IDs are always > 0)
-        self.assertFalse(_guard_evaluates_true({"thread_id": 0}))
+        # Unknown conversational type (no event, no matching message_type): TERMINAL
+        self.assertFalse(_guard_evaluates_true(
+            {"thread_id": 415}))
+        self.assertFalse(_guard_evaluates_true(
+            {"message_type": "flow_response", "thread_id": 415}))
+
+        # Zero thread_id: guard blocks
+        self.assertFalse(_guard_evaluates_true(
+            {"event": "inbound_message", "thread_id": 0}))
 
 
 if __name__ == "__main__":
