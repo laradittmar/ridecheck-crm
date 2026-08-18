@@ -3214,13 +3214,28 @@ class ConversationEngine:
             # Explicit vehicle-location evidence → candidate (LR-3) or pre-candidate fallback.
             _vzone = _vlzones[0]
             _fc = self._focus_candidate(ctx)
-            if _fc:
+            # Candidate-location isolation (M21.2.14): only write directly to a candidate
+            # that is the established current focus.  A "mentioned" candidate from a prior
+            # turn (e.g. a MOTO from a completed handoff) is NOT the current subject and
+            # must not inherit location evidence from a different vehicle's conversation.
+            _fc_is_current = (
+                _fc is not None
+                and (
+                    _fc.status == "current_focus"
+                    or (
+                        getattr(state, "current_focus_candidate_id", None) is not None
+                        and state.current_focus_candidate_id == _fc.id
+                    )
+                )
+            )
+            if _fc_is_current:
                 _fc.zone_group = _vzone.zone_group
                 _fc.zone_detail = _vzone.zone_detail
             else:
-                # No candidate yet: buffer in thread-level fallback so the candidate
-                # inherits it on creation.  Only vehicle-location evidence (not
-                # customer-origin) reaches this branch (LR-2/LR-3 preserved).
+                # No candidate yet, or only an unrelated mentioned candidate — buffer in
+                # thread-level fallback so the intended candidate inherits it on creation.
+                # Only vehicle-location evidence (not customer-origin) reaches this branch
+                # (LR-2/LR-3 preserved).
                 state.home_zone_group = _vzone.zone_group
                 state.home_zone_detail = _vzone.zone_detail
             _vehicle_location_written = True
@@ -3235,7 +3250,18 @@ class ConversationEngine:
                     if _zh.zone_group:
                         state.home_zone_group = _zh.zone_group
                     _fc2 = self._focus_candidate(ctx)
-                    if _fc2 and not _fc2.zone_group:
+                    # Same isolation: only write to an established current-focus candidate.
+                    _fc2_is_current = (
+                        _fc2 is not None
+                        and (
+                            _fc2.status == "current_focus"
+                            or (
+                                getattr(state, "current_focus_candidate_id", None) is not None
+                                and state.current_focus_candidate_id == _fc2.id
+                            )
+                        )
+                    )
+                    if _fc2_is_current and not _fc2.zone_group:
                         _fc2.zone_group = _zh.zone_group
                         _fc2.zone_detail = _zh.zone_detail
         return None, _vehicle_location_written
