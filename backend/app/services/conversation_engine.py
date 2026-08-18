@@ -221,6 +221,22 @@ _MOTORCYCLE_ADVISOR_REPLY = (
 # BEFORE the booking-flow handler.  Must not clash with booking tokens (no prefix there).
 _MOTO_HANDOFF_TOKEN_PREFIX = "moto-handoff-"
 
+# Candidate type-safety: tipo_vehiculo values that represent motorcycles.
+# A MOTO candidate must never be repurposed as an automotive candidate and vice versa.
+_MOTO_TIPO_VALUES = frozenset({"MOTO", "MOTOCICLETA"})
+
+
+def _tipo_compatible(existing: "str | None", new: "str | None") -> bool:
+    """Return True when two tipo_vehiculo values belong to the same logical type group.
+
+    An existing MOTO candidate must not be updated with AUTO data, and vice versa.
+    A null/empty tipo on either side is always considered compatible (no conflict).
+    """
+    if not existing or not new:
+        return True
+    return (existing.upper() in _MOTO_TIPO_VALUES) == (new.upper() in _MOTO_TIPO_VALUES)
+
+
 # ── M21.1.1 Service Intent Gate ───────────────────────────────────────────────
 # _PHONE_CALL_PATTERNS     — [EXISTING] line 142 — do not redefine
 # _is_phone_call_request() — [EXISTING] line 307 — do not redefine
@@ -4446,6 +4462,7 @@ Respondé SOLO con JSON válido:
 
         elif action == "update":
             raw_id = candidate_data.get("id")
+            new_tipo = (candidate_data.get("tipo_vehiculo") or "").upper() or None
             if raw_id:
                 target_id = int(raw_id)
                 target = next((c for c in ctx.candidates if c.id == target_id), None)
@@ -4453,6 +4470,12 @@ Respondé SOLO con JSON válido:
                 # AI omitted id — fall back to the current focus candidate.
                 target = self._focus_candidate(ctx)
                 target_id = target.id if target else None
+            # Type-safety: if the resolved candidate has an established tipo_vehiculo
+            # that is incompatible with the new one (e.g. MOTO vs AUTO), redirect to
+            # create rather than corrupting the existing candidate's identity.
+            if target is not None and not _tipo_compatible(target.tipo_vehiculo, new_tipo):
+                self._apply_candidate(ctx, {**candidate_data, "action": "create"})
+                return
             if target is None:
                 return
             for k in ("marca", "modelo", "version_text", "anio", "tipo_vehiculo",
@@ -4474,10 +4497,23 @@ Respondé SOLO con JSON válido:
         The catalog is always authoritative for tipo_vehiculo.  marca/modelo
         are only written if the candidate field is currently empty, so any
         version/trim detail added by the AI is preserved.
+
+        Type-safety: if the current focus candidate's tipo_vehiculo belongs to a
+        different logical group than the catalog match (e.g. an existing MOTO
+        candidate vs a catalogued AUTO vehicle), a new candidate is created rather
+        than the MOTO candidate being repurposed.
         """
         focus = self._focus_candidate(ctx)
         if focus is None:
             # AI returned action=none but catalog hit — create the candidate now.
+            self._create_candidate_from_catalog(ctx, ctx.state, match)
+            return
+        if not _tipo_compatible(focus.tipo_vehiculo, match.tipo_vehiculo):
+            # Type mismatch — preserve existing candidate and create a new one.
+            logger.info(
+                "M21.2.13 tipo conflict thread_id=%s candidate=%s existing=%r catalog=%r — creating new",
+                ctx.thread.id, focus.id, focus.tipo_vehiculo, match.tipo_vehiculo,
+            )
             self._create_candidate_from_catalog(ctx, ctx.state, match)
             return
         if focus.tipo_vehiculo != match.tipo_vehiculo:
