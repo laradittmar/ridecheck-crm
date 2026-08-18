@@ -4646,6 +4646,59 @@ Respondé SOLO con JSON válido:
             if zone_norm in normalized_text:
                 return zone
 
+        # ── M21.2.15: compact-form and ASR-tolerant fuzzy match ──────────────────
+        # Handles Whisper word-boundary merge artifacts (e.g. "Villurquiza" for
+        # "Villa Urquiza") and app-side typos like "VillaUrquiza".
+        # Engaged only after the exact-substring pass above finds nothing.
+        #
+        # Safety constraints:
+        #   - minimum compact input length ≥ 6  (rejects bare "san", "villa", "norte")
+        #   - compact-exact wins before any score comparison
+        #   - fuzzy ratio threshold ≥ 0.85
+        #   - ambiguity gap ≥ 0.20 vs runner-up  (rejects La Matanza Este/Oeste, etc.)
+        _compact_input = re.sub(r"\s+", "", _strip_accents(text))
+        if len(_compact_input) >= 6:
+            # Compact-exact: remove all whitespace from the canonical zone_detail
+            # and compare.  Handles "VillaUrquiza" → "villaurquiza".
+            for zone in zones_sorted:
+                if not zone.zone_detail:
+                    continue
+                if re.sub(r"\s+", "", _n(zone.zone_detail)) == _compact_input:
+                    return zone
+
+            # ASR-fuzzy: SequenceMatcher ratio on compact forms.
+            # Handles 1-char deletion/substitution like "villurquiza" (11)
+            # vs canonical compact "villaurquiza" (12): ratio ≈ 0.957.
+            from difflib import SequenceMatcher as _SM
+            _FUZZY_MIN = 0.85   # minimum similarity to accept a match
+            _GAP_MIN   = 0.20   # minimum lead over runner-up (anti-ambiguity)
+            _best_r    = 0.0
+            _best_zone = None
+            _second_r  = 0.0
+            for zone in zones_sorted:
+                if not zone.zone_detail:
+                    continue
+                _zc = re.sub(r"\s+", "", _n(zone.zone_detail))
+                if len(_zc) < 6:
+                    continue
+                _r = _SM(None, _compact_input, _zc).ratio()
+                if _r > _best_r:
+                    _second_r = _best_r
+                    _best_r   = _r
+                    _best_zone = zone
+                elif _r > _second_r:
+                    _second_r = _r
+            if (
+                _best_r >= _FUZZY_MIN
+                and (_best_r - _second_r) >= _GAP_MIN
+                and _best_zone is not None
+            ):
+                logger.info(
+                    "M21.2.15 ASR-fuzzy zone %r → %r ratio=%.3f gap=%.3f",
+                    text, _best_zone.zone_detail, _best_r, _best_r - _second_r,
+                )
+                return _best_zone
+
         # Pre-AI group detection: if text mentions a bare zone_group name (e.g. "Oeste")
         # that has no matching zone_detail, return a sentinel so the caller can set
         # home_zone_group and the ACEPTADO guard can ask for the specific barrio.
