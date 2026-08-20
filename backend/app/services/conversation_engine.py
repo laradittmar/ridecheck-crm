@@ -354,13 +354,27 @@ _PREPURCHASE_SIGNALS: frozenset[str] = frozenset({
     "por comprar el vehiculo",
     "quiero comprar el auto",
     "quiero comprar un auto",
+    # B5-01-A: imperfect-past inspection intent — guards Layer D bypass and Layer F Step 2.
+    # Constrained to inspection/revision vocabulary; generic "quería…" not included.
+    "quería revisar", "queria revisar",
+    "quería hacer una revisión", "queria hacer una revision",
+    "quería una inspección", "queria una inspeccion",
+    "quería cotizar", "queria cotizar",
+    "quería que revisaran", "queria que revisaran",
 })
 
 # FAQ / greeting / informational patterns (applied to accent-normalized text).
+# B5-01-B: Added service-composition family ("de qué consta", "en qué consiste") and
+# payment-method family ("se puede pagar", "medios de pago", "aceptan débito", etc.).
 _FAQ_PATTERNS = [
+    # Service content
     r'\bqu[eé]\s+incluye\b',
     r'\bqu[eé]\s+cubre\b',
     r'\bqu[eé]\s+revisan\b',
+    r'\bqu[eé]\s+verifican\b',
+    r'\bqu[eé]\s+(hacen|miran|chequean)\s+en\b',
+    r'\bde\s+qu[eé]\s+consta\b',
+    r'\ben\s+qu[eé]\s+consiste\b',
     r'\bcu[aá]nto\s+(tarda|demora|dura|tiempo)\b',
     r'\btengo\s+que\s+estar\s+presente\b',
     r'\btrabajan?\s+(los\s+)?(s[aá]bados?|domingos?|fin\s+de\s+semana)\b',
@@ -370,8 +384,17 @@ _FAQ_PATTERNS = [
     r'\bd[oó]nde\s+atienden\b',
     r'\bsalen?\s+a\s+domicilio\b',
     r'\bvan\s+al\s+lugar\b',
-    r'\bqu[eé]\s+verifican\b',
     r'\bcosto\s+del\s+servicio\b',
+    # Payment method
+    r'\bc[oó]mo\s+se\s+paga\b',
+    r'\bmedios?\s+de\s+pago\b',
+    r'\bformas?\s+de\s+pago\b',
+    r'\bse\s+puede\s+pagar\b',
+    r'\bpuedo\s+pagar\b',
+    r'\baceptan\s+(d[eé]bito|cr[eé]dito|efectivo|tarjeta|transferencia|mercado\s+pago)\b',
+    r'\bpagar\s+(con|en)\s+(d[eé]bito|cr[eé]dito|efectivo|transferencia)\b',
+    r'\bmercado\s+pago\b',
+    # Greetings / opening queries
     r'^(hola|buenas?|buen\s+d[ií]a|buenos\s+d[ií]as|buenas\s+tardes|buenas\s+noches)[,\s!.]*$',
     r'^(hola[,\s]+)?quer[ií]a\s+(hacer|hacer\s+una)\s+consulta',
     r'\bconsulta\b',
@@ -379,15 +402,19 @@ _FAQ_PATTERNS = [
 
 # M21.1.1-R1: Inspection request patterns for Layer F pass-through.
 # Applied to accent-normalized, lowercase text.
+# B5-01-A: "queria" (imperfect past, accent-normalized form of "quería") added alongside
+# quiero/quisiera/necesito — the most common Argentine opening for soft inspection intent.
+# Constrained to inspection/revision/inspección vocabulary; generic "quería + other verb"
+# is NOT matched (e.g. "quería consultar" or "quería saber" do not trigger).
 _INSPECTION_REQUEST_PATTERNS: tuple[re.Pattern, ...] = (
-    re.compile(r'\b(quiero|necesito|quisiera)\s+que\s+(me\s+)?revis[ae]n\b', re.IGNORECASE),
-    re.compile(r'\b(quiero|necesito|quisiera)\s+revis[ae]r\s+(un[ao]?|el|la)\b', re.IGNORECASE),
-    re.compile(r'\b(quiero|necesito|quisiera)\s+(hacer\s+(una\s+)?)?revisi[oó]n\b', re.IGNORECASE),
-    re.compile(r'\b(quiero|necesito|quisiera)\s+(una|la)\s+(inspecci[oó]n|revisi[oó]n)\b', re.IGNORECASE),
-    re.compile(r'\bcoordinar\s+(una|la)\s+revisi[oó]n\b', re.IGNORECASE),
+    re.compile(r'\b(quiero|queria|necesito|quisiera)\s+que\s+(?:me\s+|les?\s+)?revis\w+\b', re.IGNORECASE),
+    re.compile(r'\b(quiero|queria|necesito|quisiera)\s+revis[ae]r\s+(?:un[ao]?|el|la|este|ese)\b', re.IGNORECASE),
+    re.compile(r'\b(quiero|queria|necesito|quisiera)\s+(?:hacer\s+(?:una\s+)?)?revisi[oó]n\b', re.IGNORECASE),
+    re.compile(r'\b(quiero|queria|necesito|quisiera)\s+(?:una|la)\s+(?:inspecci[oó]n|revisi[oó]n)\b', re.IGNORECASE),
+    re.compile(r'\bcoordinar\s+(?:una|la)\s+revisi[oó]n\b', re.IGNORECASE),
     re.compile(r'\bme\s+inter[eé]sa\s+coordinar\b', re.IGNORECASE),
     # M21.1.1-R2: "quiero/necesito cotizar" signals inspection pricing intent
-    re.compile(r'\b(quiero|necesito|quisiera)\s+cotizar\b', re.IGNORECASE),
+    re.compile(r'\b(quiero|queria|necesito|quisiera)\s+cotizar\b', re.IGNORECASE),
 )
 
 # M21.1.1-R1: Vehicle-location phrase patterns ("está en/por X", "se encuentra en").
@@ -644,6 +671,7 @@ _COVERAGE_RESPONSE = (
 # Accent-stripped lowercase phrases that signal a service FAQ or soft conversation close.
 # Matched as substrings of _norm_lower(message). Conservative set — do not add price
 # or concern words here; those are handled by _wants_price_quote / _has_vehicle_concern.
+# B5-01-B: Added service-composition and payment-method phrases.
 _FAQ_OR_SOFT_CLOSE_PHRASES: frozenset[str] = frozenset({
     # Service-information / FAQ
     "que revisan",
@@ -654,6 +682,26 @@ _FAQ_OR_SOFT_CLOSE_PHRASES: frozenset[str] = frozenset({
     "con cuanto tiempo de anticipo",
     "con cuanta anticipacion",
     "como coordinan",
+    # B5-01-B: Service-composition family
+    "de que consta",
+    "en que consiste",
+    "que hacen en",
+    "que miran en",
+    "que chequean",
+    # B5-01-B: Payment-method family
+    "como se paga",
+    "medios de pago",
+    "formas de pago",
+    "se puede pagar",
+    "puedo pagar",
+    "aceptan debito",
+    "pagar con debito",
+    "pagar en debito",
+    "pagar con credito",
+    "aceptan efectivo",
+    "pagar en efectivo",
+    "aceptan transferencia",
+    "mercado pago",
     # Soft-close / polite exit
     "gracias",
     "lo tengo en cuenta",
@@ -2108,12 +2156,16 @@ class ConversationEngine:
 
         # ── M21.1.1 Layer D: FAQ bypass (all stages) ──────────────────────
         # Informational unless the same message also contains a pre-purchase signal,
-        # or unless a specific vehicle is recognized (those need the full AI path to
-        # create the candidate and deliver a commercial reply).
+        # an explicit inspection request, or a specific vehicle (those need the full
+        # AI path to preserve qualification evidence and deliver a commercial reply).
+        # B5-01-A/Part D: _detect_explicit_inspection_request guard ensures that
+        # multi-intent turns ("quería revisar... ¿de qué consta?") route to Layer F
+        # rather than the FAQ handler, so qualification evidence is not discarded.
         _text_norm_d = self._norm_text(current_turn_text)
         if (
             self._detect_general_information(_text_norm_d)
             and not self._detect_prepurchase_signal(_text_norm_d)
+            and not self._detect_explicit_inspection_request(_text_norm_d)
             and lookup_vehicle(current_turn_text) is None
         ):
             return self._handle_general_information_ai(ctx, event, ai_input_messages)
@@ -4252,6 +4304,8 @@ REGLAS DE NEGOCIO:
 14. La revisión se realiza en el lugar donde está el auto (revisión pre-compra a domicilio).
 15. La revisión suele durar aproximadamente una hora.
 16. Cuanto antes nos avise el cliente, mejor. Coordinamos según la disponibilidad de agenda.
+17. SERVICIO — QUÉ INCLUYE: Revisamos el vehículo en el lugar donde está. Verificamos carrocería y estructura, motor y compartimiento, transmisión, suspensión y tren delantero/trasero, frenos, neumáticos, interior, sistema eléctrico/electrónico, espesores de pintura con medidor (para detectar golpes y reparaciones previas), lectura de errores con escáner OBD y verificación de kilometraje real. Más de 250 puntos de control. Al terminar, el cliente recibe un informe detallado. Respondé con esta información cuando pregunten qué incluye o de qué consta el servicio. Sé conciso y natural, no leas la lista completa.
+18. MEDIOS DE PAGO: Se acepta transferencia bancaria, Mercado Pago y efectivo. NO se acepta débito ni tarjeta de crédito. Ante cualquier pregunta sobre formas de pago, respondé con exactamente esta información. NUNCA inventes ni asumas un medio de pago distinto a los tres aceptados.
 
 TIPOS DE VEHÍCULO VÁLIDOS: AUTO, SUV_4X4_DEPORTIVO, SUV/4x4, CLASICO, MOTO, ESCANEO_MOTOR{narrative_block}
 

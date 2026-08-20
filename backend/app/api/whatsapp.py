@@ -255,9 +255,27 @@ def download_media(media_id: str):
 
 
 @router.post("/media/{media_id}/transcribe", response_model=WhatsAppMediaTranscriptionOut)
-def transcribe_media(media_id: str):
+def transcribe_media(
+    media_id: str,
+    wa_message_id: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    """Transcribe an audio media file via Whisper.
+
+    When wa_message_id is provided (the inbound WhatsApp message ID for this audio),
+    the transcript is persisted to whatsapp_messages.text so that multi-audio debounce
+    bursts can reconstruct all transcript evidence during context assembly.
+    message_type remains 'audio' — the text field holds derived transcript evidence only.
+    """
     info, audio_bytes = _download_whatsapp_media_bytes(media_id)
     text = _transcribe_audio_bytes(media_id=info.media_id, audio_bytes=audio_bytes, mime_type=info.mime_type)
+    if wa_message_id:
+        msg = db.execute(
+            select(WhatsAppMessage).where(WhatsAppMessage.wa_message_id == wa_message_id)
+        ).scalar_one_or_none()
+        if msg is not None:
+            msg.text = text
+            db.commit()
     return WhatsAppMediaTranscriptionOut(text=text)
 
 
