@@ -2761,7 +2761,7 @@ class ConversationEngine:
             # This handles the ráfaga case where "si" + "mañana 12hs" arrive together
             # and the AI transitions from QUOTED→SCHEDULING in the same turn.
             det_day, det_time = _parse_scheduling_text(ai_input_messages, date.today())
-            pday = det_day or state.preferred_day
+            pday = det_day or state.preferred_day or state.active_requested_date
             ptime = det_time or extracted.get("preferred_time_str") or state.preferred_time
             if pday and ptime:
                 result = self._try_schedule_and_flow(ctx, state, pday, ptime, decision.get("reply") or "")
