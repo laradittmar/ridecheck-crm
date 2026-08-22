@@ -281,3 +281,41 @@ def lookup_vehicle(text: str) -> VehicleMatch | None:
                 recognition_only=entry.get("recognition_only", False),
             )
     return None
+
+
+# ── WILD-02-B: Contextual numeric model lookup ─────────────────────────────
+
+_GENERIC_VEHICLE_WORDS: frozenset[str] = frozenset(
+    {"auto", "coche", "vehiculo", "car", "automovil"}
+)
+_NUMERIC_MODEL_RE = re.compile(r"\b(19[89]\d|20[012]\d)\b")
+
+
+def _contextual_numeric_model_lookup(text: str) -> VehicleMatch | None:
+    """Resolve a bare numeric token as a vehicle model name only when
+    no competing make/model is present and no generic vehicle word precedes it.
+
+    Caller must verify qualification-answer context (state.last_intent check)
+    before calling — this function does not check CE state.
+
+    Returns None when the numeric token should be treated as a year.
+    """
+    n = _norm(text)
+    words = n.split()
+    if any(w in _GENERIC_VEHICLE_WORDS for w in words):
+        return None
+    seen: set[tuple[str, str]] = set()
+    for m in _NUMERIC_MODEL_RE.finditer(n):
+        num = m.group(1)
+        for entry in _CAT.values():
+            key = (entry["marca"], entry["modelo"])
+            if str(entry["modelo"]) == num and key not in seen:
+                seen.add(key)
+                return VehicleMatch(
+                    marca=entry["marca"],
+                    modelo=entry["modelo"],
+                    tipo_vehiculo=entry.get("t", ""),
+                    confidence="medium",
+                    matched_alias=num,
+                )
+    return None

@@ -573,9 +573,15 @@ class TestBR1Section6Provenance(unittest.TestCase):
 class TestBR1Section8MutationRules(unittest.TestCase):
     """BR-1 §8 — UNCERTAIN and CONVERSATIONAL must not mutate intent or commercial state."""
 
-    def test_s8_uncertain_does_not_set_last_intent(self):
+    def test_s8_uncertain_sets_awaiting_qualification(self):
+        """WILD-02-A: UNCERTAIN reply now sets last_intent=AWAITING_QUALIFICATION
+        so the next affirmative turn can be consumed as a qualification answer
+        instead of re-firing the opening message.
+        (Previously asserted last_intent is None; updated 2026-08-22 for WILD-02.)"""
+        from app.services.conversation_engine import _AWAITING_QUALIFICATION
         eng, result, state = _run("Perfecto.")
-        self.assertIsNone(state.last_intent)
+        self.assertEqual(state.last_intent, _AWAITING_QUALIFICATION,
+                         "UNCERTAIN must set AWAITING_QUALIFICATION for cross-turn continuity")
 
     def test_s8_conversational_does_not_set_last_intent(self):
         eng, result, state = _run("Gracias.")

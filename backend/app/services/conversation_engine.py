@@ -59,6 +59,7 @@ from ..services.schedule import ScheduleService
 from ..services.unanswered_alert import reset_unanswered_alert
 from ..services.vehicle_catalog import (
     VehicleMatch, lookup_vehicle, fuzzy_lookup_vehicle, FuzzyLookupResult,
+    _contextual_numeric_model_lookup,
 )
 from ..services.field_evidence import (
     resolve_field_evidence,
@@ -614,6 +615,10 @@ _FUZZY_ASK_VEHICLE_REPLY = (
 # Persisted intent token (22 chars, fits String(30) in WhatsAppThreadState.last_intent).
 _INTENT_PREPURCHASE = "PREPURCHASE_INSPECTION"
 
+# Persisted token written after UNCERTAIN clarification is sent (WILD-02-A).
+# Signals that the next turn is expected to be a vehicle-qualification answer.
+_AWAITING_QUALIFICATION = "AWAITING_QUALIFICATION"
+
 # ── M20.6D.2B Routing gate constants ─────────────────────────────────────────
 
 # Clearly out-of-coverage cities/provinces. Accent-stripped lowercase forms;
@@ -790,9 +795,12 @@ def _detect_access_barrier(text: str) -> bool:
     return any(p.search(text) for p in _INSPECTABILITY_ACCESS_BARRIER_PATTERNS)
 
 
-def _extract_year_from_text(text: str) -> int | None:
-    m = _VEHICLE_YEAR_RE.search(text)
-    return int(m.group(1)) if m else None
+def _extract_year_from_text(text: str, exclude_token: str | None = None) -> int | None:
+    for m in _VEHICLE_YEAR_RE.finditer(text):
+        if exclude_token is not None and m.group(1) == str(exclude_token):
+            continue
+        return int(m.group(1))
+    return None
 
 
 # ── Scheduling escalation ─────────────────────────────────────────────────────
@@ -2484,6 +2492,55 @@ class ConversationEngine:
                     # fall through to AI when established candidate context exists
                 # UNRESOLVED: fall through to existing unknown-vehicle path
 
+        # ── WILD-02-B: Peugeot 2008 numeric-model clarification ──────────────
+        # Owner Rule B: when "2008" is the apparent vehicle reference with no
+        # other recognized make/model present, ask "¿Es un Peugeot 2008?" rather
+        # than silently creating the candidate.  Uses the existing fuzzy CONFIRM
+        # machinery so the acceptance path (Rule D) replays zone/year evidence.
+        #
+        # Inspection context is established by any of:
+        #   – last_intent already AWAITING_QUALIFICATION or PREPURCHASE_INSPECTION
+        #   – an explicit inspection/pre-purchase signal in the current turn text
+        #     while still in QUALIFYING stage (e.g. "Quiero revisar un 2008…")
+        _text_norm_b = self._norm_text(current_turn_text)
+        _p2008_inspection_ctx = (
+            state.last_intent in (_AWAITING_QUALIFICATION, _INTENT_PREPURCHASE)
+            or (
+                state.last_stage in (STAGE_QUALIFYING, None)
+                and (
+                    self._detect_prepurchase_signal(_text_norm_b)
+                    or self._detect_explicit_inspection_request(_text_norm_b)
+                )
+            )
+        )
+        if (
+            pre_detected_vehicle is None
+            and not state.needs_human
+            and not ctx.candidates
+            and _p2008_inspection_ctx
+        ):
+            _ctx_hit = _contextual_numeric_model_lookup(current_turn_text)
+            if _ctx_hit is not None:
+                # Establish intent so the confirmation path passes Layer F Step 7.
+                if state.last_intent != _INTENT_PREPURCHASE:
+                    state.last_intent = _INTENT_PREPURCHASE
+                _p2008_question = _FUZZY_CONFIRMATION_TEMPLATE.format(
+                    marca=_ctx_hit.marca, modelo=_ctx_hit.modelo,
+                )
+                try:
+                    _p2008_sent_id = self._send_text_to_wa(ctx, _p2008_question)
+                except OutboundBlockedError:
+                    self.db.commit()
+                    return _out("vehicle_fuzzy_blocked", detail="outbound_disabled")
+                state.pending_fuzzy_catalog_key = f"{_ctx_hit.marca}||{_ctx_hit.modelo}"
+                state.pending_turn_evidence_text = current_turn_text or None
+                self.db.commit()
+                logger.info(
+                    "WILD02 P2008 clarification sent thread_id=%s vehicle=%s %s",
+                    ctx.thread.id, _ctx_hit.marca, _ctx_hit.modelo,
+                )
+                return _out("replied", wa_message_id=_p2008_sent_id)
+
         # ── M21.1.1 Layer F: QUALIFYING intent gate (QUALIFYING/None only) ──
         # F12/transfer/repair handled by all-stage Layer C above.
         # FAQ bypass handled by all-stage Layer D above.
@@ -2627,7 +2684,8 @@ class ConversationEngine:
 
         # Sync year onto focus candidate deterministically if AI missed it.
         if focus_after and focus_after.anio is None:
-            year_hit = _extract_year_from_text(all_recent_text)
+            _excl = str(focus_after.modelo) if focus_after.modelo is not None else None
+            year_hit = _extract_year_from_text(all_recent_text, exclude_token=_excl)
             if year_hit:
                 focus_after.anio = year_hit
 
@@ -3486,6 +3544,17 @@ class ConversationEngine:
         """
         text_norm = self._norm_text(current_turn_text)
 
+        # 0. Cross-turn affirmative: consume pending qualification answer (WILD-02-A).
+        # If the prior turn sent the UNCERTAIN clarification, the next "Sí/dale/claro"
+        # confirms prepurchase intent.  Set intent and fall through — do NOT return — so
+        # the rest of this turn's evidence (vehicle, location) is still processed.
+        if state.last_intent == _AWAITING_QUALIFICATION:
+            _first = text_norm.split()[0].rstrip(",.!¡¿?") if text_norm.split() else ""
+            if _first in {"si", "dale", "claro", "correcto", "ok", "bueno", "sip", "obvio", "yes"}:
+                state.last_intent = _INTENT_PREPURCHASE
+                # No db.commit() here — caller commits after full processing.
+                # Fall through so Steps 1-8 process the remaining turn evidence.
+
         # 1. Explicit inspection request → set intent, continue to full AI path
         if self._detect_explicit_inspection_request(text_norm):
             state.last_intent = _INTENT_PREPURCHASE
@@ -3539,6 +3608,9 @@ class ConversationEngine:
             return None
 
         # 9. No inspection service signal found → UNCERTAIN clarification
+        # Persist that the next turn is a vehicle-qualification answer (WILD-02-A).
+        state.last_intent = _AWAITING_QUALIFICATION
+        self.db.commit()
         return self._send_service_boundary(ctx, _UNCERTAIN_SERVICE_REPLY)
 
     def _handle_general_information_ai(
@@ -4616,7 +4688,8 @@ Respondé SOLO con JSON válido:
         match: VehicleMatch,
         source_text: str = "",
     ) -> None:
-        anio = _extract_year_from_text(source_text) if source_text else None
+        _model_str = str(match.modelo) if match.modelo is not None else None
+        anio = _extract_year_from_text(source_text, exclude_token=_model_str) if source_text else None
         # M21.1.3 LR-7 (updated): inherit pre-candidate vehicle-location fallback from
         # state.home_zone_* when set — these fields now buffer explicit vehicle-location
         # evidence accumulated before a candidate existed.  This is distinct from a
