@@ -2492,18 +2492,19 @@ class ConversationEngine:
                     # fall through to AI when established candidate context exists
                 # UNRESOLVED: fall through to existing unknown-vehicle path
 
-        # ── WILD-02-B: Peugeot 2008 numeric-model clarification ──────────────
-        # Owner Rule B: when "2008" is the apparent vehicle reference with no
-        # other recognized make/model present, ask "¿Es un Peugeot 2008?" rather
-        # than silently creating the candidate.  Uses the existing fuzzy CONFIRM
-        # machinery so the acceptance path (Rule D) replays zone/year evidence.
+        # ── WILD-02-B: numeric-model clarification (catalog-backed) ─────────
+        # Owner Rule B: when a bare year-shaped token is the only apparent
+        # vehicle reference AND it matches a catalog model (e.g. "2008" →
+        # Peugeot 2008), ask "¿Es un <Marca> <Modelo>?" instead of silently
+        # creating a candidate.  Uses the existing fuzzy CONFIRM machinery so
+        # the acceptance path (Rule D) replays zone/year evidence.
         #
         # Inspection context is established by any of:
         #   – last_intent already AWAITING_QUALIFICATION or PREPURCHASE_INSPECTION
         #   – an explicit inspection/pre-purchase signal in the current turn text
         #     while still in QUALIFYING stage (e.g. "Quiero revisar un 2008…")
         _text_norm_b = self._norm_text(current_turn_text)
-        _p2008_inspection_ctx = (
+        _numeric_model_ctx = (
             state.last_intent in (_AWAITING_QUALIFICATION, _INTENT_PREPURCHASE)
             or (
                 state.last_stage in (STAGE_QUALIFYING, None)
@@ -2517,18 +2518,18 @@ class ConversationEngine:
             pre_detected_vehicle is None
             and not state.needs_human
             and not ctx.candidates
-            and _p2008_inspection_ctx
+            and _numeric_model_ctx
         ):
             _ctx_hit = _contextual_numeric_model_lookup(current_turn_text)
             if _ctx_hit is not None:
                 # Establish intent so the confirmation path passes Layer F Step 7.
                 if state.last_intent != _INTENT_PREPURCHASE:
                     state.last_intent = _INTENT_PREPURCHASE
-                _p2008_question = _FUZZY_CONFIRMATION_TEMPLATE.format(
+                _numeric_model_question = _FUZZY_CONFIRMATION_TEMPLATE.format(
                     marca=_ctx_hit.marca, modelo=_ctx_hit.modelo,
                 )
                 try:
-                    _p2008_sent_id = self._send_text_to_wa(ctx, _p2008_question)
+                    _numeric_model_sent_id = self._send_text_to_wa(ctx, _numeric_model_question)
                 except OutboundBlockedError:
                     self.db.commit()
                     return _out("vehicle_fuzzy_blocked", detail="outbound_disabled")
@@ -2536,10 +2537,10 @@ class ConversationEngine:
                 state.pending_turn_evidence_text = current_turn_text or None
                 self.db.commit()
                 logger.info(
-                    "WILD02 P2008 clarification sent thread_id=%s vehicle=%s %s",
+                    "WILD02 numeric model clarification sent thread_id=%s vehicle=%s %s",
                     ctx.thread.id, _ctx_hit.marca, _ctx_hit.modelo,
                 )
-                return _out("replied", wa_message_id=_p2008_sent_id)
+                return _out("replied", wa_message_id=_numeric_model_sent_id)
 
         # ── M21.1.1 Layer F: QUALIFYING intent gate (QUALIFYING/None only) ──
         # F12/transfer/repair handled by all-stage Layer C above.
