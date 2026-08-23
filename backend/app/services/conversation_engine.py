@@ -416,6 +416,11 @@ _INSPECTION_REQUEST_PATTERNS: tuple[re.Pattern, ...] = (
     re.compile(r'\bme\s+inter[eé]sa\s+coordinar\b', re.IGNORECASE),
     # M21.1.1-R2: "quiero/necesito cotizar" signals inspection pricing intent
     re.compile(r'\b(quiero|queria|necesito|quisiera)\s+cotizar\b', re.IGNORECASE),
+    # WILD-03-I: bare imperative/infinitive as sentence opener ("Revisar un auto...", "Revisar una 2008...")
+    # Modal-less opening "Revisar ..." is common in Argentine WhatsApp; prior patterns required modal prefix.
+    # Restricted to indefinite article "un/una/uno" to avoid false positives on "Revisar el precio" etc.
+    # Anchored to sentence start (^ or \n) to avoid matching embedded "revisar" in other contexts.
+    re.compile(r'(?:^|\n)\s*revis[ae]r\s+un[ao]?\s+\w', re.IGNORECASE),
 )
 
 # M21.1.1-R1: Vehicle-location phrase patterns ("está en/por X", "se encuentra en").
@@ -2686,16 +2691,38 @@ class ConversationEngine:
         # Sync year onto focus candidate deterministically if AI missed it.
         if focus_after and focus_after.anio is None:
             _excl = str(focus_after.modelo) if focus_after.modelo is not None else None
-            # Phase 3 guard: when vehicle model is unresolved AND the burst contains
-            # 2+ distinct year-shaped tokens, committing any one year is an arbitrary
-            # guess — keep year unknown until the vehicle is clarified.
-            _burst_year_tokens = {
-                m.group(1) for m in _VEHICLE_YEAR_RE.finditer(all_recent_text or "")
+            # WILD-03-X guard: year sync is only safe when evidence is unambiguous.
+            # Priority 1: current-turn year tokens (highest confidence — user just said this).
+            #   Exactly one effective year in current turn → commit from current turn.
+            #   2+ effective years in current turn → explicitly ambiguous, no sync.
+            # Priority 2: historical context (all_recent_text) — only when current turn
+            #   carries zero years AND the full context has at most one effective year.
+            #   2+ effective years in history (e.g. "2008 o 2014" from a prior turn) →
+            #   no sync, even if the vehicle is now known, because the original ambiguity
+            #   was never resolved by the customer.
+            # In both cases the vehicle model token is excluded (e.g. Peugeot "2008" is
+            # the model identifier, not a year of manufacture — see Y04/Y05 cases).
+            _ct_year_tokens = {
+                m.group(1) for m in _VEHICLE_YEAR_RE.finditer(current_turn_text or "")
             }
-            if focus_after.modelo is not None or len(_burst_year_tokens) <= 1:
-                year_hit = _extract_year_from_text(all_recent_text, exclude_token=_excl)
+            _ct_effective = _ct_year_tokens - {_excl} if _excl else _ct_year_tokens
+
+            if len(_ct_effective) == 1:
+                # Current turn: exactly one unambiguous year → commit from current turn.
+                year_hit = _extract_year_from_text(current_turn_text, exclude_token=_excl)
                 if year_hit:
                     focus_after.anio = year_hit
+            elif len(_ct_effective) == 0:
+                # Current turn has no year → check historical context.
+                _all_year_tokens = {
+                    m.group(1) for m in _VEHICLE_YEAR_RE.finditer(all_recent_text or "")
+                }
+                _all_effective = _all_year_tokens - {_excl} if _excl else _all_year_tokens
+                if len(_all_effective) <= 1:
+                    year_hit = _extract_year_from_text(all_recent_text, exclude_token=_excl)
+                    if year_hit:
+                        focus_after.anio = year_hit
+            # If len(_ct_effective) > 1: current turn is explicitly ambiguous → no sync.
 
         # Recompute price after all extractions have run.
         real_price_quote = self._compute_price_quote(ctx, state)
