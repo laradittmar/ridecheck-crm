@@ -304,6 +304,11 @@ def _contextual_numeric_model_lookup(text: str) -> VehicleMatch | None:
     words = n.split()
     if any(w in _GENERIC_VEHICLE_WORDS for w in words):
         return None
+    # When 2+ distinct year-shaped tokens appear (e.g. "2008 o 2014"), the user
+    # is comparing model years — not naming a model.  Disambiguation is not safe.
+    all_numeric_tokens = {m.group(1) for m in _NUMERIC_MODEL_RE.finditer(n)}
+    if len(all_numeric_tokens) > 1:
+        return None
     seen: set[tuple[str, str]] = set()
     for m in _NUMERIC_MODEL_RE.finditer(n):
         num = m.group(1)

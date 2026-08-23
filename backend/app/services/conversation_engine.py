@@ -2686,9 +2686,16 @@ class ConversationEngine:
         # Sync year onto focus candidate deterministically if AI missed it.
         if focus_after and focus_after.anio is None:
             _excl = str(focus_after.modelo) if focus_after.modelo is not None else None
-            year_hit = _extract_year_from_text(all_recent_text, exclude_token=_excl)
-            if year_hit:
-                focus_after.anio = year_hit
+            # Phase 3 guard: when vehicle model is unresolved AND the burst contains
+            # 2+ distinct year-shaped tokens, committing any one year is an arbitrary
+            # guess — keep year unknown until the vehicle is clarified.
+            _burst_year_tokens = {
+                m.group(1) for m in _VEHICLE_YEAR_RE.finditer(all_recent_text or "")
+            }
+            if focus_after.modelo is not None or len(_burst_year_tokens) <= 1:
+                year_hit = _extract_year_from_text(all_recent_text, exclude_token=_excl)
+                if year_hit:
+                    focus_after.anio = year_hit
 
         # Recompute price after all extractions have run.
         real_price_quote = self._compute_price_quote(ctx, state)
