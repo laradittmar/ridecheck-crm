@@ -68,34 +68,87 @@ Two new columns on `whatsapp_thread_states`:
 
 `[CONTRACT]`
 
-A new inspection cycle begins when ALL of the following are true:
+A new inspection cycle begins when a human operator transitions `Lead.estado` **from any non-CONSULTA_NUEVA state TO CONSULTA_NUEVA** via the CRM UI. This explicit human action sets a one-shot reset signal (`state.cycle_reset_pending = True`) on the linked `WhatsAppThreadState`. CE consumes the signal on the next real customer inbound.
 
-1. A human operator has set `lead.estado = CONSULTA_NUEVA` via the CRM UI
-2. A prior inspection cycle was completed (evidenced by `state.current_revision_id IS NOT NULL`)
-3. A new inbound message arrives from the customer
+The cycle boundary is the **human action itself** — not an inference from state fields. CE must not auto-detect or auto-trigger a cycle boundary.
 
-The human CONSULTA_NUEVA reset is an **intentional business action**. CE must not auto-detect or auto-trigger a cycle boundary. Only a human can start a new cycle.
+**Why explicit signal, not state inference:**
 
-The reset is **edge-triggered**: it fires exactly once. After the reset, `state.current_revision_id` is cleared (set to NULL), which prevents the same reset from firing again on subsequent messages in the same new cycle.
+An inference-based predicate such as `lead.estado == CONSULTA_NUEVA AND last_stage IS NOT NULL` would incorrectly fire on every qualifying turn in a first cycle, because `lead.estado` remains `CONSULTA_NUEVA` throughout qualification and `last_stage` becomes `QUALIFYING` on the first turn. This was owner-rejected as WILD-04R design correction.
 
-**Why `current_revision_id` is the correct edge signal:**
+An inference-based predicate such as `lead.estado == CONSULTA_NUEVA AND current_revision_id IS NOT NULL` covers only booked cycles — it misses quoted-abandoned, scheduling-abandoned, provisional, and ATENCION_HUMANA lifecycle paths where `current_revision_id` is never set.
 
-- `state.current_revision_id` is set at exactly one code site: `conversation_engine.py:1539`, inside the booking flow handler, when a `ThreadRevision(status='booked')` is created
-- It is not set for provisional revisions (scheduling escalation path)
-- After reset, it is cleared to NULL — the predicate becomes false for all subsequent turns in the new cycle
-- It rearms only when the next booking is completed
+The explicit `cycle_reset_pending` flag covers all lifecycle paths and fires exactly once.
 
-**Safe cycle detection predicate:**
+### The explicit reset signal: `cycle_reset_pending`
 
-```python
-def _is_new_cycle(lead, state) -> bool:
-    return (
-        lead.estado == "CONSULTA_NUEVA"
-        and state.current_revision_id is not None
-    )
+`[CONTRACT — PLANNED]`
+
+New column on `whatsapp_thread_states`:
+
+```sql
+cycle_reset_pending  BOOLEAN  NOT NULL  DEFAULT FALSE
 ```
 
-**Fields reset at cycle boundary (all ACTIVE_REVISION fields on WhatsAppThreadState):**
+**Set by:** A centralized CRM helper (`set_lead_estado()` in `backend/app/services/lead_lifecycle.py`) called by every CRM endpoint that writes `Lead.estado`. The helper detects a real transition:
+
+```python
+previous_estado = lead.estado          # read BEFORE assignment
+lead.estado = new_estado
+if (
+    new_estado == "CONSULTA_NUEVA"
+    and previous_estado is not None    # not a brand-new row
+    and previous_estado != "CONSULTA_NUEVA"  # real transition, not a no-op
+):
+    _set_cycle_reset_signal(db, lead)  # writes state.cycle_reset_pending = True
+```
+
+**Set on:** All real human transitions to `CONSULTA_NUEVA`. Covers all lifecycle end-states:
+- Booked/completed cycle: `COORDINAR_DISPONIBILIDAD → CONSULTA_NUEVA`
+- Quoted/abandoned cycle: human may set directly
+- Scheduling/abandoned: same
+- ATENCION_HUMANA resolved: `ATENCION_HUMANA → CONSULTA_NUEVA`
+
+**NOT set on:**
+- Brand-new Lead creation (estado starts as `CONSULTA_NUEVA` from default — previous is None)
+- Setting CONSULTA_NUEVA on an already-CONSULTA_NUEVA lead (previous equals new — no-op)
+- CE internal writes (CE only writes `COORDINAR_DISPONIBILIDAD` and `ATENCION_HUMANA`)
+- Any elapsed-time or state-inference logic
+
+**Consumed by:** CE `_handle()`, positioned before the `needs_human` guard. When `state.cycle_reset_pending is True`:
+1. Capture `previous_cursor = state.last_processed_inbound_wa_message_id` (before overwrite)
+2. Determine complete burst from DB: `WHERE id > prev_db_id AND id <= current_event_db_id AND direction='in' ORDER BY id ASC`
+3. Set `state.current_cycle_start_message_db_id = first_burst_msg.id`
+4. Set `state.current_cycle_started_at = first_burst_msg.created_at`
+5. Clear all ACTIVE_REVISION fields on `WhatsAppThreadState` and `Lead`
+6. Set `state.cycle_reset_pending = False` (signal consumed)
+7. Commit
+8. Re-query candidates and messages using new watermarks
+9. Continue processing current burst normally
+
+**After consumption:** `cycle_reset_pending = False`. Subsequent turns in the same new cycle never fire the reset again.
+
+**CRM endpoints that must use `set_lead_estado()`:**
+
+| Route | File | Current direct-write line |
+|---|---|---|
+| `PATCH /leads/{lead_id}` | `api/leads.py:77` | `lead.estado = payload.estado` |
+| `POST /ui/lead_update` | `ui/kanban_actions.py:219` | `lead.estado = s` |
+| `POST /ui/move` | `ui/kanban_actions.py:241` | `lead.estado = estado` |
+| `POST /ui/move_lead` | `ui/kanban_actions.py:288` | `lead.estado = target_estado` |
+| `POST /ui/lead/{lead_id}/move` | `ui/kanban_actions.py:302` | `lead.estado = estado` |
+
+**Endpoints that write Lead.estado but do NOT need the helper** (they never write `CONSULTA_NUEVA`):
+
+| Route | Writes to |
+|---|---|
+| `PATCH /api/revisions/.../appointment-approval` | `AGENDADO` only |
+| `POST /public/revisions/.../approve` | `AGENDADO` only |
+| CE booking handler (line 1526) | `COORDINAR_DISPONIBILIDAD` only |
+| CE flow failure (line 4128) | `ATENCION_HUMANA` only |
+| CE scheduling escalation (line 4164) | `ATENCION_HUMANA` only |
+
+**Fields cleared at cycle reset — WhatsAppThreadState:**
 
 ```
 last_intent, last_stage, needs_human, current_focus_candidate_id,
@@ -105,37 +158,61 @@ last_offered_slots, last_visible_slots, flow_booking_token,
 vehicle_clarification_sent, location_clarification_sent,
 vehicle_fallback_flow_sent, location_fallback_flow_sent,
 inspectability_clarification_sent, pending_fuzzy_catalog_key,
-pending_turn_evidence_text
+pending_turn_evidence_text, cycle_reset_pending (→ False)
 ```
 
-**Fields reset at cycle boundary on Lead:**
+**Fields cleared at cycle reset — Lead:**
 
 ```
-flag, necesita_humano
+flag, necesita_humano, motivo_perdida (if set), buscando_auto_set_at
 ```
 
-`lead.estado` is NOT reset by CE — it is already CONSULTA_NUEVA (the human set it; CE must not overwrite it again).
+`lead.estado` is NOT reset — it is already `CONSULTA_NUEVA` and must remain so.
+
+**Fields preserved through reset (identity and attribution):**
+
+```
+WhatsAppContact: all fields
+WhatsAppThread: all fields
+Lead: nombre, apellido, email, telefono, canal, ref_code, rc_code, compro_el_auto
+WhatsAppThreadState: customer_name, last_processed_inbound_wa_message_id,
+    is_website_lead, current_cycle_started_at (updated by reset),
+    current_cycle_start_message_db_id (updated by reset)
+WhatsAppMessage: all rows preserved (history unchanged)
+WhatsAppThreadCandidate: all rows preserved (prior-cycle candidates remain in DB)
+ThreadRevision: all rows preserved (historical bookings intact)
+Revision: all rows preserved (CRM history intact)
+```
+
+### Known state-sync defect: `state.needs_human` vs `lead.necesita_humano`
+
+`[GAP — owner decision required]`
+
+CE reads `state.needs_human` for AI suppression. The human CRM UI writes `lead.necesita_humano` via `POST /ui/human` and `POST /ui/lead_toggle_humano`. These two endpoints do NOT write `state.needs_human`. If a human clears `lead.necesita_humano` without performing a full cycle reset (i.e., without transitioning lead to CONSULTA_NUEVA), CE remains permanently suppressed.
+
+The new cycle reset **does** clear both fields together (both are in the ACTIVE_REVISION clear list above). The gap is for cases where the human wants to resume AI on the same cycle without starting a new one.
+
+Owner decision required: should `POST /ui/human` and `POST /ui/lead_toggle_humano` also write `state.needs_human` when clearing `lead.necesita_humano`? This is a separate scope decision and must not be implemented without direction.
 
 `[CURRENT]`
 
-CE does not read `lead.estado` for routing decisions anywhere. The `needs_human` guard at `conversation_engine.py:1377–1381` is unconditional — it suppresses CE regardless of `lead.estado`. There is no cycle detection, no ACTIVE_REVISION field reset, no cycle watermark.
+CE does not read `lead.estado` or `state.cycle_reset_pending` for routing. The `needs_human` guard at `conversation_engine.py:1377–1381` is unconditional. No cycle detection, no ACTIVE_REVISION field reset, no cycle watermark exists today.
 
 `[GAP]`
 
-The human CONSULTA_NUEVA reset has no effect on CE behavior today. A returning customer whose prior cycle ended with `needs_human=True` (post-booking) will be permanently suppressed by the `needs_human` guard even after the human resets the lead.
+The human CONSULTA_NUEVA reset has no effect on CE behavior today. `cycle_reset_pending` column does not exist. `set_lead_estado()` helper does not exist. A returning customer is permanently suppressed by the `needs_human` guard (for booked cycles) or receives stale context (for abandoned cycles).
 
 `[PLANNED — WILD-04R]`
-
-Add `_is_new_cycle()` detection in `_handle()`, positioned **before** the `needs_human` guard and **before** semantic context is used. When the predicate fires: execute `_reset_revision_cycle()` which clears ACTIVE_REVISION fields, sets cycle watermarks, and commits. Then re-query candidates and messages with the new watermarks before proceeding. After reset, `needs_human = False`, so CE proceeds with the new cycle normally.
 
 Required call order in `_handle()`:
 1. `_load_context()` (loads identity + existing-watermark-filtered context)
 2. Dedup check
-3. Get/create state, set `last_processed_inbound_wa_message_id`
-4. Lead None check
-5. **Cycle detection + reset** (if fired: re-query candidates/messages with new watermarks)
-6. `needs_human` guard
-7. Route to `_process_flow_response` or `_process_text`
+3. Get/create state, capture `previous_cursor` (before overwriting `last_processed_inbound_wa_message_id`)
+4. Advance `last_processed_inbound_wa_message_id = event.wa_message_id`
+5. Lead None check
+6. **Cycle reset consumption** — if `state.cycle_reset_pending is True`: execute `_execute_cycle_reset()`, re-query candidates/messages with new watermarks, commit
+7. `needs_human` guard (evaluated after reset — reset sets `needs_human = False`)
+8. Route to `_process_flow_response` or `_process_text`
 
 ---
 
@@ -386,12 +463,15 @@ These are CRM records of completed bookings. CE must not read their fields to po
 
 | Contract requirement | Gap severity | Milestone |
 |---|---|---|
-| Active-cycle message filter | CRITICAL — confirmed WILD-04 cause | WILD-04R |
-| Active-cycle candidate filter | CRITICAL — confirmed WILD-04 cause | WILD-04R |
-| Message ordering bug (oldest-20 vs newest-20) | CRITICAL — wrong AI context | WILD-04R |
-| Cycle boundary detection (lead.estado read by CE) | CRITICAL — human reset has no effect | WILD-04R |
+| `cycle_reset_pending` column on `whatsapp_thread_states` | CRITICAL — blocking | WILD-04R |
+| `set_lead_estado()` CRM helper (5 endpoints) | CRITICAL — blocking | WILD-04R |
+| CE `_execute_cycle_reset()` consumption in `_handle()` | CRITICAL — blocking | WILD-04R |
+| Active-cycle message filter (id >= watermark) | CRITICAL — confirmed WILD-04 cause | WILD-04R |
+| Active-cycle candidate filter (created_at >= watermark) | CRITICAL — confirmed WILD-04 cause | WILD-04R |
+| Message ordering bug (oldest-20 → newest-20) | CRITICAL — wrong AI context | WILD-04R |
 | ACTIVE_REVISION field reset at cycle boundary | CRITICAL — state leaks forward | WILD-04R |
 | n8n burst completeness (sub-burst fragmentation) | HIGH — confirmed WILD-04 cause | WILD-04R |
+| `state.needs_human` / `lead.necesita_humano` sync in human-toggle endpoints | MEDIUM — owner decision pending | TBD |
 | AiEvent observability columns | MEDIUM — no performance visibility | WILD-04R obs milestone |
 | latency_ce_ms / latency_total_ms measurement | MEDIUM — no performance data | WILD-04R obs milestone |
 | Answer source tagging | MEDIUM — no provenance | WILD-04R obs milestone |
