@@ -1075,6 +1075,8 @@ _SUBMITTED_TIPO_MAP: dict[str, str] = {
     "clasico": "CLASICO",
     "clásico": "CLASICO",
     "deportivo": "SUV_4X4_DEPORTIVO",
+    "utilitario": "UTILITARIO",
+    "camioneta": "CAMIONETA",
 }
 
 
@@ -1129,10 +1131,19 @@ def _parse_website_form(texts: list[str]) -> dict | None:
             nums = re.sub(r"[^\d]", "", val)
             fields["submitted_total"] = int(nums) if nums else None
 
-    # Extract optional ref= from the raw text (value may contain hyphens/underscores).
-    ref_m = re.search(r"\bref:\s*([\w][\w\-]*)", combined, re.IGNORECASE)
+    # Extract tracking metadata before semantic processing.
+    # Client appends: ref: <ref> · cod: RC-XXXX
+    ref_m = re.search(r"\bref:\s*([A-Za-z][A-Za-z0-9\-]*)", combined, re.IGNORECASE)
     if ref_m:
-        fields["ref"] = ref_m.group(1)
+        raw_ref = ref_m.group(1)
+        # Store only if it matches the known client ref alphabet (allow unknown: preserve raw)
+        fields["ref"] = raw_ref[:10]  # cap at field max length; do not invent mapping
+
+    _RC_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+    _RC_RE = re.compile(r"\bcod:\s*(RC-[" + _RC_ALPHABET + r"]{4})\b", re.IGNORECASE)
+    rc_m = _RC_RE.search(combined)
+    if rc_m:
+        fields["rc_code"] = rc_m.group(1).upper()
 
     # Require at least vehicle or zone to proceed.
     if not fields.get("vehicle_text") and not fields.get("zone_detail"):
@@ -3793,6 +3804,15 @@ class ConversationEngine:
             logger.info(
                 "M18 website_form ref=%r thread_id=%s", form_data["ref"], ctx.thread.id
             )
+            if not lead.ref_code:
+                lead.ref_code = form_data["ref"]
+
+        if form_data.get("rc_code"):
+            logger.info(
+                "M18 website_form rc_code=%r thread_id=%s", form_data["rc_code"], ctx.thread.id
+            )
+            if not lead.rc_code:
+                lead.rc_code = form_data["rc_code"]
 
         # ── Advance state ─────────────────────────────────────────────────
         lead.flag = "PRESUPUESTO_ENVIADO"

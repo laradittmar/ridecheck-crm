@@ -89,6 +89,8 @@ class PricingService:
             "SUV 4X4 DEPORTIVO ": "SUV_4X4_DEPORTIVO",
             "SUV_4X4_DEPORTIVO": "SUV_4X4_DEPORTIVO",
             "CLASICO": "CLASICO",
+            "UTILITARIO": "UTILITARIO",
+            "CAMIONETA": "CAMIONETA",
             "ESCANEO MOTOR": "ESCANEO_MOTOR",
             "ESCANEO_MOTOR": "ESCANEO_MOTOR",
             "MOTO": "MOTO",

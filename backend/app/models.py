@@ -45,6 +45,10 @@ class Lead(Base):
     canal: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     compro_el_auto: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)  # "SI"/"NO"
 
+    # marketing attribution (first-touch, from website tracking.js)
+    ref_code: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    rc_code: Mapped[Optional[str]] = mapped_column(String(8), nullable=True, index=True)
+
     necesita_humano: Mapped[bool] = mapped_column(Boolean, default=False)
     buscando_auto_set_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
