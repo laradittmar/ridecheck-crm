@@ -50,3 +50,14 @@ class ConversationHandleOut(BaseModel):
     handled: bool = False
     wa_message_id: str | None = None
     detail: str | None = None
+    # Observability — set by CE and written back to ai_events by conversation route
+    reply_required: bool | None = None
+    reply_produced: bool | None = None
+    alert_eligible: bool | None = None
+    answer_source: str | None = None           # DETERMINISTIC_RULE | FAQ_RULE | PRICING_SERVICE | SCHEDULING_SERVICE | VEHICLE_RESOLVER | CE_AI | FLOW_RESPONSE | ERROR_FALLBACK | HUMAN
+    contributing_sources: list[str] | None = None
+    ai_invoked: bool | None = None
+    latency_ce_ms: int | None = None           # CE wall time ms
+    burst_message_count: int | None = None
+    cycle_message_count: int | None = None
+    performance_status: str | None = None      # OK | MEDIUM | ALERT | PENDING | NO_REPLY_REQUIRED

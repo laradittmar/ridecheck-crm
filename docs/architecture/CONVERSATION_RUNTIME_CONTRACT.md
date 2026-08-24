@@ -10,6 +10,7 @@ Sections use these labels:
 
 - `[CONTRACT]` — Owner-authoritative requirement. Must be true.
 - `[CURRENT]` — How the code actually behaves today (2026-08-24).
+- `[IMPLEMENTED — WILD-04R]` — Built and tested in crm_test as of 2026-08-24. Not yet run live.
 - `[GAP]` — Known delta between contract and current behavior.
 - `[PLANNED]` — Agreed implementation approach for the gap. Not yet built.
 
@@ -49,16 +50,16 @@ CE's `_load_context()` loads **all** candidates unconditionally and the **oldest
 
 No active-cycle boundary exists. CE reads prior-cycle candidates and messages as if they were current context. This was the confirmed root cause of the WILD-04 failure: the AI received the Peugeot 2008 booking sequence as its "conversation history" when the customer asked about a Ford Focus.
 
-`[PLANNED — WILD-04R]`
+`[IMPLEMENTED — WILD-04R Phase 1]`
 
 Two new columns on `whatsapp_thread_states`:
 - `current_cycle_start_message_db_id INTEGER NULL` — `WhatsAppMessage.id` of the first inbound message of the current cycle
 - `current_cycle_started_at TIMESTAMPTZ NULL` — `WhatsAppMessage.created_at` (DB server clock) of the same message
 
-`_load_context()` will filter:
+`_load_context()` filters:
 - `db_messages`: `WHERE id >= current_cycle_start_message_db_id` (when set)
 - `candidates`: `WHERE created_at >= current_cycle_started_at` (when set)
-- Message ordering corrected to: `ORDER BY id DESC LIMIT 20` then reversed (most-recent-20 in chronological order)
+- Message ordering: `ORDER BY id DESC LIMIT 20` then reversed (most-recent-20 in chronological order)
 
 ---
 
@@ -82,7 +83,7 @@ The explicit `cycle_reset_pending` flag covers all lifecycle paths and fires exa
 
 ### The explicit reset signal: `cycle_reset_pending`
 
-`[CONTRACT — PLANNED]`
+`[CONTRACT — IMPLEMENTED — WILD-04R Phase 1]`
 
 New column on `whatsapp_thread_states`:
 
@@ -194,17 +195,9 @@ The new cycle reset **does** clear both fields together (both are in the ACTIVE_
 
 Owner decision required: should `POST /ui/human` and `POST /ui/lead_toggle_humano` also write `state.needs_human` when clearing `lead.necesita_humano`? This is a separate scope decision and must not be implemented without direction.
 
-`[CURRENT]`
+`[IMPLEMENTED — WILD-04R Phase 1]`
 
-CE does not read `lead.estado` or `state.cycle_reset_pending` for routing. The `needs_human` guard at `conversation_engine.py:1377–1381` is unconditional. No cycle detection, no ACTIVE_REVISION field reset, no cycle watermark exists today.
-
-`[GAP]`
-
-The human CONSULTA_NUEVA reset has no effect on CE behavior today. `cycle_reset_pending` column does not exist. `set_lead_estado()` helper does not exist. A returning customer is permanently suppressed by the `needs_human` guard (for booked cycles) or receives stale context (for abandoned cycles).
-
-`[PLANNED — WILD-04R]`
-
-Required call order in `_handle()`:
+Call order in `_handle()` as built:
 1. `_load_context()` (loads identity + existing-watermark-filtered context)
 2. Dedup check
 3. Get/create state, capture `previous_cursor` (before overwriting `last_processed_inbound_wa_message_id`)
@@ -248,11 +241,11 @@ This is the confirmed root cause of the WILD-04 failure.
 
 n8n burst completeness is not guaranteed with the current `limit=10` message endpoint and sub-burst fragmentation behavior. CE has no guard against incomplete bursts.
 
-`[PLANNED — WILD-04R]`
+`[IMPLEMENTED — WILD-04R Phase 1]`
 
 CE-side burst completeness guard: during `_process_text()`, after assembling `_current_evidence` from `event.unanswered_recent_user_messages`, CE queries the DB for all unprocessed inbound messages between `state.last_processed_inbound_wa_message_id` and `event.wa_message_id`. Any messages present in the DB but absent from `_current_evidence` are prepended. This makes CE's burst context authoritative from the DB, eliminating the n8n sub-burst fragmentation dependency.
 
-Also planned: n8n endpoint `limit` increase from 10 to 50 to cover pathological burst sizes.
+Deferred: n8n endpoint `limit` increase from 10 to 50 to cover pathological burst sizes.
 
 ---
 
@@ -298,9 +291,9 @@ All times measured from customer message send to CE outbound reply dispatch.
 
 Latency components:
 
-- `latency_debounce_ms` — time from first burst message to CE call start (n8n debounce contribution)
-- `latency_ce_ms` — CE processing time (DB queries + OpenAI API if invoked)
-- `latency_total_ms` — end-to-end: inbound `WhatsAppMessage.created_at` to outbound `WhatsAppMessage.created_at` (both DB server clock, comparable)
+- `latency_ce_ms` — CE processing time measured by `perf_counter()` inside `handle()`
+- `latency_total_ms` — full customer wait: `AiEvent.created_at` (webhook arrival) to CE finish (`datetime.now(utc)`)
+- `latency_debounce_ms` — pre-CE wait (`latency_total_ms - latency_ce_ms`); captures n8n debounce + dispatch overhead; labeled `pre_ce_wait_ms` in implementation comments
 
 The 120-second ALERT threshold for no-reply is the owner-operative threshold. The existing `unanswered_alert.py` uses an approximately 5-minute wait.
 
@@ -314,9 +307,9 @@ No per-turn latency is measured or stored. `AiEvent` has no observability column
 - No `performance_status` classification per turn
 - Alert threshold is 300s, not 120s
 
-`[PLANNED — WILD-04R observability milestone]`
+`[IMPLEMENTED — WILD-04R Phase 2]`
 
-Add 11 nullable columns to `ai_events`. Write `latency_ce_ms` from `perf_counter()` at `handle()` entry/exit. Compute `latency_total_ms` from inbound/outbound `WhatsAppMessage.created_at` delta in `routes/whatsapp.py`. Update `unanswered_alert.py` eligibility to 120 seconds.
+13 nullable columns added to `ai_events` via migration `20260824_wild04r_ai_events_observability` + `20260824_wild04r_phase2_alert_ts`. `latency_ce_ms` written from `perf_counter()` in `handle()`. `latency_total_ms` computed from `AiEvent.created_at` → CE finish in `api/conversation.py`. `unanswered_alert.py` threshold updated to 120 seconds.
 
 ---
 
@@ -331,7 +324,7 @@ Every CE response must be tagged with the authoritative source of the business c
 | Source | Meaning |
 |---|---|
 | `DETERMINISTIC_RULE` | Response from a gate or rule requiring no AI (motorcycle gate, phone escalation, service boundary, inspectability gate, location contradiction) |
-| `FAQ_RULE` | Static FAQ copy (Layer D: `_handle_general_information_ai` without OpenAI) |
+| `FAQ_RULE` | FAQ response via `_handle_general_information_ai` (invokes OpenAI to render FAQ content) |
 | `PRICING_SERVICE` | Quote generated from PricingService; LLM renders delivery |
 | `SCHEDULING_SERVICE` | Slot availability or provisional scheduling; LLM renders delivery |
 | `VEHICLE_RESOLVER` | Vehicle catalog lookup / fuzzy match confirmation |
@@ -362,9 +355,9 @@ No source tracking exists. `AiEvent` has no `answer_source` field. `Conversation
 
 Operator cannot determine from telemetry whether a customer reply came from OpenAI, the pricing service, a static rule, or an error fallback.
 
-`[PLANNED — WILD-04R observability milestone]`
+`[IMPLEMENTED — WILD-04R Phase 2]`
 
-Extend `_out()` with `answer_source`, `contributing_sources`, and `ai_invoked` parameters. Add corresponding fields to `ConversationHandleOut`. Tag each handler at call sites. Write to `ai_events` via `routes/whatsapp.py` after CE returns. Full per-call-site tagging is a second-pass refinement; deterministic handler sources are tagged first.
+`_out()` extended with `answer_source`, `contributing_sources`, and `ai_invoked` parameters. `ConversationHandleOut` carries all three fields. `handle()` applies `_ai_invoked` flag and infers `answer_source` at the exit point (CE_AI, FLOW_RESPONSE, ERROR_FALLBACK). Call-site tagging implemented for PRICING_SERVICE and FAQ_RULE. Full per-call-site tagging for all 40+ `_out()` sites is a second-pass refinement (deferred).
 
 ---
 
@@ -388,8 +381,11 @@ Alert eligible when:
 **Not alert eligible:**
 - `skipped_dedup` — not a real turn
 - `no_lead` — no CRM record; n8n will have created one
-- `error` — internal error, not an SLA failure
+- `error` with `detail="thread_not_found"` — infrastructure gap, not an SLA failure
 - `skipped_human` — CE is suppressed intentionally; human reply is expected
+
+**Alert eligible (despite being errors):**
+- `error` with `detail="internal_error"` — CE attempted a reply but failed; customer is waiting
 
 `[CURRENT]`
 
@@ -401,9 +397,9 @@ Alert eligible when:
 - Alert is thread-level, not turn-level — cannot distinguish a no-reply on the current turn from the thread being appropriately idle
 - No `alert_eligible` flag; alert eligibility logic is approximate
 
-`[PLANNED — WILD-04R observability milestone]`
+`[IMPLEMENTED — WILD-04R Phase 2]`
 
-After observability columns are added to `ai_events`: update `unanswered_alert.py` to query `ai_events WHERE alert_eligible = true AND reply_produced IS NOT TRUE AND created_at < NOW() - INTERVAL '120 seconds' AND unanswered_alert_sent_at IS NULL`. Move per-turn alert tracking to `ai_events.unanswered_alert_sent_at`.
+`unanswered_alert.py` updated to query `ai_events WHERE reply_required = true AND alert_eligible = true AND reply_produced IS NOT TRUE AND unanswered_alert_sent_at IS NULL AND created_at < NOW() - INTERVAL '120 seconds' AND needs_human IS NULL OR needs_human = false`. Per-turn alert tracking via `ai_events.unanswered_alert_sent_at`. Thread-level human-handoff alert (legacy `needs_human=true` path) preserved alongside per-turn check. Polling interval: 60 seconds.
 
 ---
 
@@ -459,20 +455,21 @@ These are CRM records of completed bookings. CE must not read their fields to po
 
 ---
 
-## Summary of Implementation Gaps (as of 2026-08-24)
+## Summary of Implementation Status (as of 2026-08-24)
 
-| Contract requirement | Gap severity | Milestone |
+| Contract requirement | Status | Milestone |
 |---|---|---|
-| `cycle_reset_pending` column on `whatsapp_thread_states` | CRITICAL — blocking | WILD-04R |
-| `set_lead_estado()` CRM helper (5 endpoints) | CRITICAL — blocking | WILD-04R |
-| CE `_execute_cycle_reset()` consumption in `_handle()` | CRITICAL — blocking | WILD-04R |
-| Active-cycle message filter (id >= watermark) | CRITICAL — confirmed WILD-04 cause | WILD-04R |
-| Active-cycle candidate filter (created_at >= watermark) | CRITICAL — confirmed WILD-04 cause | WILD-04R |
-| Message ordering bug (oldest-20 → newest-20) | CRITICAL — wrong AI context | WILD-04R |
-| ACTIVE_REVISION field reset at cycle boundary | CRITICAL — state leaks forward | WILD-04R |
-| n8n burst completeness (sub-burst fragmentation) | HIGH — confirmed WILD-04 cause | WILD-04R |
-| `state.needs_human` / `lead.necesita_humano` sync in human-toggle endpoints | MEDIUM — owner decision pending | TBD |
-| AiEvent observability columns | MEDIUM — no performance visibility | WILD-04R obs milestone |
-| latency_ce_ms / latency_total_ms measurement | MEDIUM — no performance data | WILD-04R obs milestone |
-| Answer source tagging | MEDIUM — no provenance | WILD-04R obs milestone |
-| Unanswered alert threshold (300s → 120s) | MEDIUM — misses SLA | WILD-04R obs milestone |
+| `cycle_reset_pending` column on `whatsapp_thread_states` | IMPLEMENTED | WILD-04R Phase 1 |
+| `set_lead_estado()` CRM helper (5 endpoints) | IMPLEMENTED | WILD-04R Phase 1 |
+| CE `_execute_cycle_reset()` consumption in `_handle()` | IMPLEMENTED | WILD-04R Phase 1 |
+| Active-cycle message filter (id >= watermark) | IMPLEMENTED | WILD-04R Phase 1 |
+| Active-cycle candidate filter (created_at >= watermark) | IMPLEMENTED | WILD-04R Phase 1 |
+| Message ordering bug (oldest-20 → newest-20) | IMPLEMENTED | WILD-04R Phase 1 |
+| ACTIVE_REVISION field reset at cycle boundary | IMPLEMENTED | WILD-04R Phase 1 |
+| CE burst completeness guard (DB-authoritative burst assembly) | IMPLEMENTED | WILD-04R Phase 1 |
+| AiEvent observability columns (13 fields) | IMPLEMENTED | WILD-04R Phase 2 |
+| latency_ce_ms / latency_total_ms / latency_debounce_ms measurement | IMPLEMENTED | WILD-04R Phase 2 |
+| Answer source tagging (PRICING_SERVICE, FAQ_RULE, CE_AI, FLOW_RESPONSE, ERROR_FALLBACK) | IMPLEMENTED (partial — full per-call-site tagging deferred) | WILD-04R Phase 2 |
+| Unanswered alert threshold (300s → 120s, per-turn via ai_events) | IMPLEMENTED | WILD-04R Phase 2 |
+| `state.needs_human` / `lead.necesita_humano` sync in human-toggle endpoints | OPEN — owner decision pending | TBD |
+| n8n endpoint limit increase (10 → 50) | OPEN — deferred | TBD |

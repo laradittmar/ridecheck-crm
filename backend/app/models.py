@@ -552,6 +552,7 @@ class AiEvent(Base):
     burst_message_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     cycle_message_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     performance_status: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    unanswered_alert_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 Index("ix_whatsapp_contacts_wa_id", WhatsAppContact.wa_id)

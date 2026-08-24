@@ -1283,11 +1283,26 @@ def _parse_scheduling_text(texts: list[str], today: date) -> tuple[str | None, s
     return day_iso, time_str
 
 
+_NO_REPLY_REQUIRED_ACTIONS = frozenset({"skipped_dedup", "no_lead", "skipped_human"})
+_REPLY_PRODUCED_ACTIONS = frozenset({"replied", "flow_button_sent", "booking_created"})
+
+
 def _out(action: str, **kwargs) -> ConversationHandleOut:
+    detail = kwargs.get("detail", "") or ""
+    # thread_not_found is a routing miss — customer never expected a CE reply
+    _no_reply = action in _NO_REPLY_REQUIRED_ACTIONS or (
+        action == "error" and detail == "thread_not_found"
+    )
+    reply_required = not _no_reply
+    reply_produced = action in _REPLY_PRODUCED_ACTIONS
+    alert_eligible = reply_required
     return ConversationHandleOut(
         ok=action not in ("error", "blocked_dispatch"),
         action=action,
         handled=action in HANDLED_ACTIONS,
+        reply_required=reply_required,
+        reply_produced=reply_produced,
+        alert_eligible=alert_eligible,
         **kwargs,
     )
 
@@ -1309,12 +1324,15 @@ class ConversationEngine:
         self.settings = settings
         self._pricing = PricingService(repository=PricingRepository())
         self._schedule = ScheduleService(db=db)
+        self._ai_invoked: bool = False    # set True in _call_openai(); applied in handle()
+        self._answer_source: str | None = None  # set at key reply sites; applied in handle()
 
     # ── Public entrypoint ─────────────────────────────────────────────────
 
     def handle(self, event: ConversationHandleIn) -> ConversationHandleOut:
+        _ce_t0 = _time.perf_counter()
         try:
-            return self._handle(event)
+            out = self._handle(event)
         except OutboundBlockedError as exc:
             outcome = getattr(exc, "gate_outcome", "BLOCKED_KILL_SWITCH")
             detail = f"OUTBOUND_GATE_{outcome.upper()}"
@@ -1333,13 +1351,14 @@ class ConversationEngine:
                         self.db.rollback()
                     except Exception:
                         pass
-                return _out("blocked_dispatch", detail=detail)
-            # Duplicate / flood: CE may have partial state — do not commit.
-            try:
-                self.db.rollback()
-            except Exception:
-                pass
-            return _out("error", detail=detail)
+                out = _out("blocked_dispatch", detail=detail)
+            else:
+                # Duplicate / flood: CE may have partial state — do not commit.
+                try:
+                    self.db.rollback()
+                except Exception:
+                    pass
+                out = _out("error", detail=detail)
         except Exception:
             logger.exception(
                 "M18 engine unhandled error thread_id=%s wa=%s",
@@ -1349,7 +1368,22 @@ class ConversationEngine:
                 self.db.rollback()
             except Exception:
                 pass
-            return _out("error", detail="internal_error")
+            out = _out("error", detail="internal_error")
+        out.latency_ce_ms = int((_time.perf_counter() - _ce_t0) * 1000)
+        _ai_inv = getattr(self, "_ai_invoked", False)
+        out.ai_invoked = _ai_inv
+        # Apply answer_source: explicit tag wins; else infer from action
+        if out.answer_source is None:
+            _ans_src = getattr(self, "_answer_source", None)
+            if _ans_src is not None:
+                out.answer_source = _ans_src
+            elif out.action in ("flow_button_sent", "booking_created"):
+                out.answer_source = "FLOW_RESPONSE"
+            elif out.action == "error":
+                out.answer_source = "ERROR_FALLBACK"
+            elif _ai_inv:
+                out.answer_source = "CE_AI"
+        return out
 
     # ── Core dispatch ─────────────────────────────────────────────────────
 
@@ -1726,7 +1760,8 @@ class ConversationEngine:
             state.last_stage = STAGE_QUOTED
             self.db.commit()
             sent_id = self._send_text_to_wa(ctx, reply)
-            return _out("replied", wa_message_id=sent_id)
+            self._answer_source = "PRICING_SERVICE"
+            return _out("replied", wa_message_id=sent_id, answer_source="PRICING_SERVICE")
 
         # Zone not yet known — dispatch Location Fallback Flow directly.
         self.db.commit()
@@ -3713,10 +3748,10 @@ class ConversationEngine:
         if reply:
             try:
                 sent_id = self._send_text_to_wa(ctx, reply)
-                return _out("replied", wa_message_id=sent_id)
+                return _out("replied", wa_message_id=sent_id, answer_source="FAQ_RULE")
             except OutboundBlockedError:
                 self.db.commit()
-                return _out("service_gate_blocked", detail="faq_kill_switch")
+                return _out("service_gate_blocked", detail="faq_kill_switch", answer_source="FAQ_RULE")
         return _out("skipped_dedup", detail="faq_no_reply")
 
     # ── Deterministic QUOTED acceptance ───────────────────────────────────
@@ -4501,6 +4536,7 @@ Respondé SOLO con JSON válido:
     # ── OpenAI HTTP call (no sdk dependency) ─────────────────────────────
 
     def _call_openai(self, messages: list[dict]) -> str:
+        self._ai_invoked = True  # WILD-04R observability: mark actual OpenAI execution
         api_key = (self.settings.openai_api_key or "").strip()
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY not configured")
