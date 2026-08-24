@@ -11,6 +11,7 @@ from ..schemas.leads import LeadCreate, LeadDetailOut, LeadOut, LeadUpdate
 from ..schemas.revisions import RevisionSummaryOut
 from ..schemas.whatsapp_api import WhatsAppThreadOut
 from ..services.db_errors import commit_or_400
+from ..services.lead_lifecycle import set_lead_estado
 from ..services.phone_utils import normalize_phone_or_422, normalized_phone_sql
 from ..services.whatsapp_threads import load_thread_payload
 
@@ -74,7 +75,7 @@ def update_lead(lead_id: int, payload: LeadUpdate, db: Session = Depends(get_db)
         if payload.estado not in ESTADOS_VALIDOS:
             raise HTTPException(status_code=400, detail="Estado inválido")
 
-        lead.estado = payload.estado
+        set_lead_estado(db, lead, payload.estado)
 
         if payload.estado == "REVISION_COMPLETA" and lead.feedback is None:
             db.add(FeedbackPostRevision(lead_id=lead.id))

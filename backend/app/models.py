@@ -343,6 +343,10 @@ class WhatsAppThreadState(Base):
     pending_fuzzy_catalog_key: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)  # M21.1.4: "{marca}||{modelo}" or NULL
     pending_turn_evidence_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # M21.2: raw current_turn_text from the CONFIRM turn; cleared atomically with pending_fuzzy_catalog_key
     unanswered_alert_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # WILD-04R: cycle boundary fields
+    cycle_reset_pending: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    current_cycle_start_message_db_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    current_cycle_started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     quote_followup_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     buscando_followup_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
@@ -534,6 +538,20 @@ class AiEvent(Base):
     text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending", server_default="pending")
     last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # WILD-04R observability fields
+    reply_required: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    reply_produced: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    alert_eligible: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    action: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    answer_source: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    ai_invoked: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    contributing_sources: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    latency_total_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    latency_debounce_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    latency_ce_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    burst_message_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    cycle_message_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    performance_status: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
 
 
 Index("ix_whatsapp_contacts_wa_id", WhatsAppContact.wa_id)

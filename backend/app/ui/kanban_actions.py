@@ -15,6 +15,7 @@ from sqlalchemy import select
 
 from ..db import get_db
 from ..models import Agencia, Lead, Revision, Profesional, Vendedor
+from ..services.lead_lifecycle import set_lead_estado
 from .kanban_view import (
     ESTADOS_VALIDOS,
     MOTIVOS_PERDIDA_VALIDOS,
@@ -216,7 +217,7 @@ def ui_lead_update(
     if _has(lead, "estado"):
         s = _clean_str(estado)
         if s in ESTADOS_VALIDOS:
-            lead.estado = s
+            set_lead_estado(db, lead, s)
 
     db.commit()
     return RedirectResponse(url=f"/kanban#lead-{lead_id}", status_code=303)
@@ -238,7 +239,7 @@ def ui_move(lead_id: int = Form(...), estado: str = Form(...), db: Session = Dep
         raise HTTPException(status_code=404, detail="Lead not found")
     if estado not in ESTADOS_VALIDOS:
         raise HTTPException(status_code=400, detail="Estado inválido")
-    lead.estado = estado
+    set_lead_estado(db, lead, estado)
     if _has(lead, "motivo_perdida") and _has(lead, "flag"):
         if lead.flag != "PERDIDO":
             lead.motivo_perdida = None
@@ -285,7 +286,7 @@ def ui_move_lead(
         raise HTTPException(status_code=404, detail="Lead not found")
     if target_estado not in ESTADOS_VALIDOS:
         raise HTTPException(status_code=400, detail="Estado inválido")
-    lead.estado = target_estado
+    set_lead_estado(db, lead, target_estado)
     if _has(lead, "motivo_perdida") and _has(lead, "flag"):
         if lead.flag != "PERDIDO":
             lead.motivo_perdida = None
@@ -299,7 +300,7 @@ def ui_lead_move(lead_id: int, estado: str = Form(...), db: Session = Depends(ge
         raise HTTPException(status_code=404, detail="Lead not found")
     if estado not in ESTADOS_VALIDOS:
         raise HTTPException(status_code=400, detail="Estado inválido")
-    lead.estado = estado
+    set_lead_estado(db, lead, estado)
     if _has(lead, "motivo_perdida") and _has(lead, "flag"):
         if lead.flag != "PERDIDO":
             lead.motivo_perdida = None

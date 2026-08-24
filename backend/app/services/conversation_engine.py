@@ -1299,7 +1299,8 @@ class _Context:
     lead: Lead | None
     state: WhatsAppThreadState | None
     candidates: list[WhatsAppThreadCandidate]
-    db_messages: list[WhatsAppMessage]  # last 20 messages from DB (fallback only)
+    db_messages: list[WhatsAppMessage]  # newest 20 active-cycle messages, chronological
+    previous_processed_cursor: str | None = None  # set in _handle() before cursor overwrite
 
 
 class ConversationEngine:
@@ -1366,6 +1367,11 @@ class ConversationEngine:
         # Mark as processing — committed atomically with the final successful action,
         # so a failure mid-flight does not leave the message appearing processed.
         state = self._get_or_create_state(ctx)
+
+        # WILD-04R: capture previous cursor BEFORE overwrite (burst start discovery)
+        previous_cursor = state.last_processed_inbound_wa_message_id
+        ctx.previous_processed_cursor = previous_cursor
+
         state.last_processed_inbound_wa_message_id = event.wa_message_id
 
         # No lead linked — cannot make business decisions; commit dedup marker now
@@ -1374,7 +1380,11 @@ class ConversationEngine:
             self.db.commit()
             return _out("no_lead")
 
-        # Human takeover active: AI is suppressed; commit dedup marker now
+        # WILD-04R: consume cycle reset signal (set by set_lead_estado() in CRM)
+        if state.cycle_reset_pending:
+            self._execute_cycle_reset(ctx, state, event, previous_cursor)
+
+        # Human takeover check — AFTER cycle reset which clears needs_human
         if state.needs_human:
             logger.info("M18 thread_id=%s needs_human — AI suppressed", event.thread_id)
             self.db.commit()
@@ -2149,6 +2159,21 @@ class ConversationEngine:
         _current_evidence: list[str] = list(event.unanswered_recent_user_messages or [])
         if event.text and event.text not in _current_evidence:
             _current_evidence.append(event.text)
+
+        # WILD-04R burst completeness: DB is authoritative; n8n has a 10-message limit.
+        # Fetch all persisted inbound messages since previous cursor and prepend any
+        # that n8n did not include in unanswered_recent_user_messages.
+        _burst_db_texts = self._fetch_burst_texts(
+            ctx.thread.id, getattr(ctx, "previous_processed_cursor", None), event.wa_message_id
+        )
+        _existing_evidence_set = set(_current_evidence)
+        _missing_burst = [t for t in _burst_db_texts if t not in _existing_evidence_set]
+        if _missing_burst:
+            _current_evidence = _missing_burst + _current_evidence
+            logger.debug(
+                "WILD-04R burst completeness added %d messages thread_id=%s",
+                len(_missing_burst), ctx.thread.id,
+            )
 
         if not _current_evidence:
             logger.info("M18 no text content thread_id=%s — ignored", ctx.thread.id)
@@ -4524,31 +4549,94 @@ Respondé SOLO con JSON válido:
         if thread.lead_id:
             lead = self.db.get(Lead, thread.lead_id)
 
-        candidates = list(
-            self.db.execute(
-                select(WhatsAppThreadCandidate)
-                .where(WhatsAppThreadCandidate.thread_id == thread_id)
-                .order_by(WhatsAppThreadCandidate.updated_at.desc(), WhatsAppThreadCandidate.id.desc())
-            ).scalars().all()
-        )
+        state = thread.state  # may be None for first-ever message on this thread
 
-        db_messages = list(
-            self.db.execute(
-                select(WhatsAppMessage)
-                .where(WhatsAppMessage.thread_id == thread_id)
-                .order_by(WhatsAppMessage.timestamp.asc(), WhatsAppMessage.id.asc())
-                .limit(20)
-            ).scalars().all()
+        # WILD-04R: apply cycle watermark to candidates when set
+        cand_query = (
+            select(WhatsAppThreadCandidate)
+            .where(WhatsAppThreadCandidate.thread_id == thread_id)
+            .order_by(WhatsAppThreadCandidate.updated_at.desc(), WhatsAppThreadCandidate.id.desc())
         )
+        if state is not None and state.current_cycle_started_at is not None:
+            cand_query = cand_query.where(
+                WhatsAppThreadCandidate.created_at >= state.current_cycle_started_at
+            )
+        candidates = list(self.db.execute(cand_query).scalars().all())
+
+        # WILD-04R: apply cycle watermark to messages + fix ordering (newest-20 reversed)
+        db_messages = self._query_active_messages(thread_id, state)
 
         return _Context(
             thread=thread,
             contact=contact,
             lead=lead,
-            state=thread.state,
+            state=state,
             candidates=candidates,
             db_messages=db_messages,
         )
+
+    def _query_active_messages(
+        self, thread_id: int, state: WhatsAppThreadState | None
+    ) -> list[WhatsAppMessage]:
+        """Return the newest 20 active-cycle messages in chronological order.
+
+        WILD-04R fix: was ORDER BY timestamp ASC LIMIT 20 (oldest-20 bug).
+        Now: ORDER BY id DESC LIMIT 20, then reversed = newest-20 chronologically.
+        Cycle watermark applied when current_cycle_start_message_db_id is set.
+        """
+        msg_query = select(WhatsAppMessage).where(WhatsAppMessage.thread_id == thread_id)
+        if state is not None and state.current_cycle_start_message_db_id is not None:
+            msg_query = msg_query.where(
+                WhatsAppMessage.id >= state.current_cycle_start_message_db_id
+            )
+        msg_query = msg_query.order_by(WhatsAppMessage.id.desc()).limit(20)
+        msgs = list(self.db.execute(msg_query).scalars().all())
+        msgs.reverse()
+        return msgs
+
+    def _fetch_burst_texts(
+        self,
+        thread_id: int,
+        previous_cursor: str | None,
+        current_wa_message_id: str,
+    ) -> list[str]:
+        """Return text of all persisted inbound burst messages, oldest-first.
+
+        WILD-04R burst completeness: n8n has a 10-message limit on
+        unanswered_recent_user_messages. This fetches all inbound messages
+        between the previous processed cursor and the current event from DB,
+        which is the authoritative record with no hard limit.
+
+        Returns empty list when previous_cursor is None (first-ever message).
+        """
+        if previous_cursor is None:
+            return []
+
+        current_row = self.db.execute(
+            select(WhatsAppMessage).where(WhatsAppMessage.wa_message_id == current_wa_message_id)
+        ).scalar_one_or_none()
+        if current_row is None:
+            return []
+
+        prev_row = self.db.execute(
+            select(WhatsAppMessage).where(WhatsAppMessage.wa_message_id == previous_cursor)
+        ).scalar_one_or_none()
+        if prev_row is None:
+            return []
+
+        burst_rows = list(
+            self.db.execute(
+                select(WhatsAppMessage)
+                .where(
+                    WhatsAppMessage.thread_id == thread_id,
+                    WhatsAppMessage.direction == "in",
+                    WhatsAppMessage.id > prev_row.id,
+                    WhatsAppMessage.id <= current_row.id,
+                )
+                .order_by(WhatsAppMessage.id.asc())
+            ).scalars().all()
+        )
+        return [row.text for row in burst_rows if row.text is not None]
 
     def _get_or_create_state(self, ctx: _Context) -> WhatsAppThreadState:
         if ctx.state is not None:
@@ -4559,6 +4647,116 @@ Respondé SOLO con JSON válido:
         self.db.flush()
         ctx.state = state
         return state
+
+    def _execute_cycle_reset(
+        self,
+        ctx: _Context,
+        state: WhatsAppThreadState,
+        event: ConversationHandleIn,
+        previous_cursor: str | None,
+    ) -> None:
+        """Consume cycle_reset_pending and establish new cycle watermarks.
+
+        WILD-04R: called when a human has moved the Lead back to CONSULTA_NUEVA.
+        Clears all ACTIVE_REVISION fields and sets watermarks so subsequent
+        context queries return only new-cycle data.
+        """
+        lead = ctx.lead
+        assert lead is not None
+
+        # Find current event's DB row (always exists — persisted before CE dispatch)
+        current_event_db_row = self.db.execute(
+            select(WhatsAppMessage).where(WhatsAppMessage.wa_message_id == event.wa_message_id)
+        ).scalar_one_or_none()
+
+        # Resolve previous cursor to a DB integer id for burst boundary query
+        previous_db_id: int | None = None
+        if previous_cursor is not None:
+            prev_row = self.db.execute(
+                select(WhatsAppMessage).where(WhatsAppMessage.wa_message_id == previous_cursor)
+            ).scalar_one_or_none()
+            if prev_row is not None:
+                previous_db_id = prev_row.id
+
+        # Find the earliest inbound message in this burst to use as cycle start
+        burst_start_message = current_event_db_row
+        if current_event_db_row is not None:
+            burst_query = (
+                select(WhatsAppMessage)
+                .where(
+                    WhatsAppMessage.thread_id == ctx.thread.id,
+                    WhatsAppMessage.direction == "in",
+                    WhatsAppMessage.id <= current_event_db_row.id,
+                )
+                .order_by(WhatsAppMessage.id.asc())
+            )
+            if previous_db_id is not None:
+                burst_query = burst_query.where(WhatsAppMessage.id > previous_db_id)
+            burst_msgs = list(self.db.execute(burst_query).scalars().all())
+            if burst_msgs:
+                burst_start_message = burst_msgs[0]
+
+        # Set cycle watermarks from earliest burst message (DB server clock, no skew)
+        if burst_start_message is not None:
+            state.current_cycle_start_message_db_id = burst_start_message.id
+            state.current_cycle_started_at = burst_start_message.created_at
+
+        # Clear all ACTIVE_REVISION ThreadState fields
+        state.last_intent = None
+        state.last_stage = None
+        state.needs_human = False
+        state.current_focus_candidate_id = None
+        state.current_revision_id = None
+        state.home_zone_group = None
+        state.home_zone_detail = None
+        state.preferred_day = None
+        state.preferred_time = None
+        state.active_requested_date = None
+        state.last_requested_time = None
+        state.last_offered_slots = None
+        state.last_visible_slots = None
+        state.flow_booking_token = None
+        state.vehicle_clarification_sent = False
+        state.location_clarification_sent = False
+        state.vehicle_fallback_flow_sent = False
+        state.location_fallback_flow_sent = False
+        state.inspectability_clarification_sent = False
+        state.pending_fuzzy_catalog_key = None
+        state.pending_turn_evidence_text = None
+        state.cycle_reset_pending = False  # consume the one-shot signal
+
+        # Clear Lead ACTIVE_REVISION fields
+        lead.flag = None
+        lead.necesita_humano = False
+        lead.motivo_perdida = None
+        lead.buscando_auto_set_at = None
+
+        # Reload candidates and messages filtered to new cycle
+        if state.current_cycle_started_at is not None:
+            ctx.candidates = list(
+                self.db.execute(
+                    select(WhatsAppThreadCandidate)
+                    .where(
+                        WhatsAppThreadCandidate.thread_id == ctx.thread.id,
+                        WhatsAppThreadCandidate.created_at >= state.current_cycle_started_at,
+                    )
+                    .order_by(
+                        WhatsAppThreadCandidate.updated_at.desc(),
+                        WhatsAppThreadCandidate.id.desc(),
+                    )
+                ).scalars().all()
+            )
+        else:
+            ctx.candidates = []
+
+        ctx.db_messages = self._query_active_messages(ctx.thread.id, state)
+
+        logger.info(
+            "WILD-04R cycle reset thread_id=%s watermark_msg_id=%s watermark_ts=%s",
+            ctx.thread.id,
+            state.current_cycle_start_message_db_id,
+            state.current_cycle_started_at,
+        )
 
     def _focus_candidate(self, ctx: _Context) -> WhatsAppThreadCandidate | None:
         state = ctx.state
