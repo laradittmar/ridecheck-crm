@@ -1324,12 +1324,26 @@ class ConversationEngine:
         self.settings = settings
         self._pricing = PricingService(repository=PricingRepository())
         self._schedule = ScheduleService(db=db)
-        self._ai_invoked: bool = False    # set True in _call_openai(); applied in handle()
-        self._answer_source: str | None = None  # set at key reply sites; applied in handle()
+        self._ai_invoked: bool = False
+        self._answer_source: str | None = None
+        self._burst_message_count: int = 1
+        self._burst_earliest_inbound_db_id: int | None = None
 
     # ── Public entrypoint ─────────────────────────────────────────────────
 
+    # Actions whose answer_source is deterministic from action alone
+    _DETERMINISTIC_SOURCE_ACTIONS: frozenset[str] = frozenset({
+        "human_handoff_blocked", "location_contradiction_blocked",
+        "inspectability_gate_blocked", "blocked_dispatch",
+    })
+    _VEHICLE_RESOLVER_SOURCE_ACTIONS: frozenset[str] = frozenset({"vehicle_fuzzy_blocked"})
+
     def handle(self, event: ConversationHandleIn) -> ConversationHandleOut:
+        # Reset per-turn tracking (guard for tests that reuse an engine instance)
+        self._ai_invoked = False
+        self._answer_source = None
+        self._burst_message_count = 1
+        self._burst_earliest_inbound_db_id = None
         _ce_t0 = _time.perf_counter()
         try:
             out = self._handle(event)
@@ -1372,17 +1386,32 @@ class ConversationEngine:
         out.latency_ce_ms = int((_time.perf_counter() - _ce_t0) * 1000)
         _ai_inv = getattr(self, "_ai_invoked", False)
         out.ai_invoked = _ai_inv
-        # Apply answer_source: explicit tag wins; else infer from action
+        # Apply answer_source — priority order:
+        # 1. Inline answer_source already set in _out() call site
+        # 2. Unambiguous action inference (one-to-one action→source mapping)
+        # 3. self._answer_source (set at handler method entry for "replied" paths)
+        # 4. CE_AI when OpenAI was invoked
+        # 5. None (untagged — should not occur for launch-reachable paths)
         if out.answer_source is None:
-            _ans_src = getattr(self, "_answer_source", None)
-            if _ans_src is not None:
-                out.answer_source = _ans_src
-            elif out.action in ("flow_button_sent", "booking_created"):
+            if out.action in ("flow_button_sent", "booking_created"):
                 out.answer_source = "FLOW_RESPONSE"
+            elif out.action == "skipped_human":
+                out.answer_source = "HUMAN"
+            elif out.action in self._DETERMINISTIC_SOURCE_ACTIONS:
+                out.answer_source = "DETERMINISTIC_RULE"
+            elif out.action in self._VEHICLE_RESOLVER_SOURCE_ACTIONS:
+                out.answer_source = "VEHICLE_RESOLVER"
             elif out.action == "error":
                 out.answer_source = "ERROR_FALLBACK"
-            elif _ai_inv:
-                out.answer_source = "CE_AI"
+            else:
+                _ans_src = getattr(self, "_answer_source", None)
+                if _ans_src is not None:
+                    out.answer_source = _ans_src
+                elif _ai_inv:
+                    out.answer_source = "CE_AI"
+        # Apply burst observability fields
+        out.burst_message_count = getattr(self, "_burst_message_count", 1)
+        out.burst_earliest_inbound_db_id = getattr(self, "_burst_earliest_inbound_db_id", None)
         return out
 
     # ── Core dispatch ─────────────────────────────────────────────────────
@@ -1681,6 +1710,7 @@ class ConversationEngine:
         Updates the candidate deterministically and resumes qualification.
         Never creates a revision, never sends the booking Flow, never sets AGENDADO.
         """
+        self._answer_source = "DETERMINISTIC_RULE"
         lead = ctx.lead
         assert lead is not None
 
@@ -1787,6 +1817,7 @@ class ConversationEngine:
         Updates zone state deterministically and resumes qualification.
         Never creates a revision, never sends the booking Flow, never sets AGENDADO.
         """
+        self._answer_source = "DETERMINISTIC_RULE"
         lead = ctx.lead
         assert lead is not None
 
@@ -1826,6 +1857,7 @@ class ConversationEngine:
 
         real_price_quote = self._compute_price_quote(ctx, state)
         if real_price_quote:
+            self._answer_source = "PRICING_SERVICE"
             focus = self._focus_candidate(ctx)
             reply = self._build_quote_reply(
                 (focus.marca or "").strip() or None if focus else None,
@@ -1966,6 +1998,7 @@ class ConversationEngine:
         ).strip()
         if not flow_id:
             return None
+        self._answer_source = "VEHICLE_RESOLVER"
         logger.info(
             "M20 vehicle_flow_direct thread_id=%s flow_id=%s", ctx.thread.id, flow_id
         )
@@ -1999,6 +2032,7 @@ class ConversationEngine:
         ).strip()
         if not flow_id:
             return None
+        self._answer_source = "VEHICLE_RESOLVER"
         body = _LOC_FLOW_BODY_CONCERN if concern else _LOC_FLOW_BODY_STANDARD
         logger.info(
             "M20 location_flow_direct thread_id=%s flow_id=%s concern=%s",
@@ -2024,6 +2058,7 @@ class ConversationEngine:
         state: "WhatsAppThreadState",
     ) -> "ConversationHandleOut":
         """Send the deterministic out-of-coverage response and set needs_human."""
+        self._answer_source = "DETERMINISTIC_RULE"
         state.needs_human = True
         if ctx.lead:
             ctx.lead.necesita_humano = True
@@ -2073,6 +2108,7 @@ class ConversationEngine:
                     "para que podamos cotizarte la revisión."
                 )
                 self.db.commit()
+                self._answer_source = "VEHICLE_RESOLVER"
                 sent_id = self._send_text_to_wa(ctx, reply)
                 return _out("replied", wa_message_id=sent_id)
             flow_id = (
@@ -2096,6 +2132,7 @@ class ConversationEngine:
                     return _out("blocked_dispatch", detail="OUTBOUND_GATE_BLOCKED_KILL_SWITCH")
                 state.vehicle_fallback_flow_sent = True
                 flow_token = secrets.token_urlsafe(24)
+                self._answer_source = "VEHICLE_RESOLVER"
                 sent_id = self._send_flow_button(
                     ctx, body, flow_token, flow_id=flow_id, initial_screen="VEHICLE_DETAILS"
                 )
@@ -2114,6 +2151,7 @@ class ConversationEngine:
                     return _out("blocked_dispatch", detail="OUTBOUND_GATE_BLOCKED_KILL_SWITCH")
                 state.vehicle_clarification_sent = True
                 self.db.commit()
+                self._answer_source = "VEHICLE_RESOLVER"
                 sent_id = self._send_text_to_wa(ctx, reply)
                 return _out("replied", wa_message_id=sent_id)
             # Clarification sent but no flow ID configured — fall through to AI.
@@ -2128,6 +2166,7 @@ class ConversationEngine:
                     "del auto para que podamos cotizarte la revisión."
                 )
                 self.db.commit()
+                self._answer_source = "VEHICLE_RESOLVER"
                 sent_id = self._send_text_to_wa(ctx, reply)
                 return _out("replied", wa_message_id=sent_id)
             flow_id = (
@@ -2150,6 +2189,7 @@ class ConversationEngine:
                     return _out("blocked_dispatch", detail="OUTBOUND_GATE_BLOCKED_KILL_SWITCH")
                 state.location_fallback_flow_sent = True
                 flow_token = secrets.token_urlsafe(24)
+                self._answer_source = "VEHICLE_RESOLVER"
                 sent_id = self._send_flow_button(
                     ctx, body, flow_token, flow_id=flow_id, initial_screen="LOCATION_DETAILS"
                 )
@@ -2167,6 +2207,7 @@ class ConversationEngine:
                     return _out("blocked_dispatch", detail="OUTBOUND_GATE_BLOCKED_KILL_SWITCH")
                 state.location_clarification_sent = True
                 self.db.commit()
+                self._answer_source = "VEHICLE_RESOLVER"
                 sent_id = self._send_text_to_wa(ctx, reply)
                 return _out("replied", wa_message_id=sent_id)
             # Clarification sent but no flow ID configured — fall through to AI.
@@ -2198,9 +2239,13 @@ class ConversationEngine:
         # WILD-04R burst completeness: DB is authoritative; n8n has a 10-message limit.
         # Fetch all persisted inbound messages since previous cursor and prepend any
         # that n8n did not include in unanswered_recent_user_messages.
-        _burst_db_texts = self._fetch_burst_texts(
+        _burst_msgs = self._fetch_burst_messages(
             ctx.thread.id, getattr(ctx, "previous_processed_cursor", None), event.wa_message_id
         )
+        _burst_db_texts = [m.text for m in _burst_msgs if m.text is not None]
+        # Capture burst count and earliest inbound message for telemetry
+        self._burst_message_count = len(_burst_msgs) if _burst_msgs else 1
+        self._burst_earliest_inbound_db_id = _burst_msgs[0].id if _burst_msgs else None
         _existing_evidence_set = set(_current_evidence)
         _missing_burst = [t for t in _burst_db_texts if t not in _existing_evidence_set]
         if _missing_burst:
@@ -2300,6 +2345,7 @@ class ConversationEngine:
                     "M21.2 price restatement stage=%s thread_id=%s total=%s",
                     state.last_stage, ctx.thread.id, _requery_quote.precio_total,
                 )
+                self._answer_source = "PRICING_SERVICE"
                 sent_id = self._send_text_to_wa(ctx, _requery_reply)
                 return _out("replied", wa_message_id=sent_id)
             # Price unavailable — fall through without inventing an amount.
@@ -2485,6 +2531,7 @@ class ConversationEngine:
                 state.pending_fuzzy_catalog_key = None
                 state.pending_turn_evidence_text = None
                 self.db.commit()
+                self._answer_source = "VEHICLE_RESOLVER"
                 try:
                     sent_id = self._send_text_to_wa(ctx, _FUZZY_ASK_VEHICLE_REPLY)
                     return _out("replied", wa_message_id=sent_id)
@@ -2497,6 +2544,7 @@ class ConversationEngine:
                 _pq = _FUZZY_CONFIRMATION_TEMPLATE.format(
                     marca=_parts[0], modelo=_parts[1] if len(_parts) > 1 else "",
                 )
+                self._answer_source = "VEHICLE_RESOLVER"
                 try:
                     sent_id = self._send_text_to_wa(ctx, _pq)
                     return _out("replied", wa_message_id=sent_id)
@@ -2604,6 +2652,7 @@ class ConversationEngine:
                 _numeric_model_question = _FUZZY_CONFIRMATION_TEMPLATE.format(
                     marca=_ctx_hit.marca, modelo=_ctx_hit.modelo,
                 )
+                self._answer_source = "VEHICLE_RESOLVER"
                 try:
                     _numeric_model_sent_id = self._send_text_to_wa(ctx, _numeric_model_question)
                 except OutboundBlockedError:
@@ -2664,6 +2713,10 @@ class ConversationEngine:
         # This is a safety net in case of routing edge cases after the AI path.
         if _is_phone_call_request(ai_input_messages):
             return self._handle_phone_call_escalation(ctx, state)
+
+        # All deterministic gates returned None — reset any stale _answer_source
+        # tags so the AI path can claim CE_AI ownership if no handler below overrides.
+        self._answer_source = None
 
         # M21.1.6: determine whether narrative AI adds value for this turn (NU-14)
         _snap_pre = resolve_field_evidence(ctx, state)
@@ -3113,6 +3166,7 @@ class ConversationEngine:
         Fallback (WHATSAPP_FLOW_ID not configured):
           Immediate plain-text handoff; sets needs_human=True immediately.
         """
+        self._answer_source = "DETERMINISTIC_RULE"
         flow_id = (getattr(self.settings, "whatsapp_flow_id", "") or "").strip()
 
         if not flow_id:
@@ -3240,6 +3294,7 @@ class ConversationEngine:
         Persists client data into the Lead, preserves MOTO candidate evidence,
         sets needs_human=True, and sends the advisor confirmation reply.
         """
+        self._answer_source = "DETERMINISTIC_RULE"
         lead = ctx.lead
         assert lead is not None
 
@@ -3303,6 +3358,7 @@ class ConversationEngine:
         state: "WhatsAppThreadState",
     ) -> "ConversationHandleOut":
         """Centralized phone-call/human-agent escalation handler."""
+        self._answer_source = "DETERMINISTIC_RULE"
         logger.info("M18 phone-call escalation thread_id=%s", ctx.thread.id)
         state.needs_human = True
         if ctx.lead:
@@ -3322,6 +3378,7 @@ class ConversationEngine:
         reply: str,
     ) -> "ConversationHandleOut":
         """Send a boundary or clarification reply with no state mutation."""
+        self._answer_source = "DETERMINISTIC_RULE"
         try:
             sent_id = self._send_text_to_wa(ctx, reply)
             return _out("replied", wa_message_id=sent_id)
@@ -3385,6 +3442,7 @@ class ConversationEngine:
 
         No candidate zone mutation, no pricing, no scheduling, no Flow dispatch.
         """
+        self._answer_source = "DETERMINISTIC_RULE"
         try:
             sent_id = self._send_text_to_wa(ctx, _LOCATION_CONTRADICTION_CLARIFICATION)
             return _out("replied", wa_message_id=sent_id)
@@ -3515,6 +3573,7 @@ class ConversationEngine:
         No candidate created, no pricing, no scheduling, no Flow (VN-12).
         Kill-switch: returns vehicle_fuzzy_blocked when outbound is disabled (VN-14).
         """
+        self._answer_source = "VEHICLE_RESOLVER"
         if result.hit is None:
             return _out("replied", wa_message_id=None)
         question = _FUZZY_CONFIRMATION_TEMPLATE.format(
@@ -3550,6 +3609,7 @@ class ConversationEngine:
         # Preserve existing needs_human short-circuit — do not duplicate handoffs
         if state.needs_human:
             return None
+        self._answer_source = "DETERMINISTIC_RULE"
 
         is_assembled = _detect_assembled_accessible_confirmation(current_turn_text)
         is_disassembled = _detect_disassembled_vehicle(current_turn_text)
@@ -3612,6 +3672,7 @@ class ConversationEngine:
         Returns a boundary response for F12/transfer/repair, or None to continue.
         Motorcycle and phone-call are handled by Layers A and B (higher priority).
         """
+        self._answer_source = "DETERMINISTIC_RULE"
         text_norm = self._norm_text(current_turn_text)
 
         if self._detect_f12_request(text_norm):
@@ -3768,6 +3829,7 @@ class ConversationEngine:
         last_processed_inbound_wa_message_id is only persisted once the
         outbound message is durably stored.
         """
+        self._answer_source = "DETERMINISTIC_RULE"
         lead = ctx.lead
         assert lead is not None
 
@@ -3795,6 +3857,7 @@ class ConversationEngine:
         advances to SCHEDULING, and asks for day/time.  Sets flag=PRESUPUESTO_ENVIADO
         because the website already showed the customer a price.
         """
+        self._answer_source = "DETERMINISTIC_RULE"
         lead = ctx.lead
         assert lead is not None
 
@@ -3887,6 +3950,7 @@ class ConversationEngine:
         zone_desc = state.home_zone_detail or form_data.get("zone_detail") or "la zona"
 
         if real_price_quote:
+            self._answer_source = "PRICING_SERVICE"
             total_str = f"${real_price_quote.precio_total:,.0f}".replace(",", ".")
             price_block = f" El precio de la revisión es {total_str}."
         else:
@@ -3910,6 +3974,7 @@ class ConversationEngine:
         preferred_time_str: str | None,
         ai_reply: str,
     ) -> ConversationHandleOut | None:
+        self._answer_source = "SCHEDULING_SERVICE"
         try:
             preferred_day = date.fromisoformat(preferred_day_iso)
         except (ValueError, TypeError):
@@ -4050,6 +4115,7 @@ class ConversationEngine:
         period: str,
     ) -> ConversationHandleOut | None:
         """Filter last_offered_slots by time period and reply with available options."""
+        self._answer_source = "SCHEDULING_SERVICE"
         try:
             offered = json.loads(state.last_offered_slots or "[]")
         except (json.JSONDecodeError, TypeError):
@@ -4094,6 +4160,7 @@ class ConversationEngine:
         """User named a day (with optional time period) but no exact slot.
         Fetches full-day availability, stores sorted slots, and replies with options
         filtered by period ('tarde'/'manana') when specified."""
+        self._answer_source = "SCHEDULING_SERVICE"
         from ..schemas.schedule import ScheduleCheckIn
         assert ctx.lead is not None
         zone_parts = [state.home_zone_detail, state.home_zone_group, "Buenos Aires, Argentina"]
@@ -4181,6 +4248,7 @@ class ConversationEngine:
     ) -> ConversationHandleOut:
         """User reports they cannot open the Flow form (e.g. on WhatsApp Web).
         Hand off to human immediately."""
+        self._answer_source = "DETERMINISTIC_RULE"
         lead = ctx.lead
         assert lead is not None
 
@@ -4216,6 +4284,7 @@ class ConversationEngine:
     ) -> ConversationHandleOut:
         """Customer insists on an unavailable slot — create a provisional revision
         and hand off to Julián.  Does NOT send Flow, does NOT set AGENDADO."""
+        self._answer_source = "DETERMINISTIC_RULE"
         lead = ctx.lead
         assert lead is not None
 
@@ -4630,20 +4699,19 @@ Respondé SOLO con JSON válido:
         msgs.reverse()
         return msgs
 
-    def _fetch_burst_texts(
+    def _fetch_burst_messages(
         self,
         thread_id: int,
         previous_cursor: str | None,
         current_wa_message_id: str,
-    ) -> list[str]:
-        """Return text of all persisted inbound burst messages, oldest-first.
+    ) -> list["WhatsAppMessage"]:
+        """Return all persisted inbound burst messages as objects, oldest-first.
 
-        WILD-04R burst completeness: n8n has a 10-message limit on
-        unanswered_recent_user_messages. This fetches all inbound messages
-        between the previous processed cursor and the current event from DB,
-        which is the authoritative record with no hard limit.
+        WILD-04R burst completeness: n8n has a 10-message limit. This queries
+        all inbound messages between the previous processed cursor and the
+        current event from DB — the authoritative record with no hard limit.
 
-        Returns empty list when previous_cursor is None (first-ever message).
+        Returns [] when previous_cursor is None (first-ever message on thread).
         """
         if previous_cursor is None:
             return []
@@ -4660,7 +4728,7 @@ Respondé SOLO con JSON válido:
         if prev_row is None:
             return []
 
-        burst_rows = list(
+        return list(
             self.db.execute(
                 select(WhatsAppMessage)
                 .where(
@@ -4672,7 +4740,19 @@ Respondé SOLO con JSON válido:
                 .order_by(WhatsAppMessage.id.asc())
             ).scalars().all()
         )
-        return [row.text for row in burst_rows if row.text is not None]
+
+    def _fetch_burst_texts(
+        self,
+        thread_id: int,
+        previous_cursor: str | None,
+        current_wa_message_id: str,
+    ) -> list[str]:
+        """Return text strings of all persisted inbound burst messages, oldest-first."""
+        return [
+            row.text
+            for row in self._fetch_burst_messages(thread_id, previous_cursor, current_wa_message_id)
+            if row.text is not None
+        ]
 
     def _get_or_create_state(self, ctx: _Context) -> WhatsAppThreadState:
         if ctx.state is not None:

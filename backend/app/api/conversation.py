@@ -56,26 +56,65 @@ def _write_ai_event_telemetry(
 
         now_utc = datetime.now(timezone.utc)
 
-        # latency_total_ms: from AiEvent.created_at (webhook arrival) to now (CE finished)
-        # This includes n8n debounce + CE processing — the full customer wait time.
-        ai_event_created = ai_event.created_at
-        if ai_event_created is not None:
-            if ai_event_created.tzinfo is None:
-                ai_event_created = ai_event_created.replace(tzinfo=timezone.utc)
-            latency_total_ms = int((now_utc - ai_event_created).total_seconds() * 1000)
+        # Resolve earliest inbound burst message timestamp (DB-authoritative).
+        # When burst_earliest_inbound_db_id is known (CE provided it), query that message.
+        # Otherwise fall back to the current inbound message's created_at.
+        earliest_inbound_ts: datetime | None = None
+        if result.burst_earliest_inbound_db_id is not None:
+            earliest_msg = db.execute(
+                select(WhatsAppMessage).where(
+                    WhatsAppMessage.id == result.burst_earliest_inbound_db_id
+                )
+            ).scalar_one_or_none()
+            if earliest_msg is not None and earliest_msg.created_at is not None:
+                earliest_inbound_ts = earliest_msg.created_at
+                if earliest_inbound_ts.tzinfo is None:
+                    earliest_inbound_ts = earliest_inbound_ts.replace(tzinfo=timezone.utc)
+        if earliest_inbound_ts is None:
+            # Fall back: use current inbound message created_at
+            current_inbound = db.execute(
+                select(WhatsAppMessage).where(
+                    WhatsAppMessage.wa_message_id == payload.wa_message_id,
+                    WhatsAppMessage.direction == "in",
+                )
+            ).scalar_one_or_none()
+            if current_inbound is not None and current_inbound.created_at is not None:
+                earliest_inbound_ts = current_inbound.created_at
+                if earliest_inbound_ts.tzinfo is None:
+                    earliest_inbound_ts = earliest_inbound_ts.replace(tzinfo=timezone.utc)
+
+        # Resolve outbound message timestamp (proxy for customer reply receipt).
+        outbound_ts: datetime | None = None
+        if result.reply_produced and result.wa_message_id:
+            outbound_msg = db.execute(
+                select(WhatsAppMessage).where(
+                    WhatsAppMessage.wa_message_id == result.wa_message_id,
+                    WhatsAppMessage.direction == "out",
+                )
+            ).scalar_one_or_none()
+            if outbound_msg is not None and outbound_msg.created_at is not None:
+                outbound_ts = outbound_msg.created_at
+                if outbound_ts.tzinfo is None:
+                    outbound_ts = outbound_ts.replace(tzinfo=timezone.utc)
+
+        # latency_total_ms: earliest inbound burst message → outbound reply
+        # True customer wait time. None when no reply was produced.
+        if earliest_inbound_ts is not None and outbound_ts is not None:
+            latency_total_ms = max(0, int((outbound_ts - earliest_inbound_ts).total_seconds() * 1000))
         else:
             latency_total_ms = None
 
-        # pre_ce_wait_ms: time before CE started processing
-        # = total_latency - CE processing time
-        # Labeled latency_debounce_ms but represents "pre-CE wait" (n8n debounce + overhead).
-        if latency_total_ms is not None and result.latency_ce_ms is not None:
-            latency_debounce_ms = max(0, latency_total_ms - result.latency_ce_ms)
+        # latency_debounce_ms: pre-CE wait = earliest inbound → CE start
+        # CE start approximated as: now_utc - latency_ce_ms (valid within a few ms).
+        if earliest_inbound_ts is not None and result.latency_ce_ms is not None:
+            from datetime import timedelta
+            ce_start_approx = now_utc - timedelta(milliseconds=result.latency_ce_ms)
+            latency_debounce_ms = max(0, int((ce_start_approx - earliest_inbound_ts).total_seconds() * 1000))
         else:
             latency_debounce_ms = None
 
-        # burst_message_count: inbound messages since previous cursor → this event
-        burst_count = _count_burst_messages(db, payload)
+        # burst_message_count: CE-computed DB-authoritative count (passed via result)
+        burst_count = result.burst_message_count
 
         # cycle_message_count: inbound messages since cycle watermark
         cycle_count = _count_cycle_messages(db, payload)
@@ -110,30 +149,6 @@ def _write_ai_event_telemetry(
         except Exception:
             pass
 
-
-def _count_burst_messages(db: Session, payload: ConversationHandleIn) -> int | None:
-    try:
-        # Find current event DB row
-        current_msg = db.execute(
-            select(WhatsAppMessage).where(WhatsAppMessage.wa_message_id == payload.wa_message_id)
-        ).scalar_one_or_none()
-        if current_msg is None:
-            return None
-        # Find thread state to get previous cursor
-        from ..models import WhatsAppThread
-        thread = db.get(WhatsAppThread, payload.thread_id)
-        if thread is None:
-            return None
-        state = thread.state
-        prev_cursor = None
-        if state is not None:
-            # After CE ran, last_processed_inbound_wa_message_id is NOW the current event.
-            # We need the PREVIOUS cursor. We can't recover it here; return 1 as minimum.
-            pass
-        # Without previous cursor, count this turn as burst=1
-        return 1
-    except Exception:
-        return None
 
 
 def _count_cycle_messages(db: Session, payload: ConversationHandleIn) -> int | None:

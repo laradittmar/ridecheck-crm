@@ -57,7 +57,9 @@ class ConversationHandleOut(BaseModel):
     answer_source: str | None = None           # DETERMINISTIC_RULE | FAQ_RULE | PRICING_SERVICE | SCHEDULING_SERVICE | VEHICLE_RESOLVER | CE_AI | FLOW_RESPONSE | ERROR_FALLBACK | HUMAN
     contributing_sources: list[str] | None = None
     ai_invoked: bool | None = None
-    latency_ce_ms: int | None = None           # CE wall time ms
-    burst_message_count: int | None = None
+    latency_ce_ms: int | None = None           # CE wall time ms (perf_counter)
+    burst_message_count: int | None = None     # inbound messages in burst (DB-authoritative)
     cycle_message_count: int | None = None
     performance_status: str | None = None      # OK | MEDIUM | ALERT | PENDING | NO_REPLY_REQUIRED
+    # Internal fields for latency computation in telemetry writeback — not exposed to callers
+    burst_earliest_inbound_db_id: int | None = None  # DB id of oldest burst message

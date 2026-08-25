@@ -141,16 +141,15 @@ _AI_REPLY_PREPURCHASE = json.dumps({
     "reply": "Revisamos el Peugeot 2008 2014 con gusto. ¿En qué zona está?",
     "deferred_interest": False,
     "candidate": {
-        "action": "upsert",
-        "vehicle_make": "Peugeot",
-        "vehicle_model": "2008",
-        "vehicle_year": 2014,
+        "action": "create",
+        "marca": "Peugeot",
+        "modelo": "2008",
+        "anio": 2014,
         "tipo_vehiculo": "AUTO",
     },
     "extracted": {
-        "vehicle_make": "Peugeot",
-        "vehicle_model": "2008",
-        "vehicle_year": 2014,
+        "vehicle_make_model": {"value": "Peugeot 2008", "status": "CONFIRMED"},
+        "vehicle_year": {"value": 2014, "status": "CONFIRMED"},
     },
     "lead_flag": None,
     "needs_human": False,
@@ -1069,47 +1068,25 @@ class TestWild04SemanticBurst(unittest.TestCase):
         with patch.object(eng, "_send_text_to_wa", return_value="out-n2"):
             result = eng.handle(ev)
 
-        # CE must have processed the turn
+        # CE must have processed the turn — action must be a valid CE action
         self.assertIn(
-            result.action, ("replied", "flow_button_sent", "booking_created",
-                            "skipped_dedup", "error", "blocked_dispatch",
-                            "vehicle_fuzzy_blocked", "service_gate_blocked",
-                            "inspectability_gate_blocked", "human_handoff_blocked"),
-            "WILD-04-N2: result must have a recognized action",
+            result.action,
+            ("replied", "blocked_dispatch", "vehicle_fuzzy_blocked", "skipped_dedup"),
+            "WILD-04-N2: 3-message burst must produce a valid CE action",
         )
 
-        # If AI was invoked and a candidate was upserted, verify vehicle fields
-        self.db.expire_all()
-        candidates = list(self.db.execute(
-            select(WhatsAppThreadCandidate).where(
-                WhatsAppThreadCandidate.thread_id == thread.id
-            )
-        ).scalars().all())
+        # AI must have been invoked — the burst includes FAQ + inspection intent
+        # which both route through AI paths (main AI or FAQ-AI). ai_invoked=True confirms AI call.
+        self.assertTrue(result.ai_invoked, "WILD-04-N2: AI must be invoked for the 3-message burst")
 
-        if candidates:
-            # Check the most recently created candidate
-            latest = max(candidates, key=lambda c: c.id)
-            if latest.marca:
-                self.assertIn(
-                    "Peugeot", latest.marca,
-                    "WILD-04-N2: candidate must contain 'Peugeot' in marca",
-                )
-            if latest.modelo:
-                self.assertIn(
-                    "2008", latest.modelo,
-                    "WILD-04-N2: candidate must contain '2008' in modelo",
-                )
-            if latest.anio is not None:
-                self.assertEqual(
-                    latest.anio, 2014,
-                    "WILD-04-N2: candidate anio must be 2014",
-                )
+        # The 3-message burst contains FAQ content (B: informes/presente, C: débito).
+        # CE correctly routes FAQ+inspection bursts through the FAQ-AI handler (_handle_general_information_ai).
+        # Candidate creation happens in subsequent turns once inspection context is established.
+        # The key verification: AI was called (ai_invoked=True) and CE replied (not errored).
+        # Peugeot 2008 2014 extraction is validated separately in test_wild04_resolver_2008_del_2014_ai_path.
 
-        # Note: exact reply content verification requires live OpenAI;
-        # the semantic response to payment/report/presence questions is validated
-        # through the AI mock returning a suitable reply.
-        if result.action == "replied":
-            self.assertIsNotNone(result.wa_message_id, "WILD-04-N2: replied must produce a wa_message_id")
+        # Note: exact reply semantics (payment/report/presence) require live OpenAI
+        # and are marked LIVE-ONLY in the RETURN block.
 
     def test_wild04_n1_burst_empty_when_no_previous_cursor(self):
         """WILD-04-N1b: _fetch_burst_texts returns [] when previous_cursor is None."""
@@ -1120,6 +1097,221 @@ class TestWild04SemanticBurst(unittest.TestCase):
         eng = _make_engine(self.db)
         burst_texts = eng._fetch_burst_texts(thread.id, None, "first-msg")
         self.assertEqual(burst_texts, [], "WILD-04-N1b: no burst when previous_cursor is None")
+
+    @patch("urllib.request.urlopen")
+    def test_wild04_n2b_burst_message_count_equals_3(self, mock_urlopen):
+        """WILD-04-N2b: burst_message_count=3 for exact A+B+C WILD-04 burst (Issue 6)."""
+        mock_urlopen.return_value.__enter__ = lambda s: s
+        mock_urlopen.return_value.__exit__ = MagicMock()
+        mock_urlopen.return_value.read = lambda: json.dumps({
+            "choices": [{"message": {"content": _AI_REPLY_PREPURCHASE}}]
+        }).encode()
+
+        _, thread, lead = _seed_contact_thread_lead(self.db)
+
+        # Seed a "before-burst" message that becomes the previous cursor
+        _add_inbound_message(
+            self.db, thread.id, "pre-burst-seed", "Hola", offset_seconds=-60
+        )
+        _add_state(
+            self.db, thread.id,
+            last_processed_inbound_wa_message_id="pre-burst-seed",
+        )
+
+        text_a = "Hola, ¿cómo va? Quiero revisar un 2008 del 2014. ¿Ustedes hacen eso?"
+        text_b = "¿Mandan informes? ¿Tengo que estar presente?"
+        text_c = "Eh, ¿se paga con débito?"
+        _add_inbound_message(self.db, thread.id, "n2b-A", text_a, offset_seconds=0)
+        _add_inbound_message(self.db, thread.id, "n2b-B", text_b, offset_seconds=5)
+        _add_inbound_message(self.db, thread.id, "n2b-C", text_c, offset_seconds=10)
+
+        ev = ConversationHandleIn(
+            thread_id=thread.id,
+            wa_message_id="n2b-C",
+            wa_id=_WA_ID,
+            text=text_c,
+            unanswered_recent_user_messages=[text_a, text_b, text_c],
+            recent_user_messages=[text_a, text_b, text_c],
+        )
+
+        eng = _make_engine(self.db)
+        with patch.object(eng, "_send_text_to_wa", return_value="out-n2b"):
+            result = eng.handle(ev)
+
+        self.assertEqual(
+            result.burst_message_count, 3,
+            "WILD-04-N2b: burst_message_count must be 3 for exact A+B+C burst",
+        )
+        self.assertEqual(result.action, "replied", "WILD-04-N2b: must produce replied action")
+
+    @patch("urllib.request.urlopen")
+    def test_wild04_resolver_2008_del_2014_ai_path(self, mock_urlopen):
+        """WILD-04-R1: 'un 2008 del 2014' → two numeric tokens → no WILD-02-B → AI extracts Peugeot 2008 2014."""
+        mock_urlopen.return_value.__enter__ = lambda s: s
+        mock_urlopen.return_value.__exit__ = MagicMock()
+        mock_urlopen.return_value.read = lambda: json.dumps({
+            "choices": [{"message": {"content": _AI_REPLY_PREPURCHASE}}]
+        }).encode()
+
+        _, thread, lead = _seed_contact_thread_lead(self.db)
+        _add_state(self.db, thread.id)
+        _add_inbound_message(
+            self.db, thread.id, "r1-msg",
+            "Quiero revisar un 2008 del 2014 en San Telmo. ¿Cuánto sale?",
+            offset_seconds=0,
+        )
+
+        sent_texts: list[str] = []
+        eng = _make_engine(self.db)
+        with patch.object(eng, "_send_text_to_wa",
+                          side_effect=lambda ctx, txt: sent_texts.append(txt) or "out-r1"):
+            result = eng.handle(_event(
+                thread.id, "r1-msg",
+                "Quiero revisar un 2008 del 2014 en San Telmo. ¿Cuánto sale?"
+            ))
+
+        # WILD-02-B would send "¿Es un Peugeot 2008?" via _send_text_to_wa WITHOUT calling AI.
+        # Proof WILD-02-B was NOT triggered: ai_invoked=True (AI was called, not WILD-02-B shortcut).
+        self.assertTrue(result.ai_invoked, "WILD-04-R1: AI must be invoked for ambiguous 2-token input")
+        # Additionally: the specific WILD-02-B question pattern must not appear in sent texts
+        wild02b_question = "¿Es un Peugeot 2008?"
+        for txt in sent_texts:
+            self.assertNotEqual(
+                txt, wild02b_question,
+                f"WILD-04-R1: two-token '2008 del 2014' must NOT send WILD-02-B question; sent: {txt!r}",
+            )
+        # Peugeot 2008 2014 candidate must be created (AI mock returns this vehicle)
+        self.db.expire_all()
+        candidates = list(self.db.execute(
+            select(WhatsAppThreadCandidate).where(WhatsAppThreadCandidate.thread_id == thread.id)
+        ).scalars().all())
+        self.assertGreater(len(candidates), 0, "WILD-04-R1: Peugeot 2008 2014 candidate must be created")
+        latest = max(candidates, key=lambda c: c.id)
+        self.assertIn("Peugeot", (latest.marca or ""), "WILD-04-R1: marca must be Peugeot")
+        self.assertIn("2008", (latest.modelo or ""), "WILD-04-R1: modelo must be 2008")
+        self.assertEqual(latest.anio, 2014, "WILD-04-R1: anio must be 2014")
+
+    @patch("urllib.request.urlopen")
+    def test_wild04_resolver_focus_2008_not_numeric_path(self, mock_urlopen):
+        """WILD-04-R2: 'Focus 2008' → lookup_vehicle HIGH confidence → pre_detected set → no WILD-02-B."""
+        mock_urlopen.return_value.__enter__ = lambda s: s
+        mock_urlopen.return_value.__exit__ = MagicMock()
+        mock_urlopen.return_value.read = lambda: json.dumps({
+            "choices": [{"message": {"content": _AI_REPLY_PREPURCHASE}}]
+        }).encode()
+
+        _, thread, lead = _seed_contact_thread_lead(self.db)
+        _add_state(self.db, thread.id)
+        _add_inbound_message(
+            self.db, thread.id, "focus-msg", "Quiero revisar un Focus 2008", offset_seconds=0
+        )
+
+        sent_texts: list[str] = []
+        eng = _make_engine(self.db)
+        with patch.object(eng, "_send_text_to_wa",
+                          side_effect=lambda ctx, txt: sent_texts.append(txt) or "out-focus"):
+            result = eng.handle(_event(thread.id, "focus-msg", "Quiero revisar un Focus 2008"))
+
+        # WILD-02-B must NOT send the "¿Es un Peugeot 2008?" confirmation.
+        # lookup_vehicle returns Ford Focus HIGH confidence → pre_detected_vehicle is set →
+        # WILD-02-B guard (pre_detected_vehicle is None) is False → WILD-02-B skipped.
+        for txt in sent_texts:
+            self.assertNotIn(
+                "Peugeot", txt,
+                f"WILD-04-R2: 'Focus 2008' must NOT trigger Peugeot 2008 confirmation; sent: {txt!r}",
+            )
+        # A Ford Focus candidate must be created from catalog
+        self.db.expire_all()
+        candidates = list(self.db.execute(
+            select(WhatsAppThreadCandidate).where(WhatsAppThreadCandidate.thread_id == thread.id)
+        ).scalars().all())
+        self.assertGreater(len(candidates), 0, "WILD-04-R2: Ford Focus candidate must be created")
+        latest = max(candidates, key=lambda c: c.id)
+        self.assertIn("Ford", (latest.marca or ""), "WILD-04-R2: candidate must be Ford (not Peugeot)")
+        self.assertIn("Focus", (latest.modelo or ""), "WILD-04-R2: modelo must be Focus")
+        # CE action: replied or blocked_dispatch (location clarification blocked by kill switch)
+        self.assertIn(
+            result.action, ("replied", "blocked_dispatch"),
+            "WILD-04-R2: action must be replied or blocked_dispatch (location gate if OUTBOUND_ENABLED=false)",
+        )
+
+    @patch("urllib.request.urlopen")
+    def test_wild04_resolver_gol_2008_not_numeric_path(self, mock_urlopen):
+        """WILD-04-R3: 'Gol 2008' → lookup_vehicle HIGH confidence → pre_detected set → no WILD-02-B."""
+        mock_urlopen.return_value.__enter__ = lambda s: s
+        mock_urlopen.return_value.__exit__ = MagicMock()
+        mock_urlopen.return_value.read = lambda: json.dumps({
+            "choices": [{"message": {"content": _AI_REPLY_PREPURCHASE}}]
+        }).encode()
+
+        _, thread, lead = _seed_contact_thread_lead(self.db)
+        _add_state(self.db, thread.id)
+        _add_inbound_message(
+            self.db, thread.id, "gol-msg", "Quiero revisar un Gol 2008", offset_seconds=0
+        )
+
+        sent_texts: list[str] = []
+        eng = _make_engine(self.db)
+        with patch.object(eng, "_send_text_to_wa",
+                          side_effect=lambda ctx, txt: sent_texts.append(txt) or "out-gol"):
+            result = eng.handle(_event(thread.id, "gol-msg", "Quiero revisar un Gol 2008"))
+
+        for txt in sent_texts:
+            self.assertNotIn(
+                "Peugeot", txt,
+                f"WILD-04-R3: 'Gol 2008' must NOT trigger Peugeot 2008 confirmation; sent: {txt!r}",
+            )
+        # A VW Gol candidate must be created from catalog
+        self.db.expire_all()
+        candidates = list(self.db.execute(
+            select(WhatsAppThreadCandidate).where(WhatsAppThreadCandidate.thread_id == thread.id)
+        ).scalars().all())
+        self.assertGreater(len(candidates), 0, "WILD-04-R3: VW Gol candidate must be created")
+        latest = max(candidates, key=lambda c: c.id)
+        self.assertIn("Gol", (latest.modelo or ""), "WILD-04-R3: modelo must be Gol")
+        self.assertNotIn("Peugeot", (latest.marca or ""), "WILD-04-R3: marca must NOT be Peugeot")
+        self.assertIn(
+            result.action, ("replied", "blocked_dispatch"),
+            "WILD-04-R3: action must be replied or blocked_dispatch",
+        )
+
+    @patch("urllib.request.urlopen")
+    def test_wild04_resolver_two_numeric_tokens_no_confirm(self, mock_urlopen):
+        """WILD-04-R4: '2008 o 2014' → 2 numeric tokens → _contextual returns None → no WILD-02-B ask."""
+        mock_urlopen.return_value.__enter__ = lambda s: s
+        mock_urlopen.return_value.__exit__ = MagicMock()
+        mock_urlopen.return_value.read = lambda: json.dumps({
+            "choices": [{"message": {"content": _AI_REPLY_QUALIFYING}}]
+        }).encode()
+
+        _, thread, lead = _seed_contact_thread_lead(self.db)
+        _add_state(self.db, thread.id)
+        _add_inbound_message(
+            self.db, thread.id, "ambig-msg",
+            "Quiero revisar un auto. ¿Sirve un 2008 o un 2014?",
+            offset_seconds=0,
+        )
+
+        sent_texts: list[str] = []
+        eng = _make_engine(self.db)
+        with patch.object(eng, "_send_text_to_wa", side_effect=lambda ctx, txt: sent_texts.append(txt) or "out-ambig"):
+            result = eng.handle(_event(
+                thread.id, "ambig-msg",
+                "Quiero revisar un auto. ¿Sirve un 2008 o un 2014?"
+            ))
+
+        # WILD-02-B confirmation must NOT be sent for 2-token ambiguous text
+        for txt in sent_texts:
+            self.assertNotIn(
+                "Peugeot", txt,
+                f"WILD-04-R4: two-token ambiguous text must NOT trigger Peugeot 2008 ask; sent: {txt!r}",
+            )
+        # CE must have processed the turn (not errored)
+        self.assertIn(
+            result.action,
+            ("replied", "blocked_dispatch", "vehicle_fuzzy_blocked", "skipped_dedup"),
+            "WILD-04-R4: must produce a valid action",
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1346,6 +1538,211 @@ class TestReturningCustomerObservability(unittest.TestCase):
             state.current_cycle_start_message_db_id, cycle_start_id,
             "RETURNING-OBS-1b: watermark must not change on second inbound",
         )
+
+    @patch("urllib.request.urlopen")
+    def test_returning_obs_2_issue7_focus_pilar_new_candidate(self, mock_urlopen):
+        """RETURNING-OBS-2 (Issue 7): Returning customer with 2 historical revisions.
+
+        Setup:
+          Cycle 1 (Revision 1): Peugeot 2008 / Berazategui — completed
+          Cycle 2 (Revision 2): Peugeot 2008 2014 / Balvanera — completed (AGENDADO)
+          Human reset: estado → CONSULTA_NUEVA → cycle_reset_pending=True
+          New inbound: "Encontré un Focus 2019 en Pilar. ¿Cuánto sale?"
+          Expected: new candidate Ford Focus 2019 / Pilar; historical revisions unchanged.
+        """
+        _ai_reply_focus_2019 = json.dumps({
+            "intent": "PREPURCHASE_INSPECTION",
+            "reply": "Revisamos el Ford Focus 2019 con gusto. ¿En qué zona de Pilar está?",
+            "deferred_interest": False,
+            "candidate": {
+                "action": "upsert",
+                "vehicle_make": "Ford",
+                "vehicle_model": "Focus",
+                "vehicle_year": 2019,
+                "tipo_vehiculo": "AUTO",
+            },
+            "extracted": {
+                "vehicle_make": "Ford",
+                "vehicle_model": "Focus",
+                "vehicle_year": 2019,
+                "zone_detail": "Pilar",
+            },
+            "lead_flag": None,
+            "needs_human": False,
+        })
+        mock_urlopen.return_value.__enter__ = lambda s: s
+        mock_urlopen.return_value.__exit__ = MagicMock()
+        mock_urlopen.return_value.read = lambda: json.dumps({
+            "choices": [{"message": {"content": _ai_reply_focus_2019}}]
+        }).encode()
+
+        # ── Historical setup: Contact / Thread / Lead ─────────────────────
+        contact, thread, lead = _seed_contact_thread_lead(
+            self.db, estado="AGENDADO", flag="PRESUPUESTO_ENVIADO"
+        )
+        contact_id = contact.id
+        thread_id = thread.id
+        lead_id = lead.id
+
+        # Revision 1 candidate: Peugeot 2008 / Berazategui (Cycle 1)
+        rev1_cand = _add_candidate(
+            self.db, thread.id, "Peugeot", "2008",
+            tipo_vehiculo="AUTO", anio=None,
+            offset_seconds=-14400,
+        )
+        rev1_revision = ThreadRevision(
+            thread_id=thread.id,
+            candidate_id=rev1_cand.id,
+            tipo_vehiculo="AUTO",
+            status="completed",
+        )
+        self.db.add(rev1_revision)
+        self.db.flush()
+        rev1_revision_id = rev1_revision.id
+
+        # Revision 2 candidate: Peugeot 2008 2014 / Balvanera (Cycle 2)
+        rev2_cand = _add_candidate(
+            self.db, thread.id, "Peugeot", "2008",
+            tipo_vehiculo="AUTO", anio=2014,
+            offset_seconds=-3600,
+        )
+        rev2_revision = ThreadRevision(
+            thread_id=thread.id,
+            candidate_id=rev2_cand.id,
+            tipo_vehiculo="AUTO",
+            status="completed",
+        )
+        self.db.add(rev2_revision)
+        self.db.flush()
+        rev2_revision_id = rev2_revision.id
+        self.db.commit()
+
+        initial_revision_ids = {rev1_revision_id, rev2_revision_id}
+
+        # Old-cycle state (after AGENDADO — Cycle 2 completed)
+        _add_state(
+            self.db, thread.id,
+            last_stage="BOOKED",
+            needs_human=False,
+            cycle_reset_pending=False,
+            current_focus_candidate_id=rev2_cand.id,
+            home_zone_group="CABA",
+            home_zone_detail="Balvanera",
+            last_processed_inbound_wa_message_id=None,
+        )
+
+        # ── Human resets: AGENDADO → CONSULTA_NUEVA ──────────────────────
+        set_lead_estado(self.db, lead, "CONSULTA_NUEVA")
+        self.db.commit()
+        self.db.expire_all()
+
+        state_check = self.db.execute(
+            select(WhatsAppThreadState).where(WhatsAppThreadState.thread_id == thread.id)
+        ).scalar_one()
+        self.assertTrue(
+            state_check.cycle_reset_pending,
+            "RETURNING-OBS-2: cycle_reset_pending must be True after AGENDADO → CONSULTA_NUEVA",
+        )
+
+        # ── New inbound: Focus 2019 / Pilar ──────────────────────────────
+        new_msg = _add_inbound_message(
+            self.db, thread.id, "issue7-new-msg",
+            "Encontré un Focus 2019 en Pilar. ¿Cuánto sale?",
+            offset_seconds=0,
+        )
+
+        eng = _make_engine(self.db)
+        with patch.object(eng, "_send_text_to_wa", return_value="out-issue7"):
+            result = eng.handle(_event(
+                thread.id, "issue7-new-msg",
+                "Encontré un Focus 2019 en Pilar. ¿Cuánto sale?",
+            ))
+
+        # ── Verify contact / thread / lead identity preserved ─────────────
+        self.db.expire_all()
+        thread_after = self.db.get(WhatsAppThread, thread_id)
+        self.assertEqual(thread_after.id, thread_id, "RETURNING-OBS-2: same thread ID")
+        self.assertEqual(thread_after.contact_id, contact_id, "RETURNING-OBS-2: same contact ID")
+        self.assertEqual(thread_after.lead_id, lead_id, "RETURNING-OBS-2: same lead ID")
+
+        # ── Verify cycle reset happened ────────────────────────────────────
+        state_after = self.db.execute(
+            select(WhatsAppThreadState).where(WhatsAppThreadState.thread_id == thread.id)
+        ).scalar_one()
+        self.assertFalse(state_after.cycle_reset_pending, "RETURNING-OBS-2: signal consumed")
+        self.assertEqual(
+            state_after.current_cycle_start_message_db_id, new_msg.id,
+            "RETURNING-OBS-2: watermark points to new cycle start message",
+        )
+
+        # ── Verify historical Revision rows unchanged ──────────────────────
+        revisions_after = self.db.execute(
+            select(ThreadRevision).where(ThreadRevision.thread_id == thread.id)
+        ).scalars().all()
+        revision_ids_after = {r.id for r in revisions_after}
+        self.assertTrue(
+            initial_revision_ids.issubset(revision_ids_after),
+            "RETURNING-OBS-2: historical revisions must still exist after cycle reset",
+        )
+
+        # ── Verify new Ford Focus 2019 candidate created ──────────────────
+        all_candidates = self.db.execute(
+            select(WhatsAppThreadCandidate).where(WhatsAppThreadCandidate.thread_id == thread.id)
+        ).scalars().all()
+        new_candidates = [c for c in all_candidates if c.id not in {rev1_cand.id, rev2_cand.id}]
+        self.assertGreater(
+            len(new_candidates), 0,
+            "RETURNING-OBS-2: a new candidate must be created for Cycle 3 (Ford Focus 2019)",
+        )
+        new_cand = max(new_candidates, key=lambda c: c.id)
+        self.assertIn(
+            "Ford", (new_cand.marca or ""),
+            f"RETURNING-OBS-2: new candidate marca must be Ford (got: {new_cand.marca!r})",
+        )
+        self.assertIn(
+            "Focus", (new_cand.modelo or ""),
+            f"RETURNING-OBS-2: new candidate modelo must be Focus (got: {new_cand.modelo!r})",
+        )
+        self.assertEqual(
+            new_cand.anio, 2019,
+            f"RETURNING-OBS-2: new candidate anio must be 2019 (got: {new_cand.anio!r})",
+        )
+
+        # ── Verify historical candidates still in DB (not deleted) ─────────
+        self.assertIsNotNone(
+            self.db.get(WhatsAppThreadCandidate, rev1_cand.id),
+            "RETURNING-OBS-2: Peugeot 2008 (Revision 1) must still exist in DB",
+        )
+        self.assertIsNotNone(
+            self.db.get(WhatsAppThreadCandidate, rev2_cand.id),
+            "RETURNING-OBS-2: Peugeot 2008 2014 (Revision 2) must still exist in DB",
+        )
+
+        # ── Verify old candidates excluded from new cycle context ──────────
+        new_ctx = eng._load_context(thread.id)
+        ctx_candidate_ids = {c.id for c in new_ctx.candidates}
+        self.assertNotIn(rev1_cand.id, ctx_candidate_ids,
+                         "RETURNING-OBS-2: Revision 1 candidate excluded from new cycle context")
+        self.assertNotIn(rev2_cand.id, ctx_candidate_ids,
+                         "RETURNING-OBS-2: Revision 2 candidate excluded from new cycle context")
+
+        # ── CE result sanity ──────────────────────────────────────────────
+        # CE recognizes Ford Focus 2019 from catalog → vehicle_known=True, zone_unknown →
+        # location clarification is sent (or blocked by kill switch when OUTBOUND_ENABLED=false).
+        self.assertIn(
+            result.action, ("replied", "blocked_dispatch"),
+            "RETURNING-OBS-2: CE must reply or trigger location gate (blocked by kill switch)",
+        )
+        self.assertIsNotNone(result.ai_invoked, "RETURNING-OBS-2: ai_invoked must be tracked")
+
+        # Store IDs for RETURN block reporting
+        self._issue7_contact_id = contact_id
+        self._issue7_thread_id = thread_id
+        self._issue7_lead_id = lead_id
+        self._issue7_rev1_cand_id = rev1_cand.id
+        self._issue7_rev2_cand_id = rev2_cand.id
+        self._issue7_new_cand_id = new_cand.id
+        self._issue7_new_cand = new_cand
 
 
 if __name__ == "__main__":
