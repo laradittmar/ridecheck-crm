@@ -17,6 +17,7 @@ Before changing any of the following, **READ FIRST**:
 
 - [`docs/architecture/DOMAIN_MODEL.md`](docs/architecture/DOMAIN_MODEL.md) — Owner-authoritative business model: persistent Lead/Thread, multi-revision lifecycle, field ownership matrix, returning customer contract, invariants, anti-patterns.
 - [`docs/architecture/CONVERSATION_RUNTIME_CONTRACT.md`](docs/architecture/CONVERSATION_RUNTIME_CONTRACT.md) — CE runtime requirements: active-cycle context, cycle boundary, burst contract, latency thresholds, answer source taxonomy, human alert contract, historical context rules.
+- [`docs/architecture/INBOUND_MESSAGE_LIFECYCLE.md`](docs/architecture/INBOUND_MESSAGE_LIFECYCLE.md) — End-to-end lifecycle of a customer message: persistence, transcription, debounce, burst assembly, cycle reset, context loading, evidence extraction, routing, response composition, outbound safety, telemetry, SLA alerting. Worked examples A–D. Hard invariants.
 
 These documents contain owner-authoritative product architecture confirmed by WILD-04R audit (2026-08-24).
 
@@ -42,6 +43,11 @@ Report the mismatch as an architecture defect / owner decision required.
 | What answer_source values are valid? | CONVERSATION_RUNTIME_CONTRACT | §6 Answer Source Contract |
 | When does the human alert fire? | CONVERSATION_RUNTIME_CONTRACT | §7 Human Alert Contract |
 | What is the CE stage lifecycle? | DOMAIN_MODEL | §5 Revision Lifecycle |
+| What happens when a customer message arrives? | INBOUND_MESSAGE_LIFECYCLE | §1 High-Level Flow |
+| How does burst assembly work? | INBOUND_MESSAGE_LIFECYCLE | §4 Debounce and Burst Assembly |
+| How does cycle reset work end-to-end? | INBOUND_MESSAGE_LIFECYCLE | §6 Returning Customer / Revision Cycle Reset |
+| Why is historical context not deleted? | INBOUND_MESSAGE_LIFECYCLE | §7 Historical vs Active Context |
+| What are the failure path behaviors? | INBOUND_MESSAGE_LIFECYCLE | §15 Failure Paths |
 
 ---
 
