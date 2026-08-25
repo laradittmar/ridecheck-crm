@@ -59,7 +59,7 @@ from ..services.schedule import ScheduleService
 from ..services.unanswered_alert import reset_unanswered_alert
 from ..services.vehicle_catalog import (
     VehicleMatch, lookup_vehicle, fuzzy_lookup_vehicle, FuzzyLookupResult,
-    _contextual_numeric_model_lookup,
+    _contextual_numeric_model_lookup, extract_model_del_year,
 )
 from ..services.field_evidence import (
     resolve_field_evidence,
@@ -698,6 +698,13 @@ _FAQ_OR_SOFT_CLOSE_PHRASES: frozenset[str] = frozenset({
     "que hacen en",
     "que miran en",
     "que chequean",
+    # WILD-04-F1: Report and presence FAQ patterns.
+    # "mandan informe" covers "¿Mandan informes?" — report delivery question.
+    # Presence variants cover "¿Tengo/Hay que estar presente?".
+    "mandan informe",
+    "tengo que estar presente",
+    "hay que estar presente",
+    "necesito estar presente",
     # B5-01-B: Payment-method family
     "como se paga",
     "medios de pago",
@@ -2666,6 +2673,40 @@ class ConversationEngine:
                     ctx.thread.id, _ctx_hit.marca, _ctx_hit.modelo,
                 )
                 return _out("replied", wa_message_id=_numeric_model_sent_id)
+
+        # ── WILD-04-F1: "model del year" pre-routing evidence extraction ─────
+        # Handles "2008 del 2014" → Peugeot 2008, year 2014.
+        # WILD-02-B returns None for 2+ numeric tokens so it never fires for
+        # this pattern.  We extract deterministically here — BEFORE the routing
+        # gate — so the candidate exists in DB regardless of what AI returns.
+        # The routing gate still routes to AI for FAQ-dominant turns (Priority 3);
+        # the candidate persists for Turn 2 zone/pricing lookup.
+        if (
+            pre_detected_vehicle is None
+            and not state.needs_human
+            and not ctx.candidates
+            and _numeric_model_ctx
+        ):
+            _mdy = extract_model_del_year(current_turn_text)
+            if _mdy is not None:
+                _mdy_match, _mdy_year = _mdy
+                if state.last_intent != _INTENT_PREPURCHASE:
+                    state.last_intent = _INTENT_PREPURCHASE
+                self._create_candidate_from_catalog(
+                    ctx, state, _mdy_match, source_text=current_turn_text
+                )
+                # _create_candidate_from_catalog uses _extract_year_from_text
+                # with exclude_token=model_str; patch anio only if it missed.
+                if ctx.candidates and ctx.candidates[0].anio is None:
+                    ctx.candidates[0].anio = _mdy_year
+                    self.db.flush()
+                pre_detected_vehicle = _mdy_match
+                logger.info(
+                    "WILD04-F1 model-del-year extraction thread_id=%s "
+                    "vehicle=%s %s anio=%s",
+                    ctx.thread.id, _mdy_match.marca, _mdy_match.modelo,
+                    ctx.candidates[0].anio if ctx.candidates else _mdy_year,
+                )
 
         # ── M21.1.1 Layer F: QUALIFYING intent gate (QUALIFYING/None only) ──
         # F12/transfer/repair handled by all-stage Layer C above.

@@ -1075,15 +1075,10 @@ class TestWild04SemanticBurst(unittest.TestCase):
             "WILD-04-N2: 3-message burst must produce a valid CE action",
         )
 
-        # AI must have been invoked — the burst includes FAQ + inspection intent
-        # which both route through AI paths (main AI or FAQ-AI). ai_invoked=True confirms AI call.
-        self.assertTrue(result.ai_invoked, "WILD-04-N2: AI must be invoked for the 3-message burst")
-
-        # The 3-message burst contains FAQ content (B: informes/presente, C: débito).
-        # CE correctly routes FAQ+inspection bursts through the FAQ-AI handler (_handle_general_information_ai).
-        # Candidate creation happens in subsequent turns once inspection context is established.
-        # The key verification: AI was called (ai_invoked=True) and CE replied (not errored).
-        # Peugeot 2008 2014 extraction is validated separately in test_wild04_resolver_2008_del_2014_ai_path.
+        # WILD-04-F1: "2008 del 2014" in text_a triggers pre-routing candidate creation.
+        # CE sees vehicle_known=True + zone_unknown → routes to location clarification, not AI.
+        # ai_invoked=False is the CORRECT post-F1 behavior for this burst.
+        # Candidate creation and pricing are validated separately in test_wild04r_f1_evidence.py.
 
         # Note: exact reply semantics (payment/report/presence) require live OpenAI
         # and are marked LIVE-ONLY in the RETURN block.
@@ -1142,11 +1137,17 @@ class TestWild04SemanticBurst(unittest.TestCase):
             result.burst_message_count, 3,
             "WILD-04-N2b: burst_message_count must be 3 for exact A+B+C burst",
         )
-        self.assertEqual(result.action, "replied", "WILD-04-N2b: must produce replied action")
+        # WILD-04-F1 creates candidate before routing gate → CE asks for zone location.
+        # With OUTBOUND_ENABLED=false, _check_fallback_flow_triggers uses OutboundSafetyGate
+        # directly (not via _send_text_to_wa mock) and returns blocked_dispatch.
+        self.assertIn(
+            result.action, ("replied", "blocked_dispatch"),
+            "WILD-04-N2b: must produce valid CE action (replied or blocked_dispatch after F1)",
+        )
 
     @patch("urllib.request.urlopen")
     def test_wild04_resolver_2008_del_2014_ai_path(self, mock_urlopen):
-        """WILD-04-R1: 'un 2008 del 2014' → two numeric tokens → no WILD-02-B → AI extracts Peugeot 2008 2014."""
+        """WILD-04-R1: 'un 2008 del 2014' → WILD-02-B skips (2 tokens) → WILD-04-F1 creates Peugeot 2008 2014 candidate."""
         mock_urlopen.return_value.__enter__ = lambda s: s
         mock_urlopen.return_value.__exit__ = MagicMock()
         mock_urlopen.return_value.read = lambda: json.dumps({
@@ -1171,9 +1172,9 @@ class TestWild04SemanticBurst(unittest.TestCase):
             ))
 
         # WILD-02-B would send "¿Es un Peugeot 2008?" via _send_text_to_wa WITHOUT calling AI.
-        # Proof WILD-02-B was NOT triggered: ai_invoked=True (AI was called, not WILD-02-B shortcut).
-        self.assertTrue(result.ai_invoked, "WILD-04-R1: AI must be invoked for ambiguous 2-token input")
-        # Additionally: the specific WILD-02-B question pattern must not appear in sent texts
+        # WILD-04-F1 creates the candidate BEFORE the routing gate (no confirmation question sent).
+        # CE then sees vehicle_known=True + zone_unknown → location clarification, not AI.
+        # Proof WILD-02-B was NOT triggered: the specific question must not appear in sent texts.
         wild02b_question = "¿Es un Peugeot 2008?"
         for txt in sent_texts:
             self.assertNotEqual(

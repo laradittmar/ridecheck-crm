@@ -324,3 +324,39 @@ def _contextual_numeric_model_lookup(text: str) -> VehicleMatch | None:
                     matched_alias=num,
                 )
     return None
+
+
+# ── WILD-04-F1: "model del year" deterministic extraction ─────────────────
+# Handles "2008 del 2014" where one token is a catalog model and the other
+# is a manufacturing year.  Deliberately NOT merged with _contextual_numeric_
+# model_lookup so WILD-02-B's single-token-confirmation guard stays intact.
+
+_MODEL_DEL_YEAR_RE = re.compile(r"\b(\d{4})\s+del?\s+(\d{4})\b", re.IGNORECASE)
+_MFG_YEAR_MIN = 1990
+_MFG_YEAR_MAX = 2035
+
+
+def extract_model_del_year(text: str) -> tuple[VehicleMatch, int] | None:
+    """Detect 'MODEL del YEAR' or 'MODEL de YEAR' patterns (order-agnostic).
+
+    Returns (VehicleMatch, manufacturing_year) when exactly one of the two
+    numeric tokens resolves to a catalog model and the other falls in
+    [_MFG_YEAR_MIN, _MFG_YEAR_MAX].  Returns None when ambiguous or when
+    neither token resolves to a catalog entry.
+
+    Does not check CE state — caller is responsible for intent/context guard.
+    """
+    n = _norm(text)
+    for m in _MODEL_DEL_YEAR_RE.finditer(n):
+        a, b = m.group(1), m.group(2)
+        # Try: a = catalog model, b = manufacturing year
+        if _MFG_YEAR_MIN <= int(b) <= _MFG_YEAR_MAX:
+            hit = _contextual_numeric_model_lookup(a)
+            if hit is not None:
+                return hit, int(b)
+        # Try: b = catalog model, a = manufacturing year
+        if _MFG_YEAR_MIN <= int(a) <= _MFG_YEAR_MAX:
+            hit = _contextual_numeric_model_lookup(b)
+            if hit is not None:
+                return hit, int(a)
+    return None
