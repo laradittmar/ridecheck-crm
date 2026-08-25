@@ -899,5 +899,224 @@ class TestPricingMultiFaqComposition(unittest.TestCase):
         )
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# W4F2-A3: Post-reset context isolation — old messages excluded, DB intact
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestPostResetMessageIsolation(unittest.TestCase):
+    """W4F2-A3: After cycle reset, ctx.db_messages contains ONLY current-cycle
+    messages.  Historical prior-cycle messages must still exist in the DB (we
+    test ISOLATION, not deletion).
+
+    Fixture:
+    - Prior cycle: 5 inbound messages covering old vehicle, old zone, old quote,
+      old booking confirmation (rich prior-cycle history).
+    - cycle_reset_pending = True.
+    - New burst: "Quiero revisar un 2008 del 2014" + "¿Mandan informes?"
+
+    Assertions:
+    - All prior-cycle WhatsAppMessage rows still present in DB (not deleted).
+    - _query_active_messages with post-reset watermark returns ONLY new-cycle msgs.
+    - None of the old-cycle semantic signals (old vehicle/zone/quote/booking) appear
+      in the active message set fed to the AI.
+    """
+
+    _N_OLD = 5
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._patcher = patch("urllib.request.urlopen")
+        mock_url = cls._patcher.start()
+        mock_url.return_value.__enter__ = lambda s: s
+        mock_url.return_value.__exit__ = MagicMock()
+        mock_url.return_value.read = lambda: json.dumps({
+            "choices": [{"message": {"content": _AI_FAQ_COMBINED}}]
+        }).encode()
+
+        cls._db = _new_session()
+        _clean_all(cls._db)
+
+        # ── Seed prior-cycle history ──────────────────────────────────────────
+        contact = WhatsAppContact(wa_id=_WA_ID_A, display_name="IsoTest", phone=None)
+        cls._db.add(contact)
+        cls._db.flush()
+        lead = Lead(flag=None, estado="CONSULTA_NUEVA", nombre="IsoTest", necesita_humano=False)
+        cls._db.add(lead)
+        cls._db.flush()
+        thread = WhatsAppThread(
+            contact_id=contact.id, lead_id=lead.id, unread_count=0,
+            created_at=_T_OLD_CAND - timedelta(hours=1),
+        )
+        cls._db.add(thread)
+        cls._db.flush()
+        cls._thread_id = thread.id
+
+        old_cand = WhatsAppThreadCandidate(
+            thread_id=thread.id,
+            marca="Toyota", modelo="Corolla",
+            tipo_vehiculo="AUTO",
+            zone_group="CABA", zone_detail="Palermo",
+            anio=2017, status="archived",
+            source_text="old Toyota Corolla",
+            created_at=_T_OLD_CAND,
+        )
+        cls._db.add(old_cand)
+        cls._db.flush()
+
+        # Rich prior-cycle messages (old vehicle / zone / quote / booking)
+        _old_texts = [
+            "Hola, quiero revisar un Corolla 2017.",
+            "El auto está en Palermo.",
+            "¿Cuánto sale la revisión?",
+            "OK, presupuesto recibido $190.000 para AUTO en CABA.",
+            "Confirmado, agendado para el miércoles a las 10 hs.",
+        ]
+        for i, txt in enumerate(_old_texts):
+            cls._db.add(WhatsAppMessage(
+                thread_id=thread.id,
+                wa_message_id=f"old-iso-msg-{i}",
+                direction="in",
+                timestamp=_T_OLD_CAND - timedelta(minutes=30 - i),
+                text=txt,
+                status="received",
+            ))
+        cls._db.flush()
+
+        state = WhatsAppThreadState(
+            thread_id=thread.id,
+            needs_human=False,
+            last_stage=None,
+            last_intent=None,
+            cycle_reset_pending=True,
+            current_cycle_started_at=_T_OLD_CYCLE,
+            current_focus_candidate_id=old_cand.id,
+            last_processed_inbound_wa_message_id=f"old-iso-msg-{cls._N_OLD - 1}",
+            vehicle_clarification_sent=False,
+            location_clarification_sent=False,
+            vehicle_fallback_flow_sent=False,
+            location_fallback_flow_sent=False,
+            created_at=_T_OLD_CYCLE,
+            updated_at=_T_OLD_CYCLE,
+        )
+        cls._db.add(state)
+        cls._db.commit()
+        cls._db.expire_all()
+
+        # Persist first new-cycle message
+        burst_msg = _seed_new_burst_message(
+            cls._db, thread.id, "msg-iso-burst",
+            "Quiero revisar un 2008 del 2014.",
+            _T_NEW,
+        )
+        cls._new_msg_id = burst_msg.id
+
+        # Fire the turn
+        texts = ["Quiero revisar un 2008 del 2014.", "¿Mandan informes?"]
+        ev = _event(thread.id, "msg-iso-burst", texts)
+        eng = _make_engine(cls._db, with_sur_pricing=False)
+        with patch.object(
+            eng, "_send_text_to_wa",
+            side_effect=lambda ctx, txt: txt or "out-iso",
+        ):
+            cls._result = eng.handle(ev)
+
+        cls._db.expire_all()
+
+        # Reload state for watermark
+        cls._state = cls._db.execute(
+            select(WhatsAppThreadState).where(
+                WhatsAppThreadState.thread_id == thread.id
+            )
+        ).scalar_one()
+
+        # All inbound messages still in DB
+        cls._all_inbound = list(cls._db.execute(
+            select(WhatsAppMessage).where(
+                WhatsAppMessage.thread_id == thread.id,
+                WhatsAppMessage.direction == "in",
+            ).order_by(WhatsAppMessage.id)
+        ).scalars().all())
+
+        # Active messages per new watermark (what CE feeds to AI)
+        from app.services.conversation_engine import ConversationEngine  # noqa
+        _eng2 = _make_engine(cls._db, with_sur_pricing=False)
+        cls._active_msgs = _eng2._query_active_messages(thread.id, cls._state)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._patcher.stop()
+        cls._db.close()
+
+    def test_w4f2_a3_replied(self):
+        """A3: CE must produce a reply after reset."""
+        self.assertEqual(
+            self._result.action, "replied",
+            f"A3: expected action='replied', got '{self._result.action}'",
+        )
+
+    def test_w4f2_a3_historical_messages_preserved_in_db(self):
+        """A3: All prior-cycle inbound messages still exist in DB (not deleted)."""
+        # N_OLD prior messages + at least 1 new burst message
+        self.assertGreaterEqual(
+            len(self._all_inbound), self._N_OLD + 1,
+            f"A3: expected at least {self._N_OLD + 1} inbound messages in DB, "
+            f"got {len(self._all_inbound)} — prior-cycle rows must not be deleted.",
+        )
+
+    def test_w4f2_a3_active_context_excludes_old_messages(self):
+        """A3: Active context (post-watermark) must NOT include prior-cycle messages."""
+        active_ids = {m.id for m in self._active_msgs}
+        old_ids = {
+            m.id for m in self._all_inbound
+            if m.wa_message_id.startswith("old-iso-msg-")
+        }
+        overlap = active_ids & old_ids
+        self.assertEqual(
+            len(overlap), 0,
+            f"A3: prior-cycle messages leaked into active context: {overlap}. "
+            "ctx.db_messages must only contain new-cycle messages.",
+        )
+
+    def test_w4f2_a3_old_vehicle_not_in_active_context(self):
+        """A3: 'Corolla' (prior-cycle vehicle) must not appear in active message texts."""
+        active_texts = " ".join(m.text or "" for m in self._active_msgs)
+        self.assertNotIn(
+            "Corolla", active_texts,
+            f"A3: prior-cycle vehicle 'Corolla' found in active context: {active_texts!r}",
+        )
+
+    def test_w4f2_a3_old_zone_not_in_active_context(self):
+        """A3: 'Palermo' (prior-cycle zone) must not appear in active message texts."""
+        active_texts = " ".join(m.text or "" for m in self._active_msgs)
+        self.assertNotIn(
+            "Palermo", active_texts,
+            f"A3: prior-cycle zone 'Palermo' found in active context: {active_texts!r}",
+        )
+
+    def test_w4f2_a3_old_quote_not_in_active_context(self):
+        """A3: Old quote ('$190.000') must not appear in active message texts."""
+        active_texts = " ".join(m.text or "" for m in self._active_msgs)
+        self.assertNotIn(
+            "190.000", active_texts,
+            f"A3: prior-cycle quote found in active context: {active_texts!r}",
+        )
+
+    def test_w4f2_a3_old_booking_not_in_active_context(self):
+        """A3: Old booking confirmation must not appear in active message texts."""
+        active_texts = " ".join(m.text or "" for m in self._active_msgs)
+        self.assertNotIn(
+            "agendado", active_texts.lower(),
+            f"A3: prior-cycle booking found in active context: {active_texts!r}",
+        )
+
+    def test_w4f2_a3_active_context_contains_new_burst(self):
+        """A3: Active context MUST include the new-cycle burst message."""
+        active_texts = " ".join(m.text or "" for m in self._active_msgs)
+        self.assertIn(
+            "2008 del 2014", active_texts,
+            f"A3: new burst message not found in active context: {active_texts!r}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
