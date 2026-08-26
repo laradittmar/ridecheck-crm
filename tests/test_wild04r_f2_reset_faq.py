@@ -602,6 +602,12 @@ def _run_b_turn(
     ev = _event_b(thread.id, f"{_base_wa_id}-{len(burst_texts)-1}", burst_texts)
 
     sent_texts: list[str] = []
+    _counter = [0]
+
+    def _fake_send_wa(*, to_wa_id, text):
+        sent_texts.append(text)
+        _counter[0] += 1
+        return (f"fake-wa-{_counter[0]}", {})
 
     with patch("urllib.request.urlopen") as mock_url:
         mock_url.return_value.__enter__ = lambda s: s
@@ -610,9 +616,17 @@ def _run_b_turn(
             "choices": [{"message": {"content": ai_reply}}]
         }).encode()
 
-        with patch.object(eng, "_send_text_to_wa",
-                          side_effect=lambda ctx, txt: sent_texts.append(txt) or f"out-b-{len(sent_texts)}"):
-            result = eng.handle(ev)
+        with patch("app.services.conversation_engine.OutboundSafetyGate") as _MockGate:
+            _gate_inst = MagicMock()
+            _gate_result = MagicMock()
+            _gate_result.outcome = "allowed"
+            _gate_result.message_id = 1
+            _gate_inst.attempt.return_value = _gate_result
+            _MockGate.return_value = _gate_inst
+            with patch("app.services.conversation_engine._send_whatsapp_cloud_text",
+                       side_effect=_fake_send_wa):
+                with patch("app.services.conversation_engine.reset_unanswered_alert"):
+                    result = eng.handle(ev)
 
     db.close()
     combined = "\n".join(sent_texts)

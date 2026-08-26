@@ -247,6 +247,16 @@ CE-side burst completeness guard: during `_process_text()`, after assembling `_c
 
 Deferred: n8n endpoint `limit` increase from 10 to 50 to cover pathological burst sizes.
 
+`[IMPLEMENTED — WILD-04R-F3]`
+
+Same-burst FAQ preservation extended to all commercial-progression paths.
+
+**New routing invariant:** When a burst in QUOTED stage contains an acceptance signal (any single message satisfying `_is_acceptance([m])`) alongside FAQ signals, commercial progression takes priority over FAQ fast-path routing (Layer D). FAQ content is appended post-composition, not substituted for it.
+
+**Mechanism:** `_compose_secondary_answers()` runs in `_send_text_to_wa()` for any turn where `_faq_reconciliation_burst` is armed. It appends canonical FAQ answers for any signals present in the burst but absent from the primary reply (probe-based duplicate detection). Covers AI path, deterministic pricing path, and all other commercial handlers.
+
+**Contract implication:** A customer message containing both commercial intent (acceptance, zone, vehicle evidence) and FAQ signals must always receive both a commercial response (stage advance, quote, or scheduling) and the FAQ answer. Silent FAQ discard is a defect.
+
 ---
 
 ## 4. In-Flight Message Contract
@@ -473,3 +483,9 @@ These are CRM records of completed bookings. CE must not read their fields to po
 | Unanswered alert threshold (300s → 120s, per-turn via ai_events) | IMPLEMENTED | WILD-04R Phase 2 |
 | `state.needs_human` / `lead.necesita_humano` sync in human-toggle endpoints | OPEN — owner decision pending | TBD |
 | n8n endpoint limit increase (10 → 50) | OPEN — deferred | TBD |
+| Same-burst FAQ preservation across all commercial-progression paths | IMPLEMENTED | WILD-04R-F3 |
+| QUOTED+acceptance burst prioritized over FAQ fast-path (Layer D guard) | IMPLEMENTED | WILD-04R-F3 |
+| Zone correction re-quote guard: location change in QUOTED/SCHEDULING → re-price | IMPLEMENTED | WILD-04R-F3 |
+| Candidate dedup on create: same marca+modelo redirects to update existing | IMPLEMENTED | WILD-04R-F3 |
+| Non-focus candidate IDs surfaced in AI prompt for re-focus | IMPLEMENTED | WILD-04R-F3 |
+| Turn Reconciliation: vehicle correction/replacement/focus-switch — multi-domain | IMPLEMENTED (AI-guided, bounded seam) | WILD-04R-F3 |
