@@ -6,7 +6,7 @@
 - [`docs/architecture/DOMAIN_MODEL.md`](DOMAIN_MODEL.md) — entity model, field ownership, revision lifecycle
 - [`docs/architecture/CONVERSATION_RUNTIME_CONTRACT.md`](CONVERSATION_RUNTIME_CONTRACT.md) — active-cycle context, cycle boundary, burst contract, telemetry thresholds
 
-> **CRITICAL:** This document describes what the code does **now**, after WILD-04R, WILD-04R-F1, and WILD-04R-F2. If code conflicts with this document, STOP and report it as an architecture defect.
+> **CRITICAL:** This document describes what the code does **now**, after WILD-04R, WILD-04R-F1, WILD-04R-F2, and WILD-04R-F3. If code conflicts with this document, STOP and report it as an architecture defect.
 
 Sections use these labels:
 
@@ -436,36 +436,39 @@ The resolver distinguishes model numbers from years by catalog lookup: "2008" is
 
 Routing determines which commercial stage to advance. Response composition assembles the reply text. These are distinct operations. A routing decision must not silently discard valid questions present in the same burst.
 
-`[CURRENT]`
+`[CURRENT — WILD-04R-F3]`
 
-**The pre-F2 defect (why this rule exists):**
+**The defect this rule addresses (pre-F2):**
 
-Before WILD-04R-F2, when a burst contained zone evidence + an FAQ question, the deterministic pricing path computed the quote and called `_build_quote_reply()`. This replaced `decision["reply"]` with the quote text, which discarded any FAQ signals in the burst. The customer received the price but got no answer to their hours/payment/presence question.
+Before WILD-04R-F2, when a burst contained zone evidence + an FAQ question, the deterministic pricing path discarded any FAQ signals. The customer received the price but got no answer to their hours/payment/presence question.
 
-**The F2 fix:**
+**F3 global same-burst FAQ reconciliation layer (WILD-04R-F3):**
 
-After computing the deterministic quote and building `decision["reply"]`, CE calls `_build_faq_supplement(current_turn_text)`. This scans the combined burst text for FAQ signals and returns canonical one-sentence answers for any detected signals. The supplement is appended to the quote reply:
+F3 extends the rule to ALL commercial-progression paths, not just pricing.
 
-```
-decision["reply"] = quote_text + " " + faq_supplement
-```
+**Mechanism:** `_faq_reconciliation_burst` is a per-turn instance attribute set in `_process_text()` after all early-return gates (motorcycle, phone, service, FAQ bypass, inspectability, website form) have been cleared. At `_send_text_to_wa()` time, `_compose_secondary_answers()` checks the stored burst text for unaddressed FAQ signals and appends canonical answers to the primary reply before outbound.
 
-This fires in two locations:
-- `PRESUPUESTO_ENVIADO` stage path (re-quote on accepted customer)
-- General deterministic quote override path (first quote)
+**Key properties:**
+- Fires from `_send_text_to_wa()` — a single pre-outbound point covering ALL commercial handlers
+- Probe-based duplicate detection: each canonical answer is only appended if its key phrase is absent from the primary reply (probe strings: "lunes a viernes", "informe", "presente", "efectivo")
+- Does NOT alter state, lead.flag, candidate, zone, or scheduling
+- `contributing_sources = ["FAQ_RULE"]` added to telemetry when supplement fires
+- Arm cleared on first `_send_text_to_wa()` call (fires once per turn)
 
-Both are tagged with `contributing_sources = ["FAQ_RULE"]` in telemetry.
+**Layer D companion guard (F3):**
 
-**Example: Berazategui + horarios burst**
+In QUOTED stage, if the burst contains an acceptance word (`_is_acceptance([m])` is True for any single message), Layer D (FAQ bypass) is suppressed. Without this guard, "Dale ¿Aceptan débito?" would be intercepted as a pure FAQ turn, answering the payment question but never advancing `flag → ACEPTADO`.
+
+**Example: Berazategui + horarios burst (F2 case, now via F3)**
 
 Burst: `["El auto está en Berazategui.", "¿En qué horarios laburan?"]`  
 Candidate: Peugeot 2008 / 2014, SUV_4X4_DEPORTIVO
 
 - Zone "Berazategui" → `zone_group=Sur`, viaticos $90,000
 - Vehicle base price $150,000 (SUV_4X4_DEPORTIVO)
-- Quote: $240,000
-- `_build_faq_supplement` detects "horarios" → hours answer
-- Layer D FAQ guard: burst contains location phrase → does NOT bypass to FAQ fast-path
+- Quote: $240,000 (deterministic override path)
+- `_faq_reconciliation_burst = "El auto está en Berazategui. ¿En qué horarios laburan?"`
+- `_compose_secondary_answers` detects "horarios" → hours answer appended in `_send_text_to_wa`
 
 **Exact current reply:**
 
@@ -478,13 +481,121 @@ Trabajamos de lunes a viernes de 9 a 18 hs y los sábados de 9 a 15 hs.
 
 Telemetry: `answer_source=PRICING_SERVICE`, `contributing_sources=["FAQ_RULE"]`, `burst_message_count=2`
 
+**Example: acceptance + hours burst (exact F3 live failure)**
+
+Burst: `["Okay !", "¿Qué horarios hacen?"]` while in QUOTED stage
+
+- "horarios" not in Layer D patterns → Layer D does not intercept
+- `_is_acceptance(["Okay !", "¿Qué horarios hacen?"])` → False (mixed words) → AI path
+- AI detects acceptance → `lead_flag = "ACEPTADO"`, returns scheduling question
+- `_faq_reconciliation_burst = "Okay ! ¿Qué horarios hacen?"`
+- `_compose_secondary_answers` detects "horarios" → hours answer appended
+
+**Exact F3 reply:**
+
+```
+¡Perfecto! ¿Qué día y horario te viene mejor para la revisión?
+
+Trabajamos de lunes a viernes de 9 a 18 hs y los sábados de 9 a 15 hs.
+```
+
+Telemetry: `answer_source=CE_AI`, `contributing_sources=["FAQ_RULE"]`, `burst_message_count=2`
+
+**Example: acceptance + payment burst (Layer D guard)**
+
+Burst: `["Dale", "¿Aceptan débito?"]` while in QUOTED stage
+
+- "aceptan debito" matches Layer D FAQ pattern (would normally bypass to FAQ handler)
+- Layer D guard fires: QUOTED stage + "Dale" is an acceptance word → Layer D suppressed
+- AI path: detects acceptance → `lead_flag = "ACEPTADO"`, returns scheduling question
+- `_faq_reconciliation_burst = "Dale ¿Aceptan débito?"`
+- `_compose_secondary_answers` detects "aceptan debito" → payment answer appended
+
+**Exact reply:**
+
+```
+¡Perfecto! ¿Qué día y horario te viene mejor para la revisión?
+
+Aceptamos efectivo, transferencia bancaria y Mercado Pago.
+```
+
+---
+
+## 9.5 Turn Reconciliation
+
+`[CONTRACT]`
+
+Humans do not follow a deterministic conversational flow. Before booking or human handoff, a customer may at any time introduce, correct, or replace a vehicle; correct the inspection location; accept or reject a quote; provide or correct scheduling preferences; or ask FAQ questions. These signals may occur individually, in unexpected order, or simultaneously in the same burst.
+
+**The CRM must reconcile all structured signals in a turn without silently discarding any of them.**
+
+`[CURRENT — WILD-04R-F3]`
+
+**Three mutable pre-booking domains:**
+
+| Domain | Fields | Mutability |
+|---|---|---|
+| Vehicle | marca, modelo, anio, tipo_vehiculo | Correction (patch same candidate) or Replacement (new candidate) |
+| Inspection location | zone_group, zone_detail | Correction (patch state + candidate) |
+| Scheduling preference | preferred_day, preferred_time | Correction (overwrite prior preference) |
+
+**LLM role:**
+
+The LLM interprets natural language to extract structured signals: vehicle operations (correction vs. enrichment vs. replacement), location evidence/correction, scheduling preferences, acceptance/rejection, FAQ questions, and ambiguity. The LLM MUST NOT authoritatively decide price, scheduling availability, CRM persistence, or lifecycle transitions — these are deterministic engine responsibilities.
+
+**Deterministic engine role:**
+
+After LLM interpretation, deterministic code reconciles operations:
+
+- `_apply_candidate()`: CREATE (new vehicle, switches focus, demotes old to "mentioned") | UPDATE (patch fields on existing candidate including year, zone, tipo) | NONE
+- `_focus_candidate()`: returns current focus by `state.current_focus_candidate_id` → `status="current_focus"` → `candidates[0]`
+- `_apply_zone_from_text()`: deterministic zone extraction for vehicle-location phrases and bare localities
+- `_compute_price_quote()`: re-runs after every mutation — authoritative, never cached
+
+**Correction semantics:**
+
+| Scenario | Deterministic action | Guard |
+|---|---|---|
+| Year correction ("Perdón, es 2018") | AI → action=update anio=2018 on focus candidate | Year sync (lines 2957-2990): if focus.anio is None + single year token in turn |
+| Vehicle replacement (new marca/modelo) | AI → action=create + status=current_focus → old focus demoted to "mentioned" | Vehicle-change guard: tipo changes → reset to QUALIFYING |
+| Location correction ("Pilar, no Palermo") | Deterministic zone extraction → state+candidate zone updated | F3-T2 zone guard: zone changed + QUOTED/SCHEDULING → reset to QUALIFYING |
+| Scheduling correction ("Mejor el viernes") | Deterministic parse: new day/time overwrites state.preferred_day/preferred_time | Current turn takes priority over stored preference |
+| Return to prior candidate | AI → action=update id=<old_id> status=current_focus | F3-T3 dedup: AI action=create for same marca/modelo/tipo redirects to update existing |
+
+**F3-T2: Zone correction re-quote guard**
+
+When `state.home_zone_group` or `state.home_zone_detail` changes during a turn AND the stage is QUOTED, SCHEDULING, or FLOW_SENT: CE resets `lead.flag = "PRESUPUESTANDO"` and `state.last_stage = STAGE_QUALIFYING`. The deterministic quote override then re-prices with the new zone. This ensures the customer receives an updated quote after a location correction.
+
+**F3-T3: Candidate dedup on create**
+
+`_apply_candidate()` action=create checks whether a non-focus candidate with the same marca+modelo (case-insensitive) and compatible tipo already exists in ctx.candidates. If found, the create is redirected to an update on the existing candidate (with the target status), preventing duplicate entries when the AI mistakenly re-creates a previously-seen vehicle.
+
+**F3-T4: Non-focus candidate list in AI prompt**
+
+The AI system prompt now includes all non-focus candidates with their DB IDs under "Candidatos previos". The AI can reference these IDs to return action=update id=<N> status=current_focus to re-focus a prior vehicle without creating a duplicate. Rule 19 in the prompt instructs the AI to use this mechanism for returning customers.
+
+**Questions are independent signals:**
+
+A turn can contain a state mutation + commercial action + FAQ(s). None silently erases another. After the primary commercial handler runs, `_compose_secondary_answers()` (see §9) appends any unanswered FAQ signals from the burst. For vehicle/location mutations + FAQ in the same burst, the mutation is applied first (candidate created/updated, state reconciled, price recomputed), then the FAQ is appended to the final reply.
+
+**Derived state invalidation:**
+
+- Vehicle tipo changes → `_compute_price_quote()` re-runs, vehicle-change guard may reset stage
+- Location changes → `_compute_price_quote()` re-runs, F3-T2 guard may reset stage
+- Historical candidates (status="mentioned") are NEVER deleted — they remain as audit trail
+- Scheduling preferences are overwritten by each new explicit mention
+
+**Historical candidate preservation:**
+
+When a candidate loses focus (demoted from "current_focus" to "mentioned"), it is NOT deleted from the DB. It remains as historical evidence and may be re-focused by a later turn using action=update. The `_reload_active_candidates()` query returns all candidates for the current cycle regardless of status.
+
 ---
 
 ## 10. FAQ Sources
 
-`[CURRENT]`
+`[CURRENT — WILD-04R-F3]`
 
-FAQ answers used by `_build_faq_supplement()` are defined as module-level constants in `backend/app/services/conversation_engine.py` (lines 736–758).
+FAQ answers used by `_compose_secondary_answers()` are defined as module-level constants in `backend/app/services/conversation_engine.py` (lines 736–762).
 
 **Detection frozensets** (matched against normalized burst text):
 
@@ -504,14 +615,25 @@ FAQ answers used by `_build_faq_supplement()` are defined as module-level consta
 | `_FAQ_PRESENCE_ANSWER` | "No es necesario que estés presente durante la inspección." |
 | `_FAQ_PAYMENT_ANSWER` | "Aceptamos efectivo, transferencia bancaria y Mercado Pago." |
 
+**Probe constants** (F3 — checked against normalized primary reply to prevent double-answers):
+
+| Signal | Probe constant | Key phrase |
+|---|---|---|
+| Hours | `_FAQ_HOURS_PROBE` | `"lunes a viernes"` |
+| Report | `_FAQ_REPORT_PROBE` | `"informe"` |
+| Presence | `_FAQ_PRESENCE_PROBE` | `"presente"` |
+| Payment | `_FAQ_PAYMENT_PROBE` | `"efectivo"` |
+
+If the probe phrase is found in the normalized primary reply (whether AI-composed or deterministic), `_compose_secondary_answers()` skips that FAQ signal. This prevents double-answers when the AI already addressed the question in its natural reply.
+
 **Important:** Debit and credit card are **not** accepted. `_FAQ_PAYMENT_ANSWER` lists only cash, bank transfer, and Mercado Pago. Debit references in a burst do not enable debit as a payment method; the canonical answer is returned regardless.
 
-**Source-of-truth audit (WILD-04R-F2 pre-build verification):**
+**Source-of-truth audit (WILD-04R-F2 pre-build verification, confirmed F3):**
 
 - Hours and presence: appear **only** in these CE constants. Not in AI prompt.
 - Report and payment: appear in these constants AND in AI system prompt rules 17 and 18, respectively. Wording differs; facts are consistent. No conflicting copies.
 
-Do not add duplicate constants elsewhere. `_build_faq_supplement()` is the single injection point for deterministic FAQ content in pricing replies.
+Do not add duplicate constants elsewhere. `_compose_secondary_answers()` called from `_send_text_to_wa()` is the single injection point for deterministic FAQ content across all commercial-progression replies (see Section 9 for the full F3 mechanism). `_build_faq_supplement()` has no call sites and is retained as dead code for reference only.
 
 ---
 
@@ -974,11 +1096,13 @@ These are non-negotiable constraints. No feature, fix, or refactor may violate t
 
 6. **Facts extracted from a burst cannot be erased by the response routing path.** Vehicle and location evidence is persisted before the reply is assembled.
 
-7. **Questions in a burst cannot be silently erased by another route.** If a burst contains a pricing trigger and an FAQ question, the response must address both. (F2 invariant: `_build_faq_supplement()` enforces this in the deterministic pricing path.)
+7. **Questions in a burst cannot be silently erased by another route.** If a burst contains a pricing trigger and an FAQ question, the response must address both. (F3 invariant: `_compose_secondary_answers()` inside `_send_text_to_wa()` enforces this in the deterministic pricing path.)
 
 8. **Known information must not be re-asked.** Once a vehicle or zone is persisted in the current cycle, CE must not ask the customer to repeat it.
 
 9. **AI cannot invent prices.** All quotes come from `PricingService`. No AI response path may override or supplement a pricing figure.
+
+14. **Active candidate zone is authoritative for all customer-facing location output.** `_get_active_inspection_location(ctx, state)` returns the candidate's zone when present; `state.home_zone_*` is a fallback only. Never read `state.home_zone_detail` directly for display, scheduling, AI prompt, or notifications — use the accessor so pricing and display always agree. (F4 invariant: pricing-zone == display-zone at all times.)
 
 10. **Every reply-required turn is observable.** `ai_events` records `reply_required`, `reply_produced`, and `alert_eligible` for every CE turn. No reply-required turn is invisible to the SLA alert.
 
@@ -998,6 +1122,8 @@ These are non-negotiable constraints. No feature, fix, or refactor may violate t
 | **WILD-04R** | Owner-corrected architecture audit. Established: same Contact/Thread/Lead is canonical; `cycle_reset_pending` explicit signal (not state inference); `WhatsAppMessage.id` cursor for burst boundaries; candidate and message watermarks (`current_cycle_start_message_db_id`, `current_cycle_started_at`); newest-20 message ordering fix; ACTIVE_REVISION field clear list. |
 | **WILD-04R-F1** | DB-authoritative burst completeness guard in `_process_text()`. CE now prepends any DB messages absent from n8n payload, making burst context independent of n8n message-fetch limit. Vehicle evidence from burst-leading messages is no longer silently dropped. |
 | **WILD-04R-F2** | Two fixes: (A) Post-reset context reload — `_load_context()` runs before `_execute_cycle_reset()` and carried old-cycle data into the first new-cycle turn, blocking new candidate creation; fixed by explicit `_reload_active_candidates()` + `_query_active_messages()` after reset. (B) FAQ composition in pricing path — deterministic quote override was replacing the full reply, silently dropping FAQ signals from the same burst; fixed by `_build_faq_supplement()` appending canonical FAQ answers after the quote. |
+| **WILD-04R-F3** | Turn Reconciliation. Extended from the F3 FAQ-preservation live failure (`["Okay !", "¿Qué horarios hacen?"]` dropped hours). Root cause family: any commercial handler could silently discard FAQ signals or fail to reconcile vehicle/location mutations with quote state. Fix set: (1) `_compose_secondary_answers()` unified pre-outbound FAQ reconciliation via `_faq_reconciliation_burst`; (2) Layer D guard: QUOTED+acceptance bursts bypass FAQ fast-path; (3) F3-T2 zone-correction re-quote guard: zone change in QUOTED/SCHEDULING → reset to QUALIFYING for re-price; (4) F3-T3 candidate dedup in `_apply_candidate()` action=create: same marca+modelo redirects to update existing; (5) F3-T4 non-focus candidates surfaced in AI prompt with IDs for re-focus; (6) AI prompt Rule 19: instruct AI to re-focus prior candidates by ID instead of creating duplicates. Test suite: M1–M10 messy conversation scenarios in `tests/test_messy_turn_reconciliation.py`. |
+| **WILD-04R-F4** | Active Candidate Location Authority. Defect: `_build_quote_reply` and all display/scheduling/notification sites read `state.home_zone_detail` directly; `_compute_price_quote` (LR-1) reads candidate zone first. These disagreed when the active candidate had a different zone than state (e.g. Focus/Palermo shown as "San Miguel" because state was set from a prior Peugeot candidate). Fix: new `_get_active_inspection_location(ctx, state)` accessor returns `(zone_group, zone_detail)` with candidate-first precedence, mirroring LR-1. All customer-facing display sites (quote reply, scheduling, AI prompt, escalation/human-review notifications, CRM Revision, ThreadRevision) now use this accessor. `state.home_zone_*` is never proactively synced from candidate (Option A — fallback only). Test suite: Cases A–E + pricing/display consistency invariant in `tests/test_wild04r_f4_location_authority.py`. |
 
 ---
 
@@ -1014,7 +1140,8 @@ This document should be read before modifying any of the following:
 | Context loading (`_load_context`) | §7 (watermarks, active vs historical) |
 | Burst assembly (`_process_text`) | §4, §8 (DB-authoritative burst, evidence extraction) |
 | Routing layers | §8, §9 (evidence-first, composition-second) |
-| Response composition | §9, §10, §11 (FAQ supplement, pricing authority) |
+| Response composition | §9, §9.5, §10, §11 (FAQ supplement, turn reconciliation, pricing authority) |
+| Turn reconciliation (vehicle/location/scheduling mutation) | §9.5 (mutable domains, correction semantics, dedup, re-quote guard) |
 | Outbound | §13 (safety gate, kill switch, allowlist) |
 | Telemetry / SLA | §14, §15 (fields, thresholds, failure paths) |
 

@@ -108,6 +108,19 @@ def _is_acceptance(texts: list[str]) -> bool:
     return bool(words) and all(w in _ACCEPTANCE_KEYWORDS for w in words)
 
 
+def _has_acceptance_word(texts: list[str]) -> bool:
+    """True when any message contains at least one acceptance keyword as a standalone word.
+    Weaker than _is_acceptance (which requires ALL words to be acceptance keywords).
+    Used for Layer D suppression in QUOTED stage where "Dale, hagamos ese." must
+    prevent FAQ-only routing even though "hagamos" and "ese" are not in the keyword set.
+    """
+    for m in texts:
+        words = set(re.sub(r"[^\w\s]", " ", _norm_lower(m)).split())
+        if words & _ACCEPTANCE_KEYWORDS:
+            return True
+    return False
+
+
 # Matches a vehicle model year: 1980–2029
 _VEHICLE_YEAR_RE = re.compile(r"\b(19[89]\d|20[012]\d)\b")
 
@@ -757,6 +770,13 @@ _FAQ_REPORT_ANSWER = "Al finalizar la revisión te enviamos un informe detallado
 _FAQ_PRESENCE_ANSWER = "No es necesario que estés presente durante la inspección."
 _FAQ_PAYMENT_ANSWER = "Aceptamos efectivo, transferencia bancaria y Mercado Pago."
 
+# F3 duplicate-answer probes — key phrases checked in normalized primary reply.
+# If found, the corresponding FAQ was already answered; no supplement appended.
+_FAQ_HOURS_PROBE    = "lunes a viernes"
+_FAQ_REPORT_PROBE   = "informe"
+_FAQ_PRESENCE_PROBE = "presente"
+_FAQ_PAYMENT_PROBE  = "efectivo"
+
 
 def _norm_lower(s: str) -> str:
     """Accent-strip, lowercase, and collapse whitespace — for keyword matching."""
@@ -1362,6 +1382,7 @@ class ConversationEngine:
         self._contributing_sources: list[str] | None = None
         self._burst_message_count: int = 1
         self._burst_earliest_inbound_db_id: int | None = None
+        self._faq_reconciliation_burst: str | None = None
 
     # ── Public entrypoint ─────────────────────────────────────────────────
 
@@ -1379,6 +1400,7 @@ class ConversationEngine:
         self._contributing_sources = None
         self._burst_message_count = 1
         self._burst_earliest_inbound_db_id = None
+        self._faq_reconciliation_burst = None
         _ce_t0 = _time.perf_counter()
         try:
             out = self._handle(event)
@@ -1592,8 +1614,7 @@ class ConversationEngine:
         marca = focus.marca if focus else None
         modelo = focus.modelo if focus else None
         anio = focus.anio if focus else None
-        zone_group = state.home_zone_group or (focus.zone_group if focus else None)
-        zone_detail = state.home_zone_detail or (focus.zone_detail if focus else None)
+        zone_group, zone_detail = self._get_active_inspection_location(ctx, state)
 
         # Create ThreadRevision (WhatsApp side) with status=booked
         thread_rev = ThreadRevision(
@@ -1761,6 +1782,30 @@ class ConversationEngine:
             parts.append(_FAQ_PAYMENT_ANSWER)
         return " ".join(parts)
 
+    def _compose_secondary_answers(self, primary_reply: str, burst_text: str) -> str:
+        """F3: append unanswered same-burst FAQ signals to an already-composed reply.
+
+        Probe-based duplicate detection checks the normalized primary reply for key
+        phrases before appending each canonical answer. Fires from _send_text_to_wa
+        when _faq_reconciliation_burst is armed for the current turn.
+        Does NOT alter state, price, candidate, zone, or scheduling.
+        """
+        n_burst = _norm_lower(burst_text)
+        n_primary = _norm_lower(primary_reply)
+        parts: list[str] = []
+        if any(p in n_burst for p in _HOURS_FAQ_DETECTION) and _FAQ_HOURS_PROBE not in n_primary:
+            parts.append(_FAQ_HOURS_ANSWER)
+        if any(p in n_burst for p in _REPORT_FAQ_DETECTION) and _FAQ_REPORT_PROBE not in n_primary:
+            parts.append(_FAQ_REPORT_ANSWER)
+        if any(p in n_burst for p in _PRESENCE_FAQ_DETECTION) and _FAQ_PRESENCE_PROBE not in n_primary:
+            parts.append(_FAQ_PRESENCE_ANSWER)
+        if any(p in n_burst for p in _PAYMENT_FAQ_DETECTION) and _FAQ_PAYMENT_PROBE not in n_primary:
+            parts.append(_FAQ_PAYMENT_ANSWER)
+        if not parts:
+            return primary_reply
+        self._contributing_sources = ["FAQ_RULE"]
+        return primary_reply.rstrip() + "\n\n" + " ".join(parts)
+
     def _process_vehicle_fallback_response(
         self,
         ctx: _Context,
@@ -1842,10 +1887,11 @@ class ConversationEngine:
 
         real_price_quote = self._compute_price_quote(ctx, state)
         if real_price_quote:
+            _, _disp_det = self._get_active_inspection_location(ctx, state)
             reply = self._build_quote_reply(
                 marca or None,
                 modelo or None,
-                state.home_zone_detail or None,
+                _disp_det,
                 real_price_quote.precio_total,
             )
             lead.flag = "PRESUPUESTO_ENVIADO"
@@ -1921,10 +1967,11 @@ class ConversationEngine:
         if real_price_quote:
             self._answer_source = "PRICING_SERVICE"
             focus = self._focus_candidate(ctx)
+            _, _disp_det = self._get_active_inspection_location(ctx, state)
             reply = self._build_quote_reply(
                 (focus.marca or "").strip() or None if focus else None,
                 (focus.modelo or "").strip() or None if focus else None,
-                state.home_zone_detail or None,
+                _disp_det,
                 real_price_quote.precio_total,
             )
             lead.flag = "PRESUPUESTO_ENVIADO"
@@ -2359,6 +2406,12 @@ class ConversationEngine:
             and not self._detect_explicit_inspection_request(_text_norm_d)
             and lookup_vehicle(current_turn_text) is None
             and not self._detect_vehicle_location_phrase(_text_norm_d)
+            # F3: QUOTED + acceptance word in burst → let commercial progression handle it.
+            # Without this guard, Layer D intercepts "Dale ¿Aceptan débito?" and answers
+            # the FAQ but never advances flag to ACEPTADO, leaving the customer stuck.
+            # Uses _has_acceptance_word (weaker than _is_acceptance) so "Dale, hagamos ese."
+            # suppresses Layer D even though "hagamos"/"ese" are not acceptance keywords.
+            and not (state.last_stage == STAGE_QUOTED and _has_acceptance_word(ai_input_messages))
         ):
             return self._handle_general_information_ai(ctx, event, ai_input_messages)
 
@@ -2381,6 +2434,11 @@ class ConversationEngine:
             if _form_data:
                 return self._handle_website_form(ctx, state, _form_data)
 
+        # F3: arm same-burst FAQ reconciliation for all commercial-progression paths.
+        # Motorcycle / phone / service / FAQ-bypass / inspectability / website-form
+        # all returned above and will not trigger reconciliation.
+        self._faq_reconciliation_burst = current_turn_text
+
         # ── Deterministic price re-query (pre-AI) ────────────────────────
         # Customer asks the price again while already in QUOTED or SCHEDULING.
         # Restate the authoritative deterministic quote WITHOUT changing any
@@ -2397,10 +2455,11 @@ class ConversationEngine:
             _requery_quote = self._compute_price_quote(ctx, state)
             if _requery_quote is not None:
                 _rq_focus = self._focus_candidate(ctx)
+                _, _rq_det = self._get_active_inspection_location(ctx, state)
                 _requery_reply = self._build_quote_reply(
                     (_rq_focus.marca or "").strip() or None if _rq_focus else None,
                     (_rq_focus.modelo or "").strip() or None if _rq_focus else None,
-                    state.home_zone_detail or None,
+                    _rq_det,
                     _requery_quote.precio_total,
                     _rq_focus.anio if _rq_focus else None,
                 )
@@ -2776,6 +2835,16 @@ class ConversationEngine:
         # ── M21.1.3: Role-aware zone detection ────────────────────────────
         # Uses current-turn text only (not all_recent_text) to avoid picking
         # up prior-turn zone mentions.  Shared helper enforces LR-2/LR-3/SC17.
+        # F3-T1: snapshot zone before any mutation so the zone-correction re-quote guard
+        # can detect whether the customer corrected location this turn.
+        # Snapshot both state zone AND focus-candidate zone: vehicle-location phrases
+        # update the candidate zone (LR-3) but may leave state.home_zone_* unchanged.
+        _zone_at_turn_start = (state.home_zone_group, state.home_zone_detail)
+        _focus_before_t1 = self._focus_candidate(ctx)
+        _cand_zone_at_turn_start = (
+            (_focus_before_t1.zone_group, _focus_before_t1.zone_detail)
+            if _focus_before_t1 else None
+        )
         _zone_early, _vehicle_location_written = self._apply_zone_from_text(
             ctx, state, current_turn_text, allow_contradiction_return=True,
         )
@@ -2897,6 +2966,39 @@ class ConversationEngine:
             logger.info(
                 "M18 vehicle change %r→%r in %s — resetting to QUALIFYING for re-quote thread_id=%s",
                 _focus_before_tipo, focus_after.tipo_vehiculo, state.last_stage, ctx.thread.id,
+            )
+            lead.flag = "PRESUPUESTANDO"
+            state.last_stage = STAGE_QUALIFYING
+        # F3-T2: Zone correction re-quote guard — mirrors the vehicle-change guard above.
+        # When the customer corrects location after a quote was sent (QUOTED/SCHEDULING),
+        # the old viatico may be stale. Reset to QUALIFYING so the deterministic override
+        # re-prices with the new zone. Only fires when zone actually changed this turn AND
+        # vehicle-change guard did NOT already reset stage (avoids double-reset).
+        # Checks BOTH state zone (changed by bare-locality / AI extraction) AND candidate
+        # zone (changed by vehicle-location clause via _apply_zone_from_text LR-3 path).
+        _zone_after_mutations = (state.home_zone_group, state.home_zone_detail)
+        _focus_after_t2 = self._focus_candidate(ctx)
+        _cand_zone_after_t2 = (
+            (_focus_after_t2.zone_group, _focus_after_t2.zone_detail)
+            if _focus_after_t2 else None
+        )
+        _state_zone_changed = _zone_after_mutations != _zone_at_turn_start and any(_zone_after_mutations)
+        _cand_zone_changed = (
+            _cand_zone_at_turn_start is not None
+            and _cand_zone_after_t2 is not None
+            and _cand_zone_after_t2 != _cand_zone_at_turn_start
+            and any(_cand_zone_after_t2)
+        )
+        if (
+            (_state_zone_changed or _cand_zone_changed)
+            and state.last_stage in (STAGE_SCHEDULING, STAGE_QUOTED, STAGE_FLOW_SENT)
+            and not state.needs_human
+        ):
+            logger.info(
+                "F3 zone correction state=%r→%r cand=%r→%r in %s — resetting to QUALIFYING thread_id=%s",
+                _zone_at_turn_start, _zone_after_mutations,
+                _cand_zone_at_turn_start, _cand_zone_after_t2,
+                state.last_stage, ctx.thread.id,
             )
             lead.flag = "PRESUPUESTANDO"
             state.last_stage = STAGE_QUALIFYING
@@ -3026,18 +3128,14 @@ class ConversationEngine:
                 state.last_stage = STAGE_QUOTED
                 if real_price_quote is not None and not state.needs_human:
                     _q_focus = self._focus_candidate(ctx)
+                    _, _q_det = self._get_active_inspection_location(ctx, state)
                     decision["reply"] = self._build_quote_reply(
                         (_q_focus.marca or "").strip() or None if _q_focus else None,
                         (_q_focus.modelo or "").strip() or None if _q_focus else None,
-                        state.home_zone_detail or None,
+                        _q_det,
                         real_price_quote.precio_total,
                         _q_focus.anio if _q_focus else None,
                     )
-                    # WILD-04R-F2: supplement with FAQ answers from the same burst.
-                    _faq_supp = self._build_faq_supplement(current_turn_text)
-                    if _faq_supp:
-                        decision["reply"] = decision["reply"].rstrip() + "\n\n" + _faq_supp
-                        self._contributing_sources = ["FAQ_RULE"]
                     self._answer_source = "PRICING_SERVICE"
             elif new_flag == "ACEPTADO":
                 state.last_stage = STAGE_SCHEDULING
@@ -3066,18 +3164,14 @@ class ConversationEngine:
             lead.flag = "PRESUPUESTO_ENVIADO"
             state.last_stage = STAGE_QUOTED
             _q_focus = self._focus_candidate(ctx)
+            _, _q_det = self._get_active_inspection_location(ctx, state)
             decision["reply"] = self._build_quote_reply(
                 (_q_focus.marca or "").strip() or None if _q_focus else None,
                 (_q_focus.modelo or "").strip() or None if _q_focus else None,
-                state.home_zone_detail or None,
+                _q_det,
                 real_price_quote.precio_total,
                 _q_focus.anio if _q_focus else None,
             )
-            # WILD-04R-F2: supplement with FAQ answers from the same burst.
-            _faq_supp = self._build_faq_supplement(current_turn_text)
-            if _faq_supp:
-                decision["reply"] = decision["reply"].rstrip() + "\n\n" + _faq_supp
-                self._contributing_sources = ["FAQ_RULE"]
             self._answer_source = "PRICING_SERVICE"
 
         # Schedule check + flow when in SCHEDULING stage
@@ -4094,15 +4188,16 @@ class ConversationEngine:
         except (ValueError, TypeError):
             preferred_time_obj = time(9, 0)
 
-        zone_parts = [state.home_zone_detail, state.home_zone_group, "Buenos Aires, Argentina"]
+        _sched_grp, _sched_det = self._get_active_inspection_location(ctx, state)
+        zone_parts = [_sched_det, _sched_grp, "Buenos Aires, Argentina"]
         address = ", ".join(p for p in zone_parts if p)
 
         sched_in = ScheduleCheckIn(
             address=address,
             preferred_day=preferred_day,
             preferred_time=preferred_time_obj,
-            zone_group=state.home_zone_group,
-            zone_detail=state.home_zone_detail,
+            zone_group=_sched_grp,
+            zone_detail=_sched_det,
         )
 
         try:
@@ -4272,14 +4367,15 @@ class ConversationEngine:
         self._answer_source = "SCHEDULING_SERVICE"
         from ..schemas.schedule import ScheduleCheckIn
         assert ctx.lead is not None
-        zone_parts = [state.home_zone_detail, state.home_zone_group, "Buenos Aires, Argentina"]
+        _day_grp, _day_det = self._get_active_inspection_location(ctx, state)
+        zone_parts = [_day_det, _day_grp, "Buenos Aires, Argentina"]
         address = ", ".join(p for p in zone_parts if p)
         sched_in = ScheduleCheckIn(
             preferred_day=date.fromisoformat(day_iso),
             preferred_time=time(9, 0),
             address=address,
-            zone_group=state.home_zone_group,
-            zone_detail=state.home_zone_detail,
+            zone_group=_day_grp,
+            zone_detail=_day_det,
             exclude_revision_id=state.current_revision_id,
             is_holiday=False,
         )
@@ -4293,6 +4389,7 @@ class ConversationEngine:
             all_slots = []
 
         state.active_requested_date = day_iso
+        state.preferred_day = day_iso  # overwrite stale preference so "Sí" confirms the new day
         state.last_offered_slots = json.dumps(all_slots)  # full-day, sorted — for period filtering
 
         date_human = _format_date_human(day_iso, date.today())
@@ -4446,14 +4543,15 @@ class ConversationEngine:
             )
             self.db.add(thread_rev)
 
+            _crm_grp, _crm_det = self._get_active_inspection_location(ctx, state)
             crm_rev = Revision(
                 lead_id=lead.id,
                 tipo_vehiculo=focus.tipo_vehiculo if focus else None,
                 marca=focus.marca if focus else None,
                 modelo=focus.modelo if focus else None,
                 anio=focus.anio if focus else None,
-                zone_group=state.home_zone_group,
-                zone_detail=state.home_zone_detail,
+                zone_group=_crm_grp,
+                zone_detail=_crm_det,
                 turno_fecha=prov_date,
                 turno_hora=prov_time,
                 turno_notas="Pendiente coordinación manual — cliente insiste con horario no disponible",
@@ -4520,6 +4618,7 @@ class ConversationEngine:
             str(focus.anio) if focus and focus.anio else None,
         ]
         vehicle_str = " ".join(p for p in vehicle_parts if p) or "Sin dato"
+        _notif_grp, _notif_det = self._get_active_inspection_location(ctx, state)
 
         send_scheduling_handoff_notification(
             api_key=settings.resend_api_key,
@@ -4533,8 +4632,8 @@ class ConversationEngine:
             buyer_phone=ctx.contact.wa_id or "Sin dato",
             vehicle=vehicle_str,
             tipo_vehiculo=focus.tipo_vehiculo if focus else "Sin dato",
-            zone_group=state.home_zone_group or "Sin dato",
-            zone_detail=state.home_zone_detail or "Sin dato",
+            zone_group=_notif_grp or "Sin dato",
+            zone_detail=_notif_det or "Sin dato",
             precio_total=str(real_price_quote.precio_total) if real_price_quote else "Sin dato",
             requested_slot=requested_str,
             offered_slots=offered_str,
@@ -4581,7 +4680,8 @@ class ConversationEngine:
         stage = state.last_stage or STAGE_QUALIFYING
         flag = lead.flag or "PRESUPUESTANDO"
         customer = state.customer_name or lead.nombre or "desconocido"
-        zone = state.home_zone_detail or state.home_zone_group or "desconocida"
+        _ai_grp, _ai_det = self._get_active_inspection_location(ctx, state)
+        zone = _ai_det or _ai_grp or "desconocida"
         vehicle_txt = "ninguno"
         if focus:
             parts = [focus.marca, focus.modelo, str(focus.anio) if focus.anio else None]
@@ -4640,6 +4740,21 @@ Ejemplos: "Hola estoy buscando un auto, agendé esto para cuando decida" → def
         if focus and focus.id:
             focus_id_block = f"\n- ID candidato en foco: {focus.id} (usalo en candidate.id cuando hagas action=update)"
 
+        # F3-T4: Show all non-focus candidates so AI can re-focus a prior vehicle by ID.
+        # Example: "Al final volvamos con el Peugeot" → AI returns action=update id=<old_id>
+        # status=current_focus to switch focus without creating a duplicate.
+        _other_cands_block = ""
+        _other_cands = [c for c in ctx.candidates if focus is None or c.id != focus.id]
+        if _other_cands:
+            _cand_lines = []
+            for _oc in _other_cands:
+                _oc_parts = [_oc.marca, _oc.modelo, str(_oc.anio) if _oc.anio else None]
+                _oc_desc = " ".join(p for p in _oc_parts if p) or "sin datos"
+                _cand_lines.append(
+                    f"  - ID {_oc.id}: {_oc_desc} ({_oc.tipo_vehiculo or '?'}) [{_oc.status}]"
+                )
+            _other_cands_block = "\n- Candidatos previos (usa action=update id=<ID> status=current_focus para retomar uno):\n" + "\n".join(_cand_lines)
+
         system_prompt = f"""Sos el asistente de Ridecheck, servicio de revisión pre-compra de autos en Argentina. Ayudás a coordinar inspecciones antes de que el cliente compre un vehículo usado.
 
 ESTADO ACTUAL:
@@ -4647,7 +4762,7 @@ ESTADO ACTUAL:
 - Flag del lead: {flag}
 - Nombre del cliente: {customer}
 - Zona: {zone}
-- Vehículo en foco: {vehicle_txt}{focus_id_block}{precio_info}{detected_vehicle_block}
+- Vehículo en foco: {vehicle_txt}{focus_id_block}{_other_cands_block}{precio_info}{detected_vehicle_block}
 
 HISTORIAL RECIENTE:
 {history}
@@ -4671,6 +4786,7 @@ REGLAS DE NEGOCIO:
 16. Cuanto antes nos avise el cliente, mejor. Coordinamos según la disponibilidad de agenda.
 17. SERVICIO — QUÉ INCLUYE: Revisamos el vehículo en el lugar donde está. Verificamos carrocería y estructura, motor y compartimiento, transmisión, suspensión y tren delantero/trasero, frenos, neumáticos, interior, sistema eléctrico/electrónico, espesores de pintura con medidor (para detectar golpes y reparaciones previas), lectura de errores con escáner OBD y verificación de kilometraje real. Más de 250 puntos de control. Al terminar, el cliente recibe un informe detallado. Respondé con esta información cuando pregunten qué incluye o de qué consta el servicio. Sé conciso y natural, no leas la lista completa.
 18. MEDIOS DE PAGO: Se acepta transferencia bancaria, Mercado Pago y efectivo. NO se acepta débito ni tarjeta de crédito. Ante cualquier pregunta sobre formas de pago, respondé con exactamente esta información. NUNCA inventes ni asumas un medio de pago distinto a los tres aceptados.
+19. RETORNO A CANDIDATO PREVIO: Si el cliente vuelve a un vehículo listado en "Candidatos previos", usá action=update id=<ID del candidato> status=current_focus. NO crees un candidato duplicado con el mismo vehículo.
 
 TIPOS DE VEHÍCULO VÁLIDOS: AUTO, SUV_4X4_DEPORTIVO, SUV/4x4, CLASICO, MOTO, ESCANEO_MOTOR{narrative_block}
 
@@ -5091,6 +5207,33 @@ Respondé SOLO con JSON válido:
         state = ctx.state
 
         if action == "create":
+            # F3-T3: Dedup — if a non-focus candidate with the same marca+modelo+tipo already
+            # exists in ctx, redirect to update instead of creating a duplicate. This handles
+            # M10 ("Al final volvamos con el Peugeot") where catalog re-fires on a previously
+            # seen vehicle. Only dedup when marca AND modelo are both provided; bare-type or
+            # bare-model creates are allowed to proceed to avoid false dedup on ambiguous turns.
+            _new_marca = (candidate_data.get("marca") or "").strip().lower()
+            _new_modelo = (candidate_data.get("modelo") or "").strip().lower()
+            _new_tipo = (candidate_data.get("tipo_vehiculo") or "").upper() or None
+            if _new_marca and _new_modelo:
+                for _ex in ctx.candidates:
+                    if (
+                        (_ex.marca or "").strip().lower() == _new_marca
+                        and (_ex.modelo or "").strip().lower() == _new_modelo
+                        and _tipo_compatible(_ex.tipo_vehiculo, _new_tipo)
+                        and _ex.status != "current_focus"
+                    ):
+                        logger.info(
+                            "F3 candidate dedup: redirecting create→update id=%s %s %s",
+                            _ex.id, _new_marca, _new_modelo,
+                        )
+                        self._apply_candidate(ctx, {
+                            **candidate_data,
+                            "action": "update",
+                            "id": _ex.id,
+                            "status": candidate_data.get("status") or "current_focus",
+                        })
+                        return
             fields = {
                 k: candidate_data[k]
                 for k in ("marca", "modelo", "version_text", "anio", "tipo_vehiculo",
@@ -5441,6 +5584,38 @@ Respondé SOLO con JSON válido:
             )
         return reply
 
+    def _get_active_inspection_location(
+        self, ctx: _Context, state: "WhatsAppThreadState | None"
+    ) -> tuple[str | None, str | None]:
+        """Return (zone_group, zone_detail) for the active inspection candidate.
+
+        F4: current_focus candidate zone is authoritative when the candidate
+        carries any location data. state.home_zone_* is a revision-scoped
+        fallback used only when the candidate has no location at all.
+
+        Precedence (mirrors _compute_price_quote LR-1):
+          1. current_focus candidate zone — authoritative per-candidate location
+          2. state.home_zone_* — fallback when candidate has no zone data
+          3. (None, None) — no location available anywhere
+
+        Never call state.home_zone_detail directly for customer-facing output;
+        use this accessor instead so pricing and display always agree.
+        """
+        focus = self._focus_candidate(ctx)
+        if focus:
+            cand_grp = focus.zone_group or None
+            cand_det = focus.zone_detail or None
+            if cand_grp or cand_det:
+                # Candidate has at least one location field — candidate is authoritative.
+                # Fill the missing field from state so partial data still resolves.
+                return (
+                    cand_grp or (state.home_zone_group if state else None),
+                    cand_det or (state.home_zone_detail if state else None),
+                )
+        if state:
+            return state.home_zone_group, state.home_zone_detail
+        return None, None
+
     def _compute_price_quote(
         self, ctx: _Context, state: "WhatsAppThreadState | None"
     ) -> "PricingQuote | None":
@@ -5470,6 +5645,12 @@ Respondé SOLO con JSON válido:
     # ── WhatsApp sends ────────────────────────────────────────────────────
 
     def _send_text_to_wa(self, ctx: _Context, text: str) -> str | None:
+        # F3: apply same-burst FAQ reconciliation if armed for this turn.
+        _burst = getattr(self, "_faq_reconciliation_burst", None)
+        if _burst:
+            self._faq_reconciliation_burst = None  # consume — fires once per turn
+            text = self._compose_secondary_answers(text, _burst)
+
         from zoneinfo import ZoneInfo
         now_utc = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
         wa_id = ctx.contact.wa_id
@@ -5576,6 +5757,7 @@ Respondé SOLO con JSON válido:
             tipo_str = focus.tipo_vehiculo or ""
         vehicle_str = " ".join(vehicle_parts).strip() or tipo_str
 
+        _hr_grp, _hr_det = self._get_active_inspection_location(ctx, state)
         try:
             send_human_review_notification(
                 api_key=settings.resend_api_key,
@@ -5586,8 +5768,8 @@ Respondé SOLO con JSON válido:
                 thread_id=ctx.thread.id,
                 wa_id=ctx.contact.wa_id,
                 vehicle=vehicle_str,
-                zone_group=state.home_zone_group or "",
-                zone_detail=state.home_zone_detail or "",
+                zone_group=_hr_grp or "",
+                zone_detail=_hr_det or "",
                 reason=reason,
             )
         except Exception as exc:
