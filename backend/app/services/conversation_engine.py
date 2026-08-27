@@ -777,6 +777,29 @@ _FAQ_REPORT_PROBE   = "informe"
 _FAQ_PRESENCE_PROBE = "presente"
 _FAQ_PAYMENT_PROBE  = "efectivo"
 
+# WILD-04R-F5 D3: tipo_vehiculo alias normalization map.
+# SUV/4x4 and its variants are equivalent to SUV_4X4_DEPORTIVO (same price,
+# same catalog canonical).  Normalize on every candidate create/update so the
+# DB never stores two distinct strings for the same vehicle class.
+_TIPO_VEHICULO_ALIAS: dict[str, str] = {
+    "SUV/4X4": "SUV_4X4_DEPORTIVO",
+    "SUV/4x4": "SUV_4X4_DEPORTIVO",
+    "SUV_4X4": "SUV_4X4_DEPORTIVO",
+    "4X4": "SUV_4X4_DEPORTIVO",
+}
+
+
+def _normalize_tipo_vehiculo(tipo: str | None) -> str | None:
+    """Normalize tipo_vehiculo aliases to canonical form.
+
+    Returns the canonical string (e.g. SUV_4X4_DEPORTIVO for any SUV/4x4
+    variant), strips surrounding whitespace, and returns None for empty input.
+    """
+    if not tipo:
+        return tipo
+    stripped = tipo.strip()
+    return _TIPO_VEHICULO_ALIAS.get(stripped, stripped) or None
+
 
 def _norm_lower(s: str) -> str:
     """Accent-strip, lowercase, and collapse whitespace — for keyword matching."""
@@ -4787,8 +4810,9 @@ REGLAS DE NEGOCIO:
 17. SERVICIO — QUÉ INCLUYE: Revisamos el vehículo en el lugar donde está. Verificamos carrocería y estructura, motor y compartimiento, transmisión, suspensión y tren delantero/trasero, frenos, neumáticos, interior, sistema eléctrico/electrónico, espesores de pintura con medidor (para detectar golpes y reparaciones previas), lectura de errores con escáner OBD y verificación de kilometraje real. Más de 250 puntos de control. Al terminar, el cliente recibe un informe detallado. Respondé con esta información cuando pregunten qué incluye o de qué consta el servicio. Sé conciso y natural, no leas la lista completa.
 18. MEDIOS DE PAGO: Se acepta transferencia bancaria, Mercado Pago y efectivo. NO se acepta débito ni tarjeta de crédito. Ante cualquier pregunta sobre formas de pago, respondé con exactamente esta información. NUNCA inventes ni asumas un medio de pago distinto a los tres aceptados.
 19. RETORNO A CANDIDATO PREVIO: Si el cliente vuelve a un vehículo listado en "Candidatos previos", usá action=update id=<ID del candidato> status=current_focus. NO crees un candidato duplicado con el mismo vehículo.
+20. Si Zona='desconocida' al momento de responder: SIEMPRE terminá tu mensaje con la pregunta de zona, incluso si ya respondiste FAQs u otras consultas. No se puede cotizar sin zona. Ejemplo: "¿En qué zona o ciudad está el auto?"
 
-TIPOS DE VEHÍCULO VÁLIDOS: AUTO, SUV_4X4_DEPORTIVO, SUV/4x4, CLASICO, MOTO, ESCANEO_MOTOR{narrative_block}
+TIPOS DE VEHÍCULO VÁLIDOS: AUTO, SUV_4X4_DEPORTIVO, CLASICO, MOTO, ESCANEO_MOTOR{narrative_block}
 
 Respondé SOLO con JSON válido:
 {{
@@ -5028,6 +5052,23 @@ Respondé SOLO con JSON válido:
         lead = ctx.lead
         assert lead is not None
 
+        # WILD-04R-F5 D2: Archive all prior-cycle current_focus candidates before
+        # establishing new cycle watermarks.  Without this step the DB can accumulate
+        # multiple rows with status='current_focus' from different cycles, which
+        # corrupts _focus_candidate() resolution on any future ctx reload that
+        # accidentally includes old candidates.
+        prior_focus = list(self.db.execute(
+            select(WhatsAppThreadCandidate)
+            .where(
+                WhatsAppThreadCandidate.thread_id == ctx.thread.id,
+                WhatsAppThreadCandidate.status == "current_focus",
+            )
+        ).scalars().all())
+        for cand in prior_focus:
+            cand.status = "archived"
+        if prior_focus:
+            self.db.flush()
+
         # Find current event's DB row (always exists — persisted before CE dispatch)
         current_event_db_row = self.db.execute(
             select(WhatsAppMessage).where(WhatsAppMessage.wa_message_id == event.wa_message_id)
@@ -5240,6 +5281,9 @@ Respondé SOLO con JSON válido:
                            "zone_group", "zone_detail", "direccion_texto")
                 if candidate_data.get(k) is not None
             }
+            # WILD-04R-F5 D3: normalize tipo_vehiculo alias before persisting
+            if "tipo_vehiculo" in fields:
+                fields["tipo_vehiculo"] = _normalize_tipo_vehiculo(fields["tipo_vehiculo"])
             status = candidate_data.get("status") or "mentioned"
             candidate = WhatsAppThreadCandidate(thread_id=ctx.thread.id, status=status, **fields)
             self.db.add(candidate)
@@ -5277,7 +5321,11 @@ Respondé SOLO con JSON válido:
             for k in ("marca", "modelo", "version_text", "anio", "tipo_vehiculo",
                        "zone_group", "zone_detail", "direccion_texto"):
                 if candidate_data.get(k) is not None:
-                    setattr(target, k, candidate_data[k])
+                    val = candidate_data[k]
+                    # WILD-04R-F5 D3: normalize tipo_vehiculo alias on update
+                    if k == "tipo_vehiculo":
+                        val = _normalize_tipo_vehiculo(val)
+                    setattr(target, k, val)
             new_status = candidate_data.get("status")
             if new_status:
                 if new_status == "current_focus" and state:

@@ -1,7 +1,7 @@
 # RideCheck CRM — Inbound Message Lifecycle
 
 **Status:** CURRENT IMPLEMENTATION REFERENCE  
-**Established:** 2026-08-25  
+**Established:** 2026-08-25 — Updated 2026-08-26 (WILD-04R-F5)  
 **Read alongside:**
 - [`docs/architecture/DOMAIN_MODEL.md`](DOMAIN_MODEL.md) — entity model, field ownership, revision lifecycle
 - [`docs/architecture/CONVERSATION_RUNTIME_CONTRACT.md`](CONVERSATION_RUNTIME_CONTRACT.md) — active-cycle context, cycle boundary, burst contract, telemetry thresholds
@@ -320,13 +320,14 @@ The signal does **not** fire on first-ever lead creation (no prior estado) or on
 
 Called in `_handle()` immediately after the lead check, before the `needs_human` guard. Consumption steps:
 
-1. Capture `previous_cursor` (last processed message before the new cycle)
-2. Query the DB burst: all `WhatsAppMessage` rows `WHERE id > prev_db_id AND id <= current_db_id AND direction='in'`
-3. Set `state.current_cycle_start_message_db_id = first_burst_msg.id`
-4. Set `state.current_cycle_started_at = first_burst_msg.created_at` (DB server clock)
-5. Clear all `ACTIVE_REVISION` fields on `WhatsAppThreadState` and `Lead` (see full list in `CONVERSATION_RUNTIME_CONTRACT.md §2`)
-6. Set `state.cycle_reset_pending = False`
-7. Commit
+1. **WILD-04R-F5 D2 — Archive prior candidates:** Archive all `WhatsAppThreadCandidate` rows with `status='current_focus'` for this thread before writing new watermarks. This ensures no prior-cycle candidate ever has `current_focus` status in the DB, preventing any future stale context loading from resolving a prior-cycle candidate as the active focus.
+2. Capture `previous_cursor` (last processed message before the new cycle)
+3. Query the DB burst: all `WhatsAppMessage` rows `WHERE id > prev_db_id AND id <= current_db_id AND direction='in'`
+4. Set `state.current_cycle_start_message_db_id = first_burst_msg.id`
+5. Set `state.current_cycle_started_at = first_burst_msg.created_at` (DB server clock)
+6. Clear all `ACTIVE_REVISION` fields on `WhatsAppThreadState` and `Lead` (see full list in `CONVERSATION_RUNTIME_CONTRACT.md §2`)
+7. Set `state.cycle_reset_pending = False`
+8. Commit
 
 **Post-reset context reload (WILD-04R-F2):**
 
@@ -367,7 +368,12 @@ Prior-cycle messages remain in `whatsapp_messages` permanently and are visible t
 
 `_load_context()` filters `WhatsAppThreadCandidate WHERE created_at >= current_cycle_started_at`. `_reload_active_candidates()` applies the same filter after a reset.
 
-Prior-cycle candidates remain in `whatsapp_thread_candidates` permanently. `_focus_candidate()` only selects from `ctx.candidates`, which is already filtered — it cannot return a prior-cycle candidate.
+Prior-cycle candidates remain in `whatsapp_thread_candidates` permanently with `status='archived'`. `_focus_candidate()` only selects from `ctx.candidates`, which is already filtered — it cannot return a prior-cycle candidate.
+
+**Candidate location authority is scoped to the ACTIVE CYCLE.** The `_get_active_inspection_location(ctx, state)` accessor returns the active candidate's zone when present, and `state.home_zone_*` only as a fallback. Because `ctx.candidates` is cycle-filtered, a prior-cycle candidate's zone can never enter new-cycle semantic context — it is excluded at the query level, not at the application level.
+
+**`_execute_cycle_reset()` archives prior `current_focus` candidates (WILD-04R-F5 D2):**
+Before writing new cycle watermarks, the reset archives all `WhatsAppThreadCandidate` rows with `status='current_focus'` for the thread. This is a belt-and-suspenders guarantee: even if a future `_load_context()` were to load candidates without a watermark filter (e.g. a bug or future refactor), no prior-cycle candidate would resolve as `current_focus`. The DB invariant is: at most one `current_focus` candidate per thread at any point, and that candidate belongs to the current cycle.
 
 **Hard rule:** A historical candidate must never suppress creation of a new candidate. If `ctx.candidates` is empty at the start of a new cycle (because all prior-cycle candidates are excluded by the watermark), CE creates a new candidate from vehicle evidence in the burst. This is the correct behavior.
 
@@ -649,9 +655,22 @@ Do not add duplicate constants elsewhere. `_compose_secondary_answers()` called 
 
 | Input | Source |
 |---|---|
-| `tipo_vehiculo` | Candidate field (e.g., `SUV_4X4_DEPORTIVO`, `AUTO`, `CAMIONETA`) |
+| `tipo_vehiculo` | Candidate field (e.g., `SUV_4X4_DEPORTIVO`, `AUTO`, `CLASICO`) |
 | `zone_group` | `state.home_zone_group` (e.g., `CABA`, `Sur`, `Norte`) |
 | `zone_detail` | `state.home_zone_detail` (e.g., `Berazategui`, `Pilar`, `Balvanera`) |
+
+**`SUV_4X4_DEPORTIVO` is the canonical normalized form for all "4x4 sporty SUV" aliases (WILD-04R-F5 D3):**
+
+`_normalize_tipo_vehiculo()` (module-level helper, CE `conversation_engine.py`) maps the following aliases to `SUV_4X4_DEPORTIVO` before any candidate is persisted:
+
+| Alias | Canonical |
+|---|---|
+| `SUV/4x4` | `SUV_4X4_DEPORTIVO` |
+| `SUV/4X4` | `SUV_4X4_DEPORTIVO` |
+| `SUV_4X4` | `SUV_4X4_DEPORTIVO` |
+| `4X4` | `SUV_4X4_DEPORTIVO` |
+
+This normalization is applied in `_apply_candidate()` for both `action=create` and `action=update`. The vehicle catalog (`backend/app/data/vehicle_catalog.json`) uses `SUV_4X4_DEPORTIVO` as canonical (e.g., Peugeot 2008). AI prompt TIPOS line lists only `SUV_4X4_DEPORTIVO` (not `SUV/4x4`) as a valid type, eliminating the dual-representation bug at the source.
 
 **Computation:**
 
@@ -1104,6 +1123,10 @@ These are non-negotiable constraints. No feature, fix, or refactor may violate t
 
 14. **Active candidate zone is authoritative for all customer-facing location output.** `_get_active_inspection_location(ctx, state)` returns the candidate's zone when present; `state.home_zone_*` is a fallback only. Never read `state.home_zone_detail` directly for display, scheduling, AI prompt, or notifications — use the accessor so pricing and display always agree. (F4 invariant: pricing-zone == display-zone at all times.)
 
+15. **Candidate location authority is scoped to the active cycle.** `_execute_cycle_reset()` archives all prior `current_focus` candidates before establishing new cycle watermarks. A prior-cycle candidate's zone can never enter new-cycle semantic context — it is excluded by both the cycle watermark query filter AND the DB `status='archived'` guarantee. Historical candidate location never propagates to new-cycle display, pricing, or AI prompt context.
+
+16. **`tipo_vehiculo` stored in canonical normalized form.** All `SUV/4x4` variants are normalized to `SUV_4X4_DEPORTIVO` by `_normalize_tipo_vehiculo()` before any candidate create or update is persisted. The DB must never contain two distinct strings representing the same vehicle class.
+
 10. **Every reply-required turn is observable.** `ai_events` records `reply_required`, `reply_produced`, and `alert_eligible` for every CE turn. No reply-required turn is invisible to the SLA alert.
 
 11. **Human alert threshold is 120 seconds.** A reply-required turn with no reply produced within 120 seconds triggers an SMTP alert to `ridecheckassistance@gmail.com`.
@@ -1124,6 +1147,7 @@ These are non-negotiable constraints. No feature, fix, or refactor may violate t
 | **WILD-04R-F2** | Two fixes: (A) Post-reset context reload — `_load_context()` runs before `_execute_cycle_reset()` and carried old-cycle data into the first new-cycle turn, blocking new candidate creation; fixed by explicit `_reload_active_candidates()` + `_query_active_messages()` after reset. (B) FAQ composition in pricing path — deterministic quote override was replacing the full reply, silently dropping FAQ signals from the same burst; fixed by `_build_faq_supplement()` appending canonical FAQ answers after the quote. |
 | **WILD-04R-F3** | Turn Reconciliation. Extended from the F3 FAQ-preservation live failure (`["Okay !", "¿Qué horarios hacen?"]` dropped hours). Root cause family: any commercial handler could silently discard FAQ signals or fail to reconcile vehicle/location mutations with quote state. Fix set: (1) `_compose_secondary_answers()` unified pre-outbound FAQ reconciliation via `_faq_reconciliation_burst`; (2) Layer D guard: QUOTED+acceptance bursts bypass FAQ fast-path; (3) F3-T2 zone-correction re-quote guard: zone change in QUOTED/SCHEDULING → reset to QUALIFYING for re-price; (4) F3-T3 candidate dedup in `_apply_candidate()` action=create: same marca+modelo redirects to update existing; (5) F3-T4 non-focus candidates surfaced in AI prompt with IDs for re-focus; (6) AI prompt Rule 19: instruct AI to re-focus prior candidates by ID instead of creating duplicates. Test suite: M1–M10 messy conversation scenarios in `tests/test_messy_turn_reconciliation.py`. |
 | **WILD-04R-F4** | Active Candidate Location Authority. Defect: `_build_quote_reply` and all display/scheduling/notification sites read `state.home_zone_detail` directly; `_compute_price_quote` (LR-1) reads candidate zone first. These disagreed when the active candidate had a different zone than state (e.g. Focus/Palermo shown as "San Miguel" because state was set from a prior Peugeot candidate). Fix: new `_get_active_inspection_location(ctx, state)` accessor returns `(zone_group, zone_detail)` with candidate-first precedence, mirroring LR-1. All customer-facing display sites (quote reply, scheduling, AI prompt, escalation/human-review notifications, CRM Revision, ThreadRevision) now use this accessor. `state.home_zone_*` is never proactively synced from candidate (Option A — fallback only). Test suite: Cases A–E + pricing/display consistency invariant in `tests/test_wild04r_f4_location_authority.py`. |
+| **WILD-04R-F5** | Cycle-safe candidate authority. Three defects fixed: (D1) AI system prompt rule 20 added — when `Zona='desconocida'`, AI must always end its reply with a zone question, even in mixed FAQ+vehicle turns; `SUV/4x4` removed from TIPOS DE VEHÍCULO VÁLIDOS line (only `SUV_4X4_DEPORTIVO` listed). (D2) `_execute_cycle_reset()` now archives all `current_focus` candidates before establishing new watermarks, preventing multi-cycle `current_focus` DB corruption that could cause future context loading bugs. (D3) `_normalize_tipo_vehiculo()` module-level helper maps `SUV/4x4`, `SUV/4X4`, `SUV_4X4`, `4X4` → `SUV_4X4_DEPORTIVO`; applied in `_apply_candidate()` create and update actions. Test suite: 26 invariant tests in `tests/test_wild04r_f5_cycle_safe_authority.py`. |
 
 ---
 
