@@ -465,6 +465,64 @@ These are CRM records of completed bookings. CE must not read their fields to po
 
 ---
 
+## 10. LLM Business Authority Invariant (WILD-04R-F6)
+
+### What the LLM may NOT decide
+
+`[CONTRACT — IMPLEMENTED — WILD-04R-F6]`
+
+The LLM has **no authority** to mutate business-critical derived values. The following fields are owned by deterministic CE logic — they may not be set, overridden, or corrected by an LLM proposal:
+
+| Field / Value | Deterministic Owner | LLM Role |
+|---|---|---|
+| `tipo_vehiculo` on a catalog-resolved candidate | `VehicleCatalog` → `_catalog_tipo_for()` | May propose vehicle identity (marca/modelo); tipo is derived from catalog |
+| Inspection price (`precio_base`, `viaticos`, total) | `PricingService` | May render delivery language; must not invent or modify numbers |
+| Zone viatico | `ViaticosZone` DB + `PricingRepository` | May extract location evidence from text; pricing arithmetic is CE's |
+| Eligibility (inspectable vs non-inspectable vehicle) | `_check_inspectability_gate()` | May flag uncertainty; final eligibility decision is deterministic |
+| Required next info (location question) | `_apply_required_next_question()` | May ask; CE appends the canonical question if AI omitted it |
+| Scheduling availability | `ScheduleService` | May present slots; actual availability comes from the schedule service |
+| Booking validity | CE booking Flow handler | May express intent; booking logic is deterministic |
+
+### The authority chain for `tipo_vehiculo`
+
+```
+Customer language (natural text)
+  ↓
+Vehicle identity interpretation (marca + modelo extracted by AI or catalog lookup)
+  ↓
+VehicleCatalog._FULL_FORM_TO_ENTRY lookup (deterministic, _norm pipeline)
+  ↓  (if catalog hit → catalog tipo is authoritative)
+  ↓  (if no catalog hit → AI tipo is accepted as unknown-vehicle fallback)
+canonical tipo_vehiculo (e.g. SUV_4X4_DEPORTIVO for Peugeot 2008)
+  ↓
+PricingService.quote(tipo_vehiculo, zone_group, zone_detail)
+  ↓
+precio_total (e.g. $200,000 for SUV_4X4_DEPORTIVO + San Miguel)
+```
+
+**Live failure this rule prevents:**
+
+Turn 2 text: "El auto está en San Miguel."
+- AI NLP guess: `AUTO` (from "auto" in the message text)
+- Catalog fact: Peugeot 2008 → `SUV_4X4_DEPORTIVO`
+- Before F6: tipo written as `AUTO`, price = 140000 + 50000 = **$190,000** (wrong)
+- After F6: `_catalog_tipo_for("Peugeot", "2008")` → `SUV_4X4_DEPORTIVO`, price = **$200,000** (correct)
+
+### Implementation
+
+`_catalog_tipo_for(self, marca, modelo)` — private CE method:
+- Normalizes `"{marca} {modelo}"` via `_norm` (same pipeline as `_resolve_fuzzy_key`)
+- Looks up `_FULL_FORM_TO_ENTRY`
+- Returns `_normalize_tipo_vehiculo(entry["t"])` if found, else `None`
+
+Guard location in `_apply_candidate()`:
+- **Update path:** Before the field-write loop, if `tipo_vehiculo` is in the candidate dict, resolve effective marca+modelo (from update dict or from existing candidate), call `_catalog_tipo_for`, override if catalog hit
+- **Create path:** After alias normalization (F5 D3), before `WhatsAppThreadCandidate()` construction, call `_catalog_tipo_for`, override if catalog hit
+
+Unknown vehicles (no catalog hit) are not blocked — the AI tipo is accepted as-is. The guard only fires when the catalog has a definitive entry for the vehicle.
+
+---
+
 ## Summary of Implementation Status (as of 2026-08-24)
 
 | Contract requirement | Status | Milestone |
@@ -489,3 +547,5 @@ These are CRM records of completed bookings. CE must not read their fields to po
 | Candidate dedup on create: same marca+modelo redirects to update existing | IMPLEMENTED | WILD-04R-F3 |
 | Non-focus candidate IDs surfaced in AI prompt for re-focus | IMPLEMENTED | WILD-04R-F3 |
 | Turn Reconciliation: vehicle correction/replacement/focus-switch — multi-domain | IMPLEMENTED (AI-guided, bounded seam) | WILD-04R-F3 |
+| Catalog authority for `tipo_vehiculo` — LLM cannot overwrite catalog-validated tipo | IMPLEMENTED | WILD-04R-F6 |
+| `_catalog_tipo_for(marca, modelo)` guard in `_apply_candidate()` update and create paths | IMPLEMENTED | WILD-04R-F6 |

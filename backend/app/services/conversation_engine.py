@@ -5360,6 +5360,20 @@ Respondé SOLO con JSON válido:
             # WILD-04R-F5 D3: normalize tipo_vehiculo alias before persisting
             if "tipo_vehiculo" in fields:
                 fields["tipo_vehiculo"] = _normalize_tipo_vehiculo(fields["tipo_vehiculo"])
+            # WILD-04R-F6 guard (create path): if marca+modelo are present, look up
+            # catalog to derive the authoritative tipo_vehiculo.
+            _c_marca = (fields.get("marca") or "").strip()
+            _c_modelo = (fields.get("modelo") or "").strip()
+            if _c_marca and _c_modelo:
+                _c_catalog_tipo = self._catalog_tipo_for(_c_marca, _c_modelo)
+                if _c_catalog_tipo is not None:
+                    _c_ai_tipo = fields.get("tipo_vehiculo") or ""
+                    if _c_ai_tipo != _c_catalog_tipo:
+                        logger.info(
+                            "WILD04R-F6 create catalog authority: AI proposed %r → using %r marca=%r modelo=%r",
+                            _c_ai_tipo, _c_catalog_tipo, _c_marca, _c_modelo,
+                        )
+                    fields["tipo_vehiculo"] = _c_catalog_tipo
             status = candidate_data.get("status") or "mentioned"
             candidate = WhatsAppThreadCandidate(thread_id=ctx.thread.id, status=status, **fields)
             self.db.add(candidate)
@@ -5394,6 +5408,26 @@ Respondé SOLO con JSON válido:
                 return
             if target is None:
                 return
+            # WILD-04R-F6 guard: catalog is authoritative for tipo_vehiculo.
+            # Before applying any AI-proposed tipo, resolve the effective marca+modelo
+            # (possibly updated in this same turn) against the catalog. If the catalog
+            # has an entry, use its tipo instead of the AI proposal. This prevents
+            # e.g. a location-only turn ("El auto está en San Miguel") from silently
+            # downgrading SUV_4X4_DEPORTIVO → AUTO when the AI guesses from text alone.
+            if candidate_data.get("tipo_vehiculo") is not None:
+                _cd_for_guard = dict(candidate_data)  # copy to avoid mutating caller
+                _resolve_marca = (_cd_for_guard.get("marca") or "").strip() or (target.marca or "")
+                _resolve_modelo = (_cd_for_guard.get("modelo") or "").strip() or (target.modelo or "")
+                _catalog_tipo = self._catalog_tipo_for(_resolve_marca, _resolve_modelo)
+                if _catalog_tipo is not None:
+                    _ai_proposed_tipo = (_cd_for_guard.get("tipo_vehiculo") or "").strip()
+                    if _ai_proposed_tipo.upper() != _catalog_tipo:
+                        logger.info(
+                            "WILD04R-F6 catalog authority: AI proposed %r → using %r candidate=%s",
+                            _ai_proposed_tipo, _catalog_tipo, target.id,
+                        )
+                    _cd_for_guard["tipo_vehiculo"] = _catalog_tipo
+                    candidate_data = _cd_for_guard
             for k in ("marca", "modelo", "version_text", "anio", "tipo_vehiculo",
                        "zone_group", "zone_detail", "direccion_texto"):
                 if candidate_data.get(k) is not None:
@@ -5446,6 +5480,27 @@ Respondé SOLO con JSON válido:
             focus.marca = match.marca
         if not focus.modelo:
             focus.modelo = match.modelo
+
+    # ── WILD-04R-F6: Catalog authority guard ─────────────────────────────
+
+    def _catalog_tipo_for(self, marca: str, modelo: str) -> "str | None":
+        """Return the canonical tipo_vehiculo for a marca+modelo pair from the catalog.
+
+        Uses the same _norm pipeline and _FULL_FORM_TO_ENTRY lookup as
+        _resolve_fuzzy_key. Returns None if the pair is not in the catalog
+        (unknown vehicle fallback — AI tipo is then accepted as-is).
+        """
+        from ..services.vehicle_catalog import _FULL_FORM_TO_ENTRY, _norm
+        if not marca or not modelo:
+            return None
+        nfull = _norm(f"{marca} {modelo}")
+        entry = _FULL_FORM_TO_ENTRY.get(nfull)
+        if entry is None:
+            return None
+        raw_tipo = entry.get("t", "") or None
+        if not raw_tipo:
+            return None
+        return _normalize_tipo_vehiculo(raw_tipo)
 
     # ── Deterministic helper methods ──────────────────────────────────────
 
