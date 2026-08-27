@@ -801,6 +801,36 @@ def _normalize_tipo_vehiculo(tipo: str | None) -> str | None:
     return _TIPO_VEHICULO_ALIAS.get(stripped, stripped) or None
 
 
+# WILD-04R-F5.1 D1: location-question probe set and canonical append text.
+# Phrases (after _norm_lower) that indicate the reply already asks for location,
+# used to prevent duplicate location questions.
+_LOCATION_ASK_PROBES: frozenset[str] = frozenset({
+    "que barrio",
+    "que zona",
+    "que localidad",
+    "que ciudad",
+    "donde esta",
+    "donde se encuentra",
+    "barrio o zona",
+    "zona o ciudad",
+    "localidad o barrio",
+    "en que lugar",
+    "donde queda",
+    "en que barrio",
+    "en que zona",
+    "en que localidad",
+})
+
+# Canonical location question appended by the deterministic finalizer.
+_CANONICAL_LOCATION_ASK = "\n\n¿En qué localidad o barrio está el auto?"
+
+
+def _reply_already_asks_location(reply: str) -> bool:
+    """Return True when the reply already contains a location question."""
+    n = _norm_lower(reply)
+    return any(probe in n for probe in _LOCATION_ASK_PROBES)
+
+
 def _norm_lower(s: str) -> str:
     """Accent-strip, lowercase, and collapse whitespace — for keyword matching."""
     return " ".join(_strip_accents(s).lower().split())
@@ -1828,6 +1858,52 @@ class ConversationEngine:
             return primary_reply
         self._contributing_sources = ["FAQ_RULE"]
         return primary_reply.rstrip() + "\n\n" + " ".join(parts)
+
+    def _apply_required_next_question(
+        self, text: str, ctx: "_Context", *, _turn_text: str | None = None
+    ) -> str:
+        """WILD-04R-F5.1 D1 — Deterministic required-next-info finalizer.
+
+        When the business prerequisite (inspection location) is unmet and the
+        outbound text doesn't already ask for it, append the canonical location
+        question.  Fires after FAQ reconciliation so the duplicate probe also
+        catches location questions appended by _compose_secondary_answers.
+
+        Gate conditions (all must hold):
+          - Stage is QUALIFYING or None (not QUOTED / SCHEDULING / terminal)
+          - not needs_human
+          - Active candidate exists with tipo_vehiculo known
+          - Active inspection location is missing (group AND detail null)
+          - Text does not already ask for location
+          - Current customer turn is not a soft-close / FAQ-only message
+        """
+        state = ctx.state
+        if state is None:
+            return text
+        if state.needs_human:
+            return text
+        if state.last_stage not in (STAGE_QUALIFYING, None):
+            return text
+        focus = self._focus_candidate(ctx)
+        if focus is None or not focus.tipo_vehiculo:
+            return text
+        zone_grp, zone_det = self._get_active_inspection_location(ctx, state)
+        if zone_grp or zone_det:
+            return text
+        if _reply_already_asks_location(text):
+            return text
+        # Don't append when the customer's turn is a soft-close or pure-FAQ message
+        # with no active inspection intent (e.g. "gracias, lo dejo para más adelante").
+        # Commercial bursts that contain both FAQ phrases AND an inspection request
+        # ("quiero revisar... ¿mandan informes?") must still trigger the gate.
+        if _turn_text and _is_general_faq_or_soft_close(_turn_text):
+            if not self._detect_explicit_inspection_request(_norm_lower(_turn_text)):
+                return text
+        logger.info(
+            "WILD04R-F5.1 required-location appended thread_id=%s candidate=%s",
+            ctx.thread.id, focus.id,
+        )
+        return text.rstrip() + _CANONICAL_LOCATION_ASK
 
     def _process_vehicle_fallback_response(
         self,
@@ -5698,6 +5774,13 @@ Respondé SOLO con JSON válido:
         if _burst:
             self._faq_reconciliation_burst = None  # consume — fires once per turn
             text = self._compose_secondary_answers(text, _burst)
+
+        # WILD-04R-F5.1: deterministic required-next-info gate.
+        # Runs after FAQ reconciliation so duplicate detection also covers
+        # FAQ-appended text.  No-ops for QUOTED/SCHEDULING/terminal states.
+        # _burst (before consume) carries the customer turn text — passed so
+        # the gate can skip appending on soft-close turns.
+        text = self._apply_required_next_question(text, ctx, _turn_text=_burst)
 
         from zoneinfo import ZoneInfo
         now_utc = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
