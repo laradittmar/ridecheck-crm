@@ -85,8 +85,10 @@ def _run_check() -> None:
             try:
                 from ..ui.whatsapp_ui import _send_whatsapp_cloud_text
                 from .outbound_safety_gate import GateOutcome, OutboundSafetyGate
+                from .outbound_path_registry import OutboundPathId
                 gate = OutboundSafetyGate(db)
-                gate_result = gate.attempt(wa_id=wa_id, thread_id=thread_id, text=_FOLLOWUP_MSG)
+                gate_result = gate.attempt(wa_id=wa_id, thread_id=thread_id, text=_FOLLOWUP_MSG,
+                                           path_id=OutboundPathId.SYSTEM_NOTIFICATION.value)
                 if gate_result.outcome != GateOutcome.ALLOWED:
                     logger.info(
                         "quote_followup gate-blocked thread_id=%s wa_id=...%s: %s",

@@ -442,9 +442,11 @@ def send_thread_text(thread_id: int, payload: WhatsAppSendTextIn, db: Session = 
     now_utc = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
 
     # M19.R1.2 safety-first: route has no server-verified auth; treated as automated.
+    from ..services.outbound_path_registry import OutboundPathId
     gate = OutboundSafetyGate(db)
     gate_result = gate.attempt(wa_id=to_wa_id, thread_id=thread_id, text=text,
-                               message_type="text", now=now_utc)
+                               message_type="text", now=now_utc,
+                               path_id=OutboundPathId.MANUAL_CRM.value)
     if gate_result.outcome == GateOutcome.BLOCKED_KILL_SWITCH:
         raise HTTPException(status_code=503, detail="OUTBOUND_DISABLED")
     if gate_result.outcome != GateOutcome.ALLOWED:
@@ -483,6 +485,7 @@ def _store_outbound_and_send(
     body_text: str,
     send_fn,
     message_type: str = "text",
+    path_id: str = "",
 ) -> tuple[WhatsAppMessage, str]:
     """Gate-mediated send: check recipient gate, persist pending record, call send_fn → wa_message_id.
 
@@ -495,7 +498,7 @@ def _store_outbound_and_send(
 
     gate = OutboundSafetyGate(db)
     gate_result = gate.attempt(wa_id=to_wa_id, thread_id=thread_id, text=body_text,
-                               message_type=message_type, now=now_utc)
+                               message_type=message_type, now=now_utc, path_id=path_id or None)
     if gate_result.outcome == GateOutcome.BLOCKED_KILL_SWITCH:
         raise HTTPException(status_code=503, detail="OUTBOUND_DISABLED")
     if gate_result.outcome != GateOutcome.ALLOWED:
@@ -546,11 +549,13 @@ def send_thread_interactive(thread_id: int, payload: WhatsAppSendInteractiveIn, 
     thread, to_wa_id = _resolve_thread_wa_id(db, thread_id)
     buttons = [{"id": btn.id, "title": btn.title} for btn in payload.buttons]
 
+    from ..services.outbound_path_registry import OutboundPathId
     try:
         _, wa_message_id = _store_outbound_and_send(
             db, thread_id, thread, to_wa_id, body_text,
             lambda wa_id: _send_whatsapp_cloud_interactive(wa_id, body_text, buttons)[0],
             message_type="interactive",
+            path_id=OutboundPathId.MANUAL_CRM.value,
         )
         return WhatsAppSendInteractiveOut(ok=True, thread_id=thread_id, wa_message_id=wa_message_id, body=body_text)
     except Exception as exc:
@@ -569,6 +574,7 @@ def send_thread_list(thread_id: int, payload: WhatsAppSendListIn, db: Session = 
     thread, to_wa_id = _resolve_thread_wa_id(db, thread_id)
     rows = [{"id": r.id, "title": r.title, "description": r.description} for r in payload.rows]
 
+    from ..services.outbound_path_registry import OutboundPathId
     try:
         _, wa_message_id = _store_outbound_and_send(
             db, thread_id, thread, to_wa_id, body_text,
@@ -576,6 +582,7 @@ def send_thread_list(thread_id: int, payload: WhatsAppSendListIn, db: Session = 
                 wa_id, body_text, payload.button_label, payload.section_title, rows
             )[0],
             message_type="list",
+            path_id=OutboundPathId.MANUAL_CRM.value,
         )
         return WhatsAppSendListOut(ok=True, thread_id=thread_id, wa_message_id=wa_message_id, body=body_text)
     except Exception as exc:
@@ -603,6 +610,7 @@ def send_thread_flow(thread_id: int, payload: WhatsAppSendFlowIn, db: Session = 
     flow_token = (payload.flow_token or "").strip() or f"{thread_id}-{int(_time.time())}"
     cta_label = (payload.cta_label or "Completar datos").strip()
 
+    from ..services.outbound_path_registry import OutboundPathId
     try:
         _, wa_message_id = _store_outbound_and_send(
             db, thread_id, thread, to_wa_id, body_text,
@@ -614,6 +622,7 @@ def send_thread_flow(thread_id: int, payload: WhatsAppSendFlowIn, db: Session = 
                 cta_label=cta_label,
             )[0],
             message_type="flow",
+            path_id=OutboundPathId.MANUAL_CRM.value,
         )
         return WhatsAppSendFlowOut(
             ok=True,
@@ -724,8 +733,10 @@ def send_to_phone(payload: SendToPhoneIn, db: Session = Depends(get_db)):
     # M19.R1.2 — automated send: enter recipient safety gate (dedup + flood).
     # Gate creates the durable pending audit record BEFORE the Meta API call.
     from ..services.outbound_safety_gate import GateOutcome, OutboundSafetyGate
+    from ..services.outbound_path_registry import OutboundPathId
     gate = OutboundSafetyGate(db)
-    gate_result = gate.attempt(wa_id=wa_id, thread_id=thread.id, text=text, now=now_utc)
+    gate_result = gate.attempt(wa_id=wa_id, thread_id=thread.id, text=text, now=now_utc,
+                               path_id=OutboundPathId.SYSTEM_NOTIFICATION.value)
     if gate_result.outcome == GateOutcome.BLOCKED_KILL_SWITCH:
         raise HTTPException(status_code=503, detail="OUTBOUND_DISABLED")
     if gate_result.outcome != GateOutcome.ALLOWED:
