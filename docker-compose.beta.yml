@@ -32,7 +32,7 @@
 
 services:
   backend:
-    image: ridecheck-crm-backend:wild04r-f6-fd73611
+    image: ridecheck-crm-backend:l2-transport-53b04e5
     environment:
       DATABASE_URL: postgresql+psycopg://crm:crm@postgres:5432/crm_test
       OUTBOUND_ENABLED: "${BETA_OUTBOUND_ENABLED:-false}"
@@ -40,3 +40,6 @@ services:
       QUARANTINED_TEST_WA_IDS: ""
       INTERNAL_BOOKING_EMAIL_TO: "ridecheckassistance@gmail.com"
       INTERNAL_BOOKING_EMAIL_REPLY_TO: "ridecheckassistance@gmail.com"
+      FLOW_BOOKING_PRIVATE_KEY_PATH: /run/secrets/flow_booking_private.pem
+    volumes:
+      - /opt/ridecheck-secrets:/run/secrets:ro
