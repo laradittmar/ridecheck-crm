@@ -527,6 +527,38 @@ logging). Relevant gates 558 passed / 1 skipped / 0 failed. Full regression
 
 **Clean-Wild counter stays 0/3.** Wild C requires owner outbound authorization.
 
+### Phase B.5 — L4.7D-RESPONSE-VALIDATOR (2026-09-01) — **PASS**
+
+Closeout: `2026-09-01_RIDECHECK_CRM_L4.7D-RESPONSE-VALIDATOR_CLOSEOUT_CANONICAL-CLAIMS.md`
+
+A general deterministic validation layer now sits between composition and the outbound
+gate on **every** CE text path: COMPOSE → VALIDATE → OutboundSafetyGate → SEND.
+
+All six claim classes are state-checked (L4.7 found only one was):
+
+| Claim | Canonical proof required |
+|---|---|
+| VEHICLE | current-focus candidate |
+| LOCATION | candidate zone / cycle-scoped buffer; customer origin is never the inspection location |
+| PRICE | PricingService quote (or an amount already sent this cycle); wrong amounts are rewritten to canonical |
+| AVAILABILITY | ScheduleService evaluation or its slots; negative statements and confirmed bookings exempted |
+| BOOKING | booked ThreadRevision — sending the Flow is not booking |
+| ACCEPTANCE | lead flag ACEPTADO or stage ≥ SCHEDULING |
+
+Design rules keep it general, per §6.1: only assertive sentences carry claims (questions
+always survive), and every class names its canonical proof. Failure behaviour is
+sentence-level surgery — FAQ answers and the required next question are preserved; a
+deterministic fallback is used only when nothing survives. Decisions log as
+`CE_RESPONSE_VALIDATION`. AI authority is unchanged.
+
+Evidence: `tests/test_l4_7d_response_validator.py` 33/33; relevant gates 926 passed /
+1 skipped / 0 failed; full regression 3 161 passed / 55 failed / 9 errors — zero new
+failures. One certified test superseded and disclosed
+(`TestRC05Requote::test_rc05_price_requote`: an AI-invented $140.000 previously reached the
+customer; the canonical $150.000 is now delivered).
+
+**Clean-Wild counter stays 0/3. Wild C not run.** Next: **L4.7E-SEMANTIC-EQUIVALENCE-CORPUS**.
+
 ### Phase C — Infrastructure resilience (INFRA-OOM-01)
 
 **Host OOM incident, 2026-09-01 18:30:37Z — CONFIRMED, MEDIUM, launch-relevant.**
@@ -826,7 +858,7 @@ L4.2 closeout: `2026-09-01_RIDECHECK_CRM_L4.2-CLEAN-SLATE-TESTER_CLOSEOUT_PREPAR
 | L1 Semantic Authority | **FROZEN — CONDITIONAL PASS** | YES |
 | L2 Transport + Operations | **FROZEN — PASS (2026-09-01)** | YES |
 | L3 Dirty-History Certification | **FROZEN — PASS (2026-09-01)** | YES |
-| L4 Runtime + Wild Certification | **FAIL — Wild A (scheduling) and Wild B (evidence capture) both failed and were remediated (L4.3, L4.6); tester zero state prepared (L4.4); runtime proof still pending; 0/3 clean sessions** | AFTER A CONTROLLED WILD C PROVES L4.3 + L4.6 IN RUNTIME |
+| L4 Runtime + Wild Certification | **FAIL — Wild A (scheduling) and Wild B (evidence capture) failed and were remediated (L4.3, L4.6); response validator added (L4.7D); tester zero state prepared (L4.4); runtime proof still pending; 0/3 clean sessions** | AFTER L4.7E AND A CONTROLLED WILD C |
 | L5 Production Launch Gate | PENDING | NO |
 | Meta App Secret | EXTERNAL BLOCKER | Does not block L4 tester-only Wild |
 

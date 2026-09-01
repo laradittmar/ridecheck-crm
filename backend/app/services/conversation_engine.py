@@ -61,6 +61,7 @@ from ..services.vehicle_catalog import (
     VehicleMatch, lookup_vehicle, fuzzy_lookup_vehicle, FuzzyLookupResult,
     _contextual_numeric_model_lookup, extract_model_del_year,
 )
+from ..services.response_validator import CanonicalFacts, validate_response
 from ..services.field_evidence import (
     resolve_field_evidence,
     INSP_ASSEMBLED_ACCESSIBLE,
@@ -1655,6 +1656,8 @@ class ConversationEngine:
         import uuid as _uuid
         self._correlation_id = str(_uuid.uuid4())
         self._booking_flow_send_failed = False
+        self._turn_price_quote = None          # L4.7D canonical price for this turn
+        self._availability_checked = False     # L4.7D: set by any ScheduleService evaluation
         self._ai_invoked = False
         self._answer_source = None
         self._contributing_sources = None
@@ -4089,6 +4092,147 @@ class ConversationEngine:
         except Exception:  # logging must never break a conversation turn
             pass
 
+    # ── L4.7D — canonical response validation ────────────────────────────────
+
+    def _canonical_zone_names(self) -> tuple[str, ...]:
+        """All zone names known to the DB, cached for the life of the engine instance."""
+        cached = getattr(self, "_zone_names_cache", None)
+        if cached is not None:
+            return cached
+        names: list[str] = []
+        try:
+            from sqlalchemy import select as _select
+            for z in self.db.execute(_select(ViaticosZone)).scalars().all():
+                for value in (z.zone_detail, z.zone_group):
+                    if value and value not in names:
+                        names.append(value)
+        except Exception:
+            names = []
+        self._zone_names_cache = tuple(names)
+        return self._zone_names_cache
+
+    def _build_canonical_facts(
+        self, ctx: "_Context", state: "WhatsAppThreadState | None"
+    ) -> "CanonicalFacts":
+        """Snapshot of everything the outbound text is allowed to assert as fact."""
+        focus = self._focus_candidate(ctx)
+        zone_group, zone_detail = self._get_active_inspection_location(ctx, state)
+
+        quote = getattr(self, "_turn_price_quote", None)
+        if quote is None and state is not None:
+            try:
+                quote = self._compute_price_quote(ctx, state)
+            except Exception:
+                quote = None
+
+        offered: tuple[str, ...] = ()
+        availability_checked = bool(getattr(self, "_availability_checked", False))
+        if state is not None:
+            for source in (state.last_visible_slots, state.last_offered_slots):
+                if source:
+                    try:
+                        parsed = json.loads(source)
+                    except (json.JSONDecodeError, TypeError):
+                        parsed = []
+                    if isinstance(parsed, list) and parsed:
+                        offered = tuple(str(x) for x in parsed)
+                        availability_checked = True
+                        break
+
+        booking_confirmed = bool(
+            state is not None
+            and (
+                getattr(state, "current_revision_id", None) is not None
+                or state.last_stage == STAGE_BOOKED
+            )
+        )
+        acceptance_confirmed = bool(
+            (ctx.lead is not None and getattr(ctx.lead, "flag", None) == "ACEPTADO")
+            or (state is not None and state.last_stage in (
+                STAGE_SCHEDULING, STAGE_FLOW_SENT, STAGE_BOOKED))
+        )
+
+        origin_zones: tuple[str, ...] = ()
+        turn_text = getattr(self, "_turn_text", None)
+        if turn_text and _has_customer_origin_clause(turn_text):
+            origin_only = ""
+            try:
+                stripped = _strip_customer_origin_clauses(turn_text)
+                origin_only = turn_text.replace(stripped, " ") if stripped else turn_text
+                zone = self._extract_zone_from_text(origin_only)
+                if zone is not None and zone.zone_detail:
+                    origin_zones = (zone.zone_detail,)
+            except Exception:
+                origin_zones = ()
+
+        prior_amounts: list[int] = []
+        try:
+            for m in (ctx.db_messages or []):
+                if getattr(m, "direction", None) != "out" or not getattr(m, "text", None):
+                    continue
+                for raw in _PRICE_RE.findall(m.text):
+                    value = int(re.sub(r"\D", "", raw) or 0)
+                    if value and value not in prior_amounts:
+                        prior_amounts.append(value)
+        except Exception:
+            prior_amounts = []
+
+        return CanonicalFacts(
+            vehicle_marca=(focus.marca if focus else None),
+            vehicle_modelo=(focus.modelo if focus else None),
+            inspection_zone_detail=zone_detail,
+            inspection_zone_group=zone_group,
+            customer_origin_zones=origin_zones,
+            known_zone_names=self._canonical_zone_names(),
+            quote_total=(quote.precio_total if quote is not None else None),
+            quote_base=(quote.precio_base if quote is not None else None),
+            quote_viaticos=(quote.viaticos if quote is not None else None),
+            previously_quoted=tuple(prior_amounts),
+            availability_checked=availability_checked,
+            offered_slots=offered,
+            booking_confirmed=booking_confirmed,
+            acceptance_confirmed=acceptance_confirmed,
+        )
+
+    def _reply_vehicle_resolver(self, fragment: str):
+        """Deterministic vehicle resolution used to read claims out of composed text."""
+        hit = lookup_vehicle(fragment)
+        if hit is not None:
+            return hit
+        mdy = extract_model_del_year(fragment)
+        if mdy is not None:
+            return mdy[0]
+        return _contextual_numeric_model_lookup(fragment)
+
+    def _validate_outbound_text(
+        self, text: str, ctx: "_Context", state: "WhatsAppThreadState | None"
+    ) -> str:
+        """COMPOSE → **VALIDATE** → OutboundSafetyGate → SEND.
+
+        A composed reply may assert only what canonical state proves.  Unsupported
+        sentences are rewritten or dropped; questions, FAQ answers and the required next
+        question always survive.  Never raises: a validator failure must not break a turn.
+        """
+        try:
+            facts = self._build_canonical_facts(ctx, state)
+            result = validate_response(
+                text, facts, vehicle_resolver=self._reply_vehicle_resolver
+            )
+            for finding in result.findings:
+                logger.info(
+                    "CE_RESPONSE_VALIDATION thread_id=%s claim=%s allowed=%s proof=%r "
+                    "action=%s detail=%r",
+                    getattr(ctx.thread, "id", None), finding.claim, finding.allowed,
+                    finding.proof, finding.action, finding.detail,
+                )
+            return result.text
+        except Exception as exc:
+            logger.warning(
+                "L4.7D response validation error thread_id=%s: %s",
+                getattr(ctx.thread, "id", None), exc,
+            )
+            return text
+
     # ── L4.6 Phase E — buffered inspection location ──────────────────────────
 
     def _attach_buffered_location(self, ctx: "_Context", state: "WhatsAppThreadState") -> None:
@@ -4766,6 +4910,7 @@ class ConversationEngine:
             zone_detail=_sched_det,
         )
 
+        self._availability_checked = True   # L4.7D: ScheduleService consulted this turn
         try:
             sched_out = self._schedule.check(sched_in)
         except Exception as exc:
@@ -5028,6 +5173,7 @@ class ConversationEngine:
             exclude_revision_id=state.current_revision_id,
         )
         result = {"valid": False, "slots": [], "reason": None, "time_obj": time_obj}
+        self._availability_checked = True   # L4.7D: ScheduleService consulted this turn
         try:
             if request.time_str:
                 checked = self._schedule.check(sched_in)
@@ -5203,6 +5349,7 @@ class ConversationEngine:
             is_holiday=False,
         )
         is_closed = False
+        self._availability_checked = True   # L4.7D: ScheduleService consulted this turn
         try:
             slots_out = self._schedule.list_slots(sched_in)
             all_slots = sorted([s for s in (slots_out.slots or []) if isinstance(s, str)])
@@ -6676,6 +6823,7 @@ Respondé SOLO con JSON válido:
             )
             if not state.home_zone_group and q.zone_group:
                 state.home_zone_group = q.zone_group
+            self._turn_price_quote = q      # L4.7D: canonical amount for response validation
             return q
         except PricingNotFoundError:
             return None
@@ -6698,6 +6846,9 @@ Respondé SOLO con JSON válido:
 
         # L4.6 Phase B/D: a reply must never assert a vehicle canonical state lacks.
         text = self._enforce_canonical_vehicle_claim(text, ctx, ctx.state)
+
+        # L4.7D: canonical response validation — the last step before the safety gate.
+        text = self._validate_outbound_text(text, ctx, ctx.state)
 
         from zoneinfo import ZoneInfo
         now_utc = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
@@ -6747,6 +6898,9 @@ Respondé SOLO con JSON válido:
             flow_id = (self.settings.whatsapp_flow_id or "").strip()
         if not flow_id:
             raise RuntimeError("WHATSAPP_FLOW_ID not configured")
+
+        # L4.7D: the Flow button body is customer-facing text and is validated too.
+        body_text = self._validate_outbound_text(body_text, ctx, ctx.state)
 
         from zoneinfo import ZoneInfo
         now_utc = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))

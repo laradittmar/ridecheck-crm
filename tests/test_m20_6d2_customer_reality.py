@@ -534,7 +534,14 @@ class TestRC05Requote(unittest.TestCase):
 
     @patch("urllib.request.urlopen")
     def test_rc05_price_requote(self, mock_urlopen):
-        """Re-ask of price returns stored quote; stage stays QUOTED."""
+        """Re-ask of price returns the CANONICAL quote; stage stays QUOTED.
+
+        L4.7D supersession: the AI here states $140.000, which no PricingService quote and
+        no prior message supports. The canonical response validator now rewrites the amount
+        to the deterministic quote for this candidate + zone ($150.000). Before L4.7D the
+        invented amount was delivered verbatim — the exact class of defect the validator
+        exists to prevent.
+        """
         mock_urlopen.return_value = _ai_resp(
             "El precio para la revisión del Peugeot 3008 en Benavidez es $140.000. ¿Avanzamos?",
         )
@@ -547,8 +554,10 @@ class TestRC05Requote(unittest.TestCase):
 
         self.assertEqual(result.action, "blocked_dispatch")
         self.assertEqual(self.state.last_stage, "QUOTED")
-        self.assertTrue(any("140" in t for t in blocked),
-                        f"Stored quote must be returned: {blocked}")
+        self.assertTrue(any("150.000" in t for t in blocked),
+                        f"Canonical quote must be returned: {blocked}")
+        self.assertFalse(any("140.000" in t for t in blocked),
+                         f"AI-invented amount must not reach the customer: {blocked}")
 
     @patch("urllib.request.urlopen")
     def test_rc05_duration_faq_prompt_contains_approved_wording(self, mock_urlopen):
