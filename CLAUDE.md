@@ -1,5 +1,73 @@
 # RideCheck CRM — Developer Reference
 
+---
+
+## Launch Certification Governance
+
+Before any Wild, launch, pre-launch, runtime-certification, or launch-remediation work:
+
+**READ [`docs/launch/LAUNCH_TRUTH_ROADMAP.md`](docs/launch/LAUNCH_TRUTH_ROADMAP.md) FIRST.**
+
+Rules:
+
+1. A FROZEN launch gate must not be reopened unless new contradictory runtime or Wild evidence is produced.
+2. When a new defect is found, assign it to the launch gate it invalidates and remediate only that gate. Do not restart the project.
+3. No unrelated feature work is permitted during active launch certification.
+4. Milestone completion does not equal launch readiness. Every gate has an explicit exit criterion.
+
+---
+
+## M2 Outbound Security Invariants (M21.3-TRACE-HARDENING-FINAL)
+
+### OUTBOUND FORENSIC AUTHORITY
+`OutboundSafetyGate` is the sole authority for creating outbound `WhatsAppMessage`
+records. Every automated outbound attempt MUST pass through `gate.attempt()`.
+No code outside `outbound_safety_gate.py` may write `direction='out'` records directly.
+
+### AUTHORIZED PATH INVARIANT
+Every `gate.attempt()` call MUST pass `path_id=OutboundPathId.<X>.value`.
+Calls with `path_id=None` are blocked at step -1 (before kill switch) and emit a
+`OUTBOUND_ATTEMPT_WITH_UNKNOWN_SOURCE` BLOCKER SecurityEvent.
+Authorized paths: CE_TEXT, CE_FLOW, CE_INTERACTIVE, CE_LIST, MANUAL_CRM,
+BOOKING_FLOW, SYSTEM_NOTIFICATION. Legacy: LEGACY_N8N_AI_PIPELINE (blocked).
+
+### STATUS WEBHOOK CORRELATION
+Incoming Meta status webhooks (sent/delivered/read/failed) are matched to
+`WhatsAppMessage` records via `wa_message_id`. Status updates follow precedence
+(pending < sent < delivered < read < failed). Unknown WAMIDs emit a
+`META_STATUS_FOR_UNKNOWN_WAMID` HIGH SecurityEvent.
+
+### UNKNOWN WAMID ALERTING
+When a status webhook arrives for a WAMID not in the ledger (table
+`whatsapp_messages`) AND OUTBOUND is off, a `SUCCESSFUL_META_SEND_WHILE_OUTBOUND_OFF`
+BLOCKER SecurityEvent is created. This catches unauthorized external sends.
+
+### CONTAINER-INDEPENDENT TRACEABILITY
+All forensic data needed to reconstruct the outbound timeline is persisted in
+the PostgreSQL database BEFORE the Meta API call:
+- `whatsapp_messages` (direction=out): pending record with path_id, deployment_id,
+  correlation_id, content_fingerprint, text, thread_id, timestamp
+- `whatsapp_outbound_dedup`: wa_id + fingerprint + created_at
+- `security_events`: unauthorized path detections with details JSON
+No container log access is required to determine WHAT was sent, WHEN, by WHOM,
+via WHICH path, under WHICH deployment.
+
+### SECRET HANDLING
+`WHATSAPP_TOKEN` and `SMTP_PASSWORD` MUST NOT appear as literals in git-tracked
+files. Use `${WHATSAPP_TOKEN}` / `${SMTP_PASSWORD}` in compose files and supply
+actual values via `.env` (which is gitignored).
+Do NOT rotate the Meta token without explicit owner authorization.
+The `WHATSAPP_APP_SECRET` must be set for webhook signature verification in
+production; empty value enables dev-mode skip (logged, not silent).
+
+### OPERATOR FORENSIC QUERIES
+- `GET /security/unauthorized-path-events` — SecurityEvent log with filters:
+  since, until, wamid, thread_id, deployment_id, severity, fingerprint
+- `GET /security/outbound-ledger` — All automated outbound WhatsAppMessage records:
+  wamid (exact WAMID lookup), thread_id, path_id, fingerprint, status, window
+
+---
+
 ## Canonical Live Conversation Path
 
 The live message processor is **`conversation_engine.py`** (CE), called by n8n via:

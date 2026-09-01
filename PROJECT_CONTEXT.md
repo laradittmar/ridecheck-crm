@@ -1,5 +1,15 @@
 # RideCheck CRM — Project Context
 
+## Launch readiness
+
+**[`docs/launch/LAUNCH_TRUTH_ROADMAP.md`](docs/launch/LAUNCH_TRUTH_ROADMAP.md) is the authoritative launch-readiness roadmap.**
+
+- Milestone completion does not equal launch readiness.
+- Launch gates L1–L5 must be completed in order before any Wild or production deployment.
+- A gate is FROZEN when its exit criterion is MET. Do not reopen a frozen gate without new contradictory evidence.
+
+---
+
 ## Canonical architecture documents
 
 Before changing any of the following, **READ FIRST**:
