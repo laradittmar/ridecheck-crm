@@ -264,6 +264,11 @@ Fields are classified by their lifecycle scope:
 
 ## 5. Revision Lifecycle
 
+> **Owner decision 2026-09-01 (L4.3):** BOOKING_FLOW is the authoritative
+> scheduling/booking UX. Text conversation owns intent interpretation, availability and
+> alternatives; the published Booking Flow owns structured booking and confirmation.
+> The full contract is [`BOOKING_UX_CONTRACT.md`](BOOKING_UX_CONTRACT.md).
+
 One inspection cycle flows through the following stages. The human operator controls the boundaries between cycles.
 
 ### CE internal stages (state.last_stage)
@@ -278,9 +283,10 @@ QUALIFYING
 QUOTED
   │
   ↓  (acceptance detected)
-SCHEDULING  (date/time coordination)
+SCHEDULING  (date/time coordination in chat: intent, availability, alternatives)
   │
-  ↓  (booking Flow dispatched — WhatsApp Flow sent to customer)
+  ↓  (a VALID concrete slot is established — see BOOKING_UX_CONTRACT.md)
+  ↓  (RideCheck Booking Flow dispatched — Meta Flow 28104222025943520, path BOOKING_FLOW)
 [flow_booking_token set, boolean flags track Flow dispatch]
   │
   ↓  (customer submits Flow response)

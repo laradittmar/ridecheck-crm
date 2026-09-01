@@ -107,7 +107,10 @@ from app.services.conversation_engine import ConversationEngine
 from app.services.pricing import PricingService
 
 # ── Canonical answer strings ──────────────────────────────────────────────────
-_HOURS_ANSWER    = "Trabajamos de lunes a viernes de 9 a 18 hs y los sábados de 9 a 15 hs."
+# L4.3 Phase B: hours are DERIVED from the scheduling authority — never a literal,
+# so this suite cannot drift from ScheduleService's weekday table.
+from app.services.conversation_engine import _faq_hours_answer as _canonical_hours
+_HOURS_ANSWER    = _canonical_hours()
 _PAYMENT_ANSWER  = "Aceptamos efectivo, transferencia bancaria y Mercado Pago."
 _REPORT_ANSWER   = "Al finalizar la revisión te enviamos un informe detallado."
 _PRESENCE_ANSWER = "No es necesario que estés presente durante la inspección."
@@ -902,7 +905,7 @@ class TestM4VehicleReplacementPlusFAQ(unittest.TestCase):
         _, sent = self._run()
         combined = " ".join(sent)
         self.assertIn(
-            "lunes a viernes", combined,
+            _HOURS_ANSWER, combined,
             f"Hours FAQ answer must be appended to reply; got: {combined!r}"
         )
 

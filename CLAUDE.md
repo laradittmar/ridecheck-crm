@@ -68,6 +68,25 @@ production; empty value enables dev-mode skip (logged, not silent).
 
 ---
 
+## Booking UX Authority (L4.3 — owner decision 2026-09-01)
+
+**BOOKING_FLOW is the authoritative scheduling/booking UX.** RideCheck Booking Flow
+`28104222025943520` (`WHATSAPP_BOOKING_FLOW_ID`) is dispatched by
+`ConversationEngine._send_booking_flow()` once a concrete valid slot exists, with
+`path_id=OutboundPathId.BOOKING_FLOW` and a token from `make_booking_token()`.
+
+Text conversation negotiates availability only: it interprets ordered day/time
+preferences (PRIMARY before FALLBACK), checks `ScheduleService`, explains rejections and
+offers alternatives. It never collects booking data and never creates a booking — the
+only path creating `ThreadRevision(status="booked")` is `_process_flow_response`.
+
+Customer-facing operating hours come from `schedule.business_hours_for_weekday()`;
+never hard-code an hours sentence.
+
+Full contract: `docs/architecture/BOOKING_UX_CONTRACT.md`.
+
+---
+
 ## Canonical Live Conversation Path
 
 The live message processor is **`conversation_engine.py`** (CE), called by n8n via:

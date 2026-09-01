@@ -84,6 +84,7 @@ L1 is therefore safe to freeze and should not be reopened unless new evidence co
 | Quote authority | Recomputed from active candidate/current zone | Audited | **PROVEN** | Keep unchanged |
 | Prior-cycle acceptance leakage | Reset clears stage before acceptance check | Audited | **PROVEN** | None |
 | Booking Flow crypto + persistence | Endpoint, RSA/AES, Base64, watermark, advisory lock, atomic booking all passed audit | Audited + runtime | **PROVEN** | Later live E2E proof |
+| Booking Flow dispatch (authoritative UX) | OWNER DECISION 2026-09-01: BOOKING_FLOW authoritative. Sender wired: booking_flow_id + make_booking_token + path_id=BOOKING_FLOW; eligibility = established valid slot | Implemented + Tested (42/42 L4.3) | **NEEDS RUNTIME PROOF (WILD)** | Controlled Wild B |
 | Causal outbound dedup | New inbound allowed; same inbound retry blocked | Tested + runtime | **PROVEN** | Later Wild confirmation |
 | Blocked outbound counts as unanswered | Fixed in live query | Tested | **PROVEN at code level** | Ops certification in L2 |
 | Outbound path attribution | All 7 gate.attempt() call sites carry correct OutboundPathId | Implemented + Tested (20/20 L2-PATH) | **PROVEN / FROZEN L2** | None |
@@ -96,6 +97,11 @@ L1 is therefore safe to freeze and should not be reopened unless new evidence co
 | Controlled Wild without App Secret | Possible only as explicit temporary risk exception with tester-only outbound | Policy decision | **CONDITIONAL** | Only after L2 + L3 |
 | Production migration | Not yet applied | Not started | **NEEDS FIX BEFORE PUBLIC LAUNCH** | L5 |
 | Public launch | Not authorized | — | **NO-GO** | Complete gates below |
+| Scheduling temporal semantics (primary vs fallback day) | Primary "mñ/mañana" preference discarded when a weekday name is present; no primary+fallback representation | Wild-proven defect (Wild A) | **NEEDS FIX BEFORE WILD** | L4.3 Phase A |
+| Business-hours authority | FAQ constant contradicts ScheduleService per-weekday hours | Wild-proven defect (Wild A) | **NEEDS FIX BEFORE WILD** | L4.3 Phase B |
+| Booking Flow dispatch (28104222025943520) | Flow published but unreachable — no sender, no BOOKING_FLOW path_id, no token minting | Code-proven gap | **NEEDS FIX BEFORE PUBLIC LAUNCH** | L4.3 Phase C (owner decision first) |
+| Outbound ledger deployment_id / correlation_id | Persisted as 'unknown' / NULL — GIT_SHA not injected by any compose | Runtime-proven | **NEEDS FIX BEFORE PUBLIC LAUNCH** | L4.3 Phase D |
+| Host memory headroom / transport resilience | Global OOM killed n8n (sole inbound transport) on 4 GB zero-swap host; 4 GB swap now active and persistent | Runtime-proven incident (INFRA-OOM-01) | **NEEDS FIX BEFORE PUBLIC LAUNCH** | Container mem_limits, n8n restart policy, liveness alert, preflight memory gate |
 
 # 5. Finite launch roadmap
 
@@ -386,6 +392,96 @@ Three trivial greeting tests do not qualify.
 
 ---
 
+### Phase B — Wild A (first TRUE clean-slate Wild)
+
+**Wild A: PAUSED — SCHEDULING FAIL (2026-09-01)**
+
+Forensic audit: `2026-09-01_RIDECHECK_CRM_L4-WILD-A-SCHEDULING-FORENSIC_AUDIT_TEMPORAL-FLOW.md`
+
+Proven clean on a true zero-state thread (do not re-prove unless contradicted):
+new-customer creation, single Contact/Thread/Lead, vehicle Peugeot 2008 + year 2014 +
+`SUV_4X4_DEPORTIVO`, inspection-location authority (Berazategui kept, Tigre not applied),
+pricing 150 000 + 90 000 = 240 000, FAQ service/report/presence/payment, acceptance,
+burst assembly (7 inbound → 4 CE invocations, 0 duplicates), path attribution (4/4 `CE_TEXT`,
+all `read`).
+
+Open L4 defects:
+
+| ID | Severity | Description |
+|---|---|---|
+| SCHED-A | HIGH | Primary relative-day preference (`mñ` = tomorrow) discarded whenever any weekday name appears in the burst (`_parse_scheduling_text` guard `and not day_name_found`). |
+| SCHED-B | HIGH | Scheduling domain cannot represent PRIMARY + FALLBACK; the fallback day replaced the primary day and the primary clause's time was transplanted onto it (queried Thursday 15:00, never requested). |
+| SCHED-D | HIGH | Reply never names the primary requested day and mis-states the rejection reason ("no disponibilidad" instead of "Thursday closes at 14:00"). |
+| SCHED-E | HIGH | `_FAQ_HOURS_ANSWER` ("lunes a viernes de 9 a 18 hs") contradicts `ScheduleService._business_hours` (Mon 13–18, Tue 09:30–14, Thu 09–14). Two authorities for one business fact; directly caused the impossible Thursday 15:00 request. |
+| FLOW-A | HIGH | Published Booking Flow `28104222025943520` has no sender: `settings.booking_flow_id` unreferenced, `make_booking_token()` never called, `OutboundPathId.BOOKING_FLOW` used at zero gate call sites. CE dispatches legacy Flow `1644218879979041`. |
+| FLOW-B | HIGH | Two competing scheduling UXs (CE text negotiation vs in-Flow date/slot pickers). Runtime = TEXT, design intent = BOOKING_FLOW, `DOMAIN_MODEL §5` = text-then-Flow-for-data. **Owner decision required.** |
+| FOR-01 | MEDIUM | All Wild A outbound rows carry `deployment_id='unknown'` and `correlation_id=NULL` (`GIT_SHA` injected by no compose file). Degrades the container-independent traceability invariant. |
+| INFRA-OOM-01 | MEDIUM | Host global OOM (see §5.L4 Phase C below). |
+
+Scheduling mathematics were verified CORRECT in both directions (Wed 02/09 has no
+Berazategui-compatible slot at all; Thursday's only valid Sur slot is 13:00).
+No frozen gate is contradicted: L1 (both days came from the same current turn, not from
+stale history), L2 (path attribution and transport correct) and L3 (no history existed)
+remain FROZEN.
+
+Remediation gate: **L4.3-SCHEDULING-SEMANTICS** (Phases A–D in the audit §17).
+Wild B must not be authorized until Phase A + Phase B land and the Phase C owner decision
+is recorded.
+
+### Phase B.1 — L4.3-SCHEDULING-SEMANTICS remediation (2026-09-01)
+
+**OWNER DECISION RECORDED: AUTHORITATIVE SCHEDULING UX = BOOKING_FLOW**
+(RideCheck Booking Flow `28104222025943520`, PUBLISHED). Text conversation keeps
+availability negotiation only. Contract: `docs/architecture/BOOKING_UX_CONTRACT.md`.
+
+Closeout: `2026-09-01_RIDECHECK_CRM_L4.3-SCHEDULING-SEMANTICS_CLOSEOUT_TEMPORAL-BOOKING.md`
+
+| Finding | Phase | Status |
+|---|---|---|
+| SCHED-A primary relative-day discarded | A | **CLOSED** — `mñ` is never suppressed by a later weekday; day mentions are kept in utterance order |
+| SCHED-B no primary/fallback model | A | **CLOSED** — `_parse_scheduling_requests()` returns ordered branches; each time bound to its own clause |
+| SCHED-D rejection omits primary + real reason | A/E | **CLOSED** — one reply names the primary day, its real reason, then the fallback offer |
+| SCHED-E FAQ hours diverge from scheduler | B | **CLOSED** — hours generated from `business_hours_for_weekday()`; single authority |
+| FLOW-A published Booking Flow unreachable | C | **CLOSED** — `booking_flow_id` + `make_booking_token()` + `path_id=BOOKING_FLOW` wired through `OutboundSafetyGate` |
+| FLOW-B competing scheduling UX | C/D | **CLOSED BY OWNER DECISION** — documented sequence; no text-only booking path exists |
+| FOR-01 deployment_id/correlation_id missing | F | **CLOSED** — `GIT_SHA` injected in the beta compose; CE passes a per-turn correlation id |
+| INFRA-OOM-01 host OOM | G | **PARTIAL** — swap + container limits + n8n restart policy + preflight script done; alerting still open (Phase C below) |
+
+Evidence: `tests/test_l4_3_scheduling_semantics.py` 42/42 PASS (TEMP-01…07, ORDER-01…03,
+HOURS-01/02, FLOW-01…08, FORENSIC-01/02, Wild A reproduction). Full regression
+3074 passed / 72 failed / 9 errors — **zero regressions** against the pre-change baseline
+(same 81 pre-existing failures, verified by differential run).
+
+**L4 remains FAIL. Wild A stays PAUSED. Clean-Wild counter stays 0/3.** A new controlled
+Wild is required to prove the remediation in runtime.
+
+### Phase C — Infrastructure resilience (INFRA-OOM-01)
+
+**Host OOM incident, 2026-09-01 18:30:37Z — CONFIRMED, MEDIUM, launch-relevant.**
+
+Global OOM on a ~4 GB, zero-swap host killed the Claude Code process and the n8n container
+(exit 137, `OOMKilled=true`). No server reboot; backend and postgres survived. Occurred
+6.7 minutes AFTER the last Wild A message — **it did not cause the scheduling defect**, and
+it does not reopen L1/L2/L3.
+
+Mitigated (owner, same day): 4 GB `/swapfile` active and persisted in `/etc/fstab`;
+OUTBOUND returned to OFF; n8n restarted only after outbound was confirmed OFF.
+
+Swap alone is necessary but NOT sufficient. Required before public launch:
+
+1. Per-container `mem_limit` (n8n ≈ 1 GB, backend ≈ 1 GB, postgres ≈ 768 MB) so a runaway
+   container is killed in isolation instead of triggering a global OOM with an arbitrary victim.
+2. `restart: unless-stopped` on n8n — it is the sole inbound transport; an OOM kill currently
+   silences inbound traffic with no self-healing.
+3. n8n liveness + inbound-gap alert via the proven Resend channel (webhook received but no CE
+   invocation within N seconds).
+4. Memory cap on heavy local workloads (full pytest runs, agent processes) via
+   `systemd-run --scope -p MemoryMax=`.
+5. Preflight assertion in the Wild/test runbook: swap ≥ 2 GB active AND ≥ 1 GB available memory
+   before a full regression suite or a Wild session.
+
+---
+
 ## L5 — Production Launch Gate
 
 ### Objective
@@ -530,9 +626,26 @@ This remains an **external launch blocker**, not a reason to halt internal certi
 # 10. Current immediate next step
 
 ## NEXT ACTIVE GATE
-**L4 — Wild A: True First-Time Customer (awaiting owner outbound authorization)**
+**WILD B — runtime proof of the L4.3 remediation (awaiting owner outbound authorization)**
 
-L1, L2, L3 are frozen. L4.1 + L4.1A + L4.1B + L4.2 complete. Tester is clean-slate. Wild A ready.
+L4.3 landed 2026-09-01: ordered primary/fallback scheduling, single business-hours
+authority, Booking Flow wired as the authoritative booking UX, forensic attribution and
+OOM hardening. Code-level evidence is complete; runtime evidence is not. Next action is a
+controlled Wild B on the clean-slate tester, with OUTBOUND enabled only after the standard
+preflight (including `scripts/preflight_memory_check.sh`).
+
+Superseded entry:
+**L4.3 — SCHEDULING SEMANTICS REMEDIATION (Wild A defects)**
+
+L1, L2, L3 remain frozen. L4.1 + L4.1A + L4.1B + L4.2 complete. Wild A was executed on
+2026-09-01 against a true clean-slate tester and PAUSED at the scheduling turn; everything up
+to and including quote acceptance passed. Next action is L4.3 Phase A + Phase B, plus the
+Phase C owner decision on the authoritative booking UX (text vs Booking Flow).
+Wild B is NOT authorized until those land. Forensic audit:
+`2026-09-01_RIDECHECK_CRM_L4-WILD-A-SCHEDULING-FORENSIC_AUDIT_TEMPORAL-FLOW.md`.
+
+Historical (superseded by the line above):
+**L4 — Wild A: True First-Time Customer (awaiting owner outbound authorization)**
 
 **L4.2 CLEAN-SLATE TESTER PREPARATION complete (2026-09-01):**
 - All prior tester operational state deleted from crm_test (Contact, Thread, State, Lead, Candidates, Revisions, ThreadRevisions, Messages, Dedup, AiEvents, RecipientLock) ✅
@@ -610,7 +723,7 @@ L4.2 closeout: `2026-09-01_RIDECHECK_CRM_L4.2-CLEAN-SLATE-TESTER_CLOSEOUT_PREPAR
 | L1 Semantic Authority | **FROZEN — CONDITIONAL PASS** | YES |
 | L2 Transport + Operations | **FROZEN — PASS (2026-09-01)** | YES |
 | L3 Dirty-History Certification | **FROZEN — PASS (2026-09-01)** | YES |
-| L4 Runtime + Wild Certification | **FAIL — L4.1+L4.1A+L4.1B+L4.2 COMPLETE; tester clean-slate; Wild A awaiting outbound authorization; 0/3 clean sessions** | AFTER OWNER OUTBOUND AUTHORIZATION |
+| L4 Runtime + Wild Certification | **FAIL — Wild A PAUSED at the scheduling turn; L4.3 remediation COMPLETE at code level (42/42, zero regressions, BOOKING_FLOW wired); runtime proof pending; 0/3 clean sessions** | AFTER A CONTROLLED WILD B PROVES L4.3 IN RUNTIME |
 | L5 Production Launch Gate | PENDING | NO |
 | Meta App Secret | EXTERNAL BLOCKER | Does not block L4 tester-only Wild |
 
