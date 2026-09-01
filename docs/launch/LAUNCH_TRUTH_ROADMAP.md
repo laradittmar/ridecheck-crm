@@ -260,56 +260,49 @@ Prove that the exact failure family that caused repeated Wild crashes has actual
 
 ---
 
-## L4 — Runtime Certification + Controlled Wild  ← NEXT (PREFLIGHT DONE — IMAGE REMEDIATION REQUIRED)
+## L4 — Runtime Certification + Controlled Wild  ← ACTIVE — WILD #1 FAIL — REMEDIATION REQUIRED
 
 ### Objective
 Prove the complete system using the real WhatsApp tester.
 
 ### Phase A — Runtime proof
-**PREFLIGHT COMPLETE (2026-09-01) — CONDITIONAL NO-GO**
+**PREFLIGHT COMPLETE (2026-09-01)**
 
 Preflight audit: `2026-09-01_RIDECHECK_CRM_L4-RUNTIME-WILD-PREFLIGHT_AUDIT_RUNTIME-CERTIFICATION.md`
 
-**BLOCKER-L4-01:** Running image is `l1-semantic-820f4d6`; required is `l2.1-email-3131f88`.
-Beta compose overlay was not applied at startup. Correct image exists locally.
+BLOCKER-L4-01 (image mismatch) was remediated. Image `l2.1-email-3131f88` was deployed and all 10 post-enable preflight checks passed before outbound was authorized.
 
-**Remediation (operator action):**
-```bash
-cd /opt/ridecheck-crm
-docker compose \
-  -f docker-compose.yml \
-  -f /opt/ridecheck-crm-release-candidate/docker-compose.beta.yml \
-  up -d --force-recreate backend
-```
-Then verify 4-file hashes match RC source and 104/104 gate smokes still PASS.
+### Phase B — Wild certification
 
-**All other preflight criteria:**
-- crm_test confirmed ✓
-- WA token valid (HTTP 200 live ping) ✓
-- n8n ACTIVE, last execution success 2026-08-31 ✓
-- Control operational (auth-gated) ✓
-- Booking Flow private key present (1704 bytes) ✓
-- Outbound ledger baseline: last_id=5695, 0 non-tester sends ✓
-- OUTBOUND_ENABLED=false confirmed ✓
-- CONVERSATION_ENGINE_DIRECT_WEBHOOK_ENABLED not set (safe) ✓
-- CLOSED_BETA_ALLOWED_WA_IDS=5491153368330 active ✓
-- 104/104 frozen gate smokes PASS ✓
-- Tester state: QUOTED, focus=SUV_4X4_DEPORTIVO 2015 Sur/Berazategui, cycle_reset_pending=False
+**Wild #1: FAIL (2026-09-01)**
 
-**Pre-existing classified risks:**
+Forensic audit: `2026-09-01_RIDECHECK_CRM_L4-WILD-01-FORENSIC_AUDIT_FIRST-MESSAGE-FAILURE.md`
+
+**DEFECT-WILD-01-A (HIGH):** Quote of $240,000 delivered without the tester providing a location.
+- Root cause: L4 preflight declared READY while tester was in QUOTED state from prior Wild, `cycle_reset_pending=False`, stale `home_zone_detail=Berazategui` active. CE used the prior-cycle Berazategui zone (150,000 + 90,000 = $240,000) when processing the first-message burst.
+- CE behavior: CORRECT per L1 invariants. The failure is in the preflight checklist (missing gate on cycle_reset_pending=True).
+- Reproduction: CASE A test (9/9 repro PASS) confirms the causal chain.
+
+**DEFECT-WILD-01-B (MEDIUM):** Outbound message id=6043 delivery failed (status=failed, wamid=None).
+- Gate passed correctly (path_id=CE_TEXT). Failure at Meta API transport layer.
+- Backend logs lost (container recreated to disable outbound). Exact Meta error unknown.
+- Separate from DEFECT-WILD-01-A.
+
+**Gate invalidation:**
+- L4: FAIL — Wild #1 FAIL; consecutive clean count = 0/3
+- L1, L2, L3: FROZEN — INTACT (not contradicted by Wild #1 evidence)
+
+**Required before Wild #2:**
+1. Arm canonical lifecycle reset for tester (`cycle_reset_pending=True`)
+2. Add `cycle_reset_pending=True` gate to L4 preflight checklist (new required preflight gate)
+3. Add log retention protocol before Wild (preserve container logs before any `--force-recreate`)
+4. Investigate Meta API delivery failure
+5. Confirm `cycle_reset_pending=True` in preflight before authorizing Wild #2 outbound
+
+**Consecutive clean Wild count: 0/3**
+
+**Pre-existing classified risks (unchanged):**
 - App Secret empty (dev mode webhook skip) — ACCEPTED for tester-only Wild; allowlist compensates
-- 733 BLOCKER security events from path_id=None — pre-existing from l1 image; resolved by image upgrade
-
-Before enabling outbound after image upgrade:
-- correct image confirmed;
-- crm_test confirmed;
-- new token confirmed;
-- Control operational;
-- n8n runtime path operational;
-- Booking Flow endpoint operational;
-- outbound ledger operational;
-- unauthorized-path endpoint operational;
-- tester-only outbound restriction active.
 
 ### App Secret policy
 If Meta has still not resolved App Secret:
@@ -319,6 +312,16 @@ If Meta has still not resolved App Secret:
 - a tester-only Wild may proceed only as an explicit temporary security exception.
 
 This exception is for certification only, not launch approval.
+
+### Required preflight gate (added after Wild #1)
+Before declaring READY for any Wild, the preflight checklist MUST confirm:
+
+```
+tester.cycle_reset_pending == True
+```
+
+If False: Wild is NOT authorized until the canonical lifecycle reset is armed.
+This gate was missing from the Wild #1 preflight and caused DEFECT-WILD-01-A (HIGH).
 
 ### Wild certification loop
 Run distinct meaningful sessions:
@@ -500,28 +503,31 @@ This remains an **external launch blocker**, not a reason to halt internal certi
 # 10. Current immediate next step
 
 ## NEXT ACTIVE GATE
-**L4 — Runtime Certification + Controlled Wild**
+**L4 — Wild #2 Preparation**
 
-L1, L2, L3 are frozen.
+L1, L2, L3 are frozen. Wild #1 FAIL. Remediation required before Wild #2.
 
-**One operator action required before Wild can proceed:**
+**Required owner/operator actions before Wild #2:**
 
-Deploy the certified image:
-```bash
-cd /opt/ridecheck-crm
-docker compose \
-  -f docker-compose.yml \
-  -f /opt/ridecheck-crm-release-candidate/docker-compose.beta.yml \
-  up -d --force-recreate backend
-```
+1. Arm canonical lifecycle reset for tester:
+   - tester must initiate a new inspection conversation naturally, OR
+   - operator sets `cycle_reset_pending=True` via CRM admin (NO direct DB write)
 
-After image upgrade:
-1. Verify 4-file hashes match RC source (buscando_followup.py, quote_followup.py, unanswered_alert.py, resend_email.py)
-2. Re-run 104/104 gate smokes
-3. Owner authorizes outbound (BETA_OUTBOUND_ENABLED=true)
-4. Wild session proceeds
+2. Preflight checklist for Wild #2 MUST include:
+   ```
+   tester.cycle_reset_pending == True  ← NEW REQUIRED GATE
+   ```
+   If this gate fails, outbound must NOT be authorized.
 
-Full preflight details: `2026-09-01_RIDECHECK_CRM_L4-RUNTIME-WILD-PREFLIGHT_AUDIT_RUNTIME-CERTIFICATION.md`
+3. Add log retention before Wild: before any `docker compose up --force-recreate`, copy/stream backend logs to a persistent location so CE processing logs survive container recreation.
+
+4. Investigate Meta API delivery failure (DEFECT-WILD-01-B) — check WHATSAPP_PHONE_NUMBER_ID, token send permissions.
+
+5. Verify OUTBOUND_ENABLED=false before arming.
+
+6. Run Wild #2 preflight with all existing gates PLUS the new cycle_reset_pending gate.
+
+Forensic audit: `2026-09-01_RIDECHECK_CRM_L4-WILD-01-FORENSIC_AUDIT_FIRST-MESSAGE-FAILURE.md`
 
 # 11. Status tracker
 
@@ -530,7 +536,7 @@ Full preflight details: `2026-09-01_RIDECHECK_CRM_L4-RUNTIME-WILD-PREFLIGHT_AUDI
 | L1 Semantic Authority | **FROZEN — CONDITIONAL PASS** | YES |
 | L2 Transport + Operations | **FROZEN — PASS (2026-09-01)** | YES |
 | L3 Dirty-History Certification | **FROZEN — PASS (2026-09-01)** | YES |
-| L4 Runtime + Wild Certification | **CONDITIONAL NO-GO — IMAGE REMEDIATION REQUIRED** | AFTER BLOCKER-L4-01 FIX |
+| L4 Runtime + Wild Certification | **FAIL — Wild #1 FAIL (HIGH + MEDIUM); 0/3 clean sessions** | AFTER WILD-01 REMEDIATION |
 | L5 Production Launch Gate | PENDING | NO |
 | Meta App Secret | EXTERNAL BLOCKER | Does not block L4 tester-only Wild |
 
