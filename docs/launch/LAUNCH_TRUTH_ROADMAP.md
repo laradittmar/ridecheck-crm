@@ -530,44 +530,50 @@ This remains an **external launch blocker**, not a reason to halt internal certi
 # 10. Current immediate next step
 
 ## NEXT ACTIVE GATE
-**L4 — Wild #2 (.env fix pending owner authorization)**
+**L4 — Wild #2 (ALL PREFLIGHT GATES PASS — awaiting outbound authorization)**
 
-L1, L2, L3 are frozen. L4.1 + L4.1A complete. Wild #2 unblocked pending one `.env` change.
+L1, L2, L3 are frozen. L4.1 + L4.1A + L4.1B complete. Wild #2 ready pending owner outbound authorization.
 
-**L4.1 + L4.1A complete (2026-09-01):**
-- Canonical reset armed: `cycle_reset_pending=True` ✅
-- New preflight gate added ✅
-- Meta error capture implemented ✅
-- Wrong phone asset identified and root cause confirmed ✅
-- 13/13 L4.1 + 9/9 L4 repro + 112/112 frozen gates PASS ✅
+**L4.1B complete (2026-09-01):**
+- `.env` corrected: `WHATSAPP_PHONE_NUMBER_ID=1196075770246218` ✅
+- Container recreated with L4.1 certified image ✅
+- Runtime phone ID verified inside container: `1196075770246218` ✅
+- Outbound Meta URL: `https://graph.facebook.com/v19.0/1196075770246218/messages` ✅
+- Token access to 1196075770246218: PASS ✅
+- Meta phone status: CONNECTED / GREEN ✅
+- `cycle_reset_pending == True` ✅
+- `OUTBOUND_ENABLED == false` ✅
+- 72/72 SQLite frozen gates PASS (L1 + M2 + M21.3) ✅
+- 22/22 PostgreSQL L4+L4.1 PASS ✅
 
-**Required owner action:**
+**Pre-Wild #2 baselines (2026-09-01, post L4.1B):**
+```
+LAST_INBOUND_ID  = 6042
+LAST_OUTBOUND_ID = 6043
+OUTBOUND_LEDGER  = 39 records
+SECURITY_EVENTS  = 733
+DEDUP_COUNT      = 24
+```
 
-1. **Authorize `.env` correction:**
-   Change `WHATSAPP_PHONE_NUMBER_ID=122205934115920` → `WHATSAPP_PHONE_NUMBER_ID=1196075770246218`
-   - Intended operational phone: +54 9 11 5700-8687
-   - CLOUD_API, CONNECTED, GREEN, WABA 1520701463019847
-   - Token already has messaging access ✅
-   - All Flows already on correct WABA ✅
-   - No other env changes needed
+**All preflight gates PASS:**
+```
+tester.cycle_reset_pending == True                 ✅
+WHATSAPP_PHONE_NUMBER_ID == 1196075770246218        ✅
+phone 1196075770246218 status == CONNECTED / GREEN  ✅
+OUTBOUND_ENABLED == false                           ✅
+```
 
 **Required before Wild #2 outbound authorization:**
 
-2. Preflight MUST confirm:
-   ```
-   tester.cycle_reset_pending == True                 ← REQUIRED (armed in L4.1) ✅
-   WHATSAPP_PHONE_NUMBER_ID == 1196075770246218        ← REQUIRED (pending .env fix)
-   phone 1196075770246218 status == CONNECTED          ← REQUIRED (currently CONNECTED ✅)
-   ```
-   If any gate fails, outbound must NOT be authorized.
-
-3. Add log retention before Wild: before any `docker compose up --force-recreate`, preserve CE container logs so they survive recreation.
-
-4. Verify OUTBOUND_ENABLED=false before arming; enable only after all preflight gates pass.
+1. Owner explicitly authorizes outbound for Wild #2 tester session.
+2. Log retention: before any `docker compose up --force-recreate`, copy backend logs (prevents log loss as in Wild #1).
+3. Enable outbound: `BETA_OUTBOUND_ENABLED=true docker compose -f docker-compose.yml -f docker-compose.beta.yml up -d --force-recreate backend`
+4. Tester sends first WhatsApp message to trigger `_execute_cycle_reset`.
 
 Forensic audit: `2026-09-01_RIDECHECK_CRM_L4-WILD-01-FORENSIC_AUDIT_FIRST-MESSAGE-FAILURE.md`
 L4.1 closeout: `2026-09-01_RIDECHECK_CRM_L4.1-WILD-REMEDIATION_CLOSEOUT_REAUTHORIZE-WILD.md`
 L4.1A audit: `2026-09-01_RIDECHECK_CRM_L4.1A-META-ASSET-CORRECTION_AUDIT_DELIVERY-ROOT-CAUSE.md`
+L4.1B closeout: `2026-09-01_RIDECHECK_CRM_L4.1B-PHONE-ID-REMEDIATION_CLOSEOUT_ENV-CORRECTED.md`
 
 # 11. Status tracker
 
@@ -576,7 +582,7 @@ L4.1A audit: `2026-09-01_RIDECHECK_CRM_L4.1A-META-ASSET-CORRECTION_AUDIT_DELIVER
 | L1 Semantic Authority | **FROZEN — CONDITIONAL PASS** | YES |
 | L2 Transport + Operations | **FROZEN — PASS (2026-09-01)** | YES |
 | L3 Dirty-History Certification | **FROZEN — PASS (2026-09-01)** | YES |
-| L4 Runtime + Wild Certification | **FAIL — L4.1 REMEDIATION COMPLETE; Wild #2 BLOCKED (phone DISCONNECTED); 0/3 clean sessions** | AFTER PHONE RECONNECTION |
+| L4 Runtime + Wild Certification | **FAIL — L4.1+L4.1A+L4.1B COMPLETE; all preflight gates PASS; Wild #2 awaiting outbound authorization; 0/3 clean sessions** | AFTER OWNER OUTBOUND AUTHORIZATION |
 | L5 Production Launch Gate | PENDING | NO |
 | Meta App Secret | EXTERNAL BLOCKER | Does not block L4 tester-only Wild |
 
