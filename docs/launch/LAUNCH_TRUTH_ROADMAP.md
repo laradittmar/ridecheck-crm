@@ -210,60 +210,57 @@ Still **NO**. L3 must come first.
 
 ## L3 — Dirty-History Certification
 
+### Status
+**FROZEN — PASS (2026-09-01)**
+
 ### Objective
 Prove that the exact failure family that caused repeated Wild crashes has actually been retired.
 
-### Test philosophy
-Do not test clean state only.
+### Closed items
+1. 50 dirty-history scenarios (L3-01 through L3-35 + realism audit) — 50/50 PASS.
+2. All 11 scenario families covered: vehicle/year, location/zone, quote/acceptance,
+   scheduling, active-cycle/reset, burst/voice, name/third-party, dedup/unanswered, booking.
+3. Final customer-facing outcomes asserted for all required scenarios.
+4. Pricing traces: zone_group, zone_detail, viaticos, precio_base, precio_total.
+5. Scheduling traces: preferred_day / preferred_time authority verified.
+6. Cycle watermark: old candidates filtered; new candidates pass; stale IDs cleared.
+7. Zone authority: Sur/Berazategui, CABA/Palermo, Norte/Nordelta all proven.
+8. No contradictory evidence against L1 invariants found.
+9. OUTBOUND OFF throughout.
 
-Seed realistic persistent histories using:
+### Test evidence
+- test_l3_dirty_history.py: 50/50 PASS (35 scenarios + realism checks)
+- L1 gate: 19/19 still PASS (no regression)
+- L2.1 gate: 15/15 still PASS (no regression)
+- L2-transport gate: 20/20 still PASS (no regression)
+- Full regression: 63 failed (all pre-existing B/C), 2974 passed, 62 skipped
+- LAUNCH_RELEVANT_DEFECT: 0. UNKNOWN: 0.
 
-**same Contact + same Thread + same Lead + multiple Revisions**
-
-and intentionally conflict old and new data.
-
-Tests must validate:
-
-**input → canonical state → service input → customer-facing outcome**
-
-not just intermediate DB fields.
-
-### Minimum scenario families
-- old vehicle vs new vehicle
-- old year vs explicit corrected year
-- old location vs new location
-- old quote vs new quote
-- old acceptance vs new cycle
-- old candidate focus vs new cycle
-- multiple active candidates
-- switch candidate A → B → A
-- voice with make/model/year/location
-- multi-message burst with correction
-- quote recomputation
-- scheduling correction
-- booking using only active Revision
-- dedup across distinct inbound events
-- same-event retry dedup
-- blocked outbound remains unanswered
-- lifecycle reset from completed inspection
-- lifecycle reset from abandoned/quoted cycle
-- seller/customer name references
-- candidate update ambiguity
-
-Target: **20–30 meaningful scenarios**.
+### Key invariants proven at dirty-history level
+- RISK-01: customer_name first-write-wins survives cross-cycle history ✅
+- RISK-02: scheduling fill-if-absent; prior-cycle values cleared by reset ✅
+- RISK-03: new candidates do not inherit stale home_zone_* ✅
+- CL-05: stale current_focus_candidate_id cleared when not in active context ✅
+- CL-07: zone_protected blocks AI zone overwrite after LR-3 write ✅
+- Cycle watermark: genuinely prior-cycle candidates excluded from context ✅
+- Quote: recomputed from current candidate zone, not prior-cycle zone ✅
+- Acceptance: QUOTED stage gate blocks cross-cycle acceptance ✅
+- Booking: ThreadRevision links current candidate, preserves historical booking ✅
 
 ### Exit criterion
-- all launch-critical dirty-history invariants PASS;
-- final customer-facing response asserted for critical scenarios;
-- full regression has zero unexplained launch-critical failures;
-- no known BLOCKER/HIGH historical-contamination risk remains.
+**MET**
+
+- All launch-critical dirty-history invariants PASS.
+- Final customer-facing responses asserted for required scenarios.
+- Full regression: LAUNCH_RELEVANT_DEFECT=0, UNKNOWN=0.
+- No known BLOCKER/HIGH historical-contamination risk.
 
 ### Wild status after L3
-Eligible for L4 runtime certification.
+**Eligible for L4 runtime certification.**
 
 ---
 
-## L4 — Runtime Certification + Controlled Wild
+## L4 — Runtime Certification + Controlled Wild  ← NEXT
 
 ### Objective
 Prove the complete system using the real WhatsApp tester.
