@@ -286,9 +286,10 @@ Forensic audit: `2026-09-01_RIDECHECK_CRM_L4-WILD-01-FORENSIC_AUDIT_FIRST-MESSAG
 
 **DEFECT-WILD-01-B (MEDIUM):** Outbound message id=6043 delivery failed (status=failed, wamid=None).
 - Gate passed correctly (path_id=CE_TEXT). Failure at Meta API transport layer.
-- Root cause confirmed (L4.1): phone number `+54 9 11 5829-5318` is **DISCONNECTED** from WhatsApp Business Platform (status=DISCONNECTED, quality_rating=UNKNOWN).
+- L4.1 root cause (phone DISCONNECTED) **RETRACTED** by L4.1A audit — `status` field was unstable across API calls and is unreliable.
+- **L4.1A root cause (STRONGLY_SUPPORTED):** Runtime configured with WRONG Meta phone asset. `WHATSAPP_PHONE_NUMBER_ID=122205934115920` (+54 9 11 5829-5318 / ON_PREMISE / WABA 101584872897508). Intended operational phone is `1196075770246218` (+54 9 11 5700-8687 / CLOUD_API / CONNECTED / GREEN / WABA 1520701463019847). ON_PREMISE phone used via Cloud API endpoint → intermittent delivery failures.
 - Meta error capture now persists http_status + error_payload to `whatsapp_messages` DB before container events (L4.1).
-- **STATUS: CLASSIFIED — external dependency; owner must reconnect phone via Meta Business Manager**
+- **STATUS: ROOT CAUSE IDENTIFIED — remediation pending owner authorization**
 
 **L4.1 Remediation (CONDITIONAL PASS — 2026-09-01):**
 
@@ -298,19 +299,30 @@ Closeout: `2026-09-01_RIDECHECK_CRM_L4.1-WILD-REMEDIATION_CLOSEOUT_REAUTHORIZE-W
 2. New required preflight gate: `cycle_reset_pending=True` ✅
 3. Meta error capture: `MetaSendError` + `meta_http_status`/`meta_error_payload` columns in `whatsapp_messages` ✅
 4. Migration `20260901_l4_1_meta_error_capture.py` applied to crm_test ✅
-5. Image `ridecheck-crm-backend:l4.1-meta-error-6936137` deployed to crm_test ✅
+5. Image `ridecheck-crm-backend:l4.1-meta-error-01025b7` deployed to crm_test ✅
 6. 13/13 L4.1 tests PASS; 9/9 L4 repro PASS; 112/112 frozen gates PASS ✅
-7. **Wild #2 BLOCKED: phone number DISCONNECTED (external dependency)** ❌
+7. ~~Wild #2 BLOCKED: phone number DISCONNECTED~~ — **RETRACTED (L4.1A): wrong phone asset configured**
+
+**L4.1A Audit (2026-09-01):**
+
+Audit: `2026-09-01_RIDECHECK_CRM_L4.1A-META-ASSET-CORRECTION_AUDIT_DELIVERY-ROOT-CAUSE.md`
+
+Root cause of DEFECT-WILD-01-B identified: `WHATSAPP_PHONE_NUMBER_ID` is set to wrong phone asset:
+- Configured: `122205934115920` (+54 9 11 5829-5318 / ON_PREMISE / WABA 101584872897508) ← wrong
+- Intended: `1196075770246218` (+54 9 11 5700-8687 / CLOUD_API / CONNECTED / GREEN / WABA 1520701463019847) ← correct
+- All 5 published Flows are on the correct WABA (1520701463019847) already ✅
+- Current token has messaging access to 1196075770246218 ✅
+- Single `.env` line change is all that is required
 
 **Gate invalidation:**
-- L4: FAIL — Wild #1 FAIL; consecutive clean count = 0/3; L4.1 remediation complete but Wild #2 blocked
+- L4: FAIL — Wild #1 FAIL; consecutive clean count = 0/3; L4.1 + L4.1A complete; `.env` fix pending authorization
 - L1, L2, L3: FROZEN — INTACT (not contradicted by Wild #1 evidence)
 
 **Required before Wild #2:**
 1. ~~Arm canonical lifecycle reset for tester~~ **DONE (L4.1)**
 2. ~~Add `cycle_reset_pending=True` gate to L4 preflight checklist~~ **DONE (L4.1)**
-3. ~~Investigate Meta API delivery failure~~ **DONE (L4.1) — root cause: phone DISCONNECTED**
-4. **OWNER ACTION: Reconnect phone number `+54 9 11 5829-5318` via Meta Business Manager**
+3. ~~Investigate Meta API delivery failure~~ **DONE (L4.1A) — root cause: wrong phone asset**
+4. **OWNER ACTION: Authorize `.env` change** `WHATSAPP_PHONE_NUMBER_ID=122205934115920` → `1196075770246218`; operator restarts backend — NO other env changes needed
 5. Add log retention protocol before Wild (preserve container logs before any `--force-recreate`)
 6. Run preflight with all gates including new required gates before authorizing Wild #2 outbound
 
@@ -518,38 +530,44 @@ This remains an **external launch blocker**, not a reason to halt internal certi
 # 10. Current immediate next step
 
 ## NEXT ACTIVE GATE
-**L4 — Wild #2 (BLOCKED: phone DISCONNECTED)**
+**L4 — Wild #2 (.env fix pending owner authorization)**
 
-L1, L2, L3 are frozen. L4.1 remediation complete. Wild #2 blocked pending phone reconnection.
+L1, L2, L3 are frozen. L4.1 + L4.1A complete. Wild #2 unblocked pending one `.env` change.
 
-**L4.1 remediation complete (2026-09-01):**
+**L4.1 + L4.1A complete (2026-09-01):**
 - Canonical reset armed: `cycle_reset_pending=True` ✅
 - New preflight gate added ✅
 - Meta error capture implemented ✅
+- Wrong phone asset identified and root cause confirmed ✅
 - 13/13 L4.1 + 9/9 L4 repro + 112/112 frozen gates PASS ✅
 
-**Required owner action (BLOCKER):**
+**Required owner action:**
 
-1. **Reconnect WhatsApp Business phone number `+54 9 11 5829-5318`:**
-   - Meta Business Manager → WhatsApp Manager → Phone Numbers
-   - Status currently: `DISCONNECTED` (confirmed via Graph API capability check)
-   - Must return to `CONNECTED` before Wild #2 can be authorized
+1. **Authorize `.env` correction:**
+   Change `WHATSAPP_PHONE_NUMBER_ID=122205934115920` → `WHATSAPP_PHONE_NUMBER_ID=1196075770246218`
+   - Intended operational phone: +54 9 11 5700-8687
+   - CLOUD_API, CONNECTED, GREEN, WABA 1520701463019847
+   - Token already has messaging access ✅
+   - All Flows already on correct WABA ✅
+   - No other env changes needed
 
 **Required before Wild #2 outbound authorization:**
 
 2. Preflight MUST confirm:
    ```
-   tester.cycle_reset_pending == True  ← REQUIRED (armed in L4.1) ✅
-   phone_number.status == CONNECTED    ← REQUIRED (currently DISCONNECTED) ❌
+   tester.cycle_reset_pending == True                 ← REQUIRED (armed in L4.1) ✅
+   WHATSAPP_PHONE_NUMBER_ID == 1196075770246218        ← REQUIRED (pending .env fix)
+   phone 1196075770246218 status == CONNECTED          ← REQUIRED (currently CONNECTED ✅)
    ```
-   If either gate fails, outbound must NOT be authorized.
+   If any gate fails, outbound must NOT be authorized.
 
 3. Add log retention before Wild: before any `docker compose up --force-recreate`, preserve CE container logs so they survive recreation.
 
 4. Verify OUTBOUND_ENABLED=false before arming; enable only after all preflight gates pass.
 
 Forensic audit: `2026-09-01_RIDECHECK_CRM_L4-WILD-01-FORENSIC_AUDIT_FIRST-MESSAGE-FAILURE.md`
-Remediation closeout: `2026-09-01_RIDECHECK_CRM_L4.1-WILD-REMEDIATION_CLOSEOUT_REAUTHORIZE-WILD.md`
+L4.1 closeout: `2026-09-01_RIDECHECK_CRM_L4.1-WILD-REMEDIATION_CLOSEOUT_REAUTHORIZE-WILD.md`
+L4.1A audit: `2026-09-01_RIDECHECK_CRM_L4.1A-META-ASSET-CORRECTION_AUDIT_DELIVERY-ROOT-CAUSE.md`
 
 # 11. Status tracker
 
