@@ -530,50 +530,78 @@ This remains an **external launch blocker**, not a reason to halt internal certi
 # 10. Current immediate next step
 
 ## NEXT ACTIVE GATE
-**L4 — Wild #2 (ALL PREFLIGHT GATES PASS — awaiting outbound authorization)**
+**L4 — Wild A: True First-Time Customer (awaiting owner outbound authorization)**
 
-L1, L2, L3 are frozen. L4.1 + L4.1A + L4.1B complete. Wild #2 ready pending owner outbound authorization.
+L1, L2, L3 are frozen. L4.1 + L4.1A + L4.1B + L4.2 complete. Tester is clean-slate. Wild A ready.
 
-**L4.1B complete (2026-09-01):**
-- `.env` corrected: `WHATSAPP_PHONE_NUMBER_ID=1196075770246218` ✅
-- Container recreated with L4.1 certified image ✅
-- Runtime phone ID verified inside container: `1196075770246218` ✅
-- Outbound Meta URL: `https://graph.facebook.com/v19.0/1196075770246218/messages` ✅
-- Token access to 1196075770246218: PASS ✅
-- Meta phone status: CONNECTED / GREEN ✅
-- `cycle_reset_pending == True` ✅
-- `OUTBOUND_ENABLED == false` ✅
+**L4.2 CLEAN-SLATE TESTER PREPARATION complete (2026-09-01):**
+- All prior tester operational state deleted from crm_test (Contact, Thread, State, Lead, Candidates, Revisions, ThreadRevisions, Messages, Dedup, AiEvents, RecipientLock) ✅
+- Forensic export preserved at `/opt/ridecheck-crm-forensics/` ✅
+- 733 global security events preserved intact ✅
+- 32 demo contacts / 32 demo threads / 32 demo leads / 28 demo revisions preserved ✅
+- Tester allowlist `CLOSED_BETA_ALLOWED_WA_IDS=5491153368330` intact ✅
+- 19/19 L4.2 new tests PASS ✅
 - 72/72 SQLite frozen gates PASS (L1 + M2 + M21.3) ✅
 - 22/22 PostgreSQL L4+L4.1 PASS ✅
 
-**Pre-Wild #2 baselines (2026-09-01, post L4.1B):**
+**Certification strategy:**
+
+| Wild | Scenario | Purpose |
+|---|---|---|
+| Wild A | Brand-new customer — first Contact, Thread, Lead, Revision #1 | Prove new-customer onboarding and full quote/booking lifecycle |
+| Wild B | Same persistent identity — second Revision (cycle_reset_pending must fire) | Prove returning-customer cycle boundary; Revision #1 preserved |
+| Wild C | Third meaningful scenario (defined after A+B based on remaining risk) | TBD |
+
+**Post-cleanup pre-Wild A baselines (2026-09-01):**
 ```
-LAST_INBOUND_ID  = 6042
-LAST_OUTBOUND_ID = 6043
-OUTBOUND_LEDGER  = 39 records
-SECURITY_EVENTS  = 733
-DEDUP_COUNT      = 24
+LAST_GLOBAL_INBOUND_ID   = NULL (all prior tester messages cleaned)
+LAST_GLOBAL_OUTBOUND_ID  = NULL
+OUTBOUND_LEDGER_COUNT    = 0
+SECURITY_EVENTS_TOTAL    = 733
+UNAUTHORIZED_PATH_EVENTS = 733 (all pre-existing, audit trail from certification)
+NON_TESTER_OUTBOUND      = 0
+TESTER_CONTACT_COUNT     = 0
+TESTER_THREAD_COUNT      = 0
+TESTER_LEAD_COUNT        = 0
+TESTER_REVISION_COUNT    = 0
 ```
 
-**All preflight gates PASS:**
+**First-inbound expectation for Wild A:**
+- Creates new Contact (wa_id=5491153368330)
+- Creates new Thread linked to new Contact
+- Creates new Lead (via n8n lead-find/create)
+- Creates new ThreadState: cycle_reset_pending=False, all zone/stage/scheduling fields None
+- CE processes normally — NO cycle reset triggered (no prior cycle)
+- No inherited vehicle, location, quote, or scheduling preferences
+
+**All runtime preflight gates PASS:**
 ```
-tester.cycle_reset_pending == True                 ✅
-WHATSAPP_PHONE_NUMBER_ID == 1196075770246218        ✅
+WHATSAPP_PHONE_NUMBER_ID == 1196075770246218        ✅ (corrected in L4.1B)
 phone 1196075770246218 status == CONNECTED / GREEN  ✅
 OUTBOUND_ENABLED == false                           ✅
+cycle_reset_pending: N/A (tester does not yet exist) ✅
 ```
 
-**Required before Wild #2 outbound authorization:**
+**Required before Wild A outbound authorization:**
 
-1. Owner explicitly authorizes outbound for Wild #2 tester session.
-2. Log retention: before any `docker compose up --force-recreate`, copy backend logs (prevents log loss as in Wild #1).
-3. Enable outbound: `BETA_OUTBOUND_ENABLED=true docker compose -f docker-compose.yml -f docker-compose.beta.yml up -d --force-recreate backend`
-4. Tester sends first WhatsApp message to trigger `_execute_cycle_reset`.
+1. Owner explicitly authorizes Wild A outbound.
+2. Log retention: copy backend logs BEFORE `docker compose up --force-recreate` (mandatory — prevents log loss as in Wild #1).
+3. Enable outbound: `cd /opt/ridecheck-crm && BETA_OUTBOUND_ENABLED=true docker compose -f docker-compose.yml -f /opt/ridecheck-crm-release-candidate/docker-compose.beta.yml up -d --force-recreate backend`
+4. Tester sends first WhatsApp message — CE creates fresh Contact/Thread/Lead and responds normally.
 
-Forensic audit: `2026-09-01_RIDECHECK_CRM_L4-WILD-01-FORENSIC_AUDIT_FIRST-MESSAGE-FAILURE.md`
+**Wild B (do NOT execute until Wild A is completed):**
+After Wild A completes, the owner signals a new cycle via CRM:
+1. Set lead.estado to `REVISION_COMPLETA` (or any non-CONSULTA_NUEVA state).
+2. Then set lead.estado to `CONSULTA_NUEVA` via the CRM `set_lead_estado()` path.
+3. `cycle_reset_pending=True` is set automatically.
+4. Verify in preflight before Wild B.
+5. Tester sends new message → CE executes cycle_reset → Revision #2 begins; Revision #1 preserved.
+
+Forensic export: `/opt/ridecheck-crm-forensics/L4.2_tester_forensic_export_2026-09-01.txt`
 L4.1 closeout: `2026-09-01_RIDECHECK_CRM_L4.1-WILD-REMEDIATION_CLOSEOUT_REAUTHORIZE-WILD.md`
 L4.1A audit: `2026-09-01_RIDECHECK_CRM_L4.1A-META-ASSET-CORRECTION_AUDIT_DELIVERY-ROOT-CAUSE.md`
 L4.1B closeout: `2026-09-01_RIDECHECK_CRM_L4.1B-PHONE-ID-REMEDIATION_CLOSEOUT_ENV-CORRECTED.md`
+L4.2 closeout: `2026-09-01_RIDECHECK_CRM_L4.2-CLEAN-SLATE-TESTER_CLOSEOUT_PREPARE-ZERO-STATE.md`
 
 # 11. Status tracker
 
@@ -582,7 +610,7 @@ L4.1B closeout: `2026-09-01_RIDECHECK_CRM_L4.1B-PHONE-ID-REMEDIATION_CLOSEOUT_EN
 | L1 Semantic Authority | **FROZEN — CONDITIONAL PASS** | YES |
 | L2 Transport + Operations | **FROZEN — PASS (2026-09-01)** | YES |
 | L3 Dirty-History Certification | **FROZEN — PASS (2026-09-01)** | YES |
-| L4 Runtime + Wild Certification | **FAIL — L4.1+L4.1A+L4.1B COMPLETE; all preflight gates PASS; Wild #2 awaiting outbound authorization; 0/3 clean sessions** | AFTER OWNER OUTBOUND AUTHORIZATION |
+| L4 Runtime + Wild Certification | **FAIL — L4.1+L4.1A+L4.1B+L4.2 COMPLETE; tester clean-slate; Wild A awaiting outbound authorization; 0/3 clean sessions** | AFTER OWNER OUTBOUND AUTHORIZATION |
 | L5 Production Launch Gate | PENDING | NO |
 | Meta App Secret | EXTERNAL BLOCKER | Does not block L4 tester-only Wild |
 
