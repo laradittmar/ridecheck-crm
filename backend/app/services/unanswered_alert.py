@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import smtplib
-from email.message import EmailMessage
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -15,7 +13,6 @@ logger = logging.getLogger(__name__)
 
 _ALERT_THRESHOLD_SECONDS = 120  # escalate to ALERT after 2 minutes without a reply
 _CHECK_INTERVAL_SECONDS = 60    # poll every 60 seconds
-_ALERT_EMAIL = "ridecheckassistance@gmail.com"
 
 # ── Per-turn SLA alert (WILD-04R Phase 2) ────────────────────────────────────
 # Queries ai_events where:
@@ -70,6 +67,7 @@ _FIND_THREAD_UNANSWERED_SQL = text("""
             SELECT direction
             FROM whatsapp_messages wm
             WHERE wm.thread_id = wt.id
+            AND wm.status NOT IN ('blocked', 'failed')
             ORDER BY wm.timestamp DESC
             LIMIT 1
         ) = 'in'
@@ -97,26 +95,36 @@ _RESET_ALERT_SQL = text("""
 
 
 def _send_alert_email(thread_id: int, customer_name: str, reason: str = "CE") -> None:
+    """Send unanswered-thread operational alert via Resend."""
+    from .resend_email import send_unanswered_alert
     s = get_settings()
-    if not s.smtp_host or not s.smtp_user or not s.smtp_password:
+    if not s.resend_api_key:
         logger.warning(
-            "unanswered_alert: SMTP not configured, skipping email for thread_id=%s", thread_id
+            "unanswered_alert: RESEND_API_KEY not configured, skipping email for thread_id=%s",
+            thread_id,
         )
         return
-    threshold_min = _ALERT_THRESHOLD_SECONDS // 60
-    body = (
-        f"Hilo #{thread_id} de {customer_name} "
-        f"lleva más de {threshold_min} minutos sin respuesta. ({reason})"
+    if not s.internal_booking_email_to:
+        logger.warning(
+            "unanswered_alert: INTERNAL_BOOKING_EMAIL_TO not configured, skipping email for thread_id=%s",
+            thread_id,
+        )
+        return
+    from_email = s.internal_booking_email_from or "notificaciones@ridecheck.ar"
+    ok = send_unanswered_alert(
+        api_key=s.resend_api_key,
+        from_email=from_email,
+        to_email=s.internal_booking_email_to,
+        thread_id=thread_id,
+        customer_name=customer_name,
+        threshold_minutes=_ALERT_THRESHOLD_SECONDS // 60,
+        reason=reason,
     )
-    msg = EmailMessage()
-    msg["Subject"] = f"Hilo #{thread_id} sin respuesta - {customer_name}"
-    msg["From"] = s.smtp_from or s.smtp_user
-    msg["To"] = _ALERT_EMAIL
-    msg.set_content(body)
-    with smtplib.SMTP(s.smtp_host, s.smtp_port, timeout=15) as conn:
-        conn.starttls()
-        conn.login(s.smtp_user, s.smtp_password)
-        conn.send_message(msg)
+    if not ok:
+        logger.error(
+            "unanswered_alert: Resend delivery failed for thread_id=%s reason=%s",
+            thread_id, reason,
+        )
 
 
 def reset_unanswered_alert(db: Session, thread_id: int) -> None:
@@ -193,6 +201,7 @@ def _run_check() -> None:
                         SELECT direction
                         FROM whatsapp_messages wm
                         WHERE wm.thread_id = wt.id
+                        AND wm.status NOT IN ('blocked', 'failed')
                         ORDER BY wm.timestamp DESC
                         LIMIT 1
                     ) = 'in'

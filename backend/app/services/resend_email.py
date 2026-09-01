@@ -371,6 +371,83 @@ def send_scheduling_handoff_notification(
         return False
 
 
+def send_unanswered_alert(
+    *,
+    api_key: str,
+    from_email: str,
+    to_email: str,
+    thread_id: int | str,
+    customer_name: str,
+    threshold_minutes: int,
+    reason: str = "CE",
+) -> bool:
+    """Send an unanswered-thread operational alert via Resend. Returns True on success."""
+    if not api_key:
+        logger.error(
+            "[alert] RESEND_API_KEY not set — unanswered alert not sent thread_id=%s", thread_id
+        )
+        return False
+    if not to_email:
+        logger.error(
+            "[alert] recipient not configured — unanswered alert not sent thread_id=%s", thread_id
+        )
+        return False
+
+    subject = f"Hilo #{thread_id} sin respuesta - {customer_name}"
+    body_text = (
+        f"Hilo #{thread_id} de {customer_name} "
+        f"lleva más de {threshold_minutes} minutos sin respuesta. ({reason})"
+    )
+    html_body = f"""<!DOCTYPE html>
+<html lang="es">
+<body style="font-family:Arial,sans-serif;font-size:14px;color:#333;max-width:600px;margin:0 auto;padding:20px;">
+<h2 style="color:#b45309;">⚠️ Hilo sin respuesta</h2>
+<p>{body_text}</p>
+<p style="font-size:12px;color:#888;">Origen: {reason}</p>
+</body>
+</html>"""
+
+    _payload: dict = {
+        "from": from_email,
+        "to": [to_email],
+        "subject": subject,
+        "html": html_body,
+    }
+    payload = json.dumps(_payload).encode("utf-8")
+
+    req = urlrequest.Request(
+        _RESEND_API_URL,
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "RideCheck-CRM/1.0",
+        },
+    )
+
+    try:
+        with urlrequest.urlopen(req, timeout=15) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+        logger.info(
+            "[alert] unanswered alert sent OK thread_id=%s reason=%s — %s",
+            thread_id, reason, body,
+        )
+        return True
+    except error.HTTPError as exc:
+        err_body = exc.read().decode("utf-8", errors="replace")
+        logger.error(
+            "[alert] unanswered alert HTTP error %s thread_id=%s: %s", exc.code, thread_id, err_body
+        )
+        return False
+    except error.URLError as exc:
+        logger.error("[alert] unanswered alert URL error thread_id=%s: %s", thread_id, exc.reason)
+        return False
+    except Exception as exc:  # noqa: BLE001
+        logger.error("[alert] unanswered alert unexpected error thread_id=%s: %s", thread_id, exc)
+        return False
+
+
 def send_human_review_notification(
     *,
     api_key: str,
