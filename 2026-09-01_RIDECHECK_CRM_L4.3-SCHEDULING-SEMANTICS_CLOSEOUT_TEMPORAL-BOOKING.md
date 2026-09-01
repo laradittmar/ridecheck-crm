@@ -153,6 +153,11 @@ Limits are 3–8× steady state: they contain a runaway container instead of let
 trigger a host-wide OOM that selects an arbitrary victim. Still open (tracked, not
 implemented here): n8n liveness + inbound-gap alerting via the proven Resend channel.
 
+**Auto-recovery proven in runtime (2026-09-01):** the n8n container's main process was
+SIGKILLed from the host — the exact kernel-OOM failure mode — and Docker restarted it
+automatically within ~2 s (`RestartCount` 0 → 1, status back to `running`). Before L4.3
+the same event left n8n dead and inbound WhatsApp traffic silently unprocessed.
+
 The scheduling defect is **not** attributed to the OOM, and no frozen gate was reopened
 because of it.
 
@@ -184,11 +189,12 @@ failures, unchanged by this work.
 
 | Item | Value |
 |---|---|
-| Image | `ridecheck-crm-backend:l4.3-sched-semantics` (rebuilt from this source) |
+| Image | `ridecheck-crm-backend:l4.3-sched-103dd01` (built from commit 103dd01) |
 | Target | crm_test only |
 | OUTBOUND | OFF (`OUTBOUND_ENABLED=false`) |
 | Booking Flow ID | `28104222025943520` pinned in the beta compose |
-| deployment_id | injected via `GIT_SHA` |
+| deployment_id | `103dd01ca7b5` (injected via `GIT_SHA`; was `unknown` in Wild A) |
+| Container hardening | backend/n8n 1 GB, postgres 768 MB, all `restart: unless-stopped`; n8n auto-recovery proven |
 | Wild A tester state | untouched — thread 2036 / lead 122 / candidate 130 preserved |
 
 ---
