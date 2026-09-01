@@ -260,14 +260,47 @@ Prove that the exact failure family that caused repeated Wild crashes has actual
 
 ---
 
-## L4 — Runtime Certification + Controlled Wild  ← NEXT
+## L4 — Runtime Certification + Controlled Wild  ← NEXT (PREFLIGHT DONE — IMAGE REMEDIATION REQUIRED)
 
 ### Objective
 Prove the complete system using the real WhatsApp tester.
 
 ### Phase A — Runtime proof
-Before enabling outbound:
+**PREFLIGHT COMPLETE (2026-09-01) — CONDITIONAL NO-GO**
 
+Preflight audit: `2026-09-01_RIDECHECK_CRM_L4-RUNTIME-WILD-PREFLIGHT_AUDIT_RUNTIME-CERTIFICATION.md`
+
+**BLOCKER-L4-01:** Running image is `l1-semantic-820f4d6`; required is `l2.1-email-3131f88`.
+Beta compose overlay was not applied at startup. Correct image exists locally.
+
+**Remediation (operator action):**
+```bash
+cd /opt/ridecheck-crm
+docker compose \
+  -f docker-compose.yml \
+  -f /opt/ridecheck-crm-release-candidate/docker-compose.beta.yml \
+  up -d --force-recreate backend
+```
+Then verify 4-file hashes match RC source and 104/104 gate smokes still PASS.
+
+**All other preflight criteria:**
+- crm_test confirmed ✓
+- WA token valid (HTTP 200 live ping) ✓
+- n8n ACTIVE, last execution success 2026-08-31 ✓
+- Control operational (auth-gated) ✓
+- Booking Flow private key present (1704 bytes) ✓
+- Outbound ledger baseline: last_id=5695, 0 non-tester sends ✓
+- OUTBOUND_ENABLED=false confirmed ✓
+- CONVERSATION_ENGINE_DIRECT_WEBHOOK_ENABLED not set (safe) ✓
+- CLOSED_BETA_ALLOWED_WA_IDS=5491153368330 active ✓
+- 104/104 frozen gate smokes PASS ✓
+- Tester state: QUOTED, focus=SUV_4X4_DEPORTIVO 2015 Sur/Berazategui, cycle_reset_pending=False
+
+**Pre-existing classified risks:**
+- App Secret empty (dev mode webhook skip) — ACCEPTED for tester-only Wild; allowlist compensates
+- 733 BLOCKER security events from path_id=None — pre-existing from l1 image; resolved by image upgrade
+
+Before enabling outbound after image upgrade:
 - correct image confirmed;
 - crm_test confirmed;
 - new token confirmed;
@@ -276,7 +309,6 @@ Before enabling outbound:
 - Booking Flow endpoint operational;
 - outbound ledger operational;
 - unauthorized-path endpoint operational;
-- tester cycle reset completed canonically;
 - tester-only outbound restriction active.
 
 ### App Secret policy
@@ -468,22 +500,28 @@ This remains an **external launch blocker**, not a reason to halt internal certi
 # 10. Current immediate next step
 
 ## NEXT ACTIVE GATE
-**L2 — Transport + Operations Integrity**
+**L4 — Runtime Certification + Controlled Wild**
 
-L1 is frozen.
+L1, L2, L3 are frozen.
 
-Do not start another Wild yet.
+**One operator action required before Wild can proceed:**
 
-L2 should now resolve:
+Deploy the certified image:
+```bash
+cd /opt/ridecheck-crm
+docker compose \
+  -f docker-compose.yml \
+  -f /opt/ridecheck-crm-release-candidate/docker-compose.beta.yml \
+  up -d --force-recreate backend
+```
 
-1. missing outbound path IDs;
-2. Control forensic UI completeness;
-3. email alert delivery;
-4. n8n runtime truth;
-5. transport attribution;
-6. runtime/image parity.
+After image upgrade:
+1. Verify 4-file hashes match RC source (buscando_followup.py, quote_followup.py, unanswered_alert.py, resend_email.py)
+2. Re-run 104/104 gate smokes
+3. Owner authorizes outbound (BETA_OUTBOUND_ENABLED=true)
+4. Wild session proceeds
 
-After L2 closes, move to L3 dirty-history certification.
+Full preflight details: `2026-09-01_RIDECHECK_CRM_L4-RUNTIME-WILD-PREFLIGHT_AUDIT_RUNTIME-CERTIFICATION.md`
 
 # 11. Status tracker
 
@@ -491,10 +529,10 @@ After L2 closes, move to L3 dirty-history certification.
 |---|---|---|
 | L1 Semantic Authority | **FROZEN — CONDITIONAL PASS** | YES |
 | L2 Transport + Operations | **FROZEN — PASS (2026-09-01)** | YES |
-| L3 Dirty-History Certification | **NEXT** | — |
-| L4 Runtime + Wild Certification | PENDING | NO |
+| L3 Dirty-History Certification | **FROZEN — PASS (2026-09-01)** | YES |
+| L4 Runtime + Wild Certification | **CONDITIONAL NO-GO — IMAGE REMEDIATION REQUIRED** | AFTER BLOCKER-L4-01 FIX |
 | L5 Production Launch Gate | PENDING | NO |
-| Meta App Secret | EXTERNAL BLOCKER | Does not block L2/L3 |
+| Meta App Secret | EXTERNAL BLOCKER | Does not block L4 tester-only Wild |
 
 # 12. Definition of launch-ready
 
