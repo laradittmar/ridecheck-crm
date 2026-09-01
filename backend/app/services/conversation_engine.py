@@ -74,9 +74,10 @@ from ..services.narrative_schema import (
     narrative_needs_ai,
 )
 from ..services.outbound_guard import OutboundBlockedError
+from ..services.outbound_path_registry import OutboundPathId
 from ..services.outbound_safety_gate import GateOutcome, OutboundSafetyGate
 from ..settings import Settings
-from ..ui.whatsapp_ui import _send_whatsapp_cloud_flow, _send_whatsapp_cloud_text
+from ..ui.whatsapp_ui import MetaSendError, _send_whatsapp_cloud_flow, _send_whatsapp_cloud_text
 
 logger = logging.getLogger(__name__)
 
@@ -777,6 +778,46 @@ _FAQ_REPORT_PROBE   = "informe"
 _FAQ_PRESENCE_PROBE = "presente"
 _FAQ_PAYMENT_PROBE  = "efectivo"
 
+# M21.4A: canonical acquisition source values
+_ACQ_INSTAGRAM    = "INSTAGRAM"
+_ACQ_FACEBOOK     = "FACEBOOK"
+_ACQ_GOOGLE       = "GOOGLE"
+_ACQ_GOOGLE_MAPS  = "GOOGLE_MAPS"
+_ACQ_WEBSITE      = "WEBSITE"
+_ACQ_REFERRAL     = "REFERRAL"
+_ACQ_DIRECT       = "DIRECT"
+_ACQ_OTHER        = "OTHER"
+
+# M21.4A: website tracking ref_code → canonical acquisition source
+# Values: ga (Google Analytics / Ads), ig (Instagram), fb (Facebook),
+#         org (organic), dir (direct), otro (other)
+_REF_CODE_SOURCE_MAP: dict[str, str] = {
+    "ga":   _ACQ_GOOGLE,
+    "ig":   _ACQ_INSTAGRAM,
+    "fb":   _ACQ_FACEBOOK,
+    "org":  _ACQ_DIRECT,
+    "dir":  _ACQ_DIRECT,
+    "otro": _ACQ_OTHER,
+}
+
+
+def _ctwa_to_acq_source(source_url: str, source_id: str | None, source_type: str | None) -> str | None:
+    """Map Meta CTWA referral fields to canonical acquisition source.
+
+    Deterministic only.  Returns None when evidence is ambiguous.
+    Never guesses — UNKNOWN is not returned here; caller keeps acq_source null.
+    """
+    url = (source_url or "").lower()
+    if "instagram.com" in url or "/instagram" in url:
+        return _ACQ_INSTAGRAM
+    if "facebook.com" in url or "fb.com" in url or "/facebook" in url:
+        return _ACQ_FACEBOOK
+    # Referral present but network not determinable from URL — non-null evidence exists
+    if source_url or source_id:
+        return _ACQ_OTHER
+    return None
+
+
 # WILD-04R-F5 D3: tipo_vehiculo alias normalization map.
 # SUV/4x4 and its variants are equivalent to SUV_4X4_DEPORTIVO (same price,
 # same catalog canonical).  Normalize on every candidate create/update so the
@@ -1243,7 +1284,7 @@ def _parse_website_form(texts: list[str]) -> dict | None:
     if ref_m:
         raw_ref = ref_m.group(1)
         # Store only if it matches the known client ref alphabet (allow unknown: preserve raw)
-        fields["ref"] = raw_ref[:10]  # cap at field max length; do not invent mapping
+        fields["ref"] = raw_ref[:30]  # cap at field max length; do not invent mapping
 
     _RC_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
     _RC_RE = re.compile(r"\bcod:\s*(RC-[" + _RC_ALPHABET + r"]{4})\b", re.IGNORECASE)
@@ -1358,33 +1399,32 @@ def _parse_scheduling_text(texts: list[str], today: date) -> tuple[str | None, s
                 except ValueError:
                     pass
 
-    # ── Time extraction ───────────────────────────────────────────────────
-    time_str: str | None = None
+    # ── Time extraction: rightmost match wins (SCHED-01 fix) ─────────────
+    # When a user corrects or references a prior time ("me dijiste hasta las
+    # 18hs. sábado a las 9 entonces"), the intended request appears LAST.
+    # re.finditer across all patterns + take the rightmost by character position.
+    _time_candidates: list[tuple[int, str]] = []  # (start_pos, "HH:MM")
 
-    # "12hs", "12h", "12 ha", "9:30hs", "9:30h"  (most common Argentine patterns)
-    # "ha" is a common WhatsApp typo for "hs" (e.g. "20 ha" → 20:00)
-    m = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*h(?:s|oras?|a)?\b", combined)
-    if m:
-        h, mi = int(m.group(1)), int(m.group(2) or 0)
-        if 0 <= h <= 23 and 0 <= mi <= 59:
-            time_str = f"{h:02d}:{mi:02d}"
+    for _m in re.finditer(r"\b(\d{1,2})(?::(\d{2}))?\s*h(?:s|oras?|a)?\b", combined):
+        _h, _mi = int(_m.group(1)), int(_m.group(2) or 0)
+        if 0 <= _h <= 23 and 0 <= _mi <= 59:
+            _time_candidates.append((_m.start(), f"{_h:02d}:{_mi:02d}"))
 
-    if not time_str:
-        # "las 12", "la 1", "a las 9:30"
-        m = re.search(r"\bla[s]?\s+(\d{1,2})(?::(\d{2}))?\b", combined)
-        if m:
-            h, mi = int(m.group(1)), int(m.group(2) or 0)
-            if 0 <= h <= 23 and 0 <= mi <= 59:
-                time_str = f"{h:02d}:{mi:02d}"
+    for _m in re.finditer(r"\bla[s]?\s+(\d{1,2})(?::(\d{2}))?\b", combined):
+        _h, _mi = int(_m.group(1)), int(_m.group(2) or 0)
+        if 0 <= _h <= 23 and 0 <= _mi <= 59:
+            _time_candidates.append((_m.start(), f"{_h:02d}:{_mi:02d}"))
 
-    if not time_str:
-        # Standalone "9:30", "12:00", or abbreviated "11:3" (single digit = tens: 3→30).
-        m = re.search(r"\b(\d{1,2}):(\d{1,2})\b", combined)
-        if m:
-            h, mi_raw = int(m.group(1)), int(m.group(2))
-            mi = mi_raw * 10 if len(m.group(2)) == 1 else mi_raw
-            if 0 <= h <= 23 and 0 <= mi <= 59:
-                time_str = f"{h:02d}:{mi:02d}"
+    for _m in re.finditer(r"\b(\d{1,2}):(\d{1,2})\b", combined):
+        _h = int(_m.group(1))
+        _mi_raw = int(_m.group(2))
+        _mi = _mi_raw * 10 if len(_m.group(2)) == 1 else _mi_raw
+        if 0 <= _h <= 23 and 0 <= _mi <= 59:
+            _time_candidates.append((_m.start(), f"{_h:02d}:{_mi:02d}"))
+
+    time_str: str | None = (
+        max(_time_candidates, key=lambda x: x[0])[1] if _time_candidates else None
+    )
 
     return day_iso, time_str
 
@@ -1422,6 +1462,7 @@ class _Context:
     candidates: list[WhatsAppThreadCandidate]
     db_messages: list[WhatsAppMessage]  # newest 20 active-cycle messages, chronological
     previous_processed_cursor: str | None = None  # set in _handle() before cursor overwrite
+    inbound_wa_message_id: str | None = None  # WILD-01 FINDING-03: causal inbound for dedup
 
 
 class ConversationEngine:
@@ -1545,6 +1586,8 @@ class ConversationEngine:
         # WILD-04R: capture previous cursor BEFORE overwrite (burst start discovery)
         previous_cursor = state.last_processed_inbound_wa_message_id
         ctx.previous_processed_cursor = previous_cursor
+        # WILD-01 FINDING-03: store inbound ID on ctx for causal dedup in gate calls
+        ctx.inbound_wa_message_id = event.wa_message_id
 
         state.last_processed_inbound_wa_message_id = event.wa_message_id
 
@@ -1564,6 +1607,9 @@ class ConversationEngine:
             # to any later turn in the same cycle.
             ctx.candidates = self._reload_active_candidates(ctx.thread.id, state)
             ctx.db_messages = self._query_active_messages(ctx.thread.id, state)
+
+        # M21.4A: populate attribution fields (first-write-only, no overwrite)
+        self._maybe_set_attribution(ctx, state)
 
         # Human takeover check — AFTER cycle reset which clears needs_human
         if state.needs_human:
@@ -1687,6 +1733,7 @@ class ConversationEngine:
             modelo=modelo,
             anio=anio,
             publication_url=publication_url,
+            zone_group=zone_group,
             appointment_approval_status="PENDING",
             appointment_approval_token=secrets.token_urlsafe(32),
         )
@@ -2213,6 +2260,7 @@ class ConversationEngine:
         if os.environ.get("OUTBOUND_ENABLED") != "true":
             OutboundSafetyGate(self.db).attempt(
                 wa_id=ctx.contact.wa_id, thread_id=ctx.thread.id, text=intro,
+                path_id=OutboundPathId.CE_FLOW.value,
             )
             self.db.commit()
             return _out("blocked_dispatch", detail="OUTBOUND_GATE_BLOCKED_KILL_SWITCH")
@@ -2249,6 +2297,7 @@ class ConversationEngine:
         if os.environ.get("OUTBOUND_ENABLED") != "true":
             OutboundSafetyGate(self.db).attempt(
                 wa_id=ctx.contact.wa_id, thread_id=ctx.thread.id, text=body,
+                path_id=OutboundPathId.CE_FLOW.value,
             )
             self.db.commit()
             return _out("blocked_dispatch", detail="OUTBOUND_GATE_BLOCKED_KILL_SWITCH")
@@ -2276,6 +2325,7 @@ class ConversationEngine:
                 wa_id=ctx.contact.wa_id,
                 thread_id=ctx.thread.id,
                 text=_COVERAGE_RESPONSE,
+                path_id=OutboundPathId.CE_TEXT.value,
             )
             self.db.commit()
             return _out("blocked_dispatch", detail="OUTBOUND_GATE_BLOCKED_KILL_SWITCH")
@@ -2335,6 +2385,7 @@ class ConversationEngine:
                 if os.environ.get("OUTBOUND_ENABLED") != "true":
                     OutboundSafetyGate(self.db).attempt(
                         wa_id=ctx.contact.wa_id, thread_id=ctx.thread.id, text=body,
+                        path_id=OutboundPathId.CE_FLOW.value,
                     )
                     self.db.commit()
                     return _out("blocked_dispatch", detail="OUTBOUND_GATE_BLOCKED_KILL_SWITCH")
@@ -2354,6 +2405,7 @@ class ConversationEngine:
                 if os.environ.get("OUTBOUND_ENABLED") != "true":
                     OutboundSafetyGate(self.db).attempt(
                         wa_id=ctx.contact.wa_id, thread_id=ctx.thread.id, text=reply,
+                        path_id=OutboundPathId.CE_TEXT.value,
                     )
                     self.db.commit()
                     return _out("blocked_dispatch", detail="OUTBOUND_GATE_BLOCKED_KILL_SWITCH")
@@ -2392,6 +2444,7 @@ class ConversationEngine:
                 if os.environ.get("OUTBOUND_ENABLED") != "true":
                     OutboundSafetyGate(self.db).attempt(
                         wa_id=ctx.contact.wa_id, thread_id=ctx.thread.id, text=body,
+                        path_id=OutboundPathId.CE_FLOW.value,
                     )
                     self.db.commit()
                     return _out("blocked_dispatch", detail="OUTBOUND_GATE_BLOCKED_KILL_SWITCH")
@@ -2410,6 +2463,7 @@ class ConversationEngine:
                 if os.environ.get("OUTBOUND_ENABLED") != "true":
                     OutboundSafetyGate(self.db).attempt(
                         wa_id=ctx.contact.wa_id, thread_id=ctx.thread.id, text=reply,
+                        path_id=OutboundPathId.CE_TEXT.value,
                     )
                     self.db.commit()
                     return _out("blocked_dispatch", detail="OUTBOUND_GATE_BLOCKED_KILL_SWITCH")
@@ -3034,7 +3088,8 @@ class ConversationEngine:
             and _cand_data.get("action") in ("create", "update")
         ):
             return self._motorcycle_human_handoff(ctx, state)  # AI path: no source_text
-        self._apply_candidate(ctx, _cand_data)
+        # FIX 2 (CL-07): pass zone_protected so AI cannot overwrite LR-3-written zone.
+        self._apply_candidate(ctx, _cand_data, zone_protected=_vehicle_location_written)
 
         # ── Catalog enforcement (post-AI) ─────────────────────────────────
         # If catalog found a vehicle, override the candidate's tipo_vehiculo
@@ -3104,21 +3159,31 @@ class ConversationEngine:
         # Sync thread state → candidate only when zone was set THIS turn (by the
         # pre-AI bare-locality path or by AI extraction). Never copy stale thread
         # zone that was set in a prior turn (LR-6/LR-7).
-        if focus_after and not _vehicle_location_written and _ai_set_zone:
+        if focus_after and _vehicle_location_written:
+            # WILD-01 fix (FINDING-01): LR-3 wrote directly to candidate when a
+            # current-focus candidate existed; state.home_zone_* may be stale from
+            # a prior turn. Only fill candidate gaps — never overwrite what LR-3 set.
+            if state.home_zone_group and not focus_after.zone_group:
+                focus_after.zone_group = state.home_zone_group
+            if state.home_zone_detail and not focus_after.zone_detail:
+                focus_after.zone_detail = state.home_zone_detail
+        elif focus_after and not _vehicle_location_written and _ai_set_zone:
             if state.home_zone_group and not focus_after.zone_group:
                 focus_after.zone_group = state.home_zone_group
             if state.home_zone_detail and not focus_after.zone_detail:
                 focus_after.zone_detail = state.home_zone_detail
 
         # Sync year onto focus candidate deterministically if AI missed it.
-        if focus_after and focus_after.anio is None:
+        if focus_after:
             _excl = str(focus_after.modelo) if focus_after.modelo is not None else None
-            # WILD-03-X guard: year sync is only safe when evidence is unambiguous.
+            # WILD-01 fix (FINDING-02): run year sync even when candidate already has
+            # a year from a prior session, if current turn carries exactly one
+            # unambiguous year.  Customer explicitly stated the year → override stale.
             # Priority 1: current-turn year tokens (highest confidence — user just said this).
-            #   Exactly one effective year in current turn → commit from current turn.
+            #   Exactly one effective year in current turn → commit unconditionally.
             #   2+ effective years in current turn → explicitly ambiguous, no sync.
             # Priority 2: historical context (all_recent_text) — only when current turn
-            #   carries zero years AND the full context has at most one effective year.
+            #   carries zero years AND candidate lacks a year.
             #   2+ effective years in history (e.g. "2008 o 2014" from a prior turn) →
             #   no sync, even if the vehicle is now known, because the original ambiguity
             #   was never resolved by the customer.
@@ -3130,12 +3195,12 @@ class ConversationEngine:
             _ct_effective = _ct_year_tokens - {_excl} if _excl else _ct_year_tokens
 
             if len(_ct_effective) == 1:
-                # Current turn: exactly one unambiguous year → commit from current turn.
+                # Current turn: exactly one unambiguous year → commit, overriding stale.
                 year_hit = _extract_year_from_text(current_turn_text, exclude_token=_excl)
                 if year_hit:
                     focus_after.anio = year_hit
-            elif len(_ct_effective) == 0:
-                # Current turn has no year → check historical context.
+            elif len(_ct_effective) == 0 and focus_after.anio is None:
+                # No year in current turn AND candidate lacks one → check historical context.
                 _all_year_tokens = {
                     m.group(1) for m in _VEHICLE_YEAR_RE.finditer(all_recent_text or "")
                 }
@@ -3281,7 +3346,12 @@ class ConversationEngine:
             # and the AI transitions from QUOTED→SCHEDULING in the same turn.
             det_day, det_time = _parse_scheduling_text(ai_input_messages, date.today())
             pday = det_day or state.preferred_day or state.active_requested_date
-            ptime = det_time or extracted.get("preferred_time_str") or state.preferred_time
+            # FIX 3 (RISK-04): when a NEW deterministic day is established this turn,
+            # do not inherit a stale state.preferred_time from a prior scheduling attempt.
+            # The time must come from the current turn; stale time + new day = wrong slot.
+            ptime = det_time or extracted.get("preferred_time_str") or (
+                None if det_day else state.preferred_time
+            )
             if pday and ptime:
                 result = self._try_schedule_and_flow(ctx, state, pday, ptime, decision.get("reply") or "")
                 if result is not None:
@@ -4991,6 +5061,22 @@ Respondé SOLO con JSON válido:
             cand_query = cand_query.where(
                 WhatsAppThreadCandidate.created_at >= state.current_cycle_started_at
             )
+        else:
+            # FIX 4 (CL-04): null watermark — load all candidates (pre-watermark behavior).
+            # Threads with no cycle reset have no watermark; loading all candidates is safe
+            # because _execute_cycle_reset archives prior-cycle candidates and clears state.
+            # The cycle reset mechanism is the correct guard for cross-cycle contamination.
+            # A null watermark on a thread that HAS had a cycle reset indicates a migration
+            # gap; log a warning so it is visible in forensics.
+            if (
+                state is not None
+                and state.last_processed_inbound_wa_message_id is not None
+                and state.current_focus_candidate_id is not None
+            ):
+                logger.debug(
+                    "L1 CL-04 null watermark with prior activity thread_id=%s — loading all candidates (pre-watermark path)",
+                    thread_id,
+                )
         candidates = list(self.db.execute(cand_query).scalars().all())
 
         # WILD-04R: apply cycle watermark to messages + fix ordering (newest-20 reversed)
@@ -5004,6 +5090,71 @@ Respondé SOLO con JSON válido:
             candidates=candidates,
             db_messages=db_messages,
         )
+
+    # ── M21.4A: Attribution helper ────────────────────────────────────────────
+
+    def _maybe_set_attribution(self, ctx: "_Context", state: "WhatsAppThreadState") -> None:
+        """Populate lead.inbound_channel and lead.acq_source from available evidence.
+
+        First-write-only for both fields.  Called once per handle() invocation after
+        the lead is confirmed present.  Does NOT clear or overwrite existing values.
+        Does NOT set acq_source when evidence is absent (leaves it null = unknown).
+        Cycle reset does not invoke this method — attribution persists across cycles.
+        """
+        lead = ctx.lead
+        if lead is None:
+            return
+
+        # Propagate thread.inbound_channel → lead.inbound_channel (display copy)
+        if not getattr(lead, "inbound_channel", None):
+            thread_ch = getattr(ctx.thread, "inbound_channel", None)
+            if thread_ch:
+                lead.inbound_channel = thread_ch
+                logger.debug(
+                    "M21.4A inbound_channel propagated thread_id=%s channel=%s",
+                    ctx.thread.id, thread_ch,
+                )
+
+        # acq_source: first-write-only, evidence-based, deterministic only
+        if getattr(lead, "acq_source", None):
+            return  # already set — preserve original acquisition source
+
+        # Priority 1: website tracking ref_code (most specific — from tracking.js)
+        ref = (getattr(lead, "ref_code", None) or "").strip().lower()
+        if ref:
+            mapped = _REF_CODE_SOURCE_MAP.get(ref)
+            if mapped:
+                lead.acq_source = mapped
+                logger.info(
+                    "M21.4A acq_source from ref_code thread_id=%s ref=%s source=%s",
+                    ctx.thread.id, ref, mapped,
+                )
+                return
+
+        # Priority 2: Meta CTWA referral from thread (first-message referral object)
+        ctwa_url = (getattr(ctx.thread, "ctwa_source_url", None) or "").strip()
+        ctwa_id = getattr(ctx.thread, "ctwa_source_id", None)
+        ctwa_type = (getattr(ctx.thread, "ctwa_source_type", None) or "").strip()
+        if ctwa_url or ctwa_id:
+            src = _ctwa_to_acq_source(ctwa_url, ctwa_id, ctwa_type)
+            if src:
+                lead.acq_source = src
+                logger.info(
+                    "M21.4A acq_source from CTWA thread_id=%s source_type=%s resolved=%s",
+                    ctx.thread.id, ctwa_type or "-", src,
+                )
+                return
+
+        # Priority 3: website lead without ref_code — source is WEBSITE
+        if getattr(state, "is_website_lead", False):
+            lead.acq_source = _ACQ_WEBSITE
+            logger.info(
+                "M21.4A acq_source=WEBSITE from is_website_lead thread_id=%s",
+                ctx.thread.id,
+            )
+            return
+
+        # No deterministic evidence — leave acq_source null (unknown)
 
     def _query_active_messages(
         self, thread_id: int, state: WhatsAppThreadState | None
@@ -5240,15 +5391,34 @@ Respondé SOLO con JSON válido:
         )
 
     def _focus_candidate(self, ctx: _Context) -> WhatsAppThreadCandidate | None:
+        # FIX 5 (CL-05): explicit, non-arbitrary focus resolution.
         state = ctx.state
         if state and state.current_focus_candidate_id:
             for c in ctx.candidates:
                 if c.id == state.current_focus_candidate_id:
                     return c
+            # Stored ID not in active-cycle candidates — stale cross-cycle reference; clear it.
+            logger.warning(
+                "L1 CL-05 stale current_focus_candidate_id=%s thread_id=%s — clearing",
+                state.current_focus_candidate_id,
+                ctx.thread.id if ctx.thread else "?",
+            )
+            state.current_focus_candidate_id = None
         for c in ctx.candidates:
             if c.status == "current_focus":
                 return c
-        return ctx.candidates[0] if ctx.candidates else None
+        # Unambiguous single-candidate fallback (documented, not nondeterministic).
+        if len(ctx.candidates) == 1:
+            return ctx.candidates[0]
+        # Multiple candidates without an explicit focus — ambiguous; return None so
+        # callers receive a definitive signal instead of an arbitrary selection.
+        if len(ctx.candidates) > 1:
+            logger.warning(
+                "L1 CL-05 ambiguous focus: %d candidates, none is current_focus thread_id=%s",
+                len(ctx.candidates),
+                ctx.thread.id if ctx.thread else "?",
+            )
+        return None
 
     def _handle_deferred_interest(
         self, ctx: "_Context", state: "WhatsAppThreadState"
@@ -5286,8 +5456,23 @@ Respondé SOLO con JSON válido:
                 ctx.thread.id, exc,
             )
 
+    # ── Semantic authority hierarchy (L1-SEMANTIC-AUTHORITY) ────────────────
+    # Canonical precedence for all state/candidate field writes (highest → lowest):
+    #   1. CURRENT INBOUND EXPLICIT EVIDENCE — LR-3 zone, deterministic year/date parse
+    #   2. CURRENT BURST CORRECTION — explicit customer correction detected this turn
+    #   3. ACTIVE-CYCLE CANONICAL — established candidate field / cycle-scoped state
+    #   4. ACTIVE-CYCLE FALLBACK — state.home_zone_* when candidate has no zone
+    #   5. HISTORICAL — prior-cycle data; MUST NOT overwrite any of the above
+    # AI may interpret and propose but must not overwrite deterministic current-turn facts.
+    # _fill_if_absent pattern: write only when target field is currently falsy.
+    # ──────────────────────────────────────────────────────────────────────────
+
     def _apply_extracted(self, ctx: _Context, state: WhatsAppThreadState, extracted: dict) -> None:
-        if extracted.get("customer_name"):
+        # Semantic authority: AI fills missing values only.  Fields already written
+        # by deterministic extraction (LR-3, _parse_scheduling_text, prior customer
+        # statement) are NOT overwritten by AI interpretation.
+        # FIX 6 (RISK-01): customer_name is set once (first-write-wins, mirrors lead.nombre guard).
+        if extracted.get("customer_name") and not state.customer_name:
             state.customer_name = extracted["customer_name"]
             if ctx.lead and not ctx.lead.nombre:
                 ctx.lead.nombre = extracted["customer_name"].split()[0]
@@ -5297,7 +5482,9 @@ Respondé SOLO con JSON válido:
             state.home_zone_detail = extracted["zone_detail"]
         # zone_group is intentionally NOT read from AI — DB normalization always
         # sets the canonical value in _normalize_zone_from_db.
-        if extracted.get("preferred_day_iso"):
+        # FIX 3 (RISK-02): scheduling fields are fill-if-absent only; deterministic
+        # parse (_parse_scheduling_text) in the scheduling block is authoritative.
+        if extracted.get("preferred_day_iso") and not state.preferred_day:
             raw_day = str(extracted["preferred_day_iso"]).strip()
             try:
                 date.fromisoformat(raw_day)  # validate before storing
@@ -5307,7 +5494,7 @@ Respondé SOLO con JSON válido:
                     "M18 ignoring malformed preferred_day_iso=%r thread_id=%s",
                     raw_day, ctx.thread.id,
                 )
-        if extracted.get("preferred_time_str"):
+        if extracted.get("preferred_time_str") and not state.preferred_time:
             raw_time = str(extracted["preferred_time_str"]).strip()
             if re.match(r"^\d{1,2}:\d{2}$", raw_time):  # must be "HH:MM", max 5 chars
                 state.preferred_time = raw_time
@@ -5317,7 +5504,7 @@ Respondé SOLO con JSON válido:
                     raw_time, ctx.thread.id,
                 )
 
-    def _apply_candidate(self, ctx: _Context, candidate_data: dict) -> None:
+    def _apply_candidate(self, ctx: _Context, candidate_data: dict, *, zone_protected: bool = False) -> None:
         action = candidate_data.get("action", "none")
         if action == "none" or not candidate_data:
             return
@@ -5378,11 +5565,10 @@ Respondé SOLO con JSON válido:
             candidate = WhatsAppThreadCandidate(thread_id=ctx.thread.id, status=status, **fields)
             self.db.add(candidate)
             self.db.flush()
-            # Inherit pre-candidate vehicle-location fallback when AI didn't supply zone.
-            if state and not candidate.zone_group and state.home_zone_group:
-                candidate.zone_group = state.home_zone_group
-            if state and not candidate.zone_detail and state.home_zone_detail:
-                candidate.zone_detail = state.home_zone_detail
+            # FIX 1 (RISK-03): Do NOT inherit stale state.home_zone_* here.
+            # Zone is filled by LR-3 (explicit vehicle-location in current turn) or by
+            # the post-AI gap-fill block when LR-3 wrote to state this same turn.
+            # Historical state zones from prior sessions must not contaminate new candidates.
             if status == "current_focus" and state:
                 for c in ctx.candidates:
                     if c.status == "current_focus":
@@ -5397,9 +5583,15 @@ Respondé SOLO con JSON válido:
                 target_id = int(raw_id)
                 target = next((c for c in ctx.candidates if c.id == target_id), None)
             else:
-                # AI omitted id — fall back to the current focus candidate.
+                # FIX 7 (RISK-05): AI omitted id — only proceed when focus is unambiguous.
                 target = self._focus_candidate(ctx)
-                target_id = target.id if target else None
+                if target is None:
+                    logger.warning(
+                        "L1 RISK-05 AI update missing candidate id, focus ambiguous thread_id=%s — skipping",
+                        ctx.thread.id if ctx.thread else "?",
+                    )
+                    return
+                target_id = target.id
             # Type-safety: if the resolved candidate has an established tipo_vehiculo
             # that is incompatible with the new one (e.g. MOTO vs AUTO), redirect to
             # create rather than corrupting the existing candidate's identity.
@@ -5431,6 +5623,11 @@ Respondé SOLO con JSON válido:
             for k in ("marca", "modelo", "version_text", "anio", "tipo_vehiculo",
                        "zone_group", "zone_detail", "direccion_texto"):
                 if candidate_data.get(k) is not None:
+                    # FIX 2 (CL-07): zone fields are protected when LR-3 already wrote
+                    # an authoritative location this turn.  AI may propose but must not
+                    # overwrite deterministic current-turn vehicle-location evidence.
+                    if zone_protected and k in ("zone_group", "zone_detail"):
+                        continue
                     val = candidate_data[k]
                     # WILD-04R-F5 D3: normalize tipo_vehiculo alias on update
                     if k == "tipo_vehiculo":
@@ -5513,21 +5710,21 @@ Respondé SOLO con JSON válido:
     ) -> None:
         _model_str = str(match.modelo) if match.modelo is not None else None
         anio = _extract_year_from_text(source_text, exclude_token=_model_str) if source_text else None
-        # M21.1.3 LR-7 (updated): inherit pre-candidate vehicle-location fallback from
-        # state.home_zone_* when set — these fields now buffer explicit vehicle-location
-        # evidence accumulated before a candidate existed.  This is distinct from a
-        # stale residential zone.  Current-turn zone detection (which follows this call
-        # in _process_text) remains authoritative and may still overwrite.
-        _init_zone_group = state.home_zone_group if state else None
-        _init_zone_detail = state.home_zone_detail if state else None
+        # FIX 1 (RISK-03): create with zone_group=None / zone_detail=None.
+        # Prior state.home_zone_* MUST NOT be inherited here — it may be stale data
+        # from a prior session.  Zone is filled by one of two authoritative paths:
+        #   - LR-3 runs AFTER this call and writes directly to the candidate when zone
+        #     evidence is present in the current turn.
+        #   - The post-AI gap-fill block at line ~3161 copies state zone to candidate
+        #     only when _vehicle_location_written is True (zone was written THIS turn).
         candidate = WhatsAppThreadCandidate(
             thread_id=ctx.thread.id,
             marca=match.marca,
             modelo=match.modelo,
             tipo_vehiculo=match.tipo_vehiculo,
             anio=anio,
-            zone_group=_init_zone_group,
-            zone_detail=_init_zone_detail,
+            zone_group=None,
+            zone_detail=None,
             status="current_focus",
         )
         self.db.add(candidate)
@@ -5777,6 +5974,14 @@ Respondé SOLO con JSON válido:
           2. state.home_zone_* — fallback when candidate has no zone data
           3. (None, None) — no location available anywhere
 
+        FIX 9 (quote protection) note: the state fallback is safe because
+        _execute_cycle_reset clears state.home_zone_* on every cycle boundary.
+        After a proper reset, state zone is None for a fresh cycle, so a new
+        candidate with zone=None correctly yields (None, None) here, causing
+        F5.1 to append the location question.  Threads that never reset may
+        still see a stale state fallback (pre-existing limitation; requires
+        cycle reset to resolve).
+
         Never call state.home_zone_detail directly for customer-facing output;
         use this accessor instead so pricing and display always agree.
         """
@@ -5840,8 +6045,14 @@ Respondé SOLO con JSON válido:
         from zoneinfo import ZoneInfo
         now_utc = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
         wa_id = ctx.contact.wa_id
+        from .outbound_path_registry import OutboundPathId, get_deployment_id
         gate = OutboundSafetyGate(self.db)
-        result = gate.attempt(wa_id=wa_id, thread_id=ctx.thread.id, text=text, now=now_utc)
+        result = gate.attempt(
+            wa_id=wa_id, thread_id=ctx.thread.id, text=text, now=now_utc,
+            path_id=OutboundPathId.CE_TEXT.value,
+            deployment_id=get_deployment_id(),
+            causal_inbound_wa_message_id=ctx.inbound_wa_message_id,
+        )
         if result.outcome != GateOutcome.ALLOWED:
             raise OutboundBlockedError(
                 sender_path="engine._send_text_to_wa", kind="text",
@@ -5852,6 +6063,13 @@ Respondé SOLO con JSON válido:
         try:
             wa_message_id, _ = _send_whatsapp_cloud_text(to_wa_id=wa_id, text=text)
             gate.mark_sent(result.message_id, wa_message_id)
+        except MetaSendError as exc:
+            logger.error("M18 send_text MetaSendError thread_id=%s: %s", ctx.thread.id, exc)
+            gate.mark_failed(
+                result.message_id,
+                meta_http_status=exc.http_status,
+                meta_error_payload=exc.to_payload(),
+            )
         except Exception as exc:
             logger.error("M18 send_text failed thread_id=%s: %s", ctx.thread.id, exc)
             gate.mark_failed(result.message_id)
@@ -5875,8 +6093,15 @@ Respondé SOLO con JSON válido:
         wa_id = ctx.contact.wa_id
 
         # Safety gate: pre-send audit + duplicate/flood checks.
+        from .outbound_path_registry import OutboundPathId, get_deployment_id
         gate = OutboundSafetyGate(self.db)
-        result = gate.attempt(wa_id=wa_id, thread_id=ctx.thread.id, text=body_text, message_type="flow", now=now_utc)
+        result = gate.attempt(
+            wa_id=wa_id, thread_id=ctx.thread.id, text=body_text,
+            message_type="flow", now=now_utc,
+            path_id=OutboundPathId.CE_FLOW.value,
+            deployment_id=get_deployment_id(),
+            causal_inbound_wa_message_id=ctx.inbound_wa_message_id,
+        )
         if result.outcome != GateOutcome.ALLOWED:
             raise OutboundBlockedError(
                 sender_path="engine._send_flow_button",
@@ -5896,6 +6121,13 @@ Respondé SOLO con JSON válido:
                 initial_screen=initial_screen,
             )
             gate.mark_sent(result.message_id, wa_message_id)
+        except MetaSendError as exc:
+            gate.mark_failed(
+                result.message_id,
+                meta_http_status=exc.http_status,
+                meta_error_payload=exc.to_payload(),
+            )
+            raise
         except Exception:
             gate.mark_failed(result.message_id)
             raise  # caller can revert state on flow-send failure

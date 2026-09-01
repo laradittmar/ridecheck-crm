@@ -33,6 +33,56 @@ logger = logging.getLogger(__name__)
 _AR_TZ = ZoneInfo("America/Argentina/Buenos_Aires")
 
 
+class MetaSendError(Exception):
+    """Raised when the Meta WhatsApp Cloud API returns an error or unexpected response.
+
+    Carries structured error details that the outbound safety gate persists to the
+    DB so failures are attributable after container recreation.
+    """
+
+    def __init__(
+        self,
+        http_status: int | None,
+        raw_body: str = "",
+        error_message: str = "",
+    ) -> None:
+        self.http_status = http_status
+        self.raw_body = raw_body
+        self.error_message = error_message
+        # Parse Meta error envelope if present
+        self.meta_error_code: int | None = None
+        self.meta_error_type: str | None = None
+        self.meta_error_subcode: int | None = None
+        self.fbtrace_id: str | None = None
+        try:
+            data = json.loads(raw_body) if raw_body.strip() else {}
+            err = data.get("error", {}) if isinstance(data, dict) else {}
+            if isinstance(err, dict):
+                self.meta_error_code = err.get("code")
+                self.meta_error_type = err.get("type")
+                self.meta_error_subcode = err.get("error_subcode")
+                self.fbtrace_id = err.get("fbtrace_id")
+                if not error_message and err.get("message"):
+                    self.error_message = err["message"]
+        except Exception:
+            pass
+        super().__init__(
+            f"MetaSendError HTTP={http_status} code={self.meta_error_code} "
+            f"type={self.meta_error_type}: {self.error_message or raw_body[:200]}"
+        )
+
+    def to_payload(self) -> dict:
+        """Safe serialisable dict — excludes tokens and auth headers."""
+        return {
+            "http_status": self.http_status,
+            "meta_error_code": self.meta_error_code,
+            "meta_error_type": self.meta_error_type,
+            "meta_error_subcode": self.meta_error_subcode,
+            "fbtrace_id": self.fbtrace_id,
+            "error_message": self.error_message[:500] if self.error_message else None,
+        }
+
+
 def _to_ar(dt: datetime | None) -> datetime | None:
     """Convert a UTC datetime (naive or aware) to Argentina local time."""
     if dt is None:
@@ -121,7 +171,10 @@ def _send_whatsapp_cloud_text(to_wa_id: str, text: str) -> tuple[str, int]:
     except error.HTTPError as exc:
         err_body = exc.read().decode("utf-8", errors="replace")
         logger.error("WHATSAPP_OUTBOUND_RESPONSE status=%s body=%s", exc.code, err_body)
-        raise RuntimeError(f"HTTP {exc.code}: {err_body}") from exc
+        raise MetaSendError(exc.code, err_body) from exc
+    except OSError as exc:
+        logger.error("WHATSAPP_OUTBOUND_TIMEOUT/NETWORK: %s", exc)
+        raise MetaSendError(None, str(exc)) from exc
 
     logger.info("WHATSAPP_OUTBOUND_RESPONSE status=%s", status_code)
     response_data = json.loads(body) if body.strip() else {}
@@ -131,7 +184,7 @@ def _send_whatsapp_cloud_text(to_wa_id: str, text: str) -> tuple[str, int]:
         if wa_message_id:
             logger.info("WHATSAPP_OUTBOUND_WAMID to=%s wamid=%s", to_wa_id, wa_message_id)
             return wa_message_id, status_code
-    raise RuntimeError(f"Unexpected response from WhatsApp Cloud API: {body}")
+    raise MetaSendError(status_code, body, error_message="Unexpected response: no messages[0].id")
 
 
 def _send_whatsapp_cloud_interactive(
@@ -333,7 +386,10 @@ def _send_whatsapp_cloud_flow(
     except error.HTTPError as exc:
         err_body = exc.read().decode("utf-8", errors="replace")
         logger.error("WHATSAPP_OUTBOUND_FLOW_RESPONSE status=%s body=%s", exc.code, err_body)
-        raise RuntimeError(f"HTTP {exc.code}: {err_body}") from exc
+        raise MetaSendError(exc.code, err_body) from exc
+    except OSError as exc:
+        logger.error("WHATSAPP_OUTBOUND_FLOW_TIMEOUT/NETWORK: %s", exc)
+        raise MetaSendError(None, str(exc)) from exc
 
     logger.info("WHATSAPP_OUTBOUND_FLOW_RESPONSE status=%s", status_code)
     response_data = json.loads(body) if body.strip() else {}
@@ -343,7 +399,7 @@ def _send_whatsapp_cloud_flow(
         if wa_message_id:
             logger.info("WHATSAPP_OUTBOUND_FLOW_WAMID to=%s wamid=%s", to_wa_id, wa_message_id)
             return wa_message_id, status_code
-    raise RuntimeError(f"Unexpected flow response from WhatsApp Cloud API: {body}")
+    raise MetaSendError(status_code, body, error_message="Unexpected flow response: no messages[0].id")
 
 
 def _avatar_initials(display_name: str | None) -> str:
@@ -582,7 +638,7 @@ def _render_whatsapp_shell(user_email: str, title: str, body_html: str) -> str:
     sidebar_html = """
       <aside class="sidebar" id="sidebar">
         <div class="brandRow">
-          <div class="brandText">RIDECHECK</div>
+          <img class="brandLogo" src="/static/branding/ridecheck-logo.jpg" alt="RideCheck">
           <button class="sidebarToggle" type="button" onclick="toggleSidebar()" title="Collapse sidebar">%s</button>
         </div>
         %s
@@ -1599,6 +1655,28 @@ def _render_whatsapp_shell(user_email: str, title: str, body_html: str) -> str:
               wireMessageMenus(app);
               wireAudioPlayers(app);
               var isThreadView = !!(app.getAttribute("data-wa-current-thread-id") || "").trim();
+              if (isThreadView) {
+                var scrollEl = app.querySelector(".wa-chat-scroll");
+                if (scrollEl) {
+                  var tid = (app.getAttribute("data-wa-current-thread-id") || "").trim();
+                  var NK = "wa_nb_" + tid;
+                  var savedNear = sessionStorage.getItem(NK);
+                  if (savedNear === "0") {
+                    var pct = parseFloat(sessionStorage.getItem(NK + "p") || "0");
+                    if (pct > 0) scrollEl.scrollTop = pct * scrollEl.scrollHeight;
+                  } else {
+                    scrollEl.scrollTop = scrollEl.scrollHeight;
+                  }
+                  scrollEl.addEventListener("scroll", function(){
+                    var dist = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight;
+                    var nb = dist < 120;
+                    sessionStorage.setItem(NK, nb ? "1" : "0");
+                    if (!nb) sessionStorage.setItem(NK + "p", String(scrollEl.scrollTop / scrollEl.scrollHeight));
+                  }, { passive: true });
+                  var composeForm = app.querySelector(".wa-compose-form");
+                  if (composeForm) composeForm.addEventListener("submit", function(){ sessionStorage.removeItem(NK); sessionStorage.removeItem(NK + "p"); });
+                }
+              }
               if (isThreadView && (!app.querySelector(".wa-compose-form") || !app.querySelector(".wa-compose-input"))) {
                 waInitWarnOnce("WhatsApp init failed: composer nodes missing", app);
               }

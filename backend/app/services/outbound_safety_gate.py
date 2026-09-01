@@ -111,6 +111,7 @@ class GateOutcome(str, Enum):
     BLOCKED_DUPLICATE = "blocked_duplicate"
     BLOCKED_FLOOD = "blocked_flood"
     BLOCKED_KILL_SWITCH = "blocked_kill_switch"
+    BLOCKED_UNAUTHORIZED_PATH = "blocked_unauthorized_path"
 
 
 @dataclass
@@ -171,6 +172,12 @@ class OutboundSafetyGate:
         text: str,
         message_type: str = "text",
         now: Optional[datetime] = None,
+        # M2: authorized path attribution
+        path_id: Optional[str] = None,
+        deployment_id: Optional[str] = None,
+        correlation_id: Optional[str] = None,
+        # WILD-01 FINDING-03: causal inbound identity for dedup
+        causal_inbound_wa_message_id: Optional[str] = None,
     ) -> GateResult:
         """Check all gates and persist a pre-send audit record.
 
@@ -187,7 +194,20 @@ class OutboundSafetyGate:
             from zoneinfo import ZoneInfo
             now = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
 
+        if deployment_id is None:
+            from .outbound_path_registry import get_deployment_id as _gdid
+            deployment_id = _gdid()
+
         fp = _content_fingerprint(text)
+
+        # ── -1. Authorized path check — dedicated gate session ───────────────
+        path_result = self._check_authorized_path(
+            wa_id=wa_id, thread_id=thread_id, text=text, fp=fp,
+            message_type=message_type, now=now, path_id=path_id,
+            deployment_id=deployment_id,
+        )
+        if path_result is not None:
+            return path_result
 
         # ── 0. Kill switch — dedicated gate session ──────────────────────────
         kill_result = self._check_kill_switch(
@@ -215,6 +235,7 @@ class OutboundSafetyGate:
             dedup_result = self._check_dedup(
                 gate_db, wa_id=wa_id, thread_id=thread_id,
                 fp=fp, message_type=message_type, now=now, text_content=text,
+                causal_inbound_wa_message_id=causal_inbound_wa_message_id,
             )
             if dedup_result is not None:
                 return dedup_result  # gate_db already committed inside _check_dedup
@@ -226,6 +247,7 @@ class OutboundSafetyGate:
                 message_kind=message_type,
                 content_fingerprint=fp,
                 created_at=now,
+                causal_inbound_wa_message_id=causal_inbound_wa_message_id,
             )
             pending = WhatsAppMessage(
                 thread_id=thread_id,
@@ -237,6 +259,9 @@ class OutboundSafetyGate:
                 text=text,
                 automated=True,
                 content_fingerprint=fp,
+                path_id=path_id,
+                deployment_id=deployment_id,
+                correlation_id=correlation_id,
             )
             gate_db.add(dedup_entry)
             gate_db.add(pending)
@@ -270,11 +295,18 @@ class OutboundSafetyGate:
                 msg.thread_id, message_id, wa_message_id or "-",
             )
 
-    def mark_failed(self, message_id: int) -> None:
+    def mark_failed(
+        self,
+        message_id: int,
+        meta_http_status: Optional[int] = None,
+        meta_error_payload: Optional[dict] = None,
+    ) -> None:
         """Update the pending record to 'failed' after a Meta API call error.
 
-        The dedup entry is NOT removed — gate blocks automatic retries within the
-        10-minute window.  Uses a dedicated gate session.
+        Persists meta_http_status and meta_error_payload so delivery failures
+        survive container recreation without relying on ephemeral Docker logs.
+        The dedup entry is NOT removed — gate blocks automatic retries within
+        the 10-minute window.  Uses a dedicated gate session.
         """
         with self._gate_db() as gate_db:
             msg = gate_db.get(WhatsAppMessage, message_id)
@@ -282,11 +314,15 @@ class OutboundSafetyGate:
                 logger.warning("OUTBOUND_GATE mark_failed: message_id=%s not found", message_id)
                 return
             msg.status = "failed"
+            if meta_http_status is not None and hasattr(msg, "meta_http_status"):
+                msg.meta_http_status = meta_http_status
+            if meta_error_payload is not None and hasattr(msg, "meta_error_payload"):
+                msg.meta_error_payload = meta_error_payload
             gate_db.commit()
             logger.error(
-                "OUTBOUND_GATE_FAILED thread_id=%s message_id=%s — "
+                "OUTBOUND_GATE_FAILED thread_id=%s message_id=%s http=%s — "
                 "dedup entry retained to block automatic retries within the 10-min window",
-                msg.thread_id, message_id,
+                msg.thread_id, message_id, meta_http_status or "-",
             )
 
     # ── Private gate checks ───────────────────────────────────────────────────
@@ -321,6 +357,100 @@ class OutboundSafetyGate:
             nested.commit()
         except Exception:
             nested.rollback()  # SQLite: FOR UPDATE not supported — graceful no-op
+
+    def _check_authorized_path(
+        self,
+        wa_id: str,
+        thread_id: int,
+        text: str,
+        fp: str,
+        message_type: str,
+        now: datetime,
+        path_id: Optional[str],
+        deployment_id: Optional[str],
+    ) -> Optional[GateResult]:
+        """Block and record a SecurityEvent when path_id is missing or unregistered.
+
+        Returns a GateResult(BLOCKED_UNAUTHORIZED_PATH) if the attempt should be
+        rejected, or None if the path is valid and the gate should continue.
+
+        Uses a dedicated gate session so the SecurityEvent and blocked audit
+        survive caller rollback.
+        """
+        from .outbound_path_registry import AUTHORIZED_PATHS, LEGACY_PATHS, OutboundPathId
+        from .security_events import SecurityEventType, SecuritySeverity, create_security_event
+
+        # Determine event type before entering the session.
+        if path_id is None:
+            evt_type = SecurityEventType.OUTBOUND_ATTEMPT_WITH_UNKNOWN_SOURCE
+            severity = SecuritySeverity.BLOCKER
+            reason = "UNAUTHORIZED_PATH: path_id not provided"
+        elif path_id in LEGACY_PATHS:
+            evt_type = SecurityEventType.LEGACY_SENDER_REACHED
+            severity = SecuritySeverity.BLOCKER
+            reason = f"UNAUTHORIZED_PATH: legacy send path '{path_id}' is retired"
+        else:
+            try:
+                pid_enum = OutboundPathId(path_id)
+            except ValueError:
+                pid_enum = None
+            if pid_enum not in AUTHORIZED_PATHS:
+                evt_type = SecurityEventType.UNREGISTERED_OUTBOUND_SOURCE
+                severity = SecuritySeverity.BLOCKER
+                reason = f"UNAUTHORIZED_PATH: '{path_id}' is not in the authorized path registry"
+            else:
+                return None  # valid path — continue to kill switch
+
+        blocked_id: int
+        with self._gate_db() as _audit:
+            import uuid as _uuid
+            corr = str(_uuid.uuid4())
+            _blocked = WhatsAppMessage(
+                thread_id=thread_id,
+                direction="out",
+                status="blocked",
+                timestamp=now,
+                created_at=now,
+                message_type=message_type,
+                text=text,
+                automated=True,
+                content_fingerprint=fp,
+                blocked_reason=reason,
+                path_id=path_id,
+                deployment_id=deployment_id,
+                correlation_id=corr,
+            )
+            _audit.add(_blocked)
+            _audit.flush()
+            blocked_id = _blocked.id
+            create_security_event(
+                _audit,
+                event_type=evt_type,
+                severity=severity,
+                path_id=path_id,
+                source_component=None,
+                wa_id=wa_id,
+                deployment_id=deployment_id,
+                correlation_id=corr,
+                thread_id=thread_id,
+                details={
+                    "blocked_message_id": blocked_id,
+                    "message_type": message_type,
+                    "fp": fp[:8],
+                    "reason": reason,
+                },
+            )
+            _audit.commit()
+
+        logger.warning(
+            "OUTBOUND_GATE_UNAUTHORIZED_PATH path_id=%s wa_id=...%s thread_id=%s reason=%r",
+            path_id, wa_id[-4:], thread_id, reason,
+        )
+        return GateResult(
+            outcome=GateOutcome.BLOCKED_UNAUTHORIZED_PATH,
+            message_id=blocked_id,
+            blocked_reason=reason,
+        )
 
     def _check_kill_switch(
         self, wa_id: str, thread_id: int, text: str, fp: str,
@@ -445,20 +575,29 @@ class OutboundSafetyGate:
         message_type: str,
         now: datetime,
         text_content: str,
+        causal_inbound_wa_message_id: Optional[str] = None,
     ) -> Optional[GateResult]:
         """Rolling-window dedup check.
+
+        When causal_inbound_wa_message_id is provided, a prior dedup row only
+        blocks if it was caused by the SAME inbound event — different inbound
+        messages that happen to produce identical reply text are allowed through.
 
         Writes and commits within `db` (caller-provided gate session).
         """
         cutoff = now - timedelta(minutes=DEDUP_WINDOW_MINUTES)
-        dup_row = db.execute(
-            select(WhatsAppOutboundDedup).where(
-                WhatsAppOutboundDedup.wa_id == wa_id,
-                WhatsAppOutboundDedup.message_kind == message_type,
-                WhatsAppOutboundDedup.content_fingerprint == fp,
-                WhatsAppOutboundDedup.created_at > cutoff,
-            ).limit(1)
-        ).scalar_one_or_none()
+        q = select(WhatsAppOutboundDedup).where(
+            WhatsAppOutboundDedup.wa_id == wa_id,
+            WhatsAppOutboundDedup.message_kind == message_type,
+            WhatsAppOutboundDedup.content_fingerprint == fp,
+            WhatsAppOutboundDedup.created_at > cutoff,
+        )
+        if causal_inbound_wa_message_id is not None:
+            # WILD-01 FINDING-03: only block if the SAME inbound was already replied to.
+            q = q.where(
+                WhatsAppOutboundDedup.causal_inbound_wa_message_id == causal_inbound_wa_message_id
+            )
+        dup_row = db.execute(q.limit(1)).scalar_one_or_none()
 
         if dup_row is None:
             return None

@@ -49,6 +49,10 @@ class Lead(Base):
     ref_code: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
     rc_code: Mapped[Optional[str]] = mapped_column(String(8), nullable=True, index=True)
 
+    # M21.4A canonical attribution
+    acq_source: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    inbound_channel: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+
     necesita_humano: Mapped[bool] = mapped_column(Boolean, default=False)
     buscando_auto_set_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -282,6 +286,12 @@ class WhatsAppThread(Base):
     latest_inbound_wa_message_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
+    # M21.4A canonical attribution
+    inbound_channel: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    ctwa_source_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    ctwa_source_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    ctwa_source_type: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+
     contact: Mapped["WhatsAppContact"] = relationship("WhatsAppContact", back_populates="threads")
     state: Mapped[Optional["WhatsAppThreadState"]] = relationship(
         "WhatsAppThreadState",
@@ -422,6 +432,7 @@ class ThreadRevision(Base):
     address: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     scheduled_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     scheduled_time: Mapped[Optional[time]] = mapped_column(Time, nullable=True)
+    zone_group: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     tipo_vehiculo: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
     marca: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     modelo: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
@@ -474,6 +485,13 @@ class WhatsAppMessage(Base):
     automated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     content_fingerprint: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     blocked_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # M2: authorized path tracking
+    path_id: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    deployment_id: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    correlation_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    # L4.1: Meta transport error capture — survives container recreation
+    meta_http_status: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    meta_error_payload: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
 
     thread: Mapped["WhatsAppThread"] = relationship("WhatsAppThread", back_populates="messages")
 
@@ -503,6 +521,7 @@ class WhatsAppOutboundDedup(Base):
     message_kind: Mapped[str] = mapped_column(String(20), nullable=False, default="text", server_default="text")
     content_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    causal_inbound_wa_message_id: Mapped[Optional[str]] = mapped_column(String(191), nullable=True)
 
 
 class WhatsAppRecipientLock(Base):
@@ -554,6 +573,39 @@ class AiEvent(Base):
     performance_status: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     unanswered_alert_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
+
+class SecurityEvent(Base):
+    """Unauthorized outbound path detection record — M2.
+
+    Created whenever the OutboundSafetyGate or status webhook handler detects
+    an attempt that does not conform to the authorized path registry.
+    Every HIGH/BLOCKER event triggers an email alert via SMTP.
+    """
+
+    __tablename__ = "security_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    detected_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    event_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    severity: Mapped[str] = mapped_column(String(20), nullable=False)
+    path_id: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    source_component: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    wamid: Mapped[Optional[str]] = mapped_column(String(191), nullable=True)
+    wa_id_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    deployment_id: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    correlation_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    thread_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    details: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    alert_sent_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+Index("ix_security_events_detected_at", SecurityEvent.detected_at)
+Index("ix_security_events_event_type", SecurityEvent.event_type)
+Index("ix_security_events_wamid", SecurityEvent.wamid)
 
 Index("ix_whatsapp_contacts_wa_id", WhatsAppContact.wa_id)
 Index("ix_whatsapp_threads_contact_id", WhatsAppThread.contact_id)

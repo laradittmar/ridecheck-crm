@@ -37,8 +37,12 @@ from .auth import (
 )
 from .db import Base, engine, get_db
 from .models import User
+from .routes.flow_data_exchange import router as flow_data_exchange_router
+from .routes.ops_dashboard import router as ops_dashboard_router
+from .routes.security import router as security_router
 from .routes.whatsapp import router as whatsapp_router
 from .services.buscando_followup import buscando_followup_loop
+from .services.outbound_path_registry import AUTHORIZED_PATHS, get_deployment_id
 from .services.quote_followup import quote_followup_loop
 from .services.unanswered_alert import unanswered_alert_loop
 from .settings import get_settings
@@ -75,12 +79,16 @@ def _is_protected_path(path: str) -> bool:
         "/whatsapp",
         "/integrations/whatsapp",
         "/ui/",
+        "/control",
     )
     return path.startswith(protected_prefixes)
 
 
 def _is_public_path(path: str) -> bool:
-    public_paths = ("/integrations/whatsapp/webhook",)
+    public_paths = (
+        "/integrations/whatsapp/webhook",
+        "/integrations/whatsapp/flows/booking/data-exchange",
+    )
     return path in public_paths
 
 
@@ -471,6 +479,63 @@ def validate_whatsapp_settings() -> None:
             ", ".join(missing),
         )
 
+
+@app.on_event("startup")
+def m2_outbound_path_health_check() -> None:
+    """M2: Verify the authorized path registry and record deployment identity.
+
+    Checks:
+    1. Registry has at least one authorized path.
+    2. Active phone_number_id matches expected (non-empty).
+    3. Known Meta send call sites are covered by registered paths.
+    4. Deployment ID recorded in logs for correlation.
+
+    On failure: logs DEPLOYMENT_WITH_UNREGISTERED_META_SEND_PATH at ERROR.
+    Does NOT block startup — system must remain reachable for diagnosis.
+    """
+    deployment_id = get_deployment_id()
+    settings = get_settings()
+    outbound_on = os.environ.get("OUTBOUND_ENABLED") == "true"
+
+    # 1. Registry non-empty
+    if not AUTHORIZED_PATHS:
+        logger.error(
+            "M2_DEPLOYMENT_UNSAFE type=DEPLOYMENT_WITH_UNREGISTERED_META_SEND_PATH "
+            "reason='AUTHORIZED_PATHS registry is empty' deployment_id=%s",
+            deployment_id,
+        )
+
+    # 2. Phone number configured when outbound is on
+    phone_id = (settings.whatsapp_phone_number_id or "").strip()
+    if outbound_on and not phone_id:
+        logger.error(
+            "M2_DEPLOYMENT_UNSAFE type=DEPLOYMENT_WITH_UNREGISTERED_META_SEND_PATH "
+            "reason='OUTBOUND_ENABLED=true but WHATSAPP_PHONE_NUMBER_ID is empty' deployment_id=%s",
+            deployment_id,
+        )
+
+    # 3. Known send call sites mapped to registered paths
+    #    CE_TEXT and CE_FLOW are the only active paths in this build.
+    from .services.outbound_path_registry import OutboundPathId
+    required_paths = {OutboundPathId.CE_TEXT, OutboundPathId.CE_FLOW}
+    missing_paths = required_paths - set(AUTHORIZED_PATHS.keys())
+    if missing_paths:
+        logger.error(
+            "M2_DEPLOYMENT_UNSAFE type=DEPLOYMENT_WITH_UNREGISTERED_META_SEND_PATH "
+            "reason='Core CE paths missing from registry: %s' deployment_id=%s",
+            [p.value for p in missing_paths], deployment_id,
+        )
+
+    logger.info(
+        "M2_DEPLOYMENT_HEALTH deployment_id=%s authorized_paths=%s "
+        "phone_id=...%s outbound=%s",
+        deployment_id,
+        [p.value for p in AUTHORIZED_PATHS],
+        phone_id[-4:] if phone_id else "NONE",
+        outbound_on,
+    )
+
+
 # routers
 app.include_router(conversation_router)
 app.include_router(internal_notify_router)
@@ -489,6 +554,9 @@ app.include_router(whatsapp_thread_router)
 app.include_router(ui_router)
 app.include_router(whatsapp_ui_router)
 app.include_router(whatsapp_router)
+app.include_router(security_router)
+app.include_router(ops_dashboard_router)
+app.include_router(flow_data_exchange_router)
 
 
 

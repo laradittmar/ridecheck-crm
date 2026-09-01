@@ -260,7 +260,7 @@ Prove that the exact failure family that caused repeated Wild crashes has actual
 
 ---
 
-## L4 — Runtime Certification + Controlled Wild  ← ACTIVE — WILD #1 FAIL — REMEDIATION REQUIRED
+## L4 — Runtime Certification + Controlled Wild  ← ACTIVE — WILD #2 BLOCKED (PHONE DISCONNECTED)
 
 ### Objective
 Prove the complete system using the real WhatsApp tester.
@@ -282,22 +282,37 @@ Forensic audit: `2026-09-01_RIDECHECK_CRM_L4-WILD-01-FORENSIC_AUDIT_FIRST-MESSAG
 - Root cause: L4 preflight declared READY while tester was in QUOTED state from prior Wild, `cycle_reset_pending=False`, stale `home_zone_detail=Berazategui` active. CE used the prior-cycle Berazategui zone (150,000 + 90,000 = $240,000) when processing the first-message burst.
 - CE behavior: CORRECT per L1 invariants. The failure is in the preflight checklist (missing gate on cycle_reset_pending=True).
 - Reproduction: CASE A test (9/9 repro PASS) confirms the causal chain.
+- **STATUS: REMEDIATED (L4.1 — 2026-09-01)**
 
 **DEFECT-WILD-01-B (MEDIUM):** Outbound message id=6043 delivery failed (status=failed, wamid=None).
 - Gate passed correctly (path_id=CE_TEXT). Failure at Meta API transport layer.
-- Backend logs lost (container recreated to disable outbound). Exact Meta error unknown.
-- Separate from DEFECT-WILD-01-A.
+- Root cause confirmed (L4.1): phone number `+54 9 11 5829-5318` is **DISCONNECTED** from WhatsApp Business Platform (status=DISCONNECTED, quality_rating=UNKNOWN).
+- Meta error capture now persists http_status + error_payload to `whatsapp_messages` DB before container events (L4.1).
+- **STATUS: CLASSIFIED — external dependency; owner must reconnect phone via Meta Business Manager**
+
+**L4.1 Remediation (CONDITIONAL PASS — 2026-09-01):**
+
+Closeout: `2026-09-01_RIDECHECK_CRM_L4.1-WILD-REMEDIATION_CLOSEOUT_REAUTHORIZE-WILD.md`
+
+1. Canonical lifecycle reset armed: `cycle_reset_pending=True` via two-step `set_lead_estado()` path ✅
+2. New required preflight gate: `cycle_reset_pending=True` ✅
+3. Meta error capture: `MetaSendError` + `meta_http_status`/`meta_error_payload` columns in `whatsapp_messages` ✅
+4. Migration `20260901_l4_1_meta_error_capture.py` applied to crm_test ✅
+5. Image `ridecheck-crm-backend:l4.1-meta-error-6936137` deployed to crm_test ✅
+6. 13/13 L4.1 tests PASS; 9/9 L4 repro PASS; 112/112 frozen gates PASS ✅
+7. **Wild #2 BLOCKED: phone number DISCONNECTED (external dependency)** ❌
 
 **Gate invalidation:**
-- L4: FAIL — Wild #1 FAIL; consecutive clean count = 0/3
+- L4: FAIL — Wild #1 FAIL; consecutive clean count = 0/3; L4.1 remediation complete but Wild #2 blocked
 - L1, L2, L3: FROZEN — INTACT (not contradicted by Wild #1 evidence)
 
 **Required before Wild #2:**
-1. Arm canonical lifecycle reset for tester (`cycle_reset_pending=True`)
-2. Add `cycle_reset_pending=True` gate to L4 preflight checklist (new required preflight gate)
-3. Add log retention protocol before Wild (preserve container logs before any `--force-recreate`)
-4. Investigate Meta API delivery failure
-5. Confirm `cycle_reset_pending=True` in preflight before authorizing Wild #2 outbound
+1. ~~Arm canonical lifecycle reset for tester~~ **DONE (L4.1)**
+2. ~~Add `cycle_reset_pending=True` gate to L4 preflight checklist~~ **DONE (L4.1)**
+3. ~~Investigate Meta API delivery failure~~ **DONE (L4.1) — root cause: phone DISCONNECTED**
+4. **OWNER ACTION: Reconnect phone number `+54 9 11 5829-5318` via Meta Business Manager**
+5. Add log retention protocol before Wild (preserve container logs before any `--force-recreate`)
+6. Run preflight with all gates including new required gates before authorizing Wild #2 outbound
 
 **Consecutive clean Wild count: 0/3**
 
@@ -503,31 +518,38 @@ This remains an **external launch blocker**, not a reason to halt internal certi
 # 10. Current immediate next step
 
 ## NEXT ACTIVE GATE
-**L4 — Wild #2 Preparation**
+**L4 — Wild #2 (BLOCKED: phone DISCONNECTED)**
 
-L1, L2, L3 are frozen. Wild #1 FAIL. Remediation required before Wild #2.
+L1, L2, L3 are frozen. L4.1 remediation complete. Wild #2 blocked pending phone reconnection.
 
-**Required owner/operator actions before Wild #2:**
+**L4.1 remediation complete (2026-09-01):**
+- Canonical reset armed: `cycle_reset_pending=True` ✅
+- New preflight gate added ✅
+- Meta error capture implemented ✅
+- 13/13 L4.1 + 9/9 L4 repro + 112/112 frozen gates PASS ✅
 
-1. Arm canonical lifecycle reset for tester:
-   - tester must initiate a new inspection conversation naturally, OR
-   - operator sets `cycle_reset_pending=True` via CRM admin (NO direct DB write)
+**Required owner action (BLOCKER):**
 
-2. Preflight checklist for Wild #2 MUST include:
+1. **Reconnect WhatsApp Business phone number `+54 9 11 5829-5318`:**
+   - Meta Business Manager → WhatsApp Manager → Phone Numbers
+   - Status currently: `DISCONNECTED` (confirmed via Graph API capability check)
+   - Must return to `CONNECTED` before Wild #2 can be authorized
+
+**Required before Wild #2 outbound authorization:**
+
+2. Preflight MUST confirm:
    ```
-   tester.cycle_reset_pending == True  ← NEW REQUIRED GATE
+   tester.cycle_reset_pending == True  ← REQUIRED (armed in L4.1) ✅
+   phone_number.status == CONNECTED    ← REQUIRED (currently DISCONNECTED) ❌
    ```
-   If this gate fails, outbound must NOT be authorized.
+   If either gate fails, outbound must NOT be authorized.
 
-3. Add log retention before Wild: before any `docker compose up --force-recreate`, copy/stream backend logs to a persistent location so CE processing logs survive container recreation.
+3. Add log retention before Wild: before any `docker compose up --force-recreate`, preserve CE container logs so they survive recreation.
 
-4. Investigate Meta API delivery failure (DEFECT-WILD-01-B) — check WHATSAPP_PHONE_NUMBER_ID, token send permissions.
-
-5. Verify OUTBOUND_ENABLED=false before arming.
-
-6. Run Wild #2 preflight with all existing gates PLUS the new cycle_reset_pending gate.
+4. Verify OUTBOUND_ENABLED=false before arming; enable only after all preflight gates pass.
 
 Forensic audit: `2026-09-01_RIDECHECK_CRM_L4-WILD-01-FORENSIC_AUDIT_FIRST-MESSAGE-FAILURE.md`
+Remediation closeout: `2026-09-01_RIDECHECK_CRM_L4.1-WILD-REMEDIATION_CLOSEOUT_REAUTHORIZE-WILD.md`
 
 # 11. Status tracker
 
@@ -536,7 +558,7 @@ Forensic audit: `2026-09-01_RIDECHECK_CRM_L4-WILD-01-FORENSIC_AUDIT_FIRST-MESSAG
 | L1 Semantic Authority | **FROZEN — CONDITIONAL PASS** | YES |
 | L2 Transport + Operations | **FROZEN — PASS (2026-09-01)** | YES |
 | L3 Dirty-History Certification | **FROZEN — PASS (2026-09-01)** | YES |
-| L4 Runtime + Wild Certification | **FAIL — Wild #1 FAIL (HIGH + MEDIUM); 0/3 clean sessions** | AFTER WILD-01 REMEDIATION |
+| L4 Runtime + Wild Certification | **FAIL — L4.1 REMEDIATION COMPLETE; Wild #2 BLOCKED (phone DISCONNECTED); 0/3 clean sessions** | AFTER PHONE RECONNECTION |
 | L5 Production Launch Gate | PENDING | NO |
 | Meta App Secret | EXTERNAL BLOCKER | Does not block L4 tester-only Wild |
 
