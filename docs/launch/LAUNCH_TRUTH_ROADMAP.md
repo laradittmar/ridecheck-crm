@@ -455,6 +455,39 @@ HOURS-01/02, FLOW-01…08, FORENSIC-01/02, Wild A reproduction). Full regression
 **L4 remains FAIL. Wild A stays PAUSED. Clean-Wild counter stays 0/3.** A new controlled
 Wild is required to prove the remediation in runtime.
 
+### Phase B.2 — L4.4-CLEAN-WILD-PREP (2026-09-01) — **PASS**
+
+Closeout: `2026-09-01_RIDECHECK_CRM_L4.4-CLEAN-WILD-PREP_CLOSEOUT_RESET-TESTER-ZERO.md`
+
+Tester prepared as a TRUE ZERO-STATE customer for the next full clean Wild.
+
+- Wild A evidence exported and hashed before any DELETE:
+  `/opt/ridecheck-crm-forensics/L4.4_wildA_tester_export_pre_cleanup_2026-09-01T201508Z.txt`
+  (sha256 `d38c1be3…4cd9e0f`), alongside the Wild-window backend log, the audit-time DB
+  export and the committed forensic audit.
+- Tester operational rows deleted in ONE guarded transaction (database assertion,
+  post-delete leftover assertion, shared-data preservation assertion): 1 contact,
+  1 thread, 1 state, 1 candidate, 1 lead, 11 messages, 4 dedup, 1 recipient lock,
+  7 ai_events. 0 revisions / 0 thread_revisions / 0 feedback existed.
+- Zero-state proven by the certified L4.2 suite against live crm_test: **19/19 PASS**.
+- Preserved unchanged: 733 security_events, 32 demo contacts/threads/leads,
+  28 demo revisions (23 with turno), 211 viáticos zones, system settings, catalog,
+  Flow config, n8n DB.
+- Tester remains authorized: `CLOSED_BETA_ALLOWED_WA_IDS` unchanged (…8330) while the
+  tester has zero CRM identity.
+- Runtime preflight: image `l4.3-sched-103dd01`, DB crm_test, OUTBOUND **off**,
+  phone `1196075770246218` CONNECTED/CLOUD_API/GREEN, n8n webhook registered (ACTIVE),
+  Booking Flow `28104222025943520` **PUBLISHED** with no validation errors, BOOKING_FLOW
+  path wired and reachable in the deployed container.
+- Memory preflight PASS (swap 4095 MB, available RAM 1610 MB); n8n auto-recovery proven.
+- Test-harness repair (test-only, no product code): the L4/L4.1 SQLite fixtures used a
+  non-shared in-memory pool and a possibly-stubbed `app.db.Base`, which had been masking
+  17 tests. Fixed → relevant gate suites now **270 passed / 0 failed / 1 skipped**, and
+  full regression improves to 3 100 passed / 55 failed / 9 errors with **zero new failures**.
+
+**Clean-Wild counter stays 0/3.** Outbound stays OFF; a controlled Wild B requires
+explicit owner authorization.
+
 ### Phase C — Infrastructure resilience (INFRA-OOM-01)
 
 **Host OOM incident, 2026-09-01 18:30:37Z — CONFIRMED, MEDIUM, launch-relevant.**
@@ -628,6 +661,10 @@ This remains an **external launch blocker**, not a reason to halt internal certi
 ## NEXT ACTIVE GATE
 **WILD B — runtime proof of the L4.3 remediation (awaiting owner outbound authorization)**
 
+L4.4 (2026-09-01) has prepared the tester as a true zero-state customer and verified every
+preflight except outbound itself. The single remaining action before Wild B is the owner's
+explicit outbound authorization, followed by the standard enable procedure.
+
 L4.3 landed 2026-09-01: ordered primary/fallback scheduling, single business-hours
 authority, Booking Flow wired as the authoritative booking UX, forensic attribution and
 OOM hardening. Code-level evidence is complete; runtime evidence is not. Next action is a
@@ -723,7 +760,7 @@ L4.2 closeout: `2026-09-01_RIDECHECK_CRM_L4.2-CLEAN-SLATE-TESTER_CLOSEOUT_PREPAR
 | L1 Semantic Authority | **FROZEN — CONDITIONAL PASS** | YES |
 | L2 Transport + Operations | **FROZEN — PASS (2026-09-01)** | YES |
 | L3 Dirty-History Certification | **FROZEN — PASS (2026-09-01)** | YES |
-| L4 Runtime + Wild Certification | **FAIL — Wild A PAUSED at the scheduling turn; L4.3 remediation COMPLETE at code level (42/42, zero regressions, BOOKING_FLOW wired); runtime proof pending; 0/3 clean sessions** | AFTER A CONTROLLED WILD B PROVES L4.3 IN RUNTIME |
+| L4 Runtime + Wild Certification | **FAIL — L4.3 remediation complete at code level; L4.4 clean-wild prep PASS (tester at true zero state, runtime + memory preflight green); runtime proof still pending; 0/3 clean sessions** | AFTER A CONTROLLED WILD B PROVES L4.3 IN RUNTIME |
 | L5 Production Launch Gate | PENDING | NO |
 | Meta App Secret | EXTERNAL BLOCKER | Does not block L4 tester-only Wild |
 

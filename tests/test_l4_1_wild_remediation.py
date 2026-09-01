@@ -46,8 +46,16 @@ def _check_preflight_reset_gate(cycle_reset_pending: bool) -> dict:
 @pytest.fixture()
 def mem_db():
     import app.models  # noqa: F401
-    from app.db import Base
-    engine = create_engine("sqlite:///:memory:", echo=False)
+    # L4.4: take Base from app.models — another suite in the same session may have
+    # stubbed app.db, which would yield an empty metadata and no tables.
+    Base = app.models.Base
+    # L4.4: SQLite in-memory needs a single shared connection, otherwise every new
+    # connection gets an empty database and create_all() is invisible to the session.
+    from sqlalchemy.pool import StaticPool
+    engine = create_engine(
+        "sqlite:///:memory:", echo=False,
+        poolclass=StaticPool, connect_args={"check_same_thread": False},
+    )
     Base.metadata.create_all(engine)
     with Session(engine) as db:
         yield db

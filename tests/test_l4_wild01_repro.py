@@ -30,8 +30,16 @@ _WILD_START  = datetime(2026, 9, 1,  15, 34, 24, tzinfo=_TZ)
 def mem_db():
     """Fresh SQLite in-memory DB with full schema (JSONB→JSON patch applied by conftest)."""
     import app.models  # noqa: F401 — ensures all tables registered in metadata
-    from app.db import Base
-    engine = create_engine("sqlite:///:memory:", echo=False)
+    # L4.4: take Base from app.models — another suite in the same session may have
+    # stubbed app.db, which would yield an empty metadata and no tables.
+    Base = app.models.Base
+    # L4.4: SQLite in-memory needs a single shared connection, otherwise every new
+    # connection gets an empty database and create_all() is invisible to the session.
+    from sqlalchemy.pool import StaticPool
+    engine = create_engine(
+        "sqlite:///:memory:", echo=False,
+        poolclass=StaticPool, connect_args={"check_same_thread": False},
+    )
     Base.metadata.create_all(engine)
     with Session(engine) as db:
         yield db
