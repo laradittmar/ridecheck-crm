@@ -32,7 +32,7 @@
 
 services:
   backend:
-    image: ridecheck-crm-backend:l4.1-meta-error-6936137
+    image: ridecheck-crm-backend:l4.1-meta-error-01025b7
     environment:
       DATABASE_URL: postgresql+psycopg://crm:crm@postgres:5432/crm_test
       OUTBOUND_ENABLED: "${BETA_OUTBOUND_ENABLED:-false}"
