@@ -41,5 +41,6 @@ services:
       INTERNAL_BOOKING_EMAIL_TO: "ridecheckassistance@gmail.com"
       INTERNAL_BOOKING_EMAIL_REPLY_TO: "ridecheckassistance@gmail.com"
       FLOW_BOOKING_PRIVATE_KEY_PATH: /run/secrets/flow_booking_private.pem
+      SMTP_PASSWORD: ""
     volumes:
       - /opt/ridecheck-secrets:/run/secrets:ro
