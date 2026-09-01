@@ -51,6 +51,21 @@ from .ui.whatsapp_ui import router as whatsapp_ui_router
 
 logger = logging.getLogger(__name__)
 
+# ── L4.6 Phase F: make CE decisions visible at runtime ────────────────────────
+# Wild B could only be reconstructed by re-executing the deployed code, because the
+# container emitted nothing but uvicorn access lines (finding OBS-A).  Attach a stream
+# handler to the application logger tree so CE_DECISION records reach container logs.
+# Level is overridable with LOG_LEVEL; uvicorn's own handlers are left untouched.
+_app_logger = logging.getLogger("app")
+if not _app_logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    )
+    _app_logger.addHandler(_handler)
+_app_logger.setLevel(os.environ.get("LOG_LEVEL", "INFO").upper())
+_app_logger.propagate = False
+
 app = FastAPI()
 templates = Jinja2Templates(directory="app/templates")
 

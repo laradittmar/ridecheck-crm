@@ -613,6 +613,21 @@ def _has_customer_origin_clause(text: str) -> bool:
     return bool(_CUSTOMER_ORIGIN_RE.search(text))
 
 
+# ── L4.6 Phase C: isolate customer-origin clauses ────────────────────────────
+# "Está en Berazategui, pero yo soy de Tigre." carries BOTH an inspection location
+# and a customer origin.  The origin clause must suppress only itself — never the
+# inspection location evidence sitting in another clause (L4-WILD-B finding LOC-A).
+_ORIGIN_CLAUSE_SPLIT_RE = re.compile(r'(?:[,.;]|\bpero\b|\baunque\b)', re.IGNORECASE)
+
+
+def _strip_customer_origin_clauses(text: str) -> str:
+    """Return *text* without the clauses that state where the CUSTOMER is."""
+    parts = _ORIGIN_CLAUSE_SPLIT_RE.split(text or "")
+    kept = [p.strip() for p in parts if p.strip() and not _CUSTOMER_ORIGIN_RE.search(p)]
+    return ". ".join(kept)
+
+
+
 # ── M21.1.4: ASR fuzzy vehicle confirmation ───────────────────────────────────
 _FUZZY_CONFIRMATION_TEMPLATE = "¿Es un {marca} {modelo}?"
 
@@ -2709,6 +2724,11 @@ class ConversationEngine:
             and not self._detect_prepurchase_signal(_text_norm_d)
             and not self._detect_explicit_inspection_request(_text_norm_d)
             and lookup_vehicle(current_turn_text) is None
+            # L4.6 Phase A: a numeric model with its year ("un 2008 del 2014") is a
+            # SPECIFIC vehicle too.  Layer D already refuses to intercept a turn that
+            # names a vehicle; before L4.6 `lookup_vehicle` could not see numeric models,
+            # so a FAQ-dominant burst discarded the evidence entirely (finding VEH-A).
+            and extract_model_del_year(current_turn_text) is None
             and not self._detect_vehicle_location_phrase(_text_norm_d)
             # F3: QUOTED + acceptance word in burst → let commercial progression handle it.
             # Without this guard, Layer D intercepts "Dale ¿Aceptan débito?" and answers
@@ -2980,6 +3000,18 @@ class ConversationEngine:
                             (ctx.candidates[0].zone_group if ctx.candidates else None),
                             (ctx.candidates[0].anio if ctx.candidates else None),
                         )
+                    # L4.6 Phase E: a location already given in this cycle (buffered in
+                    # state.home_zone_*) must reach the freshly created candidate — the
+                    # customer never repeats it (finding LOC-B).
+                    self._attach_buffered_location(ctx, state)
+                    self._normalize_zone_from_db(ctx, state)
+                    self.db.commit()
+                    self._decision_log(
+                        ctx, "vehicle_candidate_persisted", source="fuzzy_confirmation",
+                        marca=_pending_match.marca, modelo=_pending_match.modelo,
+                        anio=(ctx.candidates[0].anio if ctx.candidates else None),
+                        zone=(ctx.candidates[0].zone_detail if ctx.candidates else None),
+                    )
                 # continue normal qualification — fall through
             elif _FUZZY_REJECTION_RE.search(current_turn_text):
                 # User rejected — clear both pending fields, ask for make/model
@@ -3082,7 +3114,20 @@ class ConversationEngine:
         #   – last_intent already AWAITING_QUALIFICATION or PREPURCHASE_INSPECTION
         #   – an explicit inspection/pre-purchase signal in the current turn text
         #     while still in QUALIFYING stage (e.g. "Quiero revisar un 2008…")
+        self._turn_text = current_turn_text          # L4.6: evidence source for finalizers
         _text_norm_b = self._norm_text(current_turn_text)
+        # L4.6 Phase A — EVIDENCE-DRIVEN CAPTURE.
+        # Intent wording governs routing and tone; it must never decide whether
+        # deterministic vehicle evidence may become canonical state.  Wild B proved the
+        # old whitelist gate: "Quería revisar un 2008 del 2014" persisted a candidate
+        # while "Para revisar un 2008 del 2014" persisted nothing, from identical
+        # deterministic evidence (finding VEH-A).
+        _evidence_capture_ctx = (
+            state.last_stage in (STAGE_QUALIFYING, None)
+            or state.last_intent in (_AWAITING_QUALIFICATION, _INTENT_PREPURCHASE)
+        )
+        # Legacy intent context, retained ONLY to decide whether a bare numeric token
+        # with no vehicle determiner is worth a clarification question.
         _numeric_model_ctx = (
             state.last_intent in (_AWAITING_QUALIFICATION, _INTENT_PREPURCHASE)
             or (
@@ -3093,13 +3138,25 @@ class ConversationEngine:
                 )
             )
         )
+        self._decision_log(
+            ctx, "intent_gate",
+            stage=state.last_stage, intent=state.last_intent,
+            prepurchase=self._detect_prepurchase_signal(_text_norm_b),
+            inspection_request=self._detect_explicit_inspection_request(_text_norm_b),
+            evidence_capture=_evidence_capture_ctx,
+        )
         if (
             pre_detected_vehicle is None
             and not state.needs_human
             and not ctx.candidates
-            and _numeric_model_ctx
+            and (_evidence_capture_ctx or _numeric_model_ctx)
         ):
             _ctx_hit = _contextual_numeric_model_lookup(current_turn_text)
+            # L4.6 Phase A: the GATE is now evidence-driven (any qualification-stage turn
+            # with no candidate), but the BEHAVIOUR for a bare numeric model with no
+            # companion year stays the certified WILD-02-B owner rule: confirm, never
+            # silently create.  A bare "2008" is the genuinely ambiguous case (model vs
+            # year); "2008 del 2014" is unambiguous and is persisted below.
             if _ctx_hit is not None:
                 # Establish intent so the confirmation path passes Layer F Step 7.
                 if state.last_intent != _INTENT_PREPURCHASE:
@@ -3120,6 +3177,12 @@ class ConversationEngine:
                     "WILD02 numeric model clarification sent thread_id=%s vehicle=%s %s",
                     ctx.thread.id, _ctx_hit.marca, _ctx_hit.modelo,
                 )
+                self._decision_log(
+                    ctx, "vehicle_clarification_armed", source="bare_numeric_model",
+                    marca=_ctx_hit.marca, modelo=_ctx_hit.modelo,
+                    pending_key=state.pending_fuzzy_catalog_key,
+                    evidence_text_stored=bool(state.pending_turn_evidence_text),
+                )
                 return _out("replied", wa_message_id=_numeric_model_sent_id)
 
         # ── WILD-04-F1: "model del year" pre-routing evidence extraction ─────
@@ -3133,7 +3196,7 @@ class ConversationEngine:
             pre_detected_vehicle is None
             and not state.needs_human
             and not ctx.candidates
-            and _numeric_model_ctx
+            and _evidence_capture_ctx
         ):
             _mdy = extract_model_del_year(current_turn_text)
             if _mdy is not None:
@@ -3148,12 +3211,15 @@ class ConversationEngine:
                 if ctx.candidates and ctx.candidates[0].anio is None:
                     ctx.candidates[0].anio = _mdy_year
                     self.db.flush()
+                self._attach_buffered_location(ctx, state)
                 pre_detected_vehicle = _mdy_match
-                logger.info(
-                    "WILD04-F1 model-del-year extraction thread_id=%s "
-                    "vehicle=%s %s anio=%s",
-                    ctx.thread.id, _mdy_match.marca, _mdy_match.modelo,
-                    ctx.candidates[0].anio if ctx.candidates else _mdy_year,
+                self.db.commit()
+                self._decision_log(
+                    ctx, "vehicle_candidate_persisted", source="model_del_year",
+                    marca=_mdy_match.marca, modelo=_mdy_match.modelo,
+                    tipo=_mdy_match.tipo_vehiculo,
+                    anio=(ctx.candidates[0].anio if ctx.candidates else _mdy_year),
+                    zone=(ctx.candidates[0].zone_detail if ctx.candidates else None),
                 )
 
         # ── M21.1.1 Layer F: QUALIFYING intent gate (QUALIFYING/None only) ──
@@ -4002,6 +4068,109 @@ class ConversationEngine:
             self.db.commit()
             return _out("location_contradiction_blocked", detail="outbound_disabled")
 
+    # ── L4.6 Phase F — structured CE decision logging ────────────────────────
+
+    def _decision_log(self, ctx: "_Context", event: str, **fields) -> None:
+        """One structured, secret-free line per CE decision.
+
+        Wild B could only be reconstructed by re-executing the deployed code because the
+        runtime emitted nothing but HTTP access lines (finding OBS-A).  These records make
+        the next Wild reconstructable from logs alone.  Never log message bodies, tokens,
+        phone numbers or Meta payloads — only decisions and resolved identifiers.
+        """
+        try:
+            rendered = " ".join(
+                f"{k}={v}" for k, v in fields.items() if v is not None and v != ""
+            )
+            logger.info(
+                "CE_DECISION event=%s thread_id=%s %s",
+                event, getattr(ctx.thread, "id", None), rendered,
+            )
+        except Exception:  # logging must never break a conversation turn
+            pass
+
+    # ── L4.6 Phase E — buffered inspection location ──────────────────────────
+
+    def _attach_buffered_location(self, ctx: "_Context", state: "WhatsAppThreadState") -> None:
+        """Attach a location the customer already gave in THIS cycle to a new candidate.
+
+        The customer must never have to repeat an inspection location just because the
+        vehicle was resolved afterwards (finding LOC-B).  This is cycle-safe and does NOT
+        reopen L1 RISK-03: `_execute_cycle_reset()` clears `home_zone_*` at every cycle
+        boundary, so a surviving buffer is by construction current-cycle evidence.
+        """
+        if not ctx.candidates:
+            return
+        buffered_group = getattr(state, "home_zone_group", None)
+        buffered_detail = getattr(state, "home_zone_detail", None)
+        if not buffered_group and not buffered_detail:
+            return
+        candidate = ctx.candidates[0]
+        if candidate.zone_group or candidate.zone_detail:
+            return  # explicit per-candidate evidence always wins
+        candidate.zone_group = buffered_group
+        candidate.zone_detail = buffered_detail
+        try:
+            self.db.flush()
+        except Exception:
+            pass
+        self._decision_log(
+            ctx, "location_buffer_attached",
+            candidate_id=getattr(candidate, "id", None),
+            zone_group=buffered_group, zone_detail=buffered_detail,
+        )
+
+    # ── L4.6 Phase B/D — canonical response/state consistency ────────────────
+
+    def _enforce_canonical_vehicle_claim(
+        self, text: str, ctx: "_Context", state: "WhatsAppThreadState | None"
+    ) -> str:
+        """Never let a reply speak of a vehicle that canonical state does not hold.
+
+        Wild B answered "hacemos el servicio de revisión para un 2008 del 2014" with zero
+        candidate rows, then asked the customer to confirm the same vehicle without arming
+        any pending state (findings VEH-B / LOC-B).  When no candidate exists this
+        finalizer converts an implied certainty into an explicit, deterministic
+        confirmation question AND arms the pending state, so a later "sí" resolves the
+        vehicle and replays the evidence of the originating turn.
+        """
+        if state is None or getattr(state, "needs_human", False):
+            return text
+        if state.last_stage not in (STAGE_QUALIFYING, None):
+            return text
+        if ctx.candidates or getattr(state, "current_focus_candidate_id", None):
+            return text  # canonical state holds the vehicle — speaking of it is correct
+        if not text:
+            return text
+
+        hit = lookup_vehicle(text)
+        if hit is None:
+            _mdy = extract_model_del_year(text)
+            if _mdy is not None:
+                hit = _mdy[0]
+        if hit is None:
+            hit = _contextual_numeric_model_lookup(text)
+        if hit is None:
+            return text  # reply names no specific vehicle — nothing to reconcile
+
+        question = _FUZZY_CONFIRMATION_TEMPLATE.format(marca=hit.marca, modelo=hit.modelo)
+        if getattr(state, "pending_fuzzy_catalog_key", None) is None:
+            state.pending_fuzzy_catalog_key = f"{hit.marca}||{hit.modelo}"
+            state.pending_turn_evidence_text = (
+                getattr(self, "_turn_text", None) or None
+            )
+        self._decision_log(
+            ctx, "response_state_reconciled",
+            marca=hit.marca, modelo=hit.modelo, candidate="none",
+            pending_armed=True,
+        )
+        if self._norm_text(question) in self._norm_text(text):
+            return text
+        return (
+            f"{text.rstrip()}\n\n"
+            f"Todavía no tengo confirmado el vehículo, así que te confirmo: {question}"
+        )
+
     def _apply_zone_from_text(
         self,
         ctx: "_Context",
@@ -4065,12 +4234,54 @@ class ConversationEngine:
                 state.home_zone_group = _vzone.zone_group
                 state.home_zone_detail = _vzone.zone_detail
             _vehicle_location_written = True
-        elif not _has_customer_origin_clause(text):
-            # No vehicle clause, no strong origin signal → bare locality or no info.
+            self._decision_log(
+                ctx, "location_extracted", source="vehicle_location_clause",
+                zone_group=_vzone.zone_group, zone_detail=_vzone.zone_detail,
+                target=("candidate" if _fc_is_current else "state_buffer"),
+            )
+        else:
+            # L4.6 Phase C: a customer-origin clause suppresses ONLY itself.
+            # Wild B's "Está en Berazategui, pero yo soy de Tigre." produced no
+            # vehicle-location zone (no explicit subject) and the origin clause then
+            # blocked the bare-locality fallback, dropping Berazategui entirely
+            # (finding LOC-A).  Strip the origin clauses and re-read the remainder.
+            _location_text = text
+            if _has_customer_origin_clause(text):
+                _location_text = _strip_customer_origin_clauses(text)
+                if _location_text and _location_text != text:
+                    _vlzones_stripped = self._extract_vehicle_location_zones(_location_text)
+                    if _vlzones_stripped:
+                        _vz2 = _vlzones_stripped[0]
+                        _fc3 = self._focus_candidate(ctx)
+                        _fc3_is_current = (
+                            _fc3 is not None
+                            and (
+                                _fc3.status == "current_focus"
+                                or (
+                                    getattr(state, "current_focus_candidate_id", None) is not None
+                                    and state.current_focus_candidate_id == _fc3.id
+                                )
+                            )
+                        )
+                        if _fc3_is_current:
+                            _fc3.zone_group = _vz2.zone_group
+                            _fc3.zone_detail = _vz2.zone_detail
+                        else:
+                            state.home_zone_group = _vz2.zone_group
+                            state.home_zone_detail = _vz2.zone_detail
+                        self._decision_log(
+                            ctx, "location_extracted", source="origin_clause_stripped",
+                            zone_group=_vz2.zone_group, zone_detail=_vz2.zone_detail,
+                            target=("candidate" if _fc3_is_current else "state_buffer"),
+                        )
+                        return None, True
+            # No vehicle clause and no usable origin-free clause → bare locality.
             # Preserve existing detection for thread state (location flow compatibility),
             # and write to candidate if it lacks zone (SC14: bare locality in context).
-            if not state.home_zone_detail or not state.home_zone_group:
-                _zh = self._extract_zone_from_text(text)
+            if (not _has_customer_origin_clause(_location_text)) and (
+                not state.home_zone_detail or not state.home_zone_group
+            ):
+                _zh = self._extract_zone_from_text(_location_text)
                 if _zh:
                     state.home_zone_detail = _zh.zone_detail
                     if _zh.zone_group:
@@ -4090,6 +4301,11 @@ class ConversationEngine:
                     if _fc2_is_current and not _fc2.zone_group:
                         _fc2.zone_group = _zh.zone_group
                         _fc2.zone_detail = _zh.zone_detail
+                    self._decision_log(
+                        ctx, "location_extracted", source="bare_locality",
+                        zone_group=_zh.zone_group, zone_detail=_zh.zone_detail,
+                        target=("candidate" if _fc2_is_current else "state_buffer"),
+                    )
         return None, _vehicle_location_written
 
     # ── M21.1.4: ASR fuzzy confirmation ───────────────────────────────────────
@@ -6479,6 +6695,9 @@ Respondé SOLO con JSON válido:
         # _burst (before consume) carries the customer turn text — passed so
         # the gate can skip appending on soft-close turns.
         text = self._apply_required_next_question(text, ctx, _turn_text=_burst)
+
+        # L4.6 Phase B/D: a reply must never assert a vehicle canonical state lacks.
+        text = self._enforce_canonical_vehicle_claim(text, ctx, ctx.state)
 
         from zoneinfo import ZoneInfo
         now_utc = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))

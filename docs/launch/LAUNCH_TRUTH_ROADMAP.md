@@ -97,6 +97,7 @@ L1 is therefore safe to freeze and should not be reopened unless new evidence co
 | Controlled Wild without App Secret | Possible only as explicit temporary risk exception with tester-only outbound | Policy decision | **CONDITIONAL** | Only after L2 + L3 |
 | Production migration | Not yet applied | Not started | **NEEDS FIX BEFORE PUBLIC LAUNCH** | L5 |
 | Public launch | Not authorized | — | **NO-GO** | Complete gates below |
+| Vehicle/location evidence capture | Capture is evidence-driven; intent wording no longer authority; origin clause isolates itself; response cannot claim an unheld vehicle | Implemented + Tested (28/28 L4.6) | **NEEDS RUNTIME PROOF (WILD)** | Controlled Wild C |
 | Scheduling temporal semantics (primary vs fallback day) | Primary "mñ/mañana" preference discarded when a weekday name is present; no primary+fallback representation | Wild-proven defect (Wild A) | **NEEDS FIX BEFORE WILD** | L4.3 Phase A |
 | Business-hours authority | FAQ constant contradicts ScheduleService per-weekday hours | Wild-proven defect (Wild A) | **NEEDS FIX BEFORE WILD** | L4.3 Phase B |
 | Booking Flow dispatch (28104222025943520) | Flow published but unreachable — no sender, no BOOKING_FLOW path_id, no token minting | Code-proven gap | **NEEDS FIX BEFORE PUBLIC LAUNCH** | L4.3 Phase C (owner decision first) |
@@ -488,6 +489,44 @@ Tester prepared as a TRUE ZERO-STATE customer for the next full clean Wild.
 **Clean-Wild counter stays 0/3.** Outbound stays OFF; a controlled Wild B requires
 explicit owner authorization.
 
+### Phase B.3 — Wild B (2026-09-01) — **FAIL: vehicle + location evidence capture**
+
+Forensic audit: `2026-09-01_RIDECHECK_CRM_L4-WILD-B-VEHICLE-FORENSIC_AUDIT_CANDIDATE-PERSISTENCE.md`
+
+Wild B ran from the L4.4 zero state and was stopped after two turns. Contact/Thread/Lead
+were created correctly, but **no candidate and no location were ever persisted**: the bot
+answered "hacemos el servicio de revisión para un 2008 del 2014" with zero candidate rows
+and then asked the customer to confirm the same vehicle. Findings VEH-A, VEH-B, LOC-A,
+LOC-B (HIGH) and OBS-A (MEDIUM). L1/L2/L3 not contradicted — nothing was overwritten;
+evidence was never captured. Evidence preserved and hashed before outbound was disabled.
+
+### Phase B.4 — L4.6-EVIDENCE-CAPTURE (2026-09-01) — **PASS**
+
+Closeout: `2026-09-01_RIDECHECK_CRM_L4.6-EVIDENCE-CAPTURE_CLOSEOUT_CANONICAL-CAPTURE.md`
+
+| Finding | Phase | Status |
+|---|---|---|
+| VEH-A intent whitelist blocked deterministic capture | A | **CLOSED** — capture is gated on evidence + qualification state, not on intent phrasing; Layer D no longer intercepts a FAQ-dominant burst that names a numeric model with its year |
+| VEH-B reply asserted a vehicle canonical state lacked | B | **CLOSED** — `_enforce_canonical_vehicle_claim` finalizer on the single outbound text path |
+| LOC-A origin clause suppressed the inspection location | C | **CLOSED** — origin clauses are isolated and stripped; the remainder is re-read and buffered |
+| LOC-B confirmation could not replay evidence | D/E | **CLOSED** — clarification always arms pending state; a new candidate inherits the cycle-scoped location buffer |
+| OBS-A CE decisions invisible at runtime | F | **CLOSED** — `CE_DECISION` structured records + app logger wired in `main.py` |
+
+Owner-rule conflict surfaced and resolved conservatively: L4.6 asked that
+"quiero revisar un 2008" persist a candidate, while the certified WILD-02-B owner rules
+(W02-O08…O12) require a bare numeric model to be *confirmed*, never silently created.
+A bare number is the genuinely ambiguous case (model vs year), so the certified rule was
+kept: the vehicle is resolved deterministically and the confirmation is armed, and
+"2008 **del 2014**" — unambiguous — is persisted immediately. **Owner decision required if
+the bare-numeric rule should change.**
+
+Evidence: `tests/test_l4_6_evidence_capture.py` 28/28 PASS (VEH-01…08, STATE-01/02,
+LOC-01…06, CONF-01…04, full Wild B reproduction through the $240.000 quote, decision
+logging). Relevant gates 558 passed / 1 skipped / 0 failed. Full regression
+3 128 passed / 55 failed / 9 errors — **zero new failures** against the differential baseline.
+
+**Clean-Wild counter stays 0/3.** Wild C requires owner outbound authorization.
+
 ### Phase C — Infrastructure resilience (INFRA-OOM-01)
 
 **Host OOM incident, 2026-09-01 18:30:37Z — CONFIRMED, MEDIUM, launch-relevant.**
@@ -659,6 +698,13 @@ This remains an **external launch blocker**, not a reason to halt internal certi
 # 10. Current immediate next step
 
 ## NEXT ACTIVE GATE
+**WILD C — runtime proof of the L4.3 + L4.6 remediations (awaiting owner outbound authorization)**
+
+Wild B (2026-09-01) failed on vehicle/location evidence capture and was remediated by L4.6.
+Before Wild C the tester must be returned to zero state again (the L4.4 procedure), then
+outbound enabled with owner authorization.
+
+Superseded entry:
 **WILD B — runtime proof of the L4.3 remediation (awaiting owner outbound authorization)**
 
 L4.4 (2026-09-01) has prepared the tester as a true zero-state customer and verified every
@@ -760,7 +806,7 @@ L4.2 closeout: `2026-09-01_RIDECHECK_CRM_L4.2-CLEAN-SLATE-TESTER_CLOSEOUT_PREPAR
 | L1 Semantic Authority | **FROZEN — CONDITIONAL PASS** | YES |
 | L2 Transport + Operations | **FROZEN — PASS (2026-09-01)** | YES |
 | L3 Dirty-History Certification | **FROZEN — PASS (2026-09-01)** | YES |
-| L4 Runtime + Wild Certification | **FAIL — L4.3 remediation complete at code level; L4.4 clean-wild prep PASS (tester at true zero state, runtime + memory preflight green); runtime proof still pending; 0/3 clean sessions** | AFTER A CONTROLLED WILD B PROVES L4.3 IN RUNTIME |
+| L4 Runtime + Wild Certification | **FAIL — Wild A (scheduling) and Wild B (evidence capture) both failed and were remediated (L4.3, L4.6); tester zero state prepared (L4.4); runtime proof still pending; 0/3 clean sessions** | AFTER A CONTROLLED WILD C PROVES L4.3 + L4.6 IN RUNTIME |
 | L5 Production Launch Gate | PENDING | NO |
 | Meta App Secret | EXTERNAL BLOCKER | Does not block L4 tester-only Wild |
 
