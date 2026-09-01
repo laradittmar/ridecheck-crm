@@ -635,6 +635,26 @@ Examples:
 
 A MEDIUM/LOW issue must not automatically restart the whole launch process.
 
+# 6.1 No phrase-specific patch rule (L4.7, 2026-09-01)
+
+**No production fix may consist solely of adding a phrase, regex or alias so that one Wild
+sentence passes.** Every natural-language fix must implement a documented general semantic
+invariant, and must be accepted by a semantic-equivalence corpus (≥ 20 phrasings mapping to
+the same structured evidence and the same canonical DB result) — not by the sentence that
+triggered it.
+
+Rationale: Wild A and Wild B both failed on phrasing boundaries
+("quería revisar" vs "para revisar"; "el auto está en X" vs "está en X, pero yo soy de Y").
+Enumerating phrasings deterministically does not converge. See
+`2026-09-01_RIDECHECK_CRM_L4.7-SEMANTIC-ARCHITECTURE-AUDIT_AUDIT_UNDERSTAND-RECONCILE.md`.
+
+Architecture verdict recorded by L4.7: **PARTIAL SEMANTIC ARCHITECTURE** — the semantic
+layer holds no business authority (correct), but it runs after 22 deterministic layers and
+19 early-return points, and 9 gates can still suppress evidence capture. Proposed finite
+remediation: L4.7A schema → L4.7B single UNDERSTAND pass → L4.7C evidence reconciler →
+L4.7D response validator → L4.7E semantic-equivalence corpus → L4.7F certification.
+L4.7D and L4.7E are independently valuable and need not wait for the pipeline reorder.
+
 # 7. Evidence rules
 
 | Evidence | Meaning |
