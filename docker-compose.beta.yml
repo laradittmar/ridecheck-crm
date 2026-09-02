@@ -52,6 +52,7 @@ services:
       # L4.7B: shadow UNDERSTAND — crm_test ONLY, never production. Proposes TurnEvidence
       # in parallel with the live path and mutates nothing.
       SHADOW_UNDERSTAND_ENABLED: "true"
+      SHADOW_UNDERSTAND_ASYNC: "true"   # L4.7B.2: model call off the customer turn
       SHADOW_EVIDENCE_PATH: /run/forensics/shadow_turn_evidence.jsonl
       # L4.3 Phase C: the published RideCheck Booking Flow is the authoritative
       # booking UX. Pinned explicitly so the runtime never depends on a code default.

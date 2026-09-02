@@ -33,6 +33,7 @@ class Settings:
     # L4.7B shadow UNDERSTAND — OFF by default; enabled in crm_test only.
     # When false the interpreter is never constructed and no model call is made.
     shadow_understand_enabled: bool = False
+    shadow_understand_async: bool = False
     shadow_evidence_path: str = ""
     conversation_engine_direct_webhook_enabled: bool = False
     openai_chat_model: str = "gpt-4o-mini"
@@ -101,6 +102,7 @@ def get_settings() -> Settings:
         booking_flow_id=_getenv("WHATSAPP_BOOKING_FLOW_ID", "28104222025943520"),
         flow_booking_private_key_path=_getenv("FLOW_BOOKING_PRIVATE_KEY_PATH"),
         shadow_understand_enabled=(_getenv("SHADOW_UNDERSTAND_ENABLED", "false").lower() == "true"),
+        shadow_understand_async=(_getenv("SHADOW_UNDERSTAND_ASYNC", "false").lower() == "true"),
         shadow_evidence_path=_getenv("SHADOW_EVIDENCE_PATH"),
         conversation_engine_direct_webhook_enabled=_getenv("CONVERSATION_ENGINE_DIRECT_WEBHOOK_ENABLED", "false").lower() in ("1", "true", "yes"),
         openai_chat_model=_getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),

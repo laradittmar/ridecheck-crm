@@ -113,6 +113,40 @@ interpretation says how its input was assembled.
 * `to_canonical_json()` is deterministic (sorted keys, compact separators, unicode kept),
   so shadow-replay records can be compared byte-for-byte.
 
+### 3.2.1 Interpretation hygiene (L4.7B.2, `turn-evidence/1.1`)
+
+Three rules bind any interpreter, not just today's model:
+
+* **No empty evidence.** An item whose every meaningful field is empty carries nothing and
+  must never reach reconciliation. `EvidenceItem.is_semantically_empty()` defines it and
+  `TurnEvidence.without_empty_items()` prunes it, across *every* array. Partial evidence is
+  not empty: an `AMBIGUOUS` item with alternatives, or a day without a time, survives.
+* **Time is deterministic.** The interpreter is given the current local date, weekday and
+  timezone, and may only name a day expression from the controlled vocabulary. It never
+  returns an ISO date; `resolved_date` is computed by the deterministic layer, and a date
+  proposed by a model is dropped rather than trusted.
+* **Nothing the customer said is discarded to make room.** When two numbers can be a model
+  and a year, both are kept; if the assignment is undecidable the item stays `AMBIGUOUS`
+  with the alternatives listed, and no reading is silently preferred.
+
+`1.1` is additive: `AcceptanceSignal.FUTURE_INTENT` ("I'll come back when I've bought it" —
+neither acceptance nor rejection) and the emptiness contract. Every `1.0` record still
+loads.
+
+### 3.2.2 Bounded context and advisory confidence
+
+The interpreter receives a small, explicitly bounded context: current date/weekday/timezone,
+the conversation stage, the clarification we are waiting on, slots already offered, and the
+previous customer turn **of the current cycle only**. Prior-cycle history is excluded by
+construction, so a vehicle or locality from a finished inspection cannot leak into a new
+one. The context block is labelled in the prompt as *not* customer evidence, and only the
+*names* of the supplied slots are recorded — never their values.
+
+Catalog identity the customer did not state literally (a make deduced from a model, a
+category, a normalized model) is capped at `PROPOSED` and mirrored into
+`catalog_candidate`: the deterministic catalog decides. `confidence` is advisory — it is
+recorded when offered, clamped to [0, 1], and never raises or lowers a status.
+
 ### 3.3 Reconciliation boundary
 
 `TurnEvidence` has **no** reconciliation field and no apply/commit/save API. Dispositions
@@ -232,7 +266,9 @@ Reported separately, never as a single opaque score
 | **missing-field accuracy** | cases where fields expected to stay unknown did stay unknown |
 
 A migration may proceed only when unsupported-inference rate is 0 and the other metrics do
-not regress against the previous interpreter version.
+not regress against the previous interpreter version. The concrete gate that governs the
+move of semantic authority into canonical state is defined in the L4.7B.1 audit §11 and
+evaluated on a full-corpus rerun; failing any line of it means L4.7C does not start.
 
 ---
 

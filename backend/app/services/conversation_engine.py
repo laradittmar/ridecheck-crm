@@ -4102,14 +4102,70 @@ class ConversationEngine:
 
     # ── L4.7B — shadow UNDERSTAND (no authority, no mutation) ────────────────
 
+    def _build_shadow_context(self, ctx: "_Context", messages: list[str]):
+        """L4.7B.2 Phase G — the bounded context handed to the shadow interpreter.
+
+        Current cycle only. `ctx.db_messages` already excludes prior cycles, so a vehicle
+        or locality from a finished inspection can never leak in. Nothing here is
+        authority: it exists so relative references can be read at all.
+        """
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from .semantic_interpreter import TurnContext
+
+        tz_name = "America/Argentina/Buenos_Aires"
+        now = datetime.now(ZoneInfo(tz_name))
+        context = TurnContext.now(tz=tz_name, today=now.date())
+
+        state = getattr(ctx, "state", None)
+        if state is not None:
+            stage = getattr(state, "last_stage", None)
+            if isinstance(stage, str) and stage:
+                context.stage = stage
+            # What we last asked, expressed as a canonical flag name — not a phrase.
+            for flag, label in (("pending_fuzzy_catalog_key", "confirmacion_de_modelo"),
+                                ("vehicle_clarification_sent", "vehiculo"),
+                                ("location_clarification_sent", "ubicacion"),
+                                ("inspectability_clarification_sent", "inspeccionabilidad")):
+                if getattr(state, flag, None):
+                    context.pending_clarification = label
+                    break
+            raw_slots = getattr(state, "last_offered_slots", None)
+            if isinstance(raw_slots, str) and raw_slots.strip():
+                slots: list[str] = []
+                try:
+                    parsed = json.loads(raw_slots)
+                    if isinstance(parsed, list):
+                        slots = [str(x) for x in parsed if x]
+                except Exception:
+                    slots = [p.strip() for p in raw_slots.replace("|", ",").split(",")
+                             if p.strip()]
+                context.offered_slots = tuple(slots[:5])
+
+        # Previous customer turn in this cycle — the burst itself is excluded.
+        burst = {t.strip() for t in messages if isinstance(t, str)}
+        for message in reversed(list(getattr(ctx, "db_messages", []) or [])):
+            if getattr(message, "direction", None) != "in":
+                continue
+            text = (getattr(message, "text", None) or "").strip()
+            if not text or text in burst:
+                continue
+            context.previous_customer_turn = text[:300]
+            break
+        return context
+
     def _run_shadow_understand(
         self, ctx: "_Context", event: "ConversationHandleIn", messages: list[str]
     ) -> None:
         """Interpret the burst in shadow and record it. Never affects this turn.
 
-        Every failure mode — disabled flag, missing key, HTTP error, malformed JSON,
-        unwritable log — degrades to "do nothing". The production path is untouched:
-        this method returns None, writes no state and raises nothing.
+        Provenance (burst, ids, context) is captured **synchronously**; the model call and
+        the append-only write are handed to a bounded worker when async is enabled, so the
+        customer turn never waits on a model (L4.7B measured p95 3.7 s inline).
+
+        Every failure mode — disabled flag, missing key, HTTP error, malformed JSON, full
+        queue, unwritable log — degrades to "do nothing". This method returns None, writes
+        no state and raises nothing.
         """
         try:
             # Strict identity check: only a real boolean True enables the shadow path, so a
@@ -4121,35 +4177,60 @@ class ConversationEngine:
             from ..schemas.turn_evidence import BurstReconstruction
             from .outbound_path_registry import get_deployment_id
 
+            # ── captured synchronously: this can never be reconstructed later ──
             interpreter = SemanticTurnInterpreter(self.settings)
             burst_id = getattr(self, "_correlation_id", None)
+            thread_id = getattr(ctx.thread, "id", None)
             message_ids = tuple(
                 str(m) for m in [getattr(event, "wa_message_id", None)] if m
             )
-            result = interpreter.interpret(
-                messages,
-                thread_id=getattr(ctx.thread, "id", None),
-                burst_id=burst_id,
-                message_ids=message_ids,
-                reconstruction=BurstReconstruction.LIVE_DEBOUNCE,
-            )
-            record_shadow(
-                build_record(
-                    thread_id=getattr(ctx.thread, "id", None),
+            burst_texts = list(messages)
+            deployment_id = get_deployment_id()
+            raw_path = getattr(self.settings, "shadow_evidence_path", "")
+            evidence_path = raw_path if isinstance(raw_path, str) and raw_path else None
+            try:
+                context = self._build_shadow_context(ctx, burst_texts)
+            except Exception:
+                context = None
+
+            def _work() -> None:
+                result = interpreter.interpret(
+                    burst_texts,
+                    thread_id=thread_id,
                     burst_id=burst_id,
                     message_ids=message_ids,
-                    result=result,
-                    deployment_id=get_deployment_id(),
-                    correlation_id=burst_id,
-                ),
-                path=(getattr(self.settings, "shadow_evidence_path", "") or None),
-            )
+                    reconstruction=BurstReconstruction.LIVE_DEBOUNCE,
+                    context=context,
+                )
+                record_shadow(
+                    build_record(
+                        thread_id=thread_id,
+                        burst_id=burst_id,
+                        message_ids=message_ids,
+                        result=result,
+                        deployment_id=deployment_id,
+                        correlation_id=burst_id,
+                        dispatch=("async" if self._shadow_async() else "sync"),
+                    ),
+                    path=evidence_path,
+                )
+
+            if self._shadow_async():
+                from .shadow_worker import ShadowJob, get_worker
+                get_worker().submit(ShadowJob(run=_work, thread_id=thread_id,
+                                              burst_id=burst_id))
+            else:
+                _work()
         except Exception as exc:   # shadow must never break a customer turn
             try:
                 logger.warning("L4.7B shadow understand failed thread_id=%s: %s",
                                getattr(ctx.thread, "id", None), exc)
             except Exception:
                 pass
+
+    def _shadow_async(self) -> bool:
+        """Async dispatch is opt-in and strictly boolean, like the shadow flag itself."""
+        return getattr(self.settings, "shadow_understand_async", False) is True
 
     # ── L4.7D — canonical response validation ────────────────────────────────
 

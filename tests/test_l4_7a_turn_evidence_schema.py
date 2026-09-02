@@ -272,9 +272,12 @@ class TestOrderedScheduling(unittest.TestCase):
 class TestAcceptanceSignals(unittest.TestCase):
 
     def test_acceptance_signals_are_distinct(self):
+        # turn-evidence/1.1 (L4.7B.2 Phase E) adds FUTURE_INTENT: "te aviso cuando lo
+        # compre" is neither acceptance nor rejection, and reading it as ACCEPT was a
+        # measured L4.7B.1 disagreement. Additive; every 1.0 signal is unchanged.
         self.assertEqual(
             {s.value for s in AcceptanceSignal},
-            {"ACCEPT", "REJECT", "HESITATE", "QUESTION_ONLY", "UNKNOWN"})
+            {"ACCEPT", "REJECT", "HESITATE", "FUTURE_INTENT", "QUESTION_ONLY", "UNKNOWN"})
 
     def test_accept_case(self):
         case = next(c for c in CORPUS if c["id"] == "WILD-A-03")

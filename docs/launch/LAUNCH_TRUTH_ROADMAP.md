@@ -703,6 +703,46 @@ L4.7E → L4.7A → L4.7B → L4.7B.1 → L4.7B.2 → corpus quality gate → L4
 
 Authority did not move; no code changed in this audit. Wild clean count stays **0/3**.
 
+### Phase B.10 — L4.7B.2-SHADOW-INTERPRETER-QUALITY (2026-09-02) — **COMPLETE; QUALITY GATE NOT PASSED**
+
+Closeout: `2026-09-02_RIDECHECK_CRM_L4.7B.2-SHADOW-INTERPRETER-QUALITY_CLOSEOUT_QUALITY-GATE.md`
+
+Every disagreement class named in L4.7B.1 was remediated as a general contract, not a phrase
+patch: empty-item artifact removed at prompt, mapper and schema level; temporal context
+supplied with date resolution kept deterministic; the vehicle number pair kept whole;
+catalog identity capped at `PROPOSED`; `FUTURE_INTENT` added (`turn-evidence/1.1`); intent
+scope and FAQ coexistence stated as rules; bounded current-cycle context with its provenance
+recorded; the model call moved off the customer turn into a bounded worker; confidence made
+advisory. **Model unchanged** (`gpt-4o-mini`). Three SYNTHETIC corpus labels were corrected
+under the stated intent rule; **no REAL label was touched**.
+
+Full-corpus rerun (162/162 calls OK, five draws across four prompt revisions) — shipped
+version `understand/1.4`:
+
+| Metric | L4.7B (1.0) | L4.7B.2 (1.4) | Gate |
+|---|---|---|---|
+| field precision, overall | 0.428 | **0.716** | ≥ 0.80 ❌ |
+| field recall, overall | 0.669 | 0.616 | ≥ 0.85 ❌ |
+| unsupported inference, overall | 0.056 | **0.012** | ≤ 0.01 ❌ (2/162) |
+| unsupported inference, REAL | 0.083 | **0.000** | 0.000 ✅ |
+| role accuracy | 1.000 | **1.000** | 1.000 ✅ |
+| ambiguity/conflict handling | 1.000 | **1.000** | ≥ 0.98 ✅ |
+| field precision, REAL | 0.486 | **0.720** | ≥ 0.85 ❌ |
+| field recall, REAL | 0.567 | **0.600** | ≥ 0.85 ❌ |
+| clean cases | 22 | **93** | — |
+
+**The quality gate is NOT passed** (8 of 12 groups are still below 0.70 recall; group I
+precision 0.333). Per L4.7B.1 §11 this means **L4.7C does not start**. Semantic authority did
+not move; TurnEvidence still feeds nothing.
+
+Against today's deterministic CE extractors on the same corpus, the shadow interpreter now
+leads on recall (0.616 vs 0.483) and clean cases (93 vs 47) at comparable overall precision
+(0.716 vs 0.696) — while CE keeps a decisive lead on REAL precision (0.933). SHADOW_CORRECT_CE_WRONG 62 · CE_CORRECT_SHADOW_WRONG 18 ·
+BOTH_CORRECT 29 · BOTH_WRONG 51 · OWNER_REVIEW 2. The two producers remain complementary,
+which is the premise L4.7C is built on.
+
+Wild clean count stays **0/3**. OUTBOUND OFF. L1/L2/L3 remain FROZEN.
+
 ### Phase C — Infrastructure resilience (INFRA-OOM-01)
 
 **Host OOM incident, 2026-09-01 18:30:37Z — CONFIRMED, MEDIUM, launch-relevant.**

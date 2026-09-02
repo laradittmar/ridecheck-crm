@@ -30,7 +30,10 @@ from typing import Any, Iterator, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
-SCHEMA_VERSION = "turn-evidence/1.0"
+SCHEMA_VERSION = "turn-evidence/1.1"
+# 1.1 (L4.7B.2): additive only — AcceptanceSignal.FUTURE_INTENT and the
+# `is_semantically_empty()` helper. No existing field changed meaning, so 1.0 records
+# validate unchanged under the major-version guard.
 
 
 # ── enumerations ──────────────────────────────────────────────────────────────
@@ -71,9 +74,10 @@ class ServiceIntentKind(str, Enum):
 
 
 class AcceptanceSignal(str, Enum):
-    ACCEPT = "ACCEPT"
+    ACCEPT = "ACCEPT"                 # agrees to THIS proposal, now
     REJECT = "REJECT"
-    HESITATE = "HESITATE"
+    HESITATE = "HESITATE"             # doubt about the current proposal
+    FUTURE_INTENT = "FUTURE_INTENT"   # L4.7B.2: intends to come back later — never ACCEPT
     QUESTION_ONLY = "QUESTION_ONLY"
     UNKNOWN = "UNKNOWN"
 
@@ -182,16 +186,49 @@ class EvidenceItem(_Frozen):
         """True when the item asserts something concrete enough to reconcile."""
         return self.status not in UNRESOLVED_STATUSES and self.value is not None
 
+    # ── L4.7B.2: semantic emptiness ──────────────────────────────────────────
+    # An item whose every meaningful field is empty carries no evidence and must never
+    # reach the reconciler. Subclasses name the fields that make them meaningful; the
+    # base contract also counts alternatives (an AMBIGUOUS item with alternatives IS
+    # meaningful) and an explicitly unresolved status with a reason.
+    _MEANINGFUL_FIELDS: tuple[str, ...] = ()
+
+    @staticmethod
+    def _blank(value: Any) -> bool:
+        """A value carrying nothing — including a container whose entries are all blank."""
+        if value in (None, "", [], {}):
+            return True
+        if isinstance(value, dict):
+            return all(EvidenceItem._blank(v) for v in value.values())
+        if isinstance(value, (list, tuple)):
+            return all(EvidenceItem._blank(v) for v in value)
+        return False
+
+    def is_semantically_empty(self) -> bool:
+        if not self._blank(self.value):
+            return False
+        if self.alternatives:
+            return False
+        if self.status in UNRESOLVED_STATUSES and (self.reason or self.catalog_candidate):
+            return False
+        for name in self._MEANINGFUL_FIELDS:
+            attr = getattr(self, name, None)
+            if attr is not False and not self._blank(attr):
+                return False
+        return True
+
 
 # ── typed evidence ────────────────────────────────────────────────────────────
 
 class ServiceIntentEvidence(EvidenceItem):
     field: str = "service_intent"
+    _MEANINGFUL_FIELDS = ()          # only `value` makes an intent meaningful
     kind: ServiceIntentKind = ServiceIntentKind.OTHER
 
 
 class VehicleEvidence(EvidenceItem):
     field: str = "vehicle"
+    _MEANINGFUL_FIELDS = ("make", "model", "year", "category_suggestion")
     make: Optional[str] = None
     model: Optional[str] = None
     year: Optional[int] = None
@@ -203,6 +240,7 @@ class VehicleEvidence(EvidenceItem):
 
 class LocationEvidence(EvidenceItem):
     field: str = "location"
+    _MEANINGFUL_FIELDS = ("locality", "zone_hint")
     locality: Optional[str] = None
     zone_hint: Optional[str] = None
     role: str = LocationRole.UNKNOWN_LOCATION_ROLE.value   # role is mandatory here
@@ -210,16 +248,27 @@ class LocationEvidence(EvidenceItem):
 
 class FaqIntentEvidence(EvidenceItem):
     field: str = "faq_intent"
+    _MEANINGFUL_FIELDS = ("topic",)
     topic: Optional[str] = None
 
 
 class AcceptanceEvidence(EvidenceItem):
     field: str = "acceptance"
+    _MEANINGFUL_FIELDS = ()          # UNKNOWN + no value carries nothing
     signal: AcceptanceSignal = AcceptanceSignal.UNKNOWN
+
+    def is_semantically_empty(self) -> bool:
+        # Compared by value, not identity: a signal that survived a round-trip (or a
+        # module reload in a test) is still the same signal.
+        if getattr(self.signal, "value", self.signal) != AcceptanceSignal.UNKNOWN.value:
+            return False
+        return super().is_semantically_empty()
 
 
 class SchedulingRequestEvidence(EvidenceItem):
     field: str = "scheduling_request"
+    # flexible_time alone is NOT meaningful: "no day, no time, flexible" is the empty row.
+    _MEANINGFUL_FIELDS = ("day_expression", "resolved_date", "time")
     priority: SchedulingPriority = SchedulingPriority.PRIMARY
     day_expression: Optional[str] = None      # what the customer said: "mñ", "jueves"
     resolved_date: Optional[str] = None       # ISO date, only if the interpreter resolved it
@@ -230,6 +279,7 @@ class SchedulingRequestEvidence(EvidenceItem):
 
 class CorrectionEvidence(EvidenceItem):
     field: str = "correction"
+    _MEANINGFUL_FIELDS = ("from_value", "to_value", "target_ref")
     relation: CorrectionRelation = CorrectionRelation.UNKNOWN_RELATION
     from_value: Any = None
     to_value: Any = None
@@ -238,11 +288,13 @@ class CorrectionEvidence(EvidenceItem):
 
 class IdentityEvidence(EvidenceItem):
     field: str = "identity"
+    _MEANINGFUL_FIELDS = ()
     kind: IdentityKind = IdentityKind.OTHER_IDENTITY
 
 
 class HandoffEvidence(EvidenceItem):
     field: str = "handoff"
+    _MEANINGFUL_FIELDS = ("requested",)
     requested: bool = False
 
 
@@ -315,6 +367,31 @@ class TurnEvidence(_Frozen):
         return not any(True for _ in self.iter_items()) and not self.ambiguities and not self.conflicts
 
     # ── deterministic serialization ───────────────────────────────────────────
+
+    def without_empty_items(self) -> "TurnEvidence":
+        """L4.7B.2: return a copy with semantically empty evidence rows removed.
+
+        Applies to every array, not scheduling alone. Partially meaningful evidence is
+        never dropped — an AMBIGUOUS item with alternatives or a reason survives.
+        """
+        keep = lambda seq: tuple(i for i in seq if not i.is_semantically_empty())
+        acceptance = (self.acceptance
+                      if self.acceptance is not None and not self.acceptance.is_semantically_empty()
+                      else None)
+        handoff = (self.handoff
+                   if self.handoff is not None and not self.handoff.is_semantically_empty()
+                   else None)
+        return self.model_copy(update={
+            "service_intents": keep(self.service_intents),
+            "vehicle_mentions": keep(self.vehicle_mentions),
+            "location_mentions": keep(self.location_mentions),
+            "faq_intents": keep(self.faq_intents),
+            "scheduling_requests": keep(self.scheduling_requests),
+            "corrections": keep(self.corrections),
+            "identity_mentions": keep(self.identity_mentions),
+            "acceptance": acceptance,
+            "handoff": handoff,
+        })
 
     def to_dict(self) -> dict:
         return self.model_dump(mode="json")

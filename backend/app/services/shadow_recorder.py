@@ -24,7 +24,7 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 DEFAULT_PATH = "/opt/ridecheck-crm-forensics/shadow_turn_evidence.jsonl"
-RECORD_VERSION = "shadow-record/1.0"
+RECORD_VERSION = "shadow-record/1.1"
 
 
 def _now_iso() -> str:
@@ -39,6 +39,7 @@ def build_record(
     result: Any = None,
     deployment_id: Optional[str] = None,
     correlation_id: Optional[str] = None,
+    dispatch: str = "sync",
 ) -> dict:
     """Shape one append-only shadow record. Pure — no I/O."""
     evidence = getattr(result, "evidence", None)
@@ -60,6 +61,10 @@ def build_record(
         "prompt_tokens": getattr(result, "prompt_tokens", None),
         "completion_tokens": getattr(result, "completion_tokens", None),
         "total_tokens": getattr(result, "total_tokens", None),
+        "dispatch": dispatch,
+        # WHICH context slots were supplied — never their values, so no raw text is stored.
+        "context_keys": list(getattr(result, "context_keys", ()) or ()),
+        "sanitized_items": getattr(result, "sanitized_items", 0),
         "turn_evidence": (json.loads(evidence.to_canonical_json())
                           if evidence is not None else None),
     }
@@ -84,7 +89,11 @@ def record_shadow(
     except Exception:
         pass
 
-    target = (path or os.environ.get("SHADOW_EVIDENCE_PATH") or DEFAULT_PATH).strip()
+    # A path must be a real string. A test double (or any non-string) degrades to
+    # log-only: L4.7B wrote a `MagicMock/...` tree into the repo before this guard.
+    candidate = path if isinstance(path, str) else None
+    env_path = os.environ.get("SHADOW_EVIDENCE_PATH")
+    target = (candidate or (env_path if isinstance(env_path, str) else "") or DEFAULT_PATH).strip()
     if not target:
         return False
     try:

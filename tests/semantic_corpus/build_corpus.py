@@ -358,12 +358,29 @@ VEHICLE_TEXTS = {
     "un vw fox del 2013": ("Volkswagen Fox", 2013),
     "Honda Fit 2018": ("Honda Fit", 2018),
 }
+# L4.7B.2 Phase L — label correction, reviewed 2026-09-02. These three variants state the
+# service itself, so `service_intent` IS expressed in the burst and its absence from the
+# labels was a labelling error, not an interpreter error. The governing rule (now also in
+# the interpreter prompt, rule 14) is: intent is emitted when the burst expresses wanting
+# the service — naming a vehicle, a zone, a day or accepting something is not, by itself,
+# a request for the service. SYNTHETIC labels only; no REAL label was changed.
+VEHICLE_TEXTS_WITH_INTENT = {
+    "para revisar un 2008 del 2014",
+    "quería revisar una 2008 del 2014",
+    "quiero revisar un fox",
+}
+
 for i, (text, (vehicle, year)) in enumerate(VEHICLE_TEXTS.items(), start=1):
+    vehicle_evidence = [ev("vehicle", vehicle, "CONFIRMED", role="VEHICLE_OF_INTEREST"),
+                        ev("vehicle_year", year, "CONFIRMED" if year else "AMBIGUOUS")]
+    if text in VEHICLE_TEXTS_WITH_INTENT:
+        vehicle_evidence.insert(0, ev(
+            "service_intent", "PREPURCHASE_INSPECTION", "CONFIRMED",
+            note="L4.7B.2 Phase L: the burst states the service explicitly"))
     CASES.append(case(
         f"SYN-VEH-{i:02d}", "SYNTHETIC", "authored variant (L4.7E)",
         [text], ["B"],
-        [ev("vehicle", vehicle, "CONFIRMED", role="VEHICLE_OF_INTEREST"),
-         ev("vehicle_year", year, "CONFIRMED" if year else "AMBIGUOUS")],
+        vehicle_evidence,
         canonical={"candidate": {"vehicle": vehicle, "anio": year}},
         missing=([] if year else ["vehicle_year"]),
         next_action="ASK_LOCATION",
