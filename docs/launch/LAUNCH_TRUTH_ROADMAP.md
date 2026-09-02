@@ -631,6 +631,41 @@ Evidence: `tests/test_l4_7a_turn_evidence_schema.py` 47/47 PASS (SCHEMA-01…12)
 
 Next: **L4.7B-SHADOW-UNDERSTAND**. Wild clean count stays **0/3**.
 
+### Phase B.8 — L4.7B-SHADOW-UNDERSTAND (2026-09-01) — **PASS**
+
+Closeout: `2026-09-01_RIDECHECK_CRM_L4.7B-SHADOW-UNDERSTAND_CLOSEOUT_SHADOW-INTERPRETER.md`
+
+One controlled semantic UNDERSTAND pass now runs **in shadow** on every burst, before any
+deterministic gate can early-return. It proposes `TurnEvidence` and changes nothing:
+ConversationEngine remains the sole authority for routing, canonical state and every send.
+
+- `SemanticTurnInterpreter` (`understand/1.0`, gpt-4o-mini, ≤ 1 call per burst, JSON
+  structured output). The prompt forbids price, availability, booking, lead state and
+  candidate persistence outright and requires ambiguity/conflict preservation, location-role
+  separation, ordered scheduling branches and accept/hesitate/reject distinction.
+- Append-only recorder: JSONL + `CE_SHADOW_UNDERSTAND` log line with schema/model version,
+  latency and tokens. No raw text, no secrets, no migration.
+- Failure isolation: a shadow error is logged and dropped; the customer turn is untouched.
+  The flag must be exactly `True`, so no test mock can trigger a model call.
+
+**Corpus evaluation (162/162 calls OK):** role accuracy **1.000**, ambiguity/conflict
+handling **1.000**, missing-field accuracy **1.000**, precision 0.428, recall 0.669,
+unsupported-inference rate 0.056. Wild B's location turn scores perfectly; Wild B's vehicle
+turn resolves *Peugeot 2008* but loses the year; Wild A's scheduling keeps both ordered
+branches but mis-resolves "mñ" to a weekday (no current-date context). Group I (corrections)
+is weakest at P=0.077.
+
+Cost/latency: mean 2 390 ms, p95 3 722 ms, 1 256 tokens per burst ≈ **$0.11 per 100
+conversations**. The added latency is a promotion decision, not yet a problem — shadow runs
+only in crm_test with OUTBOUND OFF.
+
+Evidence: `tests/test_l4_7b_shadow_understand.py` 29/29 (SHADOW-01…15); full regression
+3 270 passed / 55 failed / 9 errors, zero new failures. Image
+`ridecheck-crm-backend:l4.7b-shadow-a7ddddb` deployed to crm_test with shadow ON.
+
+**Authority did not move.** Next: **L4.7B.1-SHADOW-DISAGREEMENT-ANALYSIS** — do not proceed
+to L4.7C before that review. Wild clean count stays **0/3**.
+
 ### Phase C — Infrastructure resilience (INFRA-OOM-01)
 
 **Host OOM incident, 2026-09-01 18:30:37Z — CONFIRMED, MEDIUM, launch-relevant.**
