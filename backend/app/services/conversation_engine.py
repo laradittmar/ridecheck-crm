@@ -2698,6 +2698,14 @@ class ConversationEngine:
         else:
             ai_input_messages = _current_evidence
 
+        # ── L4.7B: SHADOW UNDERSTAND ──────────────────────────────────────
+        # Runs on the complete raw burst BEFORE any deterministic gate can early-return,
+        # so the interpreter observes every turn — including FAQ bypass, phone-call,
+        # clarification, fuzzy-confirmation and scheduling exits.
+        # Shadow only: it proposes TurnEvidence, mutates nothing, and can never affect
+        # routing, canonical state or customer-visible text. Disabled by default.
+        self._run_shadow_understand(ctx, event, ai_input_messages)
+
         # ── M21.1.1 Layer A: Motorcycle pre-gate (all stages) ─────────────
         if self._is_motorcycle_enquiry(current_turn_text):
             return self._motorcycle_human_handoff(ctx, state, source_text=current_turn_text)
@@ -4091,6 +4099,57 @@ class ConversationEngine:
             )
         except Exception:  # logging must never break a conversation turn
             pass
+
+    # ── L4.7B — shadow UNDERSTAND (no authority, no mutation) ────────────────
+
+    def _run_shadow_understand(
+        self, ctx: "_Context", event: "ConversationHandleIn", messages: list[str]
+    ) -> None:
+        """Interpret the burst in shadow and record it. Never affects this turn.
+
+        Every failure mode — disabled flag, missing key, HTTP error, malformed JSON,
+        unwritable log — degrades to "do nothing". The production path is untouched:
+        this method returns None, writes no state and raises nothing.
+        """
+        try:
+            # Strict identity check: only a real boolean True enables the shadow path, so a
+            # MagicMock settings object in a test can never trigger a model call.
+            if getattr(self.settings, "shadow_understand_enabled", False) is not True:
+                return
+            from .semantic_interpreter import SemanticTurnInterpreter
+            from .shadow_recorder import build_record, record_shadow
+            from ..schemas.turn_evidence import BurstReconstruction
+            from .outbound_path_registry import get_deployment_id
+
+            interpreter = SemanticTurnInterpreter(self.settings)
+            burst_id = getattr(self, "_correlation_id", None)
+            message_ids = tuple(
+                str(m) for m in [getattr(event, "wa_message_id", None)] if m
+            )
+            result = interpreter.interpret(
+                messages,
+                thread_id=getattr(ctx.thread, "id", None),
+                burst_id=burst_id,
+                message_ids=message_ids,
+                reconstruction=BurstReconstruction.LIVE_DEBOUNCE,
+            )
+            record_shadow(
+                build_record(
+                    thread_id=getattr(ctx.thread, "id", None),
+                    burst_id=burst_id,
+                    message_ids=message_ids,
+                    result=result,
+                    deployment_id=get_deployment_id(),
+                    correlation_id=burst_id,
+                ),
+                path=(getattr(self.settings, "shadow_evidence_path", "") or None),
+            )
+        except Exception as exc:   # shadow must never break a customer turn
+            try:
+                logger.warning("L4.7B shadow understand failed thread_id=%s: %s",
+                               getattr(ctx.thread, "id", None), exc)
+            except Exception:
+                pass
 
     # ── L4.7D — canonical response validation ────────────────────────────────
 
