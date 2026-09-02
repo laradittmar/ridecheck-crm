@@ -67,10 +67,84 @@ reconciliation        ACCEPTED | REJECTED | DEFERRED | CLARIFY, with a reason
 ```
 
 Corpus fixtures carry the subset that is meaningful without a live runtime: field, value,
-role, status and notes. The remaining provenance fields become mandatory at L4.7A when the
-schema is implemented.
+role, status and notes. **The full contract is implemented as of L4.7A** — see §3.1.
 
 ---
+
+### 3.1 Implemented schema (L4.7A)
+
+`backend/app/schemas/turn_evidence.py` — schema version **`turn-evidence/1.0`**. Pure
+pydantic: it imports only `json`, `enum`, `typing` and `pydantic` (asserted by test), so it
+can never reach a database, a service or the conversation engine.
+
+| Container | Purpose |
+|---|---|
+| `TurnEvidence` | everything one interpreter proposed about one burst; **frozen** |
+| `EvidenceItem` | base contract: `field, value, normalized_value, role, status, confidence, alternatives, catalog_candidate, reason, provenance` |
+| `ServiceIntentEvidence` | inspection interest, quote request, readiness, logistics offer (`kind`) |
+| `VehicleEvidence` | `make, model, year, year_status, category_suggestion, is_superseded, mention_index` |
+| `LocationEvidence` | `locality, zone_hint` + **mandatory `role`** |
+| `FaqIntentEvidence` | one per topic — FAQs never erase business evidence |
+| `AcceptanceEvidence` | `signal` ∈ ACCEPT / REJECT / HESITATE / QUESTION_ONLY / UNKNOWN |
+| `SchedulingRequestEvidence` | ordered branches: `priority, day_expression, resolved_date, time, flexible_time, rank` |
+| `CorrectionEvidence` | `relation` ∈ CORRECT_EXISTING / REPLACE_CANDIDATE / SWITCH_TO_PRIOR_CANDIDATE / ADD_SECOND_CANDIDATE / UNKNOWN_RELATION, with `from_value`/`to_value` |
+| `IdentityEvidence`, `HandoffEvidence` | customer/seller identity, human-handoff signal |
+| `AmbiguityNote`, `ConflictNote` | alternatives and both sides preserved — no winner chosen |
+| `Provenance`, `SourceSpan`, `TurnRef` | source kind, interpreter, model version, schema version, source message ids, spans, and how the burst was reconstructed |
+
+**Roles.** Location roles are `INSPECTION_LOCATION`, `CUSTOMER_ORIGIN`, `SELLER_LOCATION`,
+`UNKNOWN_LOCATION_ROLE`. Role assignment never depends on field order:
+`"Está en Berazategui, pero yo soy de Tigre."` and
+`"Yo soy de Tigre pero el auto está en Berazategui"` produce the same two roles.
+
+**Burst reconstruction is recorded, not assumed.** `TurnRef.reconstruction` ∈
+`LIVE_DEBOUNCE`, `REPLAY_CHRONOLOGICAL`, `REPLAY_CAUSAL_MARKER`, `CORPUS_FIXTURE`,
+`UNKNOWN` — because L4.7E found historical burst grouping is only PARTIAL, every
+interpretation says how its input was assembled.
+
+### 3.2 Versioning rules
+
+* `schema_version` is always serialized (`turn-evidence/<major>.<minor>`).
+* Additive, optional fields are a **minor** bump; anything that changes the meaning of an
+  existing field, or removes one, is a **major** bump.
+* `TurnEvidence.from_json` rejects an unknown prefix and any different **major** version,
+  so an old record can never be silently reinterpreted by a newer build.
+* `extra="forbid"`: unknown keys fail loudly instead of being dropped.
+* `to_canonical_json()` is deterministic (sorted keys, compact separators, unicode kept),
+  so shadow-replay records can be compared byte-for-byte.
+
+### 3.3 Reconciliation boundary
+
+`TurnEvidence` has **no** reconciliation field and no apply/commit/save API. Dispositions
+live in `ReconciliationRecord` / `ReconciliationLog` (append-only; `append()` returns a new
+log), each referencing a stable item ref such as `location_mentions[0]`, with a status of
+`ACCEPTED`, `REJECTED`, `DEFERRED`, `NEEDS_CLARIFICATION`, `CONFLICT_UNRESOLVED` or
+`SUPERSEDED`. Historical interpretation is never rewritten to match a later canonical truth.
+
+### 3.4 Worked examples
+
+```
+"para revisar un 2008 del 2014"
+  VehicleEvidence(make="Peugeot", model="2008", year=2014,
+                  category_suggestion="SUV_4X4_DEPORTIVO",   # a suggestion, not authority
+                  status=CONFIRMED)
+  → still interpreted evidence until catalog reconciliation accepts it
+
+"Está en Berazategui, pero yo soy de Tigre."
+  LocationEvidence(locality="Berazategui", role=INSPECTION_LOCATION, status=CONFIRMED)
+  LocationEvidence(locality="Tigre",       role=CUSTOMER_ORIGIN,     status=CONFIRMED)
+
+"Mñ 15hs? O nose jueves que tenes"
+  SchedulingRequestEvidence(priority=PRIMARY,  day_expression="TOMORROW", time="15:00", rank=1)
+  SchedulingRequestEvidence(priority=FALLBACK, day_expression="THURSDAY", time=None,
+                            flexible_time=True, rank=2)
+  → the 15:00 can never migrate to the Thursday branch
+
+bare "2008" with no year
+  VehicleEvidence(status=AMBIGUOUS, value=None,
+                  alternatives=[Alternative("Peugeot 2008"), Alternative(2008)])
+  AmbiguityNote(field="vehicle", reason="model vs manufacturing year")
+```
 
 ## 4. Canonical expectations in the corpus
 

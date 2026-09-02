@@ -603,6 +603,34 @@ L4.7E  corpus + truth model + harness            ← DONE
 
 L1/L2/L3 remain FROZEN, L4 remains ACTIVE, **Wild clean count stays 0/3**, no new Wild.
 
+### Phase B.7 — L4.7A-TURN-EVIDENCE-SCHEMA (2026-09-01) — **PASS**
+
+Closeout: `2026-09-01_RIDECHECK_CRM_L4.7A-TURN-EVIDENCE-SCHEMA_CLOSEOUT_STRUCTURED-EVIDENCE.md`
+
+`backend/app/schemas/turn_evidence.py` (`turn-evidence/1.0`) implements the structured
+contract between raw language and deterministic reconciliation. **Schema only** — nothing
+imports it yet, no CE reordering, no prompt/model change.
+
+- Typed evidence for service intents, vehicles, locations (mandatory role), FAQ intents,
+  acceptance/hesitation, ordered scheduling branches, corrections, identity, handoff,
+  ambiguities and conflicts — all coexisting, none erasing another.
+- Provenance on every item (source kind, interpreter, model + schema version, source
+  message ids, spans) and on the turn (`TurnRef.reconstruction`, recording that historical
+  burst grouping is only PARTIAL).
+- Interpretation is frozen; reconciliation dispositions live in a separate append-only
+  `ReconciliationLog` (ACCEPTED / REJECTED / DEFERRED / NEEDS_CLARIFICATION /
+  CONFLICT_UNRESOLVED / SUPERSEDED).
+- Deterministic canonical JSON with a major-version guard and `extra="forbid"`.
+- **Corpus compatibility 162/162** — every case maps into the schema and round-trips back
+  through the L4.7E harness with zero false positives, zero false negatives and zero
+  unsupported inferences.
+- No business authority: the module imports only `json`, `enum`, `typing`, `pydantic`
+  (asserted), and exposes no apply/commit/save path.
+
+Evidence: `tests/test_l4_7a_turn_evidence_schema.py` 47/47 PASS (SCHEMA-01…12).
+
+Next: **L4.7B-SHADOW-UNDERSTAND**. Wild clean count stays **0/3**.
+
 ### Phase C — Infrastructure resilience (INFRA-OOM-01)
 
 **Host OOM incident, 2026-09-01 18:30:37Z — CONFIRMED, MEDIUM, launch-relevant.**
