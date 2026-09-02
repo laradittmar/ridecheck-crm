@@ -174,10 +174,17 @@ untracked and was not committed.
 
 ## 8. Runtime
 
-Image `ridecheck-crm-backend:l4.7b2-quality-<sha>` deployed to **crm_test only**, with
+Image `ridecheck-crm-backend:l4.7b2-quality-cd10a0a` (deployment `cd10a0a`) deployed to **crm_test only**, with
 `OUTBOUND_ENABLED=false`, `SHADOW_UNDERSTAND_ENABLED=true`, `SHADOW_UNDERSTAND_ASYNC=true`.
-Source/runtime parity verified for `semantic_interpreter.py`, `shadow_worker.py`,
+Source/runtime parity verified (sha256) for `semantic_interpreter.py`, `shadow_worker.py`,
 `shadow_recorder.py`, `conversation_engine.py` and `turn_evidence.py`.
+
+A live runtime probe on the deployed image produced one record with `dispatch: async`,
+`shadow-record/1.1`, `understand/1.4`, `turn-evidence/1.1`: Berazategui `INSPECTION_LOCATION`
+and Tigre `CUSTOMER_ORIGIN`, vehicle `2008` **with** year `2014`, no scheduling row invented,
+`context_keys` recorded without values, and **no raw burst text stored**. The turn returned
+with the job still queued (`submitted 1, queued 1`) and the model call completed on the
+worker. `crm_test.whatsapp_messages` stayed at **6 rows** before and after.
 
 ## 9. What comes next
 
