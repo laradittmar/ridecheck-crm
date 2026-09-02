@@ -19,7 +19,7 @@
     build: ./backend
     environment:
       DATABASE_URL: postgresql+psycopg://crm:crm@postgres:5432/crm
-      WHATSAPP_TOKEN: "EAAW5PLcFtPsBReTsCEEYPCojF39LbepZBuoO4ESLs7pPvt3OUjWlOCEZBBzeu5qpBaNjjXRmCYtPaBMSDQFNSpNTmxRz6UCx6oZBKpdJSxHvVfkLNKnNdn26kewz3KMDDFkfKSDwz87rSG5MQDB0vmocXIHpTUlAsDwFnaDXkNZAFc9ABOH5WRsC8SsZBCA0AZAQZDZD"
+      WHATSAPP_TOKEN: ${WHATSAPP_TOKEN}
       WHATSAPP_VERIFY_TOKEN: "ridecheck_whatsapp_verify_2026"
       WHATSAPP_PHONE_NUMBER_ID: "1196075770246218"
       WHATSAPP_APP_SECRET: ""
@@ -29,7 +29,7 @@
       SMTP_HOST: "smtp.gmail.com"
       SMTP_PORT: "587"
       SMTP_USER: "ridecheckassistance@gmail.com"
-      SMTP_PASSWORD: "rawq msgw vwtk mgvv"
+      SMTP_PASSWORD: ${SMTP_PASSWORD}
       SMTP_FROM: "ridecheckassistance@gmail.com"
       RESEND_API_KEY: ${RESEND_API_KEY}
       INTERNAL_BOOKING_EMAIL_FROM: "notificaciones@ridecheck.ar"

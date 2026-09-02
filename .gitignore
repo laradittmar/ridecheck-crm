@@ -9,7 +9,7 @@ __pycache__/
 venv/
 env/
 
-# Env secrets
+# Env secrets — put WHATSAPP_TOKEN, SMTP_PASSWORD, etc. in .env (never commit literals)
 .env
 .env.*
 *.env
@@ -35,3 +35,21 @@ Thumbs.db
 tmp/
 uploads/
 
+# ── L4.7-SOURCE-RECOVERY: recovery hygiene ───────────────────────────────────
+# Keys and certificates (real ones live in /opt/ridecheck-secrets, never here)
+*.pem
+*.key
+*.p12
+# Local/throwaway databases
+*.db
+*.sqlite
+*.sqlite3
+# Backup archives and DB dumps (kept in /opt/ridecheck-backups, never in git)
+*.bak
+*.bak.*
+*.sql.gz
+*.dump
+*.tar.gz
+# Editor/OS noise
+.DS_Store
+*~
