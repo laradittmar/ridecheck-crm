@@ -18,7 +18,13 @@ from ..db import engine as db_engine, get_db
 from ..models import AiEvent, WhatsAppContact, WhatsAppMessage, WhatsAppThread
 from ..schemas.conversation import ConversationHandleIn
 from ..services.buscando_followup import reset_buscando_followup
+from ..services.outbound_path_registry import get_deployment_id
 from ..services.quote_followup import reset_quote_followup
+from ..services.security_events import (
+    SecurityEventType,
+    SecuritySeverity,
+    create_security_event,
+)
 from ..settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -361,6 +367,26 @@ async def inbound_webhook(request: Request, db: Session = Depends(get_db)):
                             db.add(thread)
                             db.flush()
 
+                        # M21.4A: set inbound channel (first-write-only)
+                        if not getattr(thread, "inbound_channel", None):
+                            thread.inbound_channel = "WHATSAPP"
+
+                        # M21.4A: capture Meta CTWA referral (first-write-only)
+                        if not getattr(thread, "ctwa_source_id", None) and not getattr(thread, "ctwa_source_url", None):
+                            referral = message.get("referral") if isinstance(message, dict) else None
+                            if isinstance(referral, dict):
+                                raw_url = str(referral.get("source_url") or "").strip()[:500]
+                                raw_id = str(referral.get("source_id") or "").strip()[:100]
+                                raw_type = str(referral.get("source_type") or "").strip()[:40]
+                                if raw_url or raw_id:
+                                    thread.ctwa_source_url = raw_url or None
+                                    thread.ctwa_source_id = raw_id or None
+                                    thread.ctwa_source_type = raw_type or None
+                                    logger.info(
+                                        "WHATSAPP_CTWA_REFERRAL_CAPTURED thread_id=%s source_type=%s",
+                                        thread.id, raw_type or "-",
+                                    )
+
                         db.add(
                             WhatsAppMessage(
                                 thread_id=thread.id,
@@ -505,10 +531,45 @@ async def inbound_webhook(request: Request, db: Session = Depends(get_db)):
                             select(WhatsAppMessage).where(WhatsAppMessage.wa_message_id == wa_message_id)
                         ).scalar_one_or_none()
                         if existing_msg is None:
-                            logger.info(
-                                "WHATSAPP_STATUS_PROCESSED status=%s wa_message_id=%s result=not_found",
+                            # M2: unknown WAMID — potential unauthorized send.
+                            import os as _os
+                            outbound_off = _os.environ.get("OUTBOUND_ENABLED") != "true"
+                            _sec_type = (
+                                SecurityEventType.SUCCESSFUL_META_SEND_WHILE_OUTBOUND_OFF
+                                if outbound_off and incoming_status in ("sent", "delivered")
+                                else SecurityEventType.META_STATUS_FOR_UNKNOWN_WAMID
+                            )
+                            _sec_severity = (
+                                SecuritySeverity.BLOCKER
+                                if _sec_type == SecurityEventType.SUCCESSFUL_META_SEND_WHILE_OUTBOUND_OFF
+                                else SecuritySeverity.HIGH
+                            )
+                            try:
+                                from sqlalchemy.orm import sessionmaker as _sm
+                                _sec_sess = _sm(bind=db_engine, autoflush=True, autocommit=False)()
+                                try:
+                                    create_security_event(
+                                        _sec_sess,
+                                        event_type=_sec_type,
+                                        severity=_sec_severity,
+                                        wamid=wa_message_id,
+                                        deployment_id=get_deployment_id(),
+                                        details={
+                                            "incoming_status": incoming_status,
+                                            "outbound_enabled": not outbound_off,
+                                        },
+                                    )
+                                    _sec_sess.commit()
+                                finally:
+                                    _sec_sess.close()
+                            except Exception as _sec_exc:
+                                logger.warning("M2 security event write failed: %s", _sec_exc)
+                            logger.warning(
+                                "WHATSAPP_STATUS_PROCESSED status=%s wa_message_id=%s result=not_found "
+                                "security_event=%s",
                                 incoming_status,
                                 wa_message_id,
+                                _sec_type,
                             )
                             continue
 

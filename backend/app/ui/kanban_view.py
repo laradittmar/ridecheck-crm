@@ -4,15 +4,24 @@ from __future__ import annotations
 from typing import Any
 import logging
 import json
+import os as _os
 import html as html_lib
 from datetime import datetime, date, timedelta, time
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote as _urlquote
 
 from sqlalchemy.orm import Session
 from sqlalchemy import select
 
 from ..models import Agencia, Lead, Revision, ViaticosZone, Profesional, Vendedor
+from ..services.travel import ZoneTravelProvider
 from .components import render_sidebar_ai_block, render_sidebar_ai_script, render_sidebar_nav, render_whatsapp_icon_svg
+
+# Cache-buster for bg.png — recomputed on each server restart from file mtime
+_BG_PATH = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "static", "bg.png")
+try:
+    _BG_VER = str(int(_os.path.getmtime(_BG_PATH)))
+except OSError:
+    _BG_VER = "1"
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +80,7 @@ def _sidebar_user_block(user_email: str) -> str:
         <div class="sidebarUser">{safe_email}</div>
         <form method="post" action="/logout">
           <button class="logoutBtn" type="submit">Log Out</button>
+          <button class="logoutBtnCompact" type="submit" title="Log Out">&#x2715;</button>
         </form>
       </div>
       {render_sidebar_ai_script()}
@@ -126,7 +136,7 @@ def _base_css(extra_css: str = "") -> str:
         content:"";
         position:fixed;
         inset:0;
-        background-image: linear-gradient(180deg, rgba(255,255,255,.1), rgba(243,244,246,.15)), url('/static/bg.png');
+        background-image: url('/static/bg.png?v={_BG_VER}');
         background-size: cover;
         background-position: center;
         background-repeat: no-repeat;
@@ -278,10 +288,30 @@ def _base_css(extra_css: str = "") -> str:
         cursor:pointer;
       }}
       .logoutBtn:hover {{ background: rgba(255,255,255,.1); }}
+      .logoutBtnCompact {{
+        display:none;
+        width:100%;
+        border:1px solid rgba(255,255,255,.24);
+        background:transparent;
+        color:#f9fafb;
+        border-radius:8px;
+        padding:7px 4px;
+        cursor:pointer;
+        font-size:13px;
+      }}
+      .logoutBtnCompact:hover {{ background: rgba(255,255,255,.1); }}
+      .brandLogo {{
+        width:38px; height:38px; border-radius:8px; object-fit:cover;
+        transition: width .15s, height .15s;
+      }}
+      .sidebar.collapsed .brandLogo {{ width:34px; height:34px; }}
+      .sidebar.collapsed .sidebarToggle svg {{ transform: scaleX(-1); }}
       .sidebar.collapsed .sidebarAiBlock {{
         display:none;
       }}
-      .sidebar.collapsed .sidebarFooter {{ display:none; }}
+      .sidebar.collapsed .sidebarUser {{ display:none; }}
+      .sidebar.collapsed .logoutBtn {{ display:none; }}
+      .sidebar.collapsed .logoutBtnCompact {{ display:block; }}
       .main{{
         flex:1; padding:clamp(18px, 1vw, 28px);
         background:transparent;
@@ -515,6 +545,8 @@ def _base_css(extra_css: str = "") -> str:
       .pill-approval-pending:hover {{ background:#f0c040; color:#7a5c00; }}
       .pill-approval-approved {{ background:#ecfdf3; border-color:#86efac; color:#166534; }}
       .pill-approval-rejected {{ background:#fef2f2; border-color:#fca5a5; color:#991b1b; }}
+      .pill-agenda-link {{ background:#eff6ff; border-color:#bfdbfe; color:#1d4ed8; text-decoration:none; }}
+      .pill-agenda-link:hover {{ background:#dbeafe; color:#1e40af; }}
       .leadIdBadge {{
         display:inline-flex;
         align-items:center;
@@ -1351,6 +1383,16 @@ def _render_revision_approval_ui(rev: Revision, include_actions: bool = False, l
             )
         return f'<div class="revApprovalRow">{label_html}</div>'
     if status == "APPROVED":
+        tf = getattr(rev, "turno_fecha", None)
+        if tf is not None and lead_id is not None:
+            week_param = f"&week={(tf - timedelta(days=tf.weekday())).isoformat()}"
+            date_param = f"&date={tf.isoformat()}"
+            return (
+                f'<div class="revApprovalRow">'
+                f'<a class="pill pill-approval-approved" href="/calendar?highlight_lead_id={lead_id}{week_param}{date_param}#day"'
+                f' style="cursor:pointer;text-decoration:none;">\u2713 Turno confirmado &rarr; Ver en agenda</a>'
+                f'</div>'
+            )
         return '<div class="revApprovalRow"><span class="pill pill-approval-approved">\u2713 Turno confirmado</span></div>'
     return '<div class="revApprovalRow"><span class="pill pill-approval-rejected">\u2717 Turno rechazado</span></div>'
 
@@ -1575,7 +1617,7 @@ def render_page(
     html.append("""
       <aside class="sidebar" id="sidebar">
         <div class="brandRow">
-          <div class="brandText">RIDECHECK</div>
+          <img class="brandLogo" src="/static/branding/ridecheck-logo.jpg" alt="RideCheck">
           <button class="sidebarToggle" type="button" onclick="toggleSidebar()" title="Collapse sidebar">%s</button>
         </div>
         %s
@@ -3025,7 +3067,7 @@ def render_table_page(
     html.append("""
       <aside class="sidebar" id="sidebar">
         <div class="brandRow">
-          <div class="brandText">RIDECHECK</div>
+          <img class="brandLogo" src="/static/branding/ridecheck-logo.jpg" alt="RideCheck">
           <button class="sidebarToggle" type="button" onclick="toggleSidebar()" title="Collapse sidebar">%s</button>
         </div>
         %s
@@ -3424,8 +3466,17 @@ def render_table_page(
           window.toggleSidebar = function () {
             var sidebar = document.getElementById("sidebar");
             if (!sidebar) return;
-            sidebar.classList.toggle("collapsed");
+            var collapsed = !sidebar.classList.contains("collapsed");
+            sidebar.classList.toggle("collapsed", collapsed);
+            localStorage.setItem("sidebar_collapsed", collapsed ? "1" : "0");
           };
+
+          window.addEventListener("DOMContentLoaded", function () {
+            var sb = document.getElementById("sidebar");
+            if (sb && localStorage.getItem("sidebar_collapsed") === "1") {
+              sb.classList.add("collapsed");
+            }
+          });
 
           document.addEventListener("click", function (e) {
             document.querySelectorAll("details.multiSelect[open]").forEach(function (d) {
@@ -3498,6 +3549,8 @@ def render_calendar_page(
     user_email: str = "",
     highlight_lead_id: int | None = None,
     initial_date: str | None = None,
+    schedule_svc: Any = None,
+    thread_by_lead: dict | None = None,
 ) -> str:
     base_monday: date | None = None
     if week:
@@ -3559,12 +3612,15 @@ def render_calendar_page(
     month_start = week_start.replace(day=1)
     month_last = _cal_mod.monthrange(month_start.year, month_start.month)[1]
     month_end_dt = month_start.replace(day=month_last)
+    # Extend collection through the end of the current week when it crosses into the next month,
+    # so day-view slots for e.g. Sep 1–5 are pre-rendered when the week starts on Aug 31.
+    _month_appts_end = max(month_end_dt, week_end)
     month_appts: list[dict[str, Any]] = []
     for _ml0 in leads:
         for _mr0 in (_get(_ml0, "revisions") or []):
             if not _mr0.turno_fecha:
                 continue
-            if _mr0.turno_fecha < month_start or _mr0.turno_fecha > month_end_dt:
+            if _mr0.turno_fecha < month_start or _mr0.turno_fecha > _month_appts_end:
                 continue
             month_appts.append({"lead": _ml0, "rev": _mr0, "day": _mr0.turno_fecha, "time": _mr0.turno_hora})
     month_appts.sort(key=sort_key)
@@ -3838,6 +3894,114 @@ def render_calendar_page(
       }
       .calStatusRibbonWord { display:block; font-size:7px; font-weight:800; letter-spacing:.05em; text-transform:uppercase; color:#b88200; }
       .calApptApproval .calApptBody { flex:1 1 auto; min-width:0; padding:2px 8px 2px 6px; }
+
+      /* ── Operational Day View (M21.3-UX2) ── */
+      .agendaDayWrap { padding: 6px 12px 20px; }
+      .agendaDayHeader {
+        background: rgba(255,255,255,.1); border-radius: 12px;
+        padding: 12px 16px; margin-bottom: 12px;
+      }
+      .agendaDayTitle { font-size: 1rem; font-weight: 900; color: #fff; letter-spacing: .04em; margin-bottom: 4px; }
+      .agendaDayMeta { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 4px; }
+      .agendaDayHours { font-size: 12px; color: rgba(255,255,255,.65); }
+      .agendaStat { font-size: 12px; color: rgba(255,255,255,.75); }
+      .agendaStat b { color: #fff; }
+      .agendaStatWarn b { color: #fbbf24; }
+      .agendaDayZero { font-size: 12px; color: rgba(255,255,255,.55); }
+      .agendaDayStartBlock {
+        display: flex; align-items: flex-start; gap: 12px; padding: 8px 4px; margin-bottom: 4px;
+      }
+      .agendaStartDot {
+        width: 14px; height: 14px; border-radius: 50%; background: #6b7280;
+        margin-top: 3px; flex-shrink: 0;
+      }
+      .agendaStartInfo { display: flex; flex-direction: column; gap: 2px; }
+      .agendaStartLabel { font-size: 10px; font-weight: 800; color: rgba(255,255,255,.4); letter-spacing: .06em; text-transform: uppercase; }
+      .agendaStartDetail { font-size: 13px; font-weight: 700; color: rgba(255,255,255,.8); }
+      .agendaStartTime { font-size: 11px; color: rgba(255,255,255,.45); }
+      .agendaTravelBlock {
+        display: flex; gap: 10px; align-items: flex-start; padding: 8px 4px; margin: 2px 0;
+      }
+      .agendaTravelArrow { font-size: 18px; color: rgba(255,255,255,.3); width: 14px; text-align: center; flex-shrink: 0; }
+      .agendaTravelInfo { display: flex; flex-direction: column; gap: 3px; }
+      .agendaTravelRoute { font-size: 12px; font-weight: 700; color: rgba(255,255,255,.65); }
+      .agendaTravelTimes { display: flex; gap: 10px; font-size: 11px; color: rgba(255,255,255,.45); }
+      .agendaTravelMargin { font-size: 11.5px; font-weight: 700; }
+      .agendaMargin-ok { color: #4ade80; }
+      .agendaMargin-tight { color: #fbbf24; }
+      .agendaMargin-conflict { color: #f87171; }
+      .agendaGapBlock {
+        display: flex; gap: 10px; align-items: center; padding: 6px 4px; margin: 2px 0;
+      }
+      .agendaGapArrow { font-size: 16px; color: rgba(255,255,255,.2); width: 14px; text-align: center; flex-shrink: 0; }
+      .agendaGapInfo { font-size: 11px; color: rgba(255,255,255,.38); }
+      .agendaGapWindow { color: rgba(255,255,255,.25); }
+      .agendaApptCard {
+        background: #fff; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,.12);
+        margin: 6px 0; display: flex; overflow: hidden; transition: box-shadow .15s;
+      }
+      .agendaApptCard:hover { box-shadow: 0 4px 16px rgba(0,0,0,.2); }
+      .agendaApptCard.past-appt { background: #f3f4f6; }
+      .agendaApptCard.confirmed-appt { background: #f0fdf4; }
+      .agendaApptCard.pending-appt { background: #fff7ed; }
+      .agendaApptTime {
+        flex: 0 0 54px; background: rgba(17,24,39,.06);
+        display: flex; flex-direction: column; align-items: center; justify-content: center;
+        padding: 12px 4px; gap: 2px;
+      }
+      .agendaApptHour { font-size: 13px; font-weight: 800; color: #374151; }
+      .agendaApptEndHour { font-size: 10px; color: #9ca3af; }
+      .agendaApptBody { flex: 1; padding: 12px 14px 10px; display: flex; flex-direction: column; gap: 4px; }
+      .agendaApptRow1 { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+      .agendaApptName { font-size: .95rem; font-weight: 800; color: #111827; }
+      .agendaApptVehicle { font-size: 12px; color: #4b5563; font-weight: 600; }
+      .agendaApptZone { font-size: 11.5px; color: #6b7280; }
+      .agendaAddrRow { display: flex; align-items: center; gap: 6px; margin-top: 2px; }
+      .agendaAddrLink { font-size: 12px; color: #2563eb; text-decoration: none; font-weight: 600; }
+      .agendaAddrLink:hover { text-decoration: underline; }
+      .agendaAddrPending { font-size: 12px; color: #9ca3af; font-style: italic; }
+      .agendaGpsMenu { position: relative; display: inline-block; }
+      .agendaGpsBtn {
+        border: 1px solid #d1d5db; background: #fff; border-radius: 6px;
+        cursor: pointer; font-size: 13px; padding: 2px 5px;
+      }
+      .agendaGpsDropdown {
+        position: absolute; top: 100%; left: 0; z-index: 20;
+        background: #fff; border: 1px solid #e5e7eb; border-radius: 8px;
+        box-shadow: 0 4px 12px rgba(0,0,0,.15);
+        min-width: 130px; padding: 4px;
+      }
+      .agendaGpsDropdown a {
+        display: block; padding: 7px 10px; border-radius: 6px;
+        font-size: 13px; color: #111827; text-decoration: none; font-weight: 500;
+      }
+      .agendaGpsDropdown a:hover { background: #f3f4f6; }
+      .agendaApptActions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px; }
+      .agendaActionBtn {
+        font-size: 11px; font-weight: 700; padding: 4px 10px; border-radius: 999px;
+        text-decoration: none; display: inline-flex; align-items: center; gap: 4px;
+        border: 1.5px solid;
+      }
+      .agendaEditBtn { color: #374151; border-color: #d1d5db; background: #fff; }
+      .agendaEditBtn:hover { background: #f3f4f6; }
+      .agendaWaBtn { color: #16a34a; border-color: #bbf7d0; background: #f0fdf4; }
+      .agendaWaBtn:hover { background: #dcfce7; }
+      .agendaCallBtn { color: #1d4ed8; border-color: #bfdbfe; background: #eff6ff; }
+      .agendaCallBtn:hover { background: #dbeafe; }
+      .agendaApptStatus {
+        font-size: 10px; font-weight: 700; letter-spacing: .03em; border-radius: 999px;
+        padding: 2px 8px; width: fit-content;
+        background: #e0f2fe; color: #0369a1;
+      }
+      .agendaApptStatus.past { background: #f1f5f9; color: #94a3b8; }
+      .agendaApptStatus.confirmed { background: #dcfce7; color: #166534; }
+      .agendaApptStatus.pending { background: #fff7ed; color: #c2410c; }
+      .agendaPayChip {
+        font-size: 10px; font-weight: 700; border-radius: 999px; padding: 2px 7px;
+      }
+      .agendaPaid { background: #dcfce7; color: #166534; }
+      .agendaUnpaid { background: #fef3c7; color: #92400e; }
+      .agendaEmpty { color: rgba(255,255,255,.35); padding: 20px 4px; font-size: 13px; }
     """
 
     css = _base_css(extra_css=calendar_css)
@@ -3855,7 +4019,7 @@ def render_calendar_page(
     html.append("""
       <aside class="sidebar" id="sidebar">
         <div class="brandRow">
-          <div class="brandText">RIDECHECK</div>
+          <img class="brandLogo" src="/static/branding/ridecheck-logo.jpg" alt="RideCheck">
           <button class="sidebarToggle" type="button" onclick="toggleSidebar()" title="Collapse sidebar">%s</button>
         </div>
         %s
@@ -3924,6 +4088,232 @@ def render_calendar_page(
         """Join non-empty parts with · — skips blank and '-' values."""
         kept = [str(p) for p in parts if p and str(p).strip() not in ("", "-")]
         return " &nbsp;&middot;&nbsp; ".join(kept)
+
+    _travel_provider = ZoneTravelProvider()
+
+    def _operational_day_view(day: date, appts: list, day_start_info: dict, tbl: dict) -> str:
+        """Operational field-ops Day view with travel blocks, GPS links, contact actions."""
+        is_closed = day_start_info.get("is_closed", False)
+        zero_group = day_start_info.get("zero_zone_group", "Norte")
+        zero_detail = day_start_info.get("zero_zone_detail", "") or zero_group
+        start_str = day_start_info.get("start_time", "09:00")
+        end_str = day_start_info.get("end_time", "18:00")
+        biz_str = day_start_info.get("business_hours_str", start_str + "-" + end_str)
+
+        try:
+            _h, _m = start_str.split(":")
+            biz_start_t = time(int(_h), int(_m))
+        except Exception:
+            biz_start_t = time(9, 0)
+        try:
+            _h2, _m2 = end_str.split(":")
+            biz_end_t = time(int(_h2), int(_m2))
+        except Exception:
+            biz_end_t = time(18, 0)
+
+        _DAY_NAMES = ["LUNES","MARTES","MIÉRCOLES","JUEVES","VIERNES","SÁBADO","DOMINGO"]
+        day_label = f"{_DAY_NAMES[day.weekday()]} {day.day:02d}/{day.month:02d}"
+
+        # Sort occupying appointments by start time
+        occ = sorted(
+            [it for it in appts if it["rev"].turno_hora
+             and (it["rev"].estado_revision or "").strip().upper() not in ("CANCELADO", "REPROGRAMAR")],
+            key=lambda x: x["rev"].turno_hora,
+        )
+        all_appts = sorted(
+            [it for it in appts if it["rev"].turno_hora],
+            key=lambda x: x["rev"].turno_hora,
+        )
+
+        turnos = len(occ)
+        unpaid = sum(
+            1 for it in occ
+            if not (it["rev"].pago is True or (it["rev"].cobrado or "").strip().upper() == "SI")
+        )
+
+        # Count free gaps ≥ 30 min between occupying appointments
+        free_gaps = 0
+        if occ and not is_closed:
+            prev_end_dt = datetime.combine(day, biz_start_t)
+            for it in occ:
+                slot_s = datetime.combine(day, it["rev"].turno_hora)
+                if (slot_s - prev_end_dt).total_seconds() / 60 >= 30:
+                    free_gaps += 1
+                prev_end_dt = slot_s + timedelta(minutes=45)
+            day_end_dt = datetime.combine(day, biz_end_t)
+            if prev_end_dt < day_end_dt and (day_end_dt - prev_end_dt).total_seconds() / 60 >= 30:
+                free_gaps += 1
+
+        parts: list[str] = ['<div class="agendaDayWrap">']
+
+        # Day header
+        stat_html = ""
+        stat_html += f"<span class='agendaStat'><b>{turnos}</b> turno{'s' if turnos != 1 else ''}</span>"
+        if unpaid > 0:
+            stat_html += f"<span class='agendaStat agendaStatWarn'><b>{unpaid}</b> sin cobrar</span>"
+        if free_gaps > 0:
+            stat_html += f"<span class='agendaStat'><b>{free_gaps}</b> hueco{'s' if free_gaps != 1 else ''}</span>"
+        parts.append(
+            f'<div class="agendaDayHeader">'
+            f'<div class="agendaDayTitle">{day_label}</div>'
+            f'<div class="agendaDayMeta"><span class="agendaDayHours">{html_lib.escape(biz_str)}</span>{stat_html}</div>'
+            f'<div class="agendaDayZero">Inicio: {html_lib.escape(zero_detail)}</div>'
+            f'</div>'
+        )
+
+        if is_closed:
+            parts.append('<div class="agendaEmpty">Domingo — sin operaciones.</div></div>')
+            return "".join(parts)
+
+        # Day-start block
+        parts.append(
+            f'<div class="agendaDayStartBlock">'
+            f'<div class="agendaStartDot"></div>'
+            f'<div class="agendaStartInfo">'
+            f'<div class="agendaStartLabel">INICIO</div>'
+            f'<div class="agendaStartDetail">{html_lib.escape(zero_detail)}</div>'
+            f'<div class="agendaStartTime">{start_str}</div>'
+            f'</div></div>'
+        )
+
+        if not occ:
+            parts.append('<div class="agendaEmpty">Sin turnos.</div></div>')
+            return "".join(parts)
+
+        prev_zone = zero_group
+        prev_end_dt = datetime.combine(day, biz_start_t)
+
+        # Render all appointments (including cancelled) but only compute travel for occupying ones
+        occ_idx = 0
+        for it in all_appts:
+            l, r = it["lead"], it["rev"]
+            is_non_occ = (r.estado_revision or "").strip().upper() in ("CANCELADO", "REPROGRAMAR")
+            slot_s = datetime.combine(day, r.turno_hora)
+            slot_e = slot_s + timedelta(minutes=45)
+            curr_zone = (r.zone_group or "").strip()
+
+            if not is_non_occ:
+                avail_mins = int((slot_s - prev_end_dt).total_seconds() / 60)
+                travel_mins = _travel_provider.get_travel_minutes(prev_zone, curr_zone)
+                margin_mins = avail_mins - travel_mins
+
+                if travel_mins > 0:
+                    if margin_mins >= 15:
+                        m_cls, m_txt = "ok", f"✓ +{margin_mins} min"
+                    elif margin_mins >= 0:
+                        m_cls, m_txt = "tight", f"⚠ Justo — {margin_mins} min"
+                    else:
+                        m_cls, m_txt = "conflict", f"! Faltan {-margin_mins} min"
+                    parts.append(
+                        f'<div class="agendaTravelBlock">'
+                        f'<div class="agendaTravelArrow">↓</div>'
+                        f'<div class="agendaTravelInfo">'
+                        f'<div class="agendaTravelRoute">{html_lib.escape(prev_zone or "Inicio")} → {html_lib.escape(curr_zone or "?")}</div>'
+                        f'<div class="agendaTravelTimes">'
+                        f'<span>Necesario: {travel_mins} min</span>'
+                        f'<span>Disponible: {avail_mins} min</span>'
+                        f'</div>'
+                        f'<div class="agendaTravelMargin agendaMargin-{m_cls}">{m_txt}</div>'
+                        f'</div></div>'
+                    )
+                elif avail_mins >= 30:
+                    parts.append(
+                        f'<div class="agendaGapBlock">'
+                        f'<div class="agendaGapArrow">↓</div>'
+                        f'<div class="agendaGapInfo">+ {avail_mins} min libre</div>'
+                        f'</div>'
+                    )
+
+                prev_zone = curr_zone or zero_group
+                prev_end_dt = slot_e
+
+            # Appointment card
+            cname = _aname(l)
+            veh = _aveh(r)
+            zone_parts = [p for p in [(r.zone_detail or "").strip(), curr_zone] if p]
+            zone_disp = " · ".join(zone_parts)
+            raw_addr = (r.direccion_texto or "").strip()
+
+            if raw_addr and raw_addr != "-":
+                q_addr = _urlquote(raw_addr + (", " + zone_disp if zone_disp else ""), safe="")
+                maps_url = f"https://www.google.com/maps/search/?api=1&query={q_addr}"
+                waze_url = f"https://waze.com/ul?q={_urlquote(raw_addr, safe='')}"
+                addr_html = (
+                    f'<div class="agendaAddrRow">'
+                    f'<a class="agendaAddrLink" href="{maps_url}" target="_blank" rel="noopener">'
+                    f'&#x1F4CD; {html_lib.escape(raw_addr)}</a>'
+                    f'<div class="agendaGpsMenu">'
+                    f'<button class="agendaGpsBtn" type="button" onclick="toggleGpsMenu(this)" title="Navegación">&#x1F9ED;</button>'
+                    f'<div class="agendaGpsDropdown" style="display:none">'
+                    f'<a href="{maps_url}" target="_blank" rel="noopener">Google Maps</a>'
+                    f'<a href="{waze_url}" target="_blank" rel="noopener">Waze</a>'
+                    f'</div></div></div>'
+                )
+            else:
+                addr_html = '<div class="agendaAddrPending">Dirección pendiente</div>'
+
+            cls = _acls(r)
+            estado_raw = html_lib.escape((r.estado_revision or "PENDIENTE").strip())
+            pago_chip = ""
+            if r.pago is True or (r.cobrado or "").strip().upper() == "SI":
+                pago_chip = '<span class="agendaPayChip agendaPaid">Cobrado</span>'
+            elif not is_non_occ:
+                pago_chip = '<span class="agendaPayChip agendaUnpaid">Sin cobrar</span>'
+
+            phone = (getattr(l, "telefono", None) or "").strip()
+            wa_tid = tbl.get(getattr(l, "id", None))
+            contact_html = ""
+            if wa_tid:
+                contact_html += (
+                    f'<a class="agendaActionBtn agendaWaBtn" '
+                    f'href="/whatsapp/thread/{wa_tid}" title="WhatsApp">&#x1F4AC; WA</a>'
+                )
+            if phone:
+                contact_html += (
+                    f'<a class="agendaActionBtn agendaCallBtn" '
+                    f'href="tel:{html_lib.escape(phone)}" title="Llamar">&#x1F4DE; Llamar</a>'
+                )
+
+            tstr = r.turno_hora.strftime("%H:%M")
+            tend = slot_e.strftime("%H:%M")
+            href = _ahref(l, r)
+
+            parts.append(
+                f'<div class="agendaApptCard {cls}-appt">'
+                f'<div class="agendaApptTime">'
+                f'<div class="agendaApptHour">{tstr}</div>'
+                f'<div class="agendaApptEndHour">{tend}</div>'
+                f'</div>'
+                f'<div class="agendaApptBody">'
+                f'<div class="agendaApptRow1">'
+                f'<span class="agendaApptName">{html_lib.escape(cname)}</span>{pago_chip}'
+                f'</div>'
+                f'<div class="agendaApptVehicle">{html_lib.escape(veh)}</div>'
+                + (f'<div class="agendaApptZone">{html_lib.escape(zone_disp)}</div>' if zone_disp else '')
+                + addr_html
+                + f'<div class="agendaApptActions">'
+                f'<a class="agendaActionBtn agendaEditBtn" href="{href}">&#x270E; Ver revisión</a>'
+                + contact_html
+                + f'</div>'
+                f'<span class="agendaApptStatus {cls}">{estado_raw}</span>'
+                f'</div></div>'
+            )
+
+        # Trailing gap
+        day_end_dt = datetime.combine(day, biz_end_t)
+        if prev_end_dt < day_end_dt:
+            remaining = int((day_end_dt - prev_end_dt).total_seconds() / 60)
+            if remaining >= 30:
+                parts.append(
+                    f'<div class="agendaGapBlock agendaGapEnd">'
+                    f'<div class="agendaGapArrow">↓</div>'
+                    f'<div class="agendaGapInfo">+ {remaining} min libre '
+                    f'<span class="agendaGapWindow">{prev_end_dt.strftime("%H:%M")}–{biz_end_t.strftime("%H:%M")}</span>'
+                    f'</div></div>'
+                )
+
+        parts.append('</div>')
+        return "".join(parts)
 
     def _day_slots(appts):
         by_hr = {}
@@ -4020,8 +4410,16 @@ def render_calendar_page(
     """)
 
     # ── day view ───────────────────────────────────────────────────
+    _tbl = thread_by_lead or {}
+    _init_dsi = (
+        schedule_svc.get_day_start_info(initial_day)
+        if schedule_svc is not None
+        else {"is_closed": initial_day.weekday() == 6, "business_hours_str": "",
+              "start_time": "09:00", "end_time": "18:00",
+              "zero_zone_group": "Norte", "zero_zone_detail": ""}
+    )
     html.append(f'<div id="cal-view-day" class="calViewPanel active" data-today="{today.isoformat()}">')
-    html.append(_day_slots(by_day_month.get(initial_day, [])))
+    html.append(_operational_day_view(initial_day, by_day_month.get(initial_day, []), _init_dsi, _tbl))
     html.append('</div>')
 
     # ── week view ──────────────────────────────────────────────────
@@ -4108,8 +4506,15 @@ def render_calendar_page(
     for _gi3 in range(42):
         _gd3 = _MGRID_START + timedelta(days=_gi3)
         _dappts3 = by_day_month.get(_gd3, [])
+        _dsi3 = (
+            schedule_svc.get_day_start_info(_gd3)
+            if schedule_svc is not None
+            else {"is_closed": _gd3.weekday() == 6, "business_hours_str": "",
+                  "start_time": "09:00", "end_time": "18:00",
+                  "zero_zone_group": "Norte", "zero_zone_detail": ""}
+        )
         html.append(f'<div id="cal-dayslots-{_gd3.isoformat()}">')
-        html.append(_day_slots(_dappts3))
+        html.append(_operational_day_view(_gd3, _dappts3, _dsi3, _tbl))
         html.append('</div>')
     html.append('</div>')  # cal-dayslots-data
     html.append('</div>')  # calMonthWrap
@@ -4149,6 +4554,16 @@ def render_calendar_page(
           });
           document.addEventListener("keydown",function(e){if(!(e.ctrlKey||e.metaKey))return;if((e.key||"").toLowerCase()!=="f")return;e.preventDefault();openSearch(true);},true);
         })();
+      window.toggleGpsMenu=function(btn){{
+        var menu=btn.nextElementSibling;if(!menu)return;
+        var open=menu.style.display!=="none";
+        document.querySelectorAll(".agendaGpsDropdown").forEach(function(d){{d.style.display="none";}});
+        if(!open)menu.style.display="block";
+      }};
+      document.addEventListener("click",function(e){{
+        if(!e.target.closest(".agendaGpsMenu"))
+          document.querySelectorAll(".agendaGpsDropdown").forEach(function(d){{d.style.display="none";}});
+      }});
       </script>
     """)
     html.append(f"""<script>
@@ -4205,7 +4620,7 @@ def render_calendar_page(
             var dp=document.getElementById('cal-view-day');
             if(dp){{
               var src=document.getElementById('cal-dayslots-'+ds);
-              dp.innerHTML=src?src.innerHTML:'<div class="calDaySlots"><div style="color:rgba(255,255,255,.35);padding:20px 16px;font-size:13px;">Sin turnos.</div></div>';
+              dp.innerHTML=src?src.innerHTML:'<div class="agendaDayWrap"><div class="agendaEmpty">Sin turnos.</div></div>';
             }}
           }}else if(view==='week'){{
             window.location.href=(dir<0?_hdr.dataset.prevWeek:_hdr.dataset.nextWeek)+'#week';
@@ -4255,7 +4670,7 @@ def render_profesionales_page(profesionales: list[Profesional], user_email: str 
     html.append("""
       <aside class="sidebar" id="sidebar">
         <div class="brandRow">
-          <div class="brandText">RIDECHECK</div>
+          <img class="brandLogo" src="/static/branding/ridecheck-logo.jpg" alt="RideCheck">
           <button class="sidebarToggle" type="button" onclick="toggleSidebar()" title="Collapse sidebar">%s</button>
         </div>
         %s
@@ -4548,6 +4963,29 @@ def render_lead_card(
     human_icon_alert = '<svg class="icon icon-only" viewBox="0 0 24 24"><path d="M12 4l9 16H3z"/><path d="M12 9v4M12 17h.01"/></svg>'
     human_icon = human_icon_user if not human_on else human_icon_alert
 
+    # M21.4A: read canonical attribution fields (read-only display)
+    acq_source_val = (_get(l, "acq_source") or "") if _has(l, "acq_source") else ""
+    inbound_ch_val = (_get(l, "inbound_channel") or "") if _has(l, "inbound_channel") else ""
+    ref_code_val = (_get(l, "ref_code") or "") if _has(l, "ref_code") else ""
+    rc_code_val = (_get(l, "rc_code") or "") if _has(l, "rc_code") else ""
+
+    _attr_parts: list[str] = []
+    if inbound_ch_val:
+        _attr_parts.append(f"Canal: <strong>{_txt(inbound_ch_val)}</strong>")
+    if acq_source_val:
+        _attr_parts.append(f"Origen: <strong>{_txt(acq_source_val)}</strong>")
+    if ref_code_val:
+        ref_label = f"ref:{_txt(ref_code_val)}"
+        if rc_code_val:
+            ref_label += f" · {_txt(rc_code_val)}"
+        _attr_parts.append(ref_label)
+    elif rc_code_val:
+        _attr_parts.append(_txt(rc_code_val))
+    attribution_html = (
+        f'<div class="muted leadAttribution">{" · ".join(_attr_parts)}</div>'
+        if _attr_parts else ""
+    )
+
     # 3-dots MENU (top-right): edit lead + perdido + delete
     canal_val = _get(l, "canal") if _has(l, "canal") else None
     compro_val = _get(l, "compro_el_auto") if _has(l, "compro_el_auto") else None
@@ -4794,6 +5232,7 @@ def render_lead_card(
 
         <div class="leadDetailsBody" id="lead-details-{l.id}">
           <div class="muted leadContact">Tel: {tel} · Email: {email}</div>
+          {attribution_html}
           <div class="leadRevPanel">
             <div class="leadRevTotal">Total presupuestado: {total_presu_txt}</div>
             <div class="leadRevLines">
@@ -4921,12 +5360,20 @@ def render_revisions_block(
                 approval_html = '<div class="revApprovalRow"><span class="pill pill-prof">✓ Turno confirmado</span></div>'
 
             approval_html = _render_revision_approval_ui(r, include_actions=True, lead_id=l.id)
+            _r_tf = r.turno_fecha
+            if _r_tf is not None:
+                _r_week = (_r_tf - timedelta(days=_r_tf.weekday())).isoformat()
+                _agenda_href = f"/calendar?highlight_lead_id={l.id}&week={_r_week}&date={_r_tf.isoformat()}#day"
+                _agenda_link = f'<a class="pill pill-agenda-link" href="{_agenda_href}" title="Ver en agenda">&#x1F4C5; Ver en agenda</a>'
+            else:
+                _agenda_link = ""
             chunks.append(f"""
               <div class="rev" id="rev-{l.id}-{r.id}">
                 <div class="revHead">
                   <div class="revHeadLine1">
                     <span class="revHeadTitle">Revisión {rev_num}</span>
                     <span class="revHeadTurno">Turno: {_txt(turno_txt)}</span>
+                    {_agenda_link}
                   </div>
                   <div class="revHeadLine2">
                     <span class="pill pill-prof">Profesional: {_txt(prof_label)}</span>
@@ -5859,7 +6306,7 @@ def render_revisions_table_page(
     html.append("""
       <aside class="sidebar" id="sidebar">
         <div class="brandRow">
-          <div class="brandText">RIDECHECK</div>
+          <img class="brandLogo" src="/static/branding/ridecheck-logo.jpg" alt="RideCheck">
           <button class="sidebarToggle" type="button" onclick="toggleSidebar()" title="Collapse sidebar">%s</button>
         </div>
         %s
@@ -6167,7 +6614,7 @@ def render_agencias_page(
     html = [css, '<div class="layout">']
     html.append("""
       <aside class="sidebar" id="sidebar">
-        <div class="brandRow"><div class="brandText">RIDECHECK</div><button class="sidebarToggle" type="button" onclick="toggleSidebar()" title="Collapse sidebar">%s</button></div>
+        <div class="brandRow"><img class="brandLogo" src="/static/branding/ridecheck-logo.jpg" alt="RideCheck"><button class="sidebarToggle" type="button" onclick="toggleSidebar()" title="Collapse sidebar">%s</button></div>
         %s
         %s
       </aside>

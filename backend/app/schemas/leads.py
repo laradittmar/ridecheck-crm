@@ -61,6 +61,12 @@ class LeadOut(BaseModel):
     necesita_humano: bool
     motivo_perdida: str | None = None
 
+    # M21.4A canonical attribution (read-only)
+    inbound_channel: str | None = None
+    acq_source: str | None = None
+    ref_code: str | None = None
+    rc_code: str | None = None
+
     class Config:
         from_attributes = True
 

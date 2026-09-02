@@ -26,6 +26,9 @@ class Settings:
     whatsapp_website_flow_id: str = ""
     whatsapp_vehicle_fallback_flow_id: str = ""
     whatsapp_location_fallback_flow_id: str = ""
+    # M21.3-C-D: RideCheck Booking Flow (Data Exchange version)
+    booking_flow_id: str = ""                  # WHATSAPP_BOOKING_FLOW_ID — Meta Flow asset ID
+    flow_booking_private_key_path: str = ""    # FLOW_BOOKING_PRIVATE_KEY_PATH — PEM file for Data Exchange decrypt
     conversation_engine_direct_webhook_enabled: bool = False
     openai_chat_model: str = "gpt-4o-mini"
     quarantined_test_wa_ids: tuple[str, ...] = ()
@@ -90,6 +93,8 @@ def get_settings() -> Settings:
         whatsapp_website_flow_id=_getenv("WHATSAPP_WEBSITE_FLOW_ID"),
         whatsapp_vehicle_fallback_flow_id=_getenv("WHATSAPP_VEHICLE_FALLBACK_FLOW_ID"),
         whatsapp_location_fallback_flow_id=_getenv("WHATSAPP_LOCATION_FALLBACK_FLOW_ID"),
+        booking_flow_id=_getenv("WHATSAPP_BOOKING_FLOW_ID", "28104222025943520"),
+        flow_booking_private_key_path=_getenv("FLOW_BOOKING_PRIVATE_KEY_PATH"),
         conversation_engine_direct_webhook_enabled=_getenv("CONVERSATION_ENGINE_DIRECT_WEBHOOK_ENABLED", "false").lower() in ("1", "true", "yes"),
         openai_chat_model=_getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
         quarantined_test_wa_ids=_parse_quarantined_wa_ids(),

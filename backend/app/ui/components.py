@@ -19,6 +19,16 @@ def render_whatsapp_icon_svg(size: int = 18, class_name: str = "") -> str:
     )
 
 
+_ICON_CONTROL_NAV = (
+    '<svg class="icon icon-only" viewBox="0 0 24 24" width="18" height="18" '
+    'fill="none" stroke="currentColor" stroke-width="1.8" '
+    'stroke-linecap="round" stroke-linejoin="round">'
+    '<rect x="2" y="3" width="20" height="14" rx="2"/>'
+    '<path d="M8 21h8"/><path d="M12 17v4"/>'
+    '</svg>'
+)
+
+
 def render_sidebar_nav(
     *,
     icon_board: str,
@@ -37,6 +47,7 @@ def render_sidebar_nav(
         ("/profesionales", "Profesionales", icon_prof, ""),
         ("/agencias", "Agencias", icon_ag, ""),
         ("/whatsapp/inbox", "WhatsApp Inbox", icon_wa, " waNavIcon"),
+        ("/control", "Control", _ICON_CONTROL_NAV, ""),
     ]
     if include_wa_debug:
         items.append(("/integrations/whatsapp/debug", "WhatsApp Debug", "DBG", ""))

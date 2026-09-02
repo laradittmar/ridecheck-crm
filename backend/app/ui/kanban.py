@@ -21,6 +21,8 @@ from ..models import (
     WhatsAppThread,
 )
 from . import kanban_actions as actions
+from ..services.schedule import ScheduleService
+from .control_view import render_control_page
 from .kanban_view import (
     _lead_flag_value,
     render_agencias_page,
@@ -474,6 +476,13 @@ def calendar(
     profesionales = db.execute(
         select(Profesional).order_by(Profesional.nombre, Profesional.apellido)
     ).scalars().all()
+    schedule_svc = ScheduleService(db)
+    lead_ids = [l.id for l in leads]
+    thread_rows = db.execute(
+        select(WhatsAppThread.lead_id, WhatsAppThread.id)
+        .where(WhatsAppThread.lead_id.in_(lead_ids))
+    ).all() if lead_ids else []
+    thread_by_lead = {row.lead_id: row.id for row in thread_rows if row.lead_id}
     return HTMLResponse(
         render_calendar_page(
             leads,
@@ -482,6 +491,8 @@ def calendar(
             user_email=getattr(request.state, "user_email", ""),
             highlight_lead_id=highlight_lead_id,
             initial_date=cal_date,
+            schedule_svc=schedule_svc,
+            thread_by_lead=thread_by_lead,
         ),
         media_type="text/html; charset=utf-8",
     )
@@ -601,3 +612,13 @@ router.add_api_route("/ui/vendedor_create", actions.ui_vendedor_create, methods=
 router.add_api_route("/ui/agencia_create", actions.ui_agencia_create, methods=["POST"])
 router.add_api_route("/ui/agencia_update", actions.ui_agencia_update, methods=["POST"])
 router.add_api_route("/ui/agencia_delete", actions.ui_agencia_delete, methods=["POST"])
+
+
+@router.get("/control", response_class=HTMLResponse)
+def control_dashboard(request: Request):
+    return HTMLResponse(
+        render_control_page(
+            user_email=getattr(request.state, "user_email", ""),
+        ),
+        media_type="text/html; charset=utf-8",
+    )

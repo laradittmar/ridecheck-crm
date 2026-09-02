@@ -8,3 +8,4 @@ python-multipart==0.0.9
 alembic==1.13.2
 passlib==1.7.4
 itsdangerous==2.2.0
+cryptography==42.0.8
