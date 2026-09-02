@@ -666,6 +666,43 @@ Evidence: `tests/test_l4_7b_shadow_understand.py` 29/29 (SHADOW-01…15); full r
 **Authority did not move.** Next: **L4.7B.1-SHADOW-DISAGREEMENT-ANALYSIS** — do not proceed
 to L4.7C before that review. Wild clean count stays **0/3**.
 
+### Phase B.9 — L4.7B.1-SHADOW-DISAGREEMENT-ANALYSIS (2026-09-02) — **COMPLETE**
+
+Audit: `2026-09-02_RIDECHECK_CRM_L4.7B.1-SHADOW-DISAGREEMENT-ANALYSIS_AUDIT_SEMANTIC-GAPS.md`
+
+All 162 corpus cases classified against **both** producers (shadow interpreter and a fair
+read-only re-execution of today's deterministic extractors with a seeded zone DB):
+
+| | Precision | Recall | Role acc. | Unsupported | Clean |
+|---|---|---|---|---|---|
+| CE deterministic | 0.679 (REAL 0.933) | 0.477 | 1.000 | 0.012 | 44 |
+| Shadow (measured) | 0.428 | 0.669 | 1.000 | 0.056 | 22 |
+| Shadow (artifact removed) | 0.548 | 0.669 | 1.000 | 0.012 | 44 |
+| **Union of both** | 0.567 | **0.707** | 1.000 | 0.012 | 44 |
+
+Labels: BOTH_CORRECT 6 · SHADOW_CORRECT_CE_WRONG 16 · CE_CORRECT_SHADOW_WRONG 38 ·
+BOTH_WRONG 100 · OWNER_REVIEW 2 (projected after the artifact fix: 18 / 26 / 26 / 90 / 2).
+
+**Finding: the two producers are complementary, not competing** — precise-and-blind vs
+broad-and-noisy — which is exactly the asymmetric architecture L4.7C is meant to build.
+62 % of all shadow errors come from two contract gaps (an empty-item JSON template artifact
+and unstated intent-emission scope); removing the artifact alone lifts precision 0.428 →
+0.548 and cuts unsupported inference 0.056 → 0.012. **MODEL CHANGE: NO** — every dominant
+class is a prompt, schema, context, mapper or corpus-label issue.
+
+A quality gate for promotion is now defined (REAL precision/recall ≥ 0.85, overall
+unsupported ≤ 0.01 and REAL exactly 0, role accuracy 1.000, every group recall ≥ 0.70, plus
+case-level requirements on the owner examples and the Wild cases). **Today it passes only
+role accuracy and ambiguity handling.**
+
+**L4.7B.2-SHADOW-INTERPRETER-QUALITY is therefore inserted before L4.7C.** Revised sequence:
+
+```
+L4.7E → L4.7A → L4.7B → L4.7B.1 → L4.7B.2 → corpus quality gate → L4.7C → L4.7F → Clean Wild C
+```
+
+Authority did not move; no code changed in this audit. Wild clean count stays **0/3**.
+
 ### Phase C — Infrastructure resilience (INFRA-OOM-01)
 
 **Host OOM incident, 2026-09-01 18:30:37Z — CONFIRMED, MEDIUM, launch-relevant.**
