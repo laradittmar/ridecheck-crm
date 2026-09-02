@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import re
 
 OUT = pathlib.Path(__file__).with_name("real_world_turns.jsonl")
 
@@ -25,6 +26,27 @@ def ev(field, value, status, role=None, note=None):
     if note:
         item["note"] = note
     return item
+
+
+# ── L4.7B.2A — owner intent rule (2026-09-02) ────────────────────────────────
+# A first inbound to RideCheck does NOT imply active PREPURCHASE_INSPECTION intent merely
+# because the customer wrote to an inspection business. Service intent must come from the
+# WORDING: naming the service, or the act of checking a vehicle's condition, or asking for
+# it / its price / its scheduling by name. Contacting us, politeness, saving the contact,
+# intending to write again, and searching for a car are NOT service intent.
+#
+# Service intent and commercial readiness stay separate: a customer can be semantically
+# interested in an inspection and still be neither quote-ready nor scheduling-ready.
+_SERVICE_LEXICON = re.compile(
+    r"revis|rebis|revic|inspec|chequ|checke|precompra|pre compra|pre-compra|peritaj|"
+    r"en qu\w* estado|lo mire|mirarlo|verlo antes",
+    re.IGNORECASE,
+)
+
+
+def names_the_service(text: str) -> bool:
+    """True when the wording itself carries service meaning (owner rule, L4.7B.2A)."""
+    return bool(_SERVICE_LEXICON.search(text or ""))
 
 
 def case(cid, kind, source, messages, groups, turn_evidence, canonical=None,
@@ -59,8 +81,9 @@ CASES.append(case(
     ["Hola por ahora estoy buscando un auto agende esto para no perderlo asijina vez q decida aviso"],
     ["A", "K", "L"],
     [
-        ev("service_intent", "PREPURCHASE_INSPECTION", "PROPOSED",
-           note="interest in the service exists, but no concrete inspection is requested yet"),
+        # L4.7B.2A (owner rule): `service_intent` removed — the wording names no service.
+        # Searching for a car and promising to write again is ENGAGEMENT, not service
+        # intent; it is carried by `readiness`, which stays.
         ev("readiness", "SEARCHING_NOT_READY", "CONFIRMED",
            note="customer is still looking for a vehicle and will contact again"),
         ev("vehicle", None, "AMBIGUOUS", note="no vehicle named"),
@@ -436,7 +459,10 @@ add_group("SYN-QUOTE", "D", [
     "Cuánto estarían cobrando?",
     "Me tirás un presupuesto?",
     "Cuánto salía en esa zona?",
-], lambda t: [ev("quote_request", True, "CONFIRMED")],
+], lambda t: ([ev("quote_request", True, "CONFIRMED")] +
+              ([ev("service_intent", "PREPURCHASE_INSPECTION", "PROPOSED",
+                   note="L4.7B.2A: the wording names the service being priced")]
+               if names_the_service(t) else [])),
    canonical_fn=lambda t: {},
    next_action="QUOTE_IF_READY_ELSE_ASK_MISSING",
    must_not=[{"field": "quote", "reason": "a request is not a quote; PricingService must produce it"}])
@@ -591,8 +617,10 @@ add_group("SYN-FUT", "L", [
     "Te consulto más adelante cuando tenga el auto",
     "Estoy en la búsqueda todavía",
     "Cuando lo vaya a ver te aviso para que lo revisen",
-], lambda t: [ev("service_intent", "PREPURCHASE_INSPECTION", "PROPOSED"),
-              ev("readiness", "SEARCHING_NOT_READY", "CONFIRMED")],
+], lambda t: (([ev("service_intent", "PREPURCHASE_INSPECTION", "PROPOSED",
+                   note="L4.7B.2A: the wording names the service")]
+               if names_the_service(t) else []) +
+              [ev("readiness", "SEARCHING_NOT_READY", "CONFIRMED")]),
    canonical_fn=lambda t: {"candidate": None, "quote": None, "stage": "QUALIFYING"},
    next_action="ACKNOWLEDGE_AND_REMAIN_AVAILABLE",
    must_not=[{"field": "vehicle", "reason": "no vehicle chosen yet"},

@@ -743,6 +743,44 @@ which is the premise L4.7C is built on.
 
 Wild clean count stays **0/3**. OUTBOUND OFF. L1/L2/L3 remain FROZEN.
 
+### Phase B.11 — L4.7B.2A-CORPUS-TRUTH-REVIEW (2026-09-02) — **COMPLETE; GATE STILL FAILS**
+
+Closeout: `2026-09-02_RIDECHECK_CRM_L4.7B.2A-CORPUS-TRUTH-REVIEW_CLOSEOUT_OWNER-INTENT-RULE.md`
+
+**Owner rule recorded:** a first inbound to RideCheck does not imply active
+`PREPURCHASE_INSPECTION` intent merely because the customer wrote to an inspection business.
+Service intent must come from the wording; contacting us, politeness, saving the contact,
+promising to write again and searching for a car are not intent. Service intent and
+commercial readiness stay separate. The rule is encoded once as `names_the_service()` in
+`tests/semantic_corpus/build_corpus.py` and applied by the generators, not by case lists.
+
+10 labels contradicted the rule and were corrected — **1 REAL** (REAL-001, the owner's own
+example) and **9 SYNTHETIC** (SYN-FUT-01…07 too aggressive; SYN-QUOTE-01/04 too weak). 5
+`SYN-MIX` cases were flagged OWNER_REVIEW_REQUIRED and left unchanged. No REAL raw text was
+touched; the interpreter was not changed.
+
+**Answer to the open premise: the corpus was not the problem.** Rescoring the *same*
+interpreter outputs against corrected labels moved recall 0.6157 → 0.6314 and left precision
+unchanged at 0.7163 — only 6 of 93 missing items were wrong expectations. **93.5 % of the gate
+distance is interpreter behaviour, not corpus error.**
+
+A separate instrument defect was found and deliberately not corrected here: the 8 `SYN-MIX`
+fixtures omit the business evidence their own text contains and use a `"mixed"` FAQ sentinel,
+producing **40.7 % of all false positives** in the corpus. Excluding them, the same unchanged
+interpreter measures P 0.810 — illustrative of instrument error, not an achieved metric.
+
+Gate re-applied unchanged: **FAIL** (REAL P 0.720 / R 0.621, overall P 0.716 / R 0.631,
+8 of 12 group recalls below 0.70). L4.7C does not start.
+
+Next: **L4.7B.2B-CORPUS-FIXTURE-REPAIR** (corpus only — repair the 8 J fixtures, adjudicate
+the 5 flagged cases, resolve the `readiness` vs `FUTURE_INTENT` engagement overlap), then
+**L4.7B.3** for the genuinely interpreter-side classes. MODEL CHANGE: still NO.
+
+Housekeeping: the untracked `backend/MagicMock/` tree (811 files, 839 shadow records, 0
+tracked, 0 production references) was audited and removed; its cause was fixed in L4.7B.2.
+
+Regression 3 328 passed / 60 failed / 9 errors — unchanged. OUTBOUND OFF. Wild clean count 0/3.
+
 ### Phase C — Infrastructure resilience (INFRA-OOM-01)
 
 **Host OOM incident, 2026-09-01 18:30:37Z — CONFIRMED, MEDIUM, launch-relevant.**
