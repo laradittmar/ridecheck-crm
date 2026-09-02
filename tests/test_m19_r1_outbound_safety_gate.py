@@ -47,11 +47,15 @@ if "psycopg2" not in sys.modules:
     sys.modules["psycopg2"] = _pg
     sys.modules["psycopg2.extensions"] = _pg.extensions
 
-from sqlalchemy import (
-    Boolean, Column, DateTime, Integer, JSON, MetaData, String,
-    Table, Text, create_engine, event,
-)
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session
+
+# JSONB → JSON for SQLite compatibility (must run before app.models import)
+import sqlalchemy as _sa
+import sqlalchemy.dialects.postgresql as _pg_dialect
+import sqlalchemy.dialects.postgresql.json as _pg_json
+_pg_dialect.JSONB = _sa.JSON
+_pg_json.JSONB = _sa.JSON
 
 import app.models  # noqa: F401 — registers all ORM classes against Base
 from app.models import (
@@ -61,6 +65,7 @@ from app.models import (
     WhatsAppThread,
     WhatsAppThreadState,
 )
+from app.services.outbound_path_registry import OutboundPathId
 from app.services.outbound_safety_gate import (
     DEDUP_WINDOW_MINUTES,
     FLOOD_MAX_MESSAGES,
@@ -82,95 +87,7 @@ def _sqlite_pragmas(conn, _rec):
     cursor.close()
 
 
-# Build a SQLite-compatible schema for just the tables the gate needs.
-# Uses JSON (not JSONB) for raw_payload and omits unsupported Postgres CHECK
-# constraints.  M19.R1.2: dedup table updated to rolling-window schema
-# (message_kind added, window_start removed, UNIQUE constraint removed).
-_test_meta = MetaData()
-
-Table("whatsapp_contacts", _test_meta,
-    Column("id", Integer, primary_key=True),
-    Column("wa_id", String(80), nullable=False, unique=True),
-    Column("display_name", String(255)),
-    Column("phone", String(40)),
-    Column("created_at", DateTime(timezone=True)),
-)
-Table("whatsapp_threads", _test_meta,
-    Column("id", Integer, primary_key=True),
-    Column("contact_id", Integer, nullable=False),
-    Column("display_name_override", String(255)),
-    Column("lead_id", Integer),
-    Column("last_message_at", DateTime(timezone=True)),
-    Column("unread_count", Integer, default=0),
-    Column("latest_inbound_wa_message_id", String(255)),
-    Column("created_at", DateTime(timezone=True)),
-)
-Table("whatsapp_thread_states", _test_meta,
-    Column("id", Integer, primary_key=True),
-    Column("thread_id", Integer, nullable=False, unique=True),
-    Column("last_intent", String(30)),
-    Column("last_stage", String(30)),
-    Column("needs_human", Boolean, default=False),
-    Column("current_focus_candidate_id", Integer),
-    Column("current_revision_id", Integer),
-    Column("last_processed_inbound_wa_message_id", String(191)),
-    Column("customer_name", String(120)),
-    Column("home_zone_group", String(50)),
-    Column("home_zone_detail", String(80)),
-    Column("preferred_day", String(20)),
-    Column("preferred_time", String(10)),
-    Column("active_requested_date", String(20)),
-    Column("last_requested_time", String(10)),
-    Column("last_offered_slots", Text),
-    Column("last_visible_slots", Text),
-    Column("is_website_lead", Boolean, default=False),
-    Column("flow_booking_token", String(120)),
-    Column("vehicle_clarification_sent", Boolean, default=False),
-    Column("location_clarification_sent", Boolean, default=False),
-    Column("vehicle_fallback_flow_sent", Boolean, default=False),
-    Column("location_fallback_flow_sent", Boolean, default=False),
-    Column("inspectability_clarification_sent", Boolean, default=False),
-    Column("unanswered_alert_sent_at", DateTime(timezone=True)),
-    Column("quote_followup_sent_at", DateTime(timezone=True)),
-    Column("buscando_followup_sent_at", DateTime(timezone=True)),
-    Column("created_at", DateTime(timezone=True)),
-    Column("updated_at", DateTime(timezone=True)),
-)
-Table("whatsapp_messages", _test_meta,
-    Column("id", Integer, primary_key=True),
-    Column("thread_id", Integer, nullable=False),
-    Column("wa_message_id", String(191), unique=True),
-    Column("direction", String(10), nullable=False),
-    Column("timestamp", DateTime(timezone=True), nullable=False),
-    Column("message_type", String(20), default="text"),
-    Column("media_id", String(191)),
-    Column("text", Text),
-    Column("status", String(20), nullable=False, default="received"),
-    Column("raw_payload", JSON),   # JSON instead of JSONB — SQLite compatible
-    Column("created_at", DateTime(timezone=True)),
-    # Safety gate columns (from migration 20260625_outbound_safety_gate)
-    Column("automated", Boolean, nullable=False, default=False),
-    Column("content_fingerprint", String(64)),
-    Column("blocked_reason", Text),
-)
-# M19.R1.2: rolling-window schema — message_kind added, window_start removed,
-# UNIQUE constraint replaced by recipient lock + SELECT FOR UPDATE.
-Table("whatsapp_outbound_dedup", _test_meta,
-    Column("id", Integer, primary_key=True),
-    Column("wa_id", String(80), nullable=False),
-    Column("thread_id", Integer, nullable=False),
-    Column("message_kind", String(20), nullable=False, default="text"),
-    Column("content_fingerprint", String(64), nullable=False),
-    Column("created_at", DateTime(timezone=True)),
-)
-# M19.R1.2: recipient-level lock table for SELECT FOR UPDATE serialization.
-Table("whatsapp_recipient_locks", _test_meta,
-    Column("id", Integer, primary_key=True),
-    Column("wa_id", String(80), nullable=False, unique=True),
-    Column("created_at", DateTime(timezone=True)),
-)
-
-_test_meta.create_all(_engine)
+app.models.Base.metadata.create_all(_engine)
 
 
 # ── Fixture helpers ───────────────────────────────────────────────────────────
@@ -245,7 +162,7 @@ class TestVehicleQuestionFloodSameRecipient(unittest.TestCase):
         pfx = id(self)
         for i in range(50):
             r = gate.attempt(wa_id=self.wa_id, thread_id=self.thread_id,
-                             text=text, now=now)
+                             text=text, now=now, path_id=OutboundPathId.CE_TEXT.value)
             if r.outcome == GateOutcome.ALLOWED:
                 gate.mark_sent(r.message_id, f"wamid_{pfx}_{i}")
                 sent_count += 1
@@ -266,7 +183,7 @@ class TestVehicleQuestionFloodSameRecipient(unittest.TestCase):
         """The dedup row must be keyed by wa_id, not just thread_id."""
         gate = OutboundSafetyGate(self.session)
         r = gate.attempt(wa_id=self.wa_id, thread_id=self.thread_id,
-                         text=_VEHICLE_QUESTION, now=_NOW)
+                         text=_VEHICLE_QUESTION, now=_NOW, path_id=OutboundPathId.CE_TEXT.value)
         self.assertEqual(r.outcome, GateOutcome.ALLOWED)
 
         dedup_row = self.session.query(WhatsAppOutboundDedup).filter_by(
@@ -312,14 +229,14 @@ class TestCrossThreadRecipientDedup(unittest.TestCase):
 
         # Thread A sends first.
         r1 = gate.attempt(wa_id=self.wa_id, thread_id=self.thread_a_id,
-                          text=text, now=now)
+                          text=text, now=now, path_id=OutboundPathId.CE_TEXT.value)
         self.assertEqual(r1.outcome, GateOutcome.ALLOWED,
                          "first send via thread A must be allowed")
         gate.mark_sent(r1.message_id, f"wamid_xthread_{id(self)}_a")
 
         # Thread B attempts the same text to the same recipient.
         r2 = gate.attempt(wa_id=self.wa_id, thread_id=self.thread_b_id,
-                          text=text, now=now)
+                          text=text, now=now, path_id=OutboundPathId.CE_TEXT.value)
         self.assertEqual(r2.outcome, GateOutcome.BLOCKED_DUPLICATE,
                          "same text to same wa_id via different thread must be blocked")
         self.assertIn("...%s" % self.wa_id[-4:], r2.blocked_reason or "",
@@ -338,12 +255,12 @@ class TestCrossThreadRecipientDedup(unittest.TestCase):
         pfx = id(self)
 
         r1 = gate.attempt(wa_id=self.wa_id, thread_id=self.thread_a_id,
-                          text=f"Mensaje uno {pfx}", now=now)
+                          text=f"Mensaje uno {pfx}", now=now, path_id=OutboundPathId.CE_TEXT.value)
         self.assertEqual(r1.outcome, GateOutcome.ALLOWED)
         gate.mark_sent(r1.message_id, f"wamid_{pfx}_1")
 
         r2 = gate.attempt(wa_id=self.wa_id, thread_id=self.thread_b_id,
-                          text=f"Mensaje dos {pfx}", now=now)
+                          text=f"Mensaje dos {pfx}", now=now, path_id=OutboundPathId.CE_TEXT.value)
         self.assertEqual(r2.outcome, GateOutcome.ALLOWED,
                          "different text to same recipient must not be blocked")
         gate.mark_sent(r2.message_id, f"wamid_{pfx}_2")
@@ -378,7 +295,7 @@ class TestFloodGate(unittest.TestCase):
         for i in range(4):
             text = f"Mensaje distinto {pfx} numero {i} para el turno"
             r = gate.attempt(wa_id=self.wa_id, thread_id=self.thread_id,
-                             text=text, now=now)
+                             text=text, now=now, path_id=OutboundPathId.CE_TEXT.value)
             outcomes.append(r.outcome)
             if r.outcome == GateOutcome.ALLOWED:
                 gate.mark_sent(r.message_id, f"wamid_{pfx}_{i}")
@@ -406,12 +323,12 @@ class TestFloodGate(unittest.TestCase):
 
         for i in range(FLOOD_MAX_MESSAGES):
             r = gate.attempt(wa_id=self.wa_id, thread_id=self.thread_id,
-                             text=f"Flood reason test {pfx} msg {i}", now=now)
+                             text=f"Flood reason test {pfx} msg {i}", now=now, path_id=OutboundPathId.CE_TEXT.value)
             self.assertEqual(r.outcome, GateOutcome.ALLOWED)
             gate.mark_sent(r.message_id, f"wamid_fr_{pfx}_{i}")
 
         r_blocked = gate.attempt(wa_id=self.wa_id, thread_id=self.thread_id,
-                                 text=f"Flood reason test {pfx} trigger", now=now)
+                                 text=f"Flood reason test {pfx} trigger", now=now, path_id=OutboundPathId.CE_TEXT.value)
         self.assertEqual(r_blocked.outcome, GateOutcome.BLOCKED_FLOOD)
         reason = r_blocked.blocked_reason or ""
         self.assertIn(self.wa_id[-4:], reason,
@@ -457,19 +374,19 @@ class TestDedupWindowExpiry(unittest.TestCase):
 
         pfx = id(self)
         r1 = gate.attempt(wa_id=self.wa_id, thread_id=self.thread_id,
-                          text=text, now=now1)
+                          text=text, now=now1, path_id=OutboundPathId.CE_TEXT.value)
         self.assertEqual(r1.outcome, GateOutcome.ALLOWED)
         gate.mark_sent(r1.message_id, f"wamid_{pfx}_first")
 
         # Within the rolling 10-minute window → blocked.
         r_dup = gate.attempt(wa_id=self.wa_id, thread_id=self.thread_id,
-                             text=text, now=now1 + timedelta(minutes=3))
+                             text=text, now=now1 + timedelta(minutes=3), path_id=OutboundPathId.CE_TEXT.value)
         self.assertEqual(r_dup.outcome, GateOutcome.BLOCKED_DUPLICATE,
                          "same text within 10-min rolling window must be blocked")
 
         # Exactly 10 minutes later — row at created_at is NOT > cutoff → allowed.
         r2 = gate.attempt(wa_id=self.wa_id, thread_id=self.thread_id,
-                          text=text, now=now2)
+                          text=text, now=now2, path_id=OutboundPathId.CE_TEXT.value)
         self.assertEqual(r2.outcome, GateOutcome.ALLOWED,
                          "same text exactly 10min later must be allowed (rolling boundary)")
         gate.mark_sent(r2.message_id, f"wamid_{pfx}_second")
@@ -524,6 +441,7 @@ class TestLegitimateProgressionNotBlocked(unittest.TestCase):
                 text=text,
                 message_type=msg_type,
                 now=now + timedelta(seconds=i * 30),
+                path_id=OutboundPathId.CE_TEXT.value,
             )
             self.assertEqual(
                 r.outcome, GateOutcome.ALLOWED,
@@ -568,7 +486,7 @@ class TestMetaApiFailure(unittest.TestCase):
         now = _NOW
 
         r = gate.attempt(wa_id=self.wa_id, thread_id=self.thread_id,
-                         text=text, now=now)
+                         text=text, now=now, path_id=OutboundPathId.CE_TEXT.value)
         self.assertEqual(r.outcome, GateOutcome.ALLOWED)
 
         # Simulate Meta API failure — caller invokes mark_failed.
@@ -580,7 +498,7 @@ class TestMetaApiFailure(unittest.TestCase):
 
         # Automatic retry in the same dedup window is blocked.
         r2 = gate.attempt(wa_id=self.wa_id, thread_id=self.thread_id,
-                          text=text, now=now)
+                          text=text, now=now, path_id=OutboundPathId.CE_TEXT.value)
         self.assertEqual(r2.outcome, GateOutcome.BLOCKED_DUPLICATE,
                          "Automatic retry must be blocked — dedup entry was written "
                          "before the Meta call even on failure")
@@ -595,7 +513,7 @@ class TestMetaApiFailure(unittest.TestCase):
         """pending record is durable BEFORE any Meta API call."""
         gate = OutboundSafetyGate(self.session)
         r = gate.attempt(wa_id=self.wa_id, thread_id=self.thread_id,
-                         text=_VEHICLE_QUESTION, now=_NOW)
+                         text=_VEHICLE_QUESTION, now=_NOW, path_id=OutboundPathId.CE_TEXT.value)
         self.assertEqual(r.outcome, GateOutcome.ALLOWED)
 
         msg = self.session.get(WhatsAppMessage, r.message_id)

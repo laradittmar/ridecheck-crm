@@ -249,8 +249,11 @@ class TestLP02_CandidateInheritsZone(unittest.TestCase):
             eng._create_candidate_from_catalog(c, st, match, source_text="Ford Focus 2019")
 
         kwargs = MockCand.call_args.kwargs if MockCand.call_args else MockCand.call_args[1]
-        self.assertEqual(kwargs.get("zone_group"), "CABA")
-        self.assertEqual(kwargs.get("zone_detail"), "Palermo")
+        # FIX 1 (RISK-03): zone_group and zone_detail must be None at creation.
+        # State home_zone_* is NOT passed to the constructor; it serves as a
+        # _get_active_inspection_location fallback when the candidate has no zone.
+        self.assertIsNone(kwargs.get("zone_group"), "FIX 1: zone_group must be None at creation")
+        self.assertIsNone(kwargs.get("zone_detail"), "FIX 1: zone_detail must be None at creation")
 
     def test_create_from_catalog_no_zone_when_state_empty(self):
         """Candidate starts with None zones when home_zone_* is empty."""
@@ -298,9 +301,11 @@ class TestLP02_CandidateInheritsZone(unittest.TestCase):
                 "status": "current_focus",
             })
 
-        # Candidate should have received zone from state fallback
-        self.assertEqual(mock_cand_inst.zone_group, "CABA")
-        self.assertEqual(mock_cand_inst.zone_detail, "Palermo")
+        # FIX 1 (RISK-03): candidate zone must remain None after _apply_candidate create.
+        # State home_zone_* is NOT written to the candidate here; it is the fallback
+        # only in _get_active_inspection_location when candidate.zone_group is None.
+        self.assertIsNone(mock_cand_inst.zone_group, "FIX 1: zone_group must be None at creation")
+        self.assertIsNone(mock_cand_inst.zone_detail, "FIX 1: zone_detail must be None at creation")
 
     def test_apply_candidate_create_does_not_overwrite_explicit_zone(self):
         """If AI supplies zone, home_zone_* must not overwrite it."""

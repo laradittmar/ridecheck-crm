@@ -28,7 +28,7 @@ Test index:
   18. Static (AST): _send_text_to_wa raises OutboundBlockedError on
       BLOCKED_KILL_SWITCH (not on dedup/flood blocks).
   19. Static (AST): every ConversationEngine path to a Meta send goes through
-      gate.attempt() — blocked audit coverage is universal for engine sends.
+      gate.attempt(, path_id=OutboundPathId.CE_TEXT.value) — blocked audit coverage is universal for engine sends.
   20. Gate killed but ALLOWED would route to Meta — layer-2 guard is last resort.
 """
 from __future__ import annotations
@@ -45,6 +45,8 @@ from pathlib import Path
 # ── Path setup ────────────────────────────────────────────────────────────────
 ROOT_DIR = Path(__file__).resolve().parents[1]
 BACKEND_DIR = ROOT_DIR / "backend"
+if not BACKEND_DIR.exists():   # container: /app/backend absent, app code is at /app
+    BACKEND_DIR = ROOT_DIR
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
@@ -113,10 +115,11 @@ from app.models import (
     WhatsAppThreadState,
 )
 
-Base.metadata.create_all(_engine)
+app.models.Base.metadata.create_all(_engine)
 
 # ── Import units under test ───────────────────────────────────────────────────
 from app.services.outbound_guard import OutboundBlockedError, enforce_outbound_enabled
+from app.services.outbound_path_registry import OutboundPathId
 from app.services.outbound_safety_gate import GateOutcome, OutboundSafetyGate
 
 # ── File paths for static tests ───────────────────────────────────────────────
@@ -278,6 +281,7 @@ class TestGateKillSwitch(unittest.TestCase):
         result = gate.attempt(
             wa_id=_WA_ID, thread_id=self.thread.id,
             text="Para cotizarte la revisión…", now=_NOW,
+            path_id=OutboundPathId.CE_TEXT.value,
         )
         self.assertEqual(result.outcome, GateOutcome.BLOCKED_KILL_SWITCH)
         self.assertIsNotNone(result.message_id)
@@ -305,6 +309,7 @@ class TestGateKillSwitch(unittest.TestCase):
         result = OutboundSafetyGate(self.db).attempt(
             wa_id=_WA_ID, thread_id=self.thread.id,
             text="Para cotizarte la revisión…", now=_NOW,
+            path_id=OutboundPathId.CE_TEXT.value,
         )
         self.assertEqual(result.outcome, GateOutcome.ALLOWED)
 
@@ -332,6 +337,7 @@ class TestStateFlagIntegrity(unittest.TestCase):
     def _assert_gate_blocks_before_flag(self, flag_name: str, text: str) -> None:
         result = OutboundSafetyGate(self.db).attempt(
             wa_id=_WA_ID, thread_id=self.thread.id, text=text, now=_NOW,
+            path_id=OutboundPathId.CE_TEXT.value,
         )
         self.assertEqual(result.outcome, GateOutcome.BLOCKED_KILL_SWITCH)
         # State flag: never set (simulates early return before mutation).
@@ -385,6 +391,7 @@ class TestFollowupTimestampNotSet(unittest.TestCase):
         result = OutboundSafetyGate(self.db).attempt(
             wa_id=_WA_ID, thread_id=self.thread.id,
             text="Hola! ¿Pudiste revisar el presupuesto?", now=_NOW,
+            path_id=OutboundPathId.CE_TEXT.value,
         )
         # Follow-up loop: if result.outcome != ALLOWED: continue → no upsert.
         self.assertEqual(result.outcome, GateOutcome.BLOCKED_KILL_SWITCH)
@@ -435,7 +442,7 @@ class TestDirtySessionIsolation(unittest.TestCase):
 
     Protocol:
       1. Make thread-state dirty in session_a (no commit).
-      2. Call OutboundSafetyGate(session_a).attempt() → kill switch fires.
+      2. Call OutboundSafetyGate(session_a).attempt(, path_id=OutboundPathId.CE_TEXT.value) → kill switch fires.
          Gate uses its own dedicated SessionLocal() → separate connection.
       3. Gate's commit writes only the blocked audit record.
       4. Verify via session_b (independent connection):
@@ -453,7 +460,7 @@ class TestDirtySessionIsolation(unittest.TestCase):
             f"sqlite:///{self._iso_path}",
             connect_args={"check_same_thread": False},
         )
-        Base.metadata.create_all(self._iso_engine)
+        app.models.Base.metadata.create_all(self._iso_engine)
         self._IsoSession = sessionmaker(
             bind=self._iso_engine, autoflush=False, autocommit=False
         )
@@ -486,6 +493,7 @@ class TestDirtySessionIsolation(unittest.TestCase):
             thread_id=self.thread.id,
             text="Para cotizarte la revisión…",
             now=_NOW,
+            path_id=OutboundPathId.CE_TEXT.value,
         )
         self.assertEqual(result.outcome, GateOutcome.BLOCKED_KILL_SWITCH)
 
@@ -603,16 +611,16 @@ class TestSendTextToWaStaticProof(unittest.TestCase):
         )
 
 
-# ── 19  Static: all engine send paths go through gate.attempt() ───────────────
+# ── 19  Static: all engine send paths go through gate.attempt(, path_id=OutboundPathId.CE_TEXT.value) ───────────────
 
 class TestEngineAuditCoverage(unittest.TestCase):
     """Test 19 — every ConversationEngine path to a Meta API call goes through
-    OutboundSafetyGate.attempt() in either _send_text_to_wa or _send_flow_button.
+    OutboundSafetyGate.attempt(, path_id=OutboundPathId.CE_TEXT.value) in either _send_text_to_wa or _send_flow_button.
 
     We prove this by verifying:
       (a) The only callers of _send_whatsapp_cloud_text and _send_whatsapp_cloud_flow
           inside conversation_engine.py are _send_text_to_wa and _send_flow_button.
-      (b) Both helpers call gate.attempt() before reaching the cloud sender.
+      (b) Both helpers call gate.attempt(, path_id=OutboundPathId.CE_TEXT.value) before reaching the cloud sender.
     """
 
     def _src(self) -> str:
@@ -646,7 +654,7 @@ class TestEngineAuditCoverage(unittest.TestCase):
         self.assertIn("_send_flow_button", callers)
 
     def test_19b_helpers_call_gate_attempt_before_meta(self):
-        """_send_text_to_wa and _send_flow_button both call gate.attempt()."""
+        """_send_text_to_wa and _send_flow_button both call gate.attempt(, path_id=OutboundPathId.CE_TEXT.value)."""
         src = self._src()
         tree = _ast.parse(src, filename=str(_ENGINE_FILE))
         for fn_name in ("_send_text_to_wa", "_send_flow_button"):
@@ -663,7 +671,7 @@ class TestEngineAuditCoverage(unittest.TestCase):
                                 found_attempt = True
                         self.assertTrue(
                             found_attempt,
-                            f"{fn_name} must call gate.attempt() for blocked-audit coverage",
+                            f"{fn_name} must call gate.attempt(, path_id=OutboundPathId.CE_TEXT.value) for blocked-audit coverage",
                         )
 
     def test_19c_send_text_raises_for_all_blocked_outcomes(self):

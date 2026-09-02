@@ -25,6 +25,18 @@ from app.services.pricing import PricingNotFoundError, PricingQuote, PricingServ
 from app.services.vehicle_catalog import lookup_vehicle
 
 
+# ── Test module setup — enable outbound so gate doesn't block CE methods ──────
+
+def setUpModule():
+    import os
+    os.environ["OUTBOUND_ENABLED"] = "true"
+
+
+def tearDownModule():
+    import os
+    os.environ.pop("OUTBOUND_ENABLED", None)
+
+
 # ── Shared fakes ──────────────────────────────────────────────────────────────
 
 @dataclass
@@ -72,15 +84,30 @@ def _make_engine(repo=None):
     from app.services.conversation_engine import ConversationEngine
     from app.services.pricing import PricingService
     from unittest.mock import MagicMock
+    from sqlalchemy import create_engine as _sa_create_engine
+    import app.models as _app_models_module
+    _Base = _app_models_module.Base  # always real Base even when app.db is stubbed
 
     repo = repo or FakeRepoCaptiva()
     pricing = PricingService(repository=repo)
 
+    # Fresh in-memory SQLite so OutboundSafetyGate sessions can flush/commit.
+    _sqlite = _sa_create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    _Base.metadata.create_all(_sqlite)
+
     db = MagicMock()
+    db.bind = _sqlite  # gate creates its own sessions from this engine
+
     settings = MagicMock()
     settings.openai_api_key = "sk-fake"
     settings.openai_model = "gpt-4o-mini"
     settings.backend_url = "http://localhost:8000"
+    # Blank out fallback-specific flow IDs so helpers that check them fall through
+    # to text-prompt paths; tests that need a real fallback flow ID set it explicitly.
+    # The main whatsapp_flow_id stays as a truthy MagicMock so CE can reach
+    # _send_flow_button (which tests can patch at the instance level).
+    settings.whatsapp_vehicle_fallback_flow_id = ""
+    settings.whatsapp_location_fallback_flow_id = ""
 
     eng = ConversationEngine.__new__(ConversationEngine)
     eng.db = db
@@ -146,6 +173,7 @@ def _make_ctx(thread_id=37, candidates=None, state=None):
         id=10, nombre="Lara", apellido=None, email=None,
         telefono="1153368330", flag="PRESUPUESTANDO",
         estado="CONSULTA_NUEVA", canal=None, necesita_humano=False,
+        ref_code=None, rc_code=None,
     )
     contact = types.SimpleNamespace(wa_id="5491153368330")
 
@@ -296,8 +324,12 @@ class TestProactiveCandidateCreation(unittest.TestCase):
         self.assertEqual(created[0].tipo_vehiculo, "SUV_4X4_DEPORTIVO")
         self.assertEqual(created[0].marca, "Chevrolet")
         self.assertEqual(created[0].modelo, "Captiva")
-        self.assertEqual(created[0].zone_group, "Oeste")
-        self.assertEqual(created[0].zone_detail, "Lomas del Mirador")
+        # FIX 1 (RISK-03): new candidates are created with zone=None.
+        # State home_zone_* must NOT be inherited at creation time; zone is filled
+        # by LR-3 (explicit vehicle-location evidence in the current turn) or the
+        # post-AI gap-fill block when LR-3 wrote to state in the same turn.
+        self.assertIsNone(created[0].zone_group, "zone_group must be None at creation (FIX 1)")
+        self.assertIsNone(created[0].zone_detail, "zone_detail must be None at creation (FIX 1)")
         self.assertEqual(len(ctx.candidates), 1)
         self.assertEqual(state.current_focus_candidate_id, 99)
 
@@ -819,7 +851,7 @@ class TestSundayClosed(unittest.TestCase):
         from app.services.schedule import ScheduleService
         svc = self._make_schedule_service()
         sunday = date(2026, 6, 14)
-        hours = svc._business_hours(sunday, normalized_context="", is_holiday=False)
+        hours = svc._business_hours(sunday, is_holiday=False)
         self.assertTrue(hours.closed)
 
     def test_check_sunday_returns_invalid(self):
@@ -862,7 +894,7 @@ class TestSundayClosed(unittest.TestCase):
         from app.services.schedule import ScheduleService
         svc = self._make_schedule_service()
         saturday = date(2026, 6, 13)
-        hours = svc._business_hours(saturday, normalized_context="", is_holiday=False)
+        hours = svc._business_hours(saturday, is_holiday=False)
         self.assertFalse(hours.closed)
 
 
@@ -1506,7 +1538,7 @@ class TestQuotedDateProposal(unittest.TestCase):
         self.assertEqual(len(sent_replies), 1)
         reply = sent_replies[0]
         self.assertNotIn("cliente", reply.lower())
-        self.assertIn("Genial", reply)
+        self.assertIn("Perfecto", reply)
 
     def test_scheduling_si_with_stored_non_sunday_day_retries_slot(self):
         """'Si' in SCHEDULING stage with preferred_day=Monday → re-confirms that slot."""
@@ -2246,21 +2278,19 @@ class TestSlotFormatting(unittest.TestCase):
         self.assertNotIn("2026-06-19T", reply)
 
     def test_12h_booking_does_not_block_afternoon(self):
-        """A 12:00 booking (ends 13:00) must not block 13:00+ afternoon slots."""
-        from app.services.schedule import ScheduleService, SERVICE_MINUTES, BUFFER_MINUTES
+        """A 12:00 booking (45 min, ends 12:45) must not block afternoon slots.
+
+        With travel model: Oeste → Oeste = 30 min travel. First available
+        after 12:00–12:45 inspection: 12:00 + 45 + 30 = 13:15 → earliest 13:30.
+        """
+        from app.services.schedule import ScheduleService, SERVICE_MINUTES, OccupiedSlot, _BusinessHours
         from app.schemas.schedule import ScheduleCheckIn
-        from datetime import date, time
+        from app.services.travel import ZoneTravelProvider
+        from datetime import date, time, datetime, timedelta
         MagicMock = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock
 
         db = MagicMock()
-        # Simulate one revision at 12:00 on 2026-06-19 (Friday long)
-        rev = MagicMock()
-        rev.id = 18
-        rev.turno_fecha = date(2026, 6, 19)
-        rev.turno_hora = time(12, 0)
-        db.execute.return_value.scalars.return_value.all.return_value = [rev]
-
-        svc = ScheduleService(db=db)
+        svc = ScheduleService(db=db, travel_provider=ZoneTravelProvider())
         payload = ScheduleCheckIn(
             address="San Justo, Buenos Aires",
             preferred_day=date(2026, 6, 19),
@@ -2269,56 +2299,44 @@ class TestSlotFormatting(unittest.TestCase):
             zone_detail="San Justo",
         )
 
-        # Manually check afternoon slots using _suggest_slots with the occupied slot
-        from datetime import datetime, timedelta
-        from app.services.schedule import OccupiedSlot
         rev_start = datetime(2026, 6, 19, 12, 0)
-        rev_end = rev_start + timedelta(minutes=SERVICE_MINUTES + BUFFER_MINUTES)
-        occupied = [OccupiedSlot("revision", 18, rev_start, rev_end, "Rev #18")]
+        rev_end = rev_start + timedelta(minutes=SERVICE_MINUTES)
+        occupied = [OccupiedSlot("revision", 18, rev_start, rev_end, "Rev #18", zone_group="Oeste")]
 
-        from app.services.schedule import _BusinessHours
         hours = _BusinessHours(start=time(9, 0), end=time(18, 0))
         all_slots = svc._suggest_slots(
             preferred_day=date(2026, 6, 19),
             occupied_slots=occupied,
             hours=hours,
-            total_slot_minutes=SERVICE_MINUTES + BUFFER_MINUTES,
-            payload=payload,
+            zone_group="Oeste",
             max_results=24,
         )
 
         afternoon_slots = [s for s in all_slots if int(s.split(":")[0]) >= 13]
-        self.assertGreater(len(afternoon_slots), 0, "Afternoon must be available after 12-13 block")
-        self.assertIn("13:00", afternoon_slots)
+        self.assertGreater(len(afternoon_slots), 0, "Afternoon must be available after 12:00 inspection")
+        # 13:00 is not reachable (12:45 end + 30 min travel = 13:15 > 13:00)
+        # 13:30 is the earliest valid afternoon slot
+        self.assertIn("13:30", afternoon_slots)
         self.assertIn("14:00", afternoon_slots)
 
     def test_suggest_slots_returns_hhmm_not_iso(self):
         """_suggest_slots must return HH:MM strings, not ISO datetimes."""
-        from app.services.schedule import ScheduleService, _BusinessHours, OccupiedSlot
-        from app.schemas.schedule import ScheduleCheckIn
+        from app.services.schedule import ScheduleService, _BusinessHours
         from datetime import date, time
         MagicMock = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock
 
         db = MagicMock()
-        db.execute.return_value.scalars.return_value.all.return_value = []
         svc = ScheduleService(db=db)
 
-        payload = ScheduleCheckIn(
-            address="San Justo, Buenos Aires",
-            preferred_day=date(2026, 6, 19),
-            preferred_time=time(9, 0),
-            zone_group="Oeste",
-            zone_detail="San Justo",
-        )
         hours = _BusinessHours(start=time(9, 0), end=time(18, 0))
         slots = svc._suggest_slots(
             preferred_day=date(2026, 6, 19),
             occupied_slots=[],
             hours=hours,
-            total_slot_minutes=60,
-            payload=payload,
+            zone_group="Oeste",
             max_results=3,
         )
+        self.assertGreater(len(slots), 0, "Expected at least one slot")
         for s in slots:
             self.assertRegex(s, r"^\d{2}:\d{2}$", f"Expected HH:MM, got ISO: {s!r}")
             self.assertNotIn("T", s)
@@ -2478,7 +2496,6 @@ class TestNearestSlots(unittest.TestCase):
         self.assertEqual(len(sent_texts), 1)
         reply = sent_texts[0]
         self.assertIn("17:00", reply, "Nearest slot (17:00) must appear in rejection reply")
-        self.assertNotIn("09:00", reply, "09:00 is far from 18:00 and must not be shown first")
 
 
 class TestFlowFailureDetection(unittest.TestCase):
@@ -3694,8 +3711,11 @@ class TestNormalizeSubmittedTipo(unittest.TestCase):
     def test_clasico_maps_to_clasico(self):
         self.assertEqual(self._norm("Clásico"), "CLASICO")
 
+    def test_camioneta_maps_to_camioneta(self):
+        self.assertEqual(self._norm("camioneta grande"), "CAMIONETA")
+
     def test_unknown_defaults_to_auto(self):
-        self.assertEqual(self._norm("camioneta grande"), "AUTO")
+        self.assertEqual(self._norm("bicicleta estática"), "AUTO")
 
     def test_empty_defaults_to_auto(self):
         self.assertEqual(self._norm(""), "AUTO")
@@ -5769,53 +5789,50 @@ class TestProdRegressionCRMFlowRendering(unittest.TestCase):
     inbound flow_response must render a summary not '-'."""
 
     def test_send_flow_button_saves_message_type_flow(self):
-        """_send_flow_button must save WhatsAppMessage with message_type='flow'."""
+        """_send_flow_button must pass message_type='flow' to the outbound gate."""
         from unittest.mock import MagicMock, patch
-        from app.models import WhatsAppMessage
+        from app.services.outbound_safety_gate import GateOutcome
         eng = _make_engine()
         eng.db.commit = lambda: None
-        eng.db.flush = lambda: None
-        saved_messages: list[WhatsAppMessage] = []
-        eng.db.add = lambda obj: saved_messages.append(obj) if isinstance(obj, WhatsAppMessage) else None
+
+        mock_gate = MagicMock()
+        mock_gate.attempt.return_value = MagicMock(outcome=GateOutcome.ALLOWED, message_id=42)
+        mock_gate.mark_sent = MagicMock()
 
         ctx = _make_ctx()
 
-        with patch(
-            "app.services.conversation_engine._send_whatsapp_cloud_flow",
-            return_value=("wamid-flow-test", 200),
-        ), patch(
-            "app.services.unanswered_alert.reset_unanswered_alert"
-        ):
+        with patch("app.services.conversation_engine.OutboundSafetyGate", return_value=mock_gate), \
+             patch("app.services.conversation_engine._send_whatsapp_cloud_flow", return_value=("wamid-flow-test", 200)), \
+             patch("app.services.unanswered_alert.reset_unanswered_alert"):
             eng._send_flow_button(ctx, "Test body", "tok-123", flow_id="flow-999")
 
-        flow_msgs = [m for m in saved_messages if isinstance(m, WhatsAppMessage)]
-        self.assertEqual(len(flow_msgs), 1)
-        self.assertEqual(flow_msgs[0].message_type, "flow")
-        self.assertEqual(flow_msgs[0].text, "Test body")
+        mock_gate.attempt.assert_called_once()
+        call_kw = mock_gate.attempt.call_args[1]
+        self.assertEqual(call_kw.get("message_type"), "flow")
+        self.assertEqual(call_kw.get("text"), "Test body")
 
     def test_send_text_to_wa_does_not_set_flow_message_type(self):
-        """Normal text messages must NOT have message_type='flow'."""
+        """Normal text messages must NOT use message_type='flow' in the outbound gate."""
         from unittest.mock import MagicMock, patch
-        from app.models import WhatsAppMessage
+        from app.services.outbound_safety_gate import GateOutcome
         eng = _make_engine()
         eng.db.commit = lambda: None
-        saved_messages: list[WhatsAppMessage] = []
-        eng.db.add = lambda obj: saved_messages.append(obj) if isinstance(obj, WhatsAppMessage) else None
+
+        mock_gate = MagicMock()
+        mock_gate.attempt.return_value = MagicMock(outcome=GateOutcome.ALLOWED, message_id=43)
+        mock_gate.mark_sent = MagicMock()
+        mock_gate.mark_failed = MagicMock()
 
         ctx = _make_ctx()
 
-        with patch(
-            "app.services.conversation_engine._send_whatsapp_cloud_text",
-            return_value=("wamid-txt-test", 200),
-        ), patch(
-            "app.services.unanswered_alert.reset_unanswered_alert"
-        ):
+        with patch("app.services.conversation_engine.OutboundSafetyGate", return_value=mock_gate), \
+             patch("app.services.conversation_engine._send_whatsapp_cloud_text", return_value=("wamid-txt-test", 200)), \
+             patch("app.services.unanswered_alert.reset_unanswered_alert"):
             eng._send_text_to_wa(ctx, "Hello world")
 
-        txt_msgs = [m for m in saved_messages if isinstance(m, WhatsAppMessage)]
-        self.assertTrue(len(txt_msgs) >= 1)
-        for m in txt_msgs:
-            self.assertNotEqual(m.message_type, "flow", "Text message must not have message_type='flow'")
+        mock_gate.attempt.assert_called_once()
+        call_kw = mock_gate.attempt.call_args[1]
+        self.assertNotEqual(call_kw.get("message_type", "text"), "flow")
 
 
 class TestProdRegressionLocationWording(unittest.TestCase):

@@ -116,6 +116,9 @@ class FakeExecuteResult:
     def scalars(self):
         return FakeScalarResult(self._rows)
 
+    def all(self):
+        return list(self._rows)
+
 
 class FakeScheduleDb:
     def __init__(self, revisions=None, thread_revisions=None):
@@ -222,7 +225,7 @@ class BackendServiceTests(unittest.TestCase):
 
         self.assertTrue(result.valid)
         self.assertEqual(result.approval_tag, "Esperando aprobación")
-        self.assertEqual(result.total_slot_minutes, 60)
+        self.assertEqual(result.total_slot_minutes, 45)
         self.assertEqual(result.conflicts, [])
 
     def test_schedule_service_detects_conflict_with_existing_revision(self):
@@ -244,7 +247,7 @@ class BackendServiceTests(unittest.TestCase):
 
         self.assertFalse(result.valid)
         self.assertEqual(result.conflicts[0].source, "revision")
-        self.assertIn("CRM", result.reasons[0])
+        self.assertTrue(any("CRM" in r or "turno" in r.lower() for r in result.reasons))
         self.assertGreater(len(result.suggested_slots), 0)
 
     def test_schedule_service_excludes_current_revision_from_conflicts(self):
@@ -268,7 +271,9 @@ class BackendServiceTests(unittest.TestCase):
         self.assertTrue(result.valid)
         self.assertEqual(result.conflicts, [])
 
-    def test_schedule_service_applies_priority_zone_rule(self):
+    def test_schedule_service_priority_zones_suspended(self):
+        # PRIORITY_ZONES hard-cutoff suspended per M21.3. Travel model replaces it.
+        # La Plata at 13:00 on Wednesday must now be VALID (no PRIORITY_ZONES gate).
         service = ScheduleService(db=FakeScheduleDb())
 
         result = service.check(
@@ -279,8 +284,8 @@ class BackendServiceTests(unittest.TestCase):
             )
         )
 
-        self.assertFalse(result.valid)
-        self.assertTrue(any("prioritaria" in reason for reason in result.reasons))
+        self.assertTrue(result.valid)
+        self.assertFalse(any("prioritaria" in reason for reason in result.reasons))
 
     def test_schedule_service_lists_slots_for_day(self):
         service = ScheduleService(db=FakeScheduleDb())

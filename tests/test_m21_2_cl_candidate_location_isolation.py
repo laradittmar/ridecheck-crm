@@ -232,8 +232,11 @@ class TestCL03PreCandidateFallback(unittest.TestCase):
             "status": "current_focus",
         })
         new_cand = next(c for c in ctx.candidates if c.tipo_vehiculo == "AUTO")
-        self.assertEqual(new_cand.zone_group, "CABA")
-        self.assertEqual(new_cand.zone_detail, "Palermo")
+        # FIX 1 (RISK-03): new candidates must have zone=None at creation time.
+        # State home_zone_* is NOT inherited directly; it serves as a fallback in
+        # _get_active_inspection_location when the candidate has no zone.
+        self.assertIsNone(new_cand.zone_group, "FIX 1: zone_group must be None at creation")
+        self.assertIsNone(new_cand.zone_detail, "FIX 1: zone_detail must be None at creation")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -394,12 +397,14 @@ class TestCL07HomZoneNoBroadcast(unittest.TestCase):
             "status": "current_focus",
         })
 
-        # Existing Ford candidate must not receive Palermo
+        # Existing Ford candidate must not receive Palermo (unchanged by FIX 1)
         self.assertIsNone(existing_cand.zone_group, "Existing candidate zone must not be set")
-        # New Toyota candidate inherits Palermo from home_zone_*
+        # FIX 1 (RISK-03): New Toyota candidate also has zone=None at creation.
+        # Prior behavior: new candidate inherited home_zone_* (CABA/Palermo).
+        # New behavior: zone=None; LR-3 or gap-fill fills it only from current-turn evidence.
         toyota_cand = next(c for c in ctx.candidates if (c.marca or "") == "Toyota")
-        self.assertEqual(toyota_cand.zone_group, "CABA")
-        self.assertEqual(toyota_cand.zone_detail, "Palermo")
+        self.assertIsNone(toyota_cand.zone_group, "FIX 1: new candidate zone_group must be None")
+        self.assertIsNone(toyota_cand.zone_detail, "FIX 1: new candidate zone_detail must be None")
 
 
 if __name__ == "__main__":

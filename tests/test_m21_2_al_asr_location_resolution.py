@@ -465,7 +465,16 @@ class TestAL09CandidateIsolation(unittest.TestCase):
         self.assertEqual(state.home_zone_detail, "Villa Urquiza")
 
     def test_al09_new_auto_candidate_inherits_home_zone(self):
-        """New Peugeot AUTO candidate created after LIVE09 must inherit Villa Urquiza."""
+        """FIX 1 (RISK-03): new candidate created via _apply_candidate has zone=None.
+
+        Prior behavior: new candidate inherited home_zone_* at creation time.
+        New behavior (L1-SEMANTIC-AUTHORITY): zone is always None at creation;
+        it is filled by LR-3 in the current turn or the post-AI gap-fill block
+        (only when LR-3 wrote to state in the same turn).
+        State home_zone_* is still the correct pricing/F5.1 fallback via
+        _get_active_inspection_location — it is not lost, just not inherited
+        directly onto the candidate at creation time.
+        """
         from app.models import WhatsAppThreadCandidate
         eng = _engine_with_zones(_zone_rows())
         _next_id = [100]
@@ -487,8 +496,10 @@ class TestAL09CandidateIsolation(unittest.TestCase):
             "status": "current_focus",
         })
         peugeot = next(c for c in ctx.candidates if (c.marca or "") == "Peugeot")
-        self.assertEqual(peugeot.zone_group, "CABA")
-        self.assertEqual(peugeot.zone_detail, "Villa Urquiza")
+        # FIX 1: zone must be None at creation; LR-3 or gap-fill sets it from state
+        # only when zone evidence appears in the current turn.
+        self.assertIsNone(peugeot.zone_group, "FIX 1: zone_group must be None at creation")
+        self.assertIsNone(peugeot.zone_detail, "FIX 1: zone_detail must be None at creation")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
