@@ -4193,6 +4193,18 @@ class ConversationEngine:
             except Exception:
                 context = None
 
+            # L4.7C.1: the deterministic snapshot is read synchronously — it reads ctx and
+            # state, which belong to this turn — and handed to the worker as a value.
+            # `resolve_field_evidence` is read-only (M21.1.5) and already runs three times
+            # per turn in the live path; a failure here degrades to semantic-only claims.
+            try:
+                field_snapshot = resolve_field_evidence(ctx, ctx.state)
+            except Exception:
+                field_snapshot = None
+            cycle_id = str(getattr(ctx.state, "current_cycle_start_message_db_id", None)
+                           or getattr(ctx.state, "current_cycle_started_at", None) or "")
+            revision_id = getattr(ctx.state, "current_revision_id", None)
+
             def _work() -> None:
                 result = interpreter.interpret(
                     burst_texts,
@@ -4202,6 +4214,25 @@ class ConversationEngine:
                     reconstruction=BurstReconstruction.LIVE_DEBOUNCE,
                     context=context,
                 )
+                # ── shadow claim projection + reconciliation (writes nothing) ──
+                reconciliation = None
+                try:
+                    from .claim_projection import project_all
+                    from .shadow_reconciler import reconcile, summarise
+                    claims = project_all(
+                        result.evidence, field_snapshot, texts=burst_texts,
+                        cycle_id=(cycle_id or None),
+                        revision_id=(revision_id if isinstance(revision_id, int) else None))
+                    reconciliation = summarise(
+                        reconcile(claims, cycle_id=(cycle_id or None),
+                                  revision_id=(revision_id if isinstance(revision_id, int)
+                                               else None)))
+                except Exception as exc:      # shadow reconciliation is never load-bearing
+                    try:
+                        logger.warning("L4.7C.1 shadow reconciliation failed thread_id=%s: %s",
+                                       thread_id, exc)
+                    except Exception:
+                        pass
                 record_shadow(
                     build_record(
                         thread_id=thread_id,
@@ -4211,6 +4242,7 @@ class ConversationEngine:
                         deployment_id=deployment_id,
                         correlation_id=burst_id,
                         dispatch=("async" if self._shadow_async() else "sync"),
+                        reconciliation=reconciliation,
                     ),
                     path=evidence_path,
                 )

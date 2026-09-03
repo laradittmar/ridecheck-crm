@@ -278,7 +278,9 @@ class TestFutureIntent(unittest.TestCase):
         self.assertIn("FUTURE_INTENT", _SYSTEM_PROMPT)
 
     def test_quality_14_schema_version_bumped_and_backward_compatible(self):
-        self.assertEqual(SCHEMA_VERSION, "turn-evidence/1.1")
+        # L4.7C.1 bumped the minor version additively (ReconciliationRecord gained the
+        # fields a decision needs to be replayable). 1.0/1.1 records still load.
+        self.assertEqual(SCHEMA_VERSION, "turn-evidence/1.2")
         self.assertEqual(PROMPT_VERSION, "understand/1.18",
                          "L4.7B.3/B.4 moved the prompt; turn-evidence/1.1 is unchanged")
         old = TurnEvidence.from_json(json.dumps({"schema_version": "turn-evidence/1.0"}))

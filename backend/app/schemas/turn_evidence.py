@@ -30,10 +30,14 @@ from typing import Any, Iterator, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
-SCHEMA_VERSION = "turn-evidence/1.1"
+SCHEMA_VERSION = "turn-evidence/1.2"
 # 1.1 (L4.7B.2): additive only — AcceptanceSignal.FUTURE_INTENT and the
 # `is_semantically_empty()` helper. No existing field changed meaning, so 1.0 records
 # validate unchanged under the major-version guard.
+# 1.2 (L4.7C.1): additive only — ReconciliationRecord gained the fields a decision needs to
+# be replayable (claim_type, evidence_ids, candidate_values, rule id/version,
+# information_state, outcome, cycle/revision scope, depends_on, supersedes, risk_tier).
+# Every 1.0/1.1 field kept its meaning; older records still validate.
 
 
 # ── enumerations ──────────────────────────────────────────────────────────────
@@ -434,10 +438,12 @@ class TurnEvidence(_Frozen):
 # ── reconciliation disposition (separate, append-only) ────────────────────────
 
 class ReconciliationRecord(_Frozen):
-    """What deterministic reconciliation decided about ONE evidence item.
+    """What deterministic reconciliation decided about ONE claim.
 
     Stored apart from the interpretation so historical evidence is never rewritten to
-    match a later canonical truth.
+    match a later canonical truth. L4.7C.1 extended it so a decision can be re-explained
+    offline: which claims were weighed, which rule at which version weighed them, what the
+    information state was, and what the decision depends on.
     """
     evidence_ref: str
     status: ReconciliationStatus
@@ -445,6 +451,21 @@ class ReconciliationRecord(_Frozen):
     decided_by: Optional[str] = None            # e.g. "reconciler:catalog_authority"
     decided_at: Optional[str] = None            # ISO timestamp
     canonical_value: Any = None                 # what canonical state actually took, if any
+
+    # ── L4.7C.1 additions (all optional; 1.0/1.1 records remain valid) ──────────
+    claim_type: Optional[str] = None
+    evidence_ids: tuple[str, ...] = ()          # the claims this decision rests on
+    candidate_values: tuple[Any, ...] = ()      # what was considered, not only what won
+    rule_id: Optional[str] = None               # e.g. "reconcile.location_role"
+    rule_version: Optional[str] = None          # e.g. "v1"
+    information_state: Optional[str] = None     # NEITHER | TRUE_ONLY | FALSE_ONLY | BOTH
+    outcome: Optional[str] = None               # ACCEPT | CLARIFY | HOLD | NEEDS_HUMAN
+    risk_tier: Optional[str] = None             # LOW | MEDIUM | HIGH
+    cycle_id: Optional[str] = None
+    revision_id: Optional[int] = None
+    depends_on: tuple[str, ...] = ()            # claim types this value was derived from
+    supersedes: tuple[str, ...] = ()            # earlier records/claims this replaces
+    shadow: bool = True                         # C1 writes nothing canonical
 
 
 class ReconciliationLog(_Frozen):

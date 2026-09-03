@@ -24,7 +24,7 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 DEFAULT_PATH = "/opt/ridecheck-crm-forensics/shadow_turn_evidence.jsonl"
-RECORD_VERSION = "shadow-record/1.1"
+RECORD_VERSION = "shadow-record/1.2"
 
 
 def _now_iso() -> str:
@@ -40,6 +40,7 @@ def build_record(
     deployment_id: Optional[str] = None,
     correlation_id: Optional[str] = None,
     dispatch: str = "sync",
+    reconciliation: Optional[dict] = None,
 ) -> dict:
     """Shape one append-only shadow record. Pure — no I/O."""
     evidence = getattr(result, "evidence", None)
@@ -62,6 +63,9 @@ def build_record(
         "completion_tokens": getattr(result, "completion_tokens", None),
         "total_tokens": getattr(result, "total_tokens", None),
         "dispatch": dispatch,
+        # L4.7C.1: what the shadow reconciler decided — claim types, information states and
+        # outcomes only. No values, so no customer text or PII enters the log.
+        "reconciliation": reconciliation,
         # WHICH context slots were supplied — never their values, so no raw text is stored.
         "context_keys": list(getattr(result, "context_keys", ()) or ()),
         "sanitized_items": getattr(result, "sanitized_items", 0),
