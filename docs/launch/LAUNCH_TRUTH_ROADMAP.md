@@ -912,6 +912,58 @@ group-L labels. Tests 16/16; regression 3 392 / 60 / 9 — identical to baseline
 Image `ridecheck-crm-backend:l4.7b4-companion-c33ab79`, crm_test only, OUTBOUND OFF.
 Wild clean count **0/3**.
 
+### Phase B.15 — L4.7C-SEMANTIC-RECONCILER-DESIGN (2026-09-03) — **DESIGN COMPLETE; NOTHING IMPLEMENTED**
+
+Audit: `2026-09-03_RIDECHECK_CRM_L4.7C-SEMANTIC-RECONCILER-DESIGN_AUDIT_CLAIM-AUTHORITY.md`
+
+**Owner quality exception, recorded:** L4.7B.4 passed 9 of 10 gate lines (group L recall
+0.636, group I 0.737/0.684). Accepted **for reconciler design only**. It does not authorise
+semantic evidence to mutate canonical state, and the recorded metrics stand unaltered —
+**L4.7B is not marked complete or perfect**. The exception is defensible because the residual
+is an *omission* class and the design makes omission structurally harmless: a missing
+`SEARCHING_NOT_READY` yields NEITHER, which authorises nothing.
+
+Design decisions of record:
+
+* **Reconcile and authorize are separate steps.** "What is true enough to record" is not
+  "what may now be done". A confirmed vehicle authorises no quote; a confirmed quote
+  authorises no booking.
+* **Authority is per claim type, never per producer.** No "CE beats LLM", no confidence
+  ranking, no last-writer-wins. The semantic interpreter outranks CE on location *roles*; the
+  catalog and zone resolver outrank it on vehicle identity and zone validity; price,
+  availability and booking have **no** semantic producer at all.
+* **Four information states** (NEITHER / TRUE_ONLY / FALSE_ONLY / BOTH) map onto the existing
+  `turn-evidence/1.1` statuses plus a new `polarity`. **Absence is never false**, and no
+  authorization precondition may be written as "not X".
+* **Claims carry `temporality` and `modality`**, so *"si me cierra te hablo"* (FUTURE +
+  CONDITIONAL) is structurally disqualified from acceptance regardless of confidence.
+* `quote_accepted = TRUE` requires five conditions including a quote already delivered in this
+  cycle and unchanged since.
+* **Truth maintenance is minimal**: a `Justification` per canonical value (evidence ids +
+  rule id + version) plus a ~20-row static dependency table for invalidation. No
+  event-sourcing platform, no new canonical tables, at most one append-only log table.
+* **`field_evidence.py` (M21.1.5) is the seed of the reconciler**, not a competitor: it
+  already resolves eight fields with source labels, read-only, and is consumed by CE.
+* ~40 CE deterministic helpers classified A (authoritative validator) / B (secondary evidence)
+  / C (business rule) / D (redundant NLP gate). Class D is retired **last**, in C6, only after
+  replay certification.
+* `ReconciliationRecord`: **EXTEND** (claim_type, evidence_ids, candidate_values, rule
+  id/version, information_state, outcome, cycle/revision, depends_on, supersedes, risk_tier) —
+  additive, `turn-evidence/1.2`.
+* Reproducibility stated honestly: the *decision* replays exactly; the *model's claims* do not
+  — they are recorded rather than re-derived.
+
+Plan C1…C7, each flag-guarded and reversible: primitives+log → vehicle/location →
+intent/stance/acceptance → scheduling interface → derived-state invalidation → authority
+cutover → replay certification. **Migration size MEDIUM; no big-bang rewrite.** New runtime
+metrics defined for Wild certification, with three launch-blocking zero-targets: false
+progression, quote error, booking error.
+
+No code, no migration, no runtime change, no authority moved. Semantic migration is **not**
+complete. OUTBOUND OFF · Wild clean count **0/3**.
+
+Next: **L4.7C.1-RECONCILER-PRIMITIVES (phase C1)** — shadow only, changes nothing.
+
 ### Phase C — Infrastructure resilience (INFRA-OOM-01)
 
 **Host OOM incident, 2026-09-01 18:30:37Z — CONFIRMED, MEDIUM, launch-relevant.**
