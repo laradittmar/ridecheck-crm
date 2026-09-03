@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+from types import SimpleNamespace
 import os
 import re
 import secrets
@@ -2171,14 +2172,10 @@ class ConversationEngine:
         # Update or create candidate
         focus = self._focus_candidate(ctx)
         if focus:
-            if marca:
-                focus.marca = marca
-            if modelo:
-                focus.modelo = modelo
-            if tipo:
-                focus.tipo_vehiculo = tipo
-            if anio:
-                focus.anio = anio
+            # L4.7C.2: single canonical vehicle write path.
+            self._apply_vehicle_identity(ctx, focus, marca=marca, modelo=modelo,
+                                         tipo=tipo, anio=anio, source="flow_or_form",
+                                         state=state)
         else:
             from app.models import WhatsAppThreadCandidate
             cand = WhatsAppThreadCandidate(
@@ -3220,7 +3217,9 @@ class ConversationEngine:
                 # _create_candidate_from_catalog uses _extract_year_from_text
                 # with exclude_token=model_str; patch anio only if it missed.
                 if ctx.candidates and ctx.candidates[0].anio is None:
-                    ctx.candidates[0].anio = _mdy_year
+                    self._apply_vehicle_identity(ctx, ctx.candidates[0],
+                                                 anio=_mdy_year, source="ce",
+                                                 state=ctx.state)
                     self.db.flush()
                 self._attach_buffered_location(ctx, state)
                 pre_detected_vehicle = _mdy_match
@@ -3421,14 +3420,26 @@ class ConversationEngine:
             # current-focus candidate existed; state.home_zone_* may be stale from
             # a prior turn. Only fill candidate gaps — never overwrite what LR-3 set.
             if state.home_zone_group and not focus_after.zone_group:
-                focus_after.zone_group = state.home_zone_group
+                self._apply_inspection_zone(ctx, focus_after,
+                                            zone_group=state.home_zone_group,
+                                            zone_detail=state.home_zone_detail,
+                                            source="buffer", state=state)
             if state.home_zone_detail and not focus_after.zone_detail:
-                focus_after.zone_detail = state.home_zone_detail
+                self._apply_inspection_zone(ctx, focus_after,
+                                            zone_group=focus_after.zone_group,
+                                            zone_detail=state.home_zone_detail,
+                                            source="buffer", state=state)
         elif focus_after and not _vehicle_location_written and _ai_set_zone:
             if state.home_zone_group and not focus_after.zone_group:
-                focus_after.zone_group = state.home_zone_group
+                self._apply_inspection_zone(ctx, focus_after,
+                                            zone_group=state.home_zone_group,
+                                            zone_detail=state.home_zone_detail,
+                                            source="buffer", state=state)
             if state.home_zone_detail and not focus_after.zone_detail:
-                focus_after.zone_detail = state.home_zone_detail
+                self._apply_inspection_zone(ctx, focus_after,
+                                            zone_group=focus_after.zone_group,
+                                            zone_detail=state.home_zone_detail,
+                                            source="buffer", state=state)
 
         # Sync year onto focus candidate deterministically if AI missed it.
         if focus_after:
@@ -3455,7 +3466,8 @@ class ConversationEngine:
                 # Current turn: exactly one unambiguous year → commit, overriding stale.
                 year_hit = _extract_year_from_text(current_turn_text, exclude_token=_excl)
                 if year_hit:
-                    focus_after.anio = year_hit
+                    self._apply_vehicle_identity(ctx, focus_after, anio=year_hit,
+                                                 source="ce", state=state)
             elif len(_ct_effective) == 0 and focus_after.anio is None:
                 # No year in current turn AND candidate lacks one → check historical context.
                 _all_year_tokens = {
@@ -3465,7 +3477,8 @@ class ConversationEngine:
                 if len(_all_effective) <= 1:
                     year_hit = _extract_year_from_text(all_recent_text, exclude_token=_excl)
                     if year_hit:
-                        focus_after.anio = year_hit
+                        self._apply_vehicle_identity(ctx, focus_after, anio=year_hit,
+                                                 source="ce", state=state)
             # If len(_ct_effective) > 1: current turn is explicitly ambiguous → no sync.
 
         # Recompute price after all extractions have run.
@@ -4264,6 +4277,147 @@ class ConversationEngine:
         """Async dispatch is opt-in and strictly boolean, like the shadow flag itself."""
         return getattr(self.settings, "shadow_understand_async", False) is True
 
+    # ── L4.7C.2 — the single canonical write path for vehicle and location ────
+    #
+    # Every canonical vehicle-identity and inspection-location write goes through these two
+    # methods. With the flags OFF they assign exactly what the legacy code assigned, so the
+    # cutover is reversible by configuration alone. With a flag ON the proposed value is
+    # submitted as a claim, reconciled under a named rule, and applied only on ACCEPT — the
+    # legacy parsers stay evidence producers and validators, but stop being writers.
+
+    def _vehicle_authority_on(self) -> bool:
+        return getattr(self.settings, "reconciler_vehicle_authority_enabled", False) is True
+
+    def _location_authority_on(self) -> bool:
+        return getattr(self.settings, "reconciler_location_authority_enabled", False) is True
+
+    def _reconciler_cycle_id(self, state) -> "str | None":
+        value = (getattr(state, "current_cycle_start_message_db_id", None)
+                 or getattr(state, "current_cycle_started_at", None))
+        return str(value) if value else None
+
+    def _record_reconciliation(self, ctx, decision, claim_type: str, state=None) -> None:
+        """Append the justification. Log-only in C2: no new table, no migration."""
+        try:
+            record = decision.to_record(
+                claim_type=claim_type,
+                cycle_id=self._reconciler_cycle_id(state if state is not None
+                                                   else getattr(ctx, "state", None)),
+                revision_id=getattr(getattr(ctx, "state", None), "current_revision_id", None))
+            logger.info(
+                "L4.7C.2 RECONCILE thread_id=%s claim=%s outcome=%s rule=%s@%s state=%s "
+                "value=%r evidence=%s reason=%s",
+                getattr(ctx.thread, "id", None), record.claim_type, record.outcome,
+                record.rule_id, record.rule_version, record.information_state,
+                record.canonical_value, list(record.evidence_ids), record.reason)
+        except Exception:
+            pass
+
+    def _apply_vehicle_identity(self, ctx, target, *, marca=None, modelo=None, tipo=None,
+                                anio=None, source: str = "ce", texts=(), state=None) -> bool:
+        """Write vehicle identity onto a candidate. Returns True when anything was written."""
+        if not self._vehicle_authority_on():
+            wrote = False
+            if marca:
+                target.marca = marca; wrote = True
+            if modelo:
+                target.modelo = modelo; wrote = True
+            if tipo:
+                target.tipo_vehiculo = tipo; wrote = True
+            if anio:
+                target.anio = anio; wrote = True
+            return wrote
+
+        from ..schemas.claims import ClaimEvidence, ClaimType, EvidenceClass, Explicitness
+        from .field_reconciler import reconcile_vehicle_identity
+        from .vehicle_catalog import lookup_vehicle
+
+        evidence_class = {
+            "flow": EvidenceClass.HUMAN_CONFIRMED,
+            "form": EvidenceClass.HUMAN_CONFIRMED,
+            "catalog": EvidenceClass.CATALOG_CONFIRMED,
+        }.get(source, EvidenceClass.DETERMINISTIC_EXTRACTED)
+        cycle_id = self._reconciler_cycle_id(state if state is not None else ctx.state)
+        claims = []
+        for claim_type, value in ((ClaimType.VEHICLE_MODEL, modelo),
+                                  (ClaimType.VEHICLE_MAKE, marca),
+                                  (ClaimType.VEHICLE_YEAR, anio),
+                                  (ClaimType.VEHICLE_CATEGORY, tipo)):
+            if value in (None, "", []):
+                continue
+            claims.append(ClaimEvidence(
+                claim_type=claim_type, value=value, evidence_class=evidence_class,
+                producer=f"ce:{source}", explicitness=Explicitness.STATED,
+                cycle_id=cycle_id).with_id())
+
+        decision = reconcile_vehicle_identity(claims, catalog_lookup=lookup_vehicle)
+        self._record_reconciliation(ctx, decision, ClaimType.VEHICLE_MODEL, state)
+        if not decision.accepted:
+            # CLARIFY / HOLD: the legacy value is NOT written. The turn continues on the
+            # existing conversational path, which asks rather than assumes.
+            return False
+        identity = decision.value
+        wrote = False
+        if identity.marca:
+            target.marca = identity.marca; wrote = True
+        if identity.modelo:
+            target.modelo = identity.modelo; wrote = True
+        if identity.tipo_vehiculo:
+            target.tipo_vehiculo = identity.tipo_vehiculo; wrote = True
+        if identity.anio:
+            target.anio = identity.anio; wrote = True
+        elif anio:
+            target.anio = anio; wrote = True          # the year travels with the identity
+        return wrote
+
+    def _apply_inspection_zone(self, ctx, target, *, zone_group=None, zone_detail=None,
+                               source: str = "ce", role: str = "INSPECTION_LOCATION",
+                               state=None) -> bool:
+        """Write an inspection locality onto a candidate or onto the pre-candidate buffer."""
+        if not self._location_authority_on():
+            wrote = False
+            if zone_group is not None:
+                target.zone_group = zone_group; wrote = True
+            if zone_detail is not None:
+                target.zone_detail = zone_detail; wrote = True
+            return wrote
+
+        from ..schemas.claims import ClaimEvidence, ClaimType, EvidenceClass, Explicitness
+        from .field_reconciler import reconcile_inspection_location
+
+        # An origin claim can never populate an inspection location (rule E).
+        claim_type = (ClaimType.INSPECTION_LOCATION if role == "INSPECTION_LOCATION"
+                      else ClaimType.CUSTOMER_ORIGIN)
+        evidence_class = {
+            "flow": EvidenceClass.HUMAN_CONFIRMED,
+            "form": EvidenceClass.HUMAN_CONFIRMED,
+            "zone": EvidenceClass.DETERMINISTIC_EXTRACTED,
+        }.get(source, EvidenceClass.DETERMINISTIC_EXTRACTED)
+        cycle_id = self._reconciler_cycle_id(state if state is not None else ctx.state)
+        locality = zone_detail or zone_group
+        claims = ([ClaimEvidence(claim_type=claim_type, value=locality,
+                                 evidence_class=evidence_class, producer=f"ce:{source}",
+                                 explicitness=Explicitness.STATED,
+                                 cycle_id=cycle_id).with_id()]
+                  if locality else [])
+
+        def _validate(value: str):
+            zone = self._extract_zone_from_text(value)
+            if zone is not None:
+                return zone
+            # A group already validated upstream (Flow, form, canonical group) stands.
+            if zone_group:
+                return SimpleNamespace(zone_group=zone_group, zone_detail=zone_detail)
+            return None
+
+        decision = reconcile_inspection_location(claims, zone_validator=_validate)
+        self._record_reconciliation(ctx, decision, claim_type, state)
+        if not decision.accepted:
+            return False
+        target.zone_group = decision.value.zone_group or zone_group
+        target.zone_detail = decision.value.zone_detail or zone_detail
+        return True
+
     # ── L4.7D — canonical response validation ────────────────────────────────
 
     def _canonical_zone_names(self) -> tuple[str, ...]:
@@ -4424,8 +4578,9 @@ class ConversationEngine:
         candidate = ctx.candidates[0]
         if candidate.zone_group or candidate.zone_detail:
             return  # explicit per-candidate evidence always wins
-        candidate.zone_group = buffered_group
-        candidate.zone_detail = buffered_detail
+        self._apply_inspection_zone(ctx, candidate, zone_group=buffered_group,
+                                    zone_detail=buffered_detail, source="buffer",
+                                    state=getattr(ctx, "state", None))
         try:
             self.db.flush()
         except Exception:
@@ -4540,8 +4695,9 @@ class ConversationEngine:
                 )
             )
             if _fc_is_current:
-                _fc.zone_group = _vzone.zone_group
-                _fc.zone_detail = _vzone.zone_detail
+                self._apply_inspection_zone(ctx, _fc, zone_group=_vzone.zone_group,
+                                            zone_detail=_vzone.zone_detail,
+                                            source="zone", state=state)
             else:
                 # No candidate yet, or only an unrelated mentioned candidate — buffer in
                 # thread-level fallback so the intended candidate inherits it on creation.
@@ -4580,8 +4736,10 @@ class ConversationEngine:
                             )
                         )
                         if _fc3_is_current:
-                            _fc3.zone_group = _vz2.zone_group
-                            _fc3.zone_detail = _vz2.zone_detail
+                            self._apply_inspection_zone(ctx, _fc3,
+                                                        zone_group=_vz2.zone_group,
+                                                        zone_detail=_vz2.zone_detail,
+                                                        source="zone", state=state)
                         else:
                             state.home_zone_group = _vz2.zone_group
                             state.home_zone_detail = _vz2.zone_detail
@@ -4615,8 +4773,9 @@ class ConversationEngine:
                         )
                     )
                     if _fc2_is_current and not _fc2.zone_group:
-                        _fc2.zone_group = _zh.zone_group
-                        _fc2.zone_detail = _zh.zone_detail
+                        self._apply_inspection_zone(ctx, _fc2, zone_group=_zh.zone_group,
+                                                    zone_detail=_zh.zone_detail,
+                                                    source="zone", state=state)
                     self._decision_log(
                         ctx, "location_extracted", source="bare_locality",
                         zone_group=_zh.zone_group, zone_detail=_zh.zone_detail,
@@ -6645,11 +6804,17 @@ Respondé SOLO con JSON válido:
                 "M18 catalog override thread_id=%s candidate=%s tipo %r→%r",
                 ctx.thread.id, focus.id, focus.tipo_vehiculo, match.tipo_vehiculo,
             )
-            focus.tipo_vehiculo = match.tipo_vehiculo
-        if not focus.marca:
-            focus.marca = match.marca
-        if not focus.modelo:
-            focus.modelo = match.modelo
+            _catalog_tipo = match.tipo_vehiculo
+        else:
+            _catalog_tipo = None
+        # L4.7C.2: the catalog is the naming authority; the write still goes through the
+        # single path so the decision is recorded like every other identity write.
+        self._apply_vehicle_identity(
+            ctx, focus,
+            marca=(match.marca if not focus.marca else None),
+            modelo=(match.modelo if not focus.modelo else None),
+            tipo=_catalog_tipo,
+            source="catalog", state=ctx.state)
 
     # ── WILD-04R-F6: Catalog authority guard ─────────────────────────────
 

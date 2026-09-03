@@ -235,24 +235,29 @@ def information_state(claims: Iterable[ClaimEvidence]) -> InformationState:
     if not claims:
         return InformationState.NEITHER
 
-    positive, negative, values = False, False, []
+    asserted: list = []
+    negated: list = []
     for claim in claims:
         if claim.status in (EvidenceStatus.AMBIGUOUS, EvidenceStatus.CONFLICT):
             continue                          # uncertainty is not support
-        if claim.polarity is Polarity.NEGATED or claim.modality is Modality.NEGATED:
-            negative = True
-            continue
         if claim.value in (None, "", [], {}):
             continue                          # a claim with no value supports nothing
-        positive = True
-        values.append(_hashable(claim.value))
+        target = (negated
+                  if (claim.polarity is Polarity.NEGATED
+                      or claim.modality is Modality.NEGATED)
+                  else asserted)
+        target.append(json.dumps(_hashable(claim.value), sort_keys=True, default=str))
 
-    if positive and negative:
+    # A negation contradicts only the value it denies. "It is not a Ka, it is a Kuga" is a
+    # REPLACEMENT, not a contradiction: denying X while asserting Y leaves Y standing, and
+    # the supersession is recorded separately (L4.7C.2).
+    if asserted and set(asserted) & set(negated):
         return InformationState.BOTH
-    if positive:
-        distinct = {json.dumps(v, sort_keys=True, default=str) for v in values}
-        return InformationState.BOTH if len(distinct) > 1 else InformationState.TRUE_ONLY
-    if negative:
+    if len(set(asserted)) > 1:
+        return InformationState.BOTH
+    if asserted:
+        return InformationState.TRUE_ONLY
+    if negated:
         return InformationState.FALSE_ONLY
     return InformationState.NEITHER
 
