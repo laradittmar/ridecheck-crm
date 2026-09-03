@@ -79,6 +79,70 @@ def normalize(value: Any) -> Any:
     return normalize(str(value))
 
 
+# ── L4.7B.2B — one stance, one field ─────────────────────────────────────────
+# turn-evidence/1.1 carries six acceptance signals. The harness used to flatten them to a
+# boolean, so FUTURE_INTENT ("I'll come back when I've bought it") was indistinguishable
+# from REJECT, and a false ACCEPT could not be counted at all. Stance is now scored on the
+# signal itself.
+ACCEPTANCE_SIGNALS = ("ACCEPT", "REJECT", "HESITATE", "FUTURE_INTENT",
+                      "QUESTION_ONLY", "UNKNOWN")
+
+# Legacy spellings of the same truth, accepted from any producer and canonicalised before
+# scoring: an interpreter that still says `readiness=FUTURE_CONTACT_INTENDED` means the
+# stance FUTURE_INTENT, and must be scored on meaning rather than wording.
+_LEGACY_READINESS_AS_STANCE = {
+    "FUTURE_CONTACT_INTENDED": "FUTURE_INTENT",
+    "HESITANT_OR_DEFERRED": "HESITATE",
+}
+_LEGACY_BOOLEAN_AS_STANCE = {True: "ACCEPT", False: "REJECT"}
+
+# `readiness` keeps only what stance cannot express: a fact about the customer's own
+# purchase process. Everything else is stance.
+CANONICAL_READINESS_VALUES = ("SEARCHING_NOT_READY",)
+
+# Fields whose value is a set, not a sequence: order carries no meaning.
+_SET_VALUED_FIELDS = frozenset({"faq_topics"})
+
+
+def as_signal(value: Any) -> Optional[str]:
+    """Canonical stance string for any accepted spelling, or None when not a stance."""
+    if isinstance(value, bool):
+        return _LEGACY_BOOLEAN_AS_STANCE[value]
+    if isinstance(value, str):
+        text = value.strip().upper()
+        if text in ACCEPTANCE_SIGNALS:
+            return text
+        if text in _LEGACY_READINESS_AS_STANCE:
+            return _LEGACY_READINESS_AS_STANCE[text]
+    return None
+
+
+def canonicalise_engagement(items: Iterable[dict]) -> list[dict]:
+    """Collapse the two spellings of stance into one `acceptance` item.
+
+    A `readiness` item whose value is a retired stance value becomes the stance itself,
+    unless an explicit `acceptance` item is already present (which always wins). A
+    `readiness` item that carries a genuine process fact is left alone.
+    """
+    items = list(_items(items))
+    has_acceptance = any(str(i["field"]) == "acceptance" for i in items)
+    out: list[dict] = []
+    for item in items:
+        field = str(item["field"])
+        if field == "acceptance":
+            signal = as_signal(item.get("value"))
+            out.append({**item, "value": signal if signal else item.get("value")})
+            continue
+        if field == "readiness":
+            signal = as_signal(item.get("value"))
+            if signal is not None:
+                if not has_acceptance:
+                    out.append({**item, "field": "acceptance", "value": signal})
+                continue          # retired spelling never survives as `readiness`
+        out.append(item)
+    return out
+
+
 def _items(evidence: Iterable[dict]) -> list[dict]:
     return [e for e in (evidence or []) if isinstance(e, dict) and e.get("field")]
 
@@ -90,12 +154,21 @@ def _by_field(evidence: Iterable[dict]) -> dict[str, dict]:
     return out
 
 
-def values_match(expected: Any, produced: Any) -> bool:
+def values_match(expected: Any, produced: Any, field: Optional[str] = None) -> bool:
     """True when a produced value means the same as the expected one.
 
     Scheduling alternatives are compared as ordered lists of (day, time, rank) so that a
     transplanted time or a swapped primary/fallback is a mismatch, not a near-miss.
+    Set-valued fields (FAQ topics) are compared without order, because the order in which
+    a customer asks two questions carries no meaning. Stance is compared on the canonical
+    signal, so `True` and `"ACCEPT"` are the same answer (L4.7B.2B).
     """
+    if field == "acceptance":
+        exp_signal, got_signal = as_signal(expected), as_signal(produced)
+        if exp_signal or got_signal:
+            return exp_signal == got_signal
+    if field in _SET_VALUED_FIELDS and isinstance(expected, list) and isinstance(produced, list):
+        return sorted(normalize(expected)) == sorted(normalize(produced))
     return normalize(expected) == normalize(produced)
 
 
@@ -116,6 +189,14 @@ class CaseResult:
     ambiguity_honoured: int = 0
     missing_expected: int = 0
     missing_honoured: int = 0
+    # L4.7B.2B — stance scoring, distinct per signal
+    stance_expected: int = 0
+    stance_correct: int = 0
+    false_accepts: int = 0            # produced ACCEPT where the customer did not accept
+    future_intent_expected: int = 0
+    future_intent_recalled: int = 0
+    hesitate_expected: int = 0
+    hesitate_recalled: int = 0
     notes: list[str] = dc_field(default_factory=list)
 
     @property
@@ -128,6 +209,42 @@ class CaseResult:
         )
 
 
+def _score_stance(result: "CaseResult", expected_items: list[dict],
+                  produced_map: dict[str, dict]) -> None:
+    """Score the conversational stance on its own terms (L4.7B.2B).
+
+    Separate from precision/recall on purpose: reading FUTURE_INTENT as ACCEPT is a
+    different kind of failure from missing a locality, and the business consequence — a
+    customer treated as having agreed when they did not — deserves its own number.
+    """
+    expected = next((i for i in expected_items if str(i["field"]) == "acceptance"), None)
+    got = produced_map.get("acceptance")
+    exp_signal = as_signal(expected.get("value")) if expected else None
+    got_signal = as_signal(got.get("value")) if got else None
+
+    if exp_signal is not None:
+        result.stance_expected += 1
+        if got_signal == exp_signal:
+            result.stance_correct += 1
+        else:
+            result.notes.append(f"stance: expected {exp_signal}, got {got_signal}")
+        if exp_signal == "FUTURE_INTENT":
+            result.future_intent_expected += 1
+            if got_signal == "FUTURE_INTENT":
+                result.future_intent_recalled += 1
+        if exp_signal == "HESITATE":
+            result.hesitate_expected += 1
+            if got_signal == "HESITATE":
+                result.hesitate_recalled += 1
+
+    # A false ACCEPT is claiming agreement the customer did not give — counted whenever
+    # ACCEPT is produced and the corpus says the stance is anything else, including
+    # "no stance at all".
+    if got_signal == "ACCEPT" and exp_signal != "ACCEPT":
+        result.false_accepts += 1
+        result.notes.append("stance: produced ACCEPT where the customer did not accept")
+
+
 def evaluate_case(case: dict, produced: dict) -> CaseResult:
     """Score one corpus case against one interpreter output."""
     result = CaseResult(
@@ -136,9 +253,11 @@ def evaluate_case(case: dict, produced: dict) -> CaseResult:
         groups=list(case.get("groups") or []),
     )
 
-    expected_items = _items(case.get("expected_turn_evidence"))
-    produced_items = _items(produced.get("turn_evidence"))
+    # L4.7B.2B: both sides are canonicalised so that one truth has one spelling.
+    expected_items = canonicalise_engagement(case.get("expected_turn_evidence"))
+    produced_items = canonicalise_engagement(produced.get("turn_evidence"))
     produced_map = _by_field(produced_items)
+    _score_stance(result, expected_items, produced_map)
     produced_canonical = produced.get("canonical_state") or {}
 
     matched_produced_fields: set[str] = set()
@@ -171,7 +290,7 @@ def evaluate_case(case: dict, produced: dict) -> CaseResult:
             continue
 
         matched_produced_fields.add(field_name)
-        if values_match(exp.get("value"), got.get("value")):
+        if values_match(exp.get("value"), got.get("value"), field=field_name):
             result.true_positives += 1
         else:
             result.false_positives += 1
@@ -211,7 +330,7 @@ def evaluate_case(case: dict, produced: dict) -> CaseResult:
         for value in candidates:
             if value in (None, "", [], {}):
                 continue
-            if forbidden == "__ANY__" or values_match(forbidden, value):
+            if forbidden == "__ANY__" or values_match(forbidden, value, field=name):
                 result.unsupported_inferences.append(
                     f"{name}={value!r} ({rule.get('reason', 'forbidden')})"
                 )
@@ -247,6 +366,9 @@ class EvaluationReport:
         amb_exp, amb_ok = self._sum("ambiguity_expected", rs), self._sum("ambiguity_honoured", rs)
         miss_exp, miss_ok = self._sum("missing_expected", rs), self._sum("missing_honoured", rs)
         offenders = [r for r in rs if r.unsupported_inferences]
+        stance_exp = self._sum("stance_expected", rs)
+        fut_exp = self._sum("future_intent_expected", rs)
+        hes_exp = self._sum("hesitate_expected", rs)
         return {
             "cases": len(rs),
             "field_precision": (tp / (tp + fp)) if (tp + fp) else None,
@@ -255,10 +377,17 @@ class EvaluationReport:
             "unsupported_inference_rate": (len(offenders) / len(rs)) if rs else None,
             "ambiguity_handling_accuracy": (amb_ok / amb_exp) if amb_exp else None,
             "missing_field_accuracy": (miss_ok / miss_exp) if miss_exp else None,
+            # L4.7B.2B — stance metrics, reported separately from field precision/recall
+            "stance_exact_accuracy": (self._sum("stance_correct", rs) / stance_exp) if stance_exp else None,
+            "false_accept_rate": (self._sum("false_accepts", rs) / len(rs)) if rs else None,
+            "future_intent_recall": (self._sum("future_intent_recalled", rs) / fut_exp) if fut_exp else None,
+            "hesitate_recall": (self._sum("hesitate_recalled", rs) / hes_exp) if hes_exp else None,
             "clean_cases": sum(1 for r in rs if r.clean),
             "counts": {"tp": tp, "fp": fp, "fn": fn,
                        "role_expected": role_exp, "ambiguity_expected": amb_exp,
-                       "missing_expected": miss_exp},
+                       "missing_expected": miss_exp, "stance_expected": stance_exp,
+                       "future_intent_expected": fut_exp, "hesitate_expected": hes_exp,
+                       "false_accepts": self._sum("false_accepts", rs)},
         }
 
     def by_kind(self) -> dict[str, dict]:
@@ -280,7 +409,9 @@ class EvaluationReport:
         overall = self.metrics()
         for key in ("cases", "field_precision", "field_recall", "role_accuracy",
                     "unsupported_inference_rate", "ambiguity_handling_accuracy",
-                    "missing_field_accuracy", "clean_cases"):
+                    "missing_field_accuracy", "stance_exact_accuracy",
+                    "false_accept_rate", "future_intent_recall", "hesitate_recall",
+                    "clean_cases"):
             value = overall[key]
             lines.append(f"  {key:32} {value if value is None else (round(value, 4) if isinstance(value, float) else value)}")
         lines.append("-" * 60)

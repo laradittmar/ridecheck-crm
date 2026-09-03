@@ -781,6 +781,55 @@ tracked, 0 production references) was audited and removed; its cause was fixed i
 
 Regression 3 328 passed / 60 failed / 9 errors — unchanged. OUTBOUND OFF. Wild clean count 0/3.
 
+### Phase B.12 — L4.7B.2B-CORPUS-FIXTURE-REPAIR (2026-09-02) — **COMPLETE; GATE STILL FAILS**
+
+Closeout: `2026-09-02_RIDECHECK_CRM_L4.7B.2B-CORPUS-FIXTURE-REPAIR_CLOSEOUT_TRUTH-INSTRUMENT.md`
+
+The measuring instrument was repaired before any further interpreter work. Three defects,
+all punishing correct behaviour: a `"mixed"` FAQ sentinel no interpreter can emit; fixtures
+(all 8 `SYN-MIX`, all 8 `SYN-CORR`) that omitted the vehicle, year, locality or corrected
+value written in their own raw text; and a harness that flattened the six `turn-evidence/1.1`
+acceptance signals to a boolean, so FUTURE_INTENT was indistinguishable from REJECT and a
+**false ACCEPT could not be counted at all**.
+
+**Engagement ontology decided:** stance is represented once, in `acceptance`
+(ACCEPT/REJECT/HESITATE/FUTURE_INTENT/QUESTION_ONLY/UNKNOWN). `readiness` keeps only
+`SEARCHING_NOT_READY`, a fact about the customer's purchase process. `FUTURE_CONTACT_INTENDED`
+and `HESITANT_OR_DEFERRED` are retired as duplicate truth and canonicalised by the harness.
+Business readiness stays deterministic and downstream, out of the semantic object.
+
+Same interpreter — `semantic_interpreter.py` SHA-256 identical before and after, prompt
+`understand/1.4`, model `gpt-4o-mini`:
+
+| | Before | After | Cause |
+|---|---|---|---|
+| overall precision | 0.716 | **0.885** | instrument |
+| overall recall | 0.631 | **0.728** | instrument |
+| unsupported inference | 0.0123 | **0.0062** | instrument (a fixture forbade a locality its own text named) |
+| clean cases | 92 | **99** | instrument |
+| REAL precision / recall | 0.720 / 0.621 | **0.800 / 0.667** | instrument |
+| group I precision | 0.333 | **0.909** | instrument |
+| group J precision | 0.250 | **0.857** | instrument |
+
+New stance metrics: exact accuracy **0.725**, **false ACCEPT rate 0.000**, FUTURE_INTENT
+recall 0.727, HESITATE recall 0.167. Rescoring the *identical saved outputs* with the
+repaired ruler accounts for +0.115 precision on its own — **none of the movement is model
+quality**, and the closeout says so explicitly.
+
+Gate re-applied unchanged: **FAIL** — REAL P 0.800, REAL R 0.667, overall R 0.728, and 7 of
+12 group recalls below 0.70. Six of ten gate lines now pass (up from four). L4.7C does not
+start.
+
+Corpus integrity audit (`tests/semantic_corpus/integrity.py`, new): 7 findings → 4 objective
+synthetic repairs, 3 detector corrections; final audit clean. 3 REAL labels changed, each a
+mechanical ontology migration or the owner's explicit example; **no REAL raw text changed**,
+owner REAL-001…004 byte-verbatim, all Wild raw examples untouched.
+
+Tests `tests/test_l4_7b_2b_corpus_instrument.py` 19/19 (FIXTURE-01…12). Regression 3 347
+passed / 60 failed / 9 errors — failure set byte-identical to baseline.
+
+Next: **L4.7B.3-SHADOW-SEMANTIC-QUALITY**. OUTBOUND OFF. Wild clean count **0/3**.
+
 ### Phase C — Infrastructure resilience (INFRA-OOM-01)
 
 **Host OOM incident, 2026-09-01 18:30:37Z — CONFIRMED, MEDIUM, launch-relevant.**

@@ -132,7 +132,13 @@ def corpus_case_to_turn_evidence(case: dict) -> TurnEvidence:
                 is_superseded=True, status=status, reason=note, provenance=prov,
                 mention_index=len(vehicles)))
         elif field == "vehicle_year":
-            continue      # folded into the vehicle mention above
+            # Folded into the vehicle mention above — unless the case states a year with no
+            # vehicle at all ("Es del 2015 no del 2014"), where the year IS the evidence.
+            if not any(v.field == "vehicle" for v in vehicles) and isinstance(value, int):
+                vehicles.append(VehicleEvidence(
+                    value=None, year=value, year_status=status, status=status,
+                    reason=note, provenance=prov, mention_index=len(vehicles)))
+            continue
         elif field == "inspection_location":
             locations.append(LocationEvidence(
                 value=value, locality=value, role=LocationRole.INSPECTION_LOCATION.value,
@@ -146,7 +152,14 @@ def corpus_case_to_turn_evidence(case: dict) -> TurnEvidence:
                 faqs.append(FaqIntentEvidence(
                     value=topic, topic=topic, status=status, provenance=prov))
         elif field == "acceptance":
-            if value is True:
+            # L4.7B.2B: the corpus states the stance itself. Booleans are still accepted so
+            # that any older fixture or producer round-trips to the same meaning.
+            if isinstance(value, str):
+                try:
+                    signal = AcceptanceSignal(value.strip().upper())
+                except ValueError:
+                    signal = AcceptanceSignal.UNKNOWN
+            elif value is True:
                 signal = AcceptanceSignal.ACCEPT
             elif value is False:
                 signal = (AcceptanceSignal.HESITATE
@@ -155,7 +168,9 @@ def corpus_case_to_turn_evidence(case: dict) -> TurnEvidence:
             else:
                 signal = AcceptanceSignal.UNKNOWN
             acceptance = AcceptanceEvidence(
-                value=value, signal=signal, status=status, reason=note, provenance=prov)
+                value={"ACCEPT": True, "REJECT": False, "HESITATE": False,
+                       "FUTURE_INTENT": False}.get(signal.value),
+                signal=signal, status=status, reason=note, provenance=prov)
         elif field == "scheduling_preference":
             for branch in (value or []):
                 rank = int(branch.get("rank", len(schedule) + 1))
@@ -227,7 +242,9 @@ def turn_evidence_to_harness_items(evidence: TurnEvidence) -> list[dict]:
                     "value": [f.topic for f in evidence.faq_intents],
                     "status": evidence.faq_intents[0].status.value})
     if evidence.acceptance is not None:
-        out.append({"field": "acceptance", "value": evidence.acceptance.value,
+        # L4.7B.2B: the harness scores the stance itself. Emitting the boolean here made
+        # FUTURE_INTENT indistinguishable from REJECT.
+        out.append({"field": "acceptance", "value": evidence.acceptance.signal.value,
                     "status": evidence.acceptance.status.value})
     if evidence.scheduling_requests:
         out.append({"field": "scheduling_preference",
