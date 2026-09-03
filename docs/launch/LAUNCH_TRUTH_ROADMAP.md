@@ -830,6 +830,48 @@ passed / 60 failed / 9 errors — failure set byte-identical to baseline.
 
 Next: **L4.7B.3-SHADOW-SEMANTIC-QUALITY**. OUTBOUND OFF. Wild clean count **0/3**.
 
+### Phase B.13 — L4.7B.3-SHADOW-SEMANTIC-QUALITY (2026-09-03) — **COMPLETE; 9 OF 10 GATE LINES PASS**
+
+Closeout: `2026-09-03_RIDECHECK_CRM_L4.7B.3-SHADOW-SEMANTIC-QUALITY_CLOSEOUT_FINAL-QUALITY-GATE.md`
+
+One focused interpreter pass against the instrument repaired in L4.7B.2B. Eight prompt
+revisions, each measured on the full 162-case corpus; two were rejected for re-introducing an
+unsupported inference on a REAL case despite higher aggregate recall. Shipped
+**`understand/1.12`**; **model unchanged** (`gpt-4o-mini`).
+
+| | L4.7B.2B (1.4) | L4.7B.3 (1.12) |
+|---|---|---|
+| field precision / recall, overall | 0.885 / 0.728 | **0.938 / 0.890** |
+| field precision / recall, REAL | 0.800 / 0.667 | **0.871 / 0.900** |
+| unsupported inference | 0.0062 | **0.000** |
+| role accuracy · ambiguity | 1.000 · 1.000 | **1.000 · 1.000** |
+| clean cases | 99 | **131** |
+| stance exact · false ACCEPT | 0.725 · 0.000 | **0.875 · 0.000** |
+
+**Quality gate: FAIL on one line only** — every group A–L recall ≥ 0.70, missed by group I
+(0.632) and group L (0.591). All nine other lines pass, including REAL precision and recall,
+which failed in every previous milestone. Both group failures are the same residual class:
+the companion item omitted next to the value it belongs to (`corrections[]` beside a corrected
+value; `SEARCHING_NOT_READY` beside a stance).
+
+Critical cases, reproducible across two draws: **WILD-A-04 clean** (PRIMARY TOMORROW 15:00 /
+FALLBACK THURSDAY flexible — the Wild A scheduling class is closed), **WILD-B-02 clean** (both
+location roles), **WILD-B-01 keeps Peugeot 2008 + 2014**, REAL-001 and REAL-004 clean, and
+**zero unsupported inference on every owner example and every Wild case**. Group C reached
+1.000 recall at 1.000 role accuracy.
+
+Authority unchanged: no CE behaviour change, no canonical mutation, no outbound, shadow still
+asynchronous. Image `ridecheck-crm-backend:l4.7b3-semantic-29538be` on crm_test only, parity
+verified, live probe correct on all three Wild classes, `whatsapp_messages` 6 → 6.
+
+Tests `tests/test_l4_7b_3_shadow_semantic_quality.py` 29/29. Regression 3 376 passed / 60
+failed / 9 errors — failure set identical to baseline. Launch-gate suites 427 passed, with
+only the pre-existing environment-dependent `test_l4_2_clean_slate` allowlist case.
+
+Next: **L4.7B.4-COMPANION-EVIDENCE** (finite: lift groups I and L over the 0.70 recall floor
+without disturbing the nine passing lines), then **L4.7C-SEMANTIC-RECONCILER-DESIGN** as an
+audit/design pass. Wild clean count **0/3**. OUTBOUND OFF.
+
 ### Phase C — Infrastructure resilience (INFRA-OOM-01)
 
 **Host OOM incident, 2026-09-01 18:30:37Z — CONFIRMED, MEDIUM, launch-relevant.**
