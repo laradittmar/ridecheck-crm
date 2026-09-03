@@ -52,9 +52,11 @@ from semantic_corpus.integrity import FAQ_TOPICS, audit_corpus, render  # noqa: 
 CORPUS = {c["id"]: c for c in load_corpus()}
 MIX = [c for cid, c in CORPUS.items() if cid.startswith("SYN-MIX")]
 
-# The interpreter as shipped by L4.7B.2. This milestone repairs the ruler, never the thing
-# being measured, so the hash below is a contract, not a snapshot to refresh.
-INTERPRETER_SHA256 = "00cb78d15aa83885a56b1f17ba6ef9af593b8a10f45c5926dda66c9adce40f86"
+# The interpreter as shipped by the CURRENT milestone. L4.7B.2B pinned understand/1.4 to
+# prove the ruler was repaired without touching the interpreter; L4.7B.3 then changed the
+# interpreter on purpose, so the pin moved with it — deliberately, and only in a milestone
+# whose stated job is to change the interpreter.
+INTERPRETER_SHA256 = "f45dc2f42611707d7a74262792871121158dda3fb454b32109222455054225f0"
 INTERPRETER_PATH = ROOT / "backend" / "app" / "services" / "semantic_interpreter.py"
 
 
@@ -226,7 +228,8 @@ class TestImmutability(unittest.TestCase):
 
     def test_fixture_11_prompt_version_unchanged(self):
         from app.services.semantic_interpreter import PROMPT_VERSION
-        self.assertEqual(PROMPT_VERSION, "understand/1.4")
+        self.assertEqual(PROMPT_VERSION, "understand/1.12",
+                         "prompt version moved in L4.7B.3; the MODEL did not")
         source = INTERPRETER_PATH.read_text(encoding="utf-8")
         self.assertIn('or "gpt-4o-mini"', source, "the model is unchanged")
 

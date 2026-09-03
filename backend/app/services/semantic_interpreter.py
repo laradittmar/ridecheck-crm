@@ -61,16 +61,19 @@ from ..schemas.turn_evidence import (
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "understand/1.4"
+PROMPT_VERSION = "understand/1.12"
 INTERPRETER_ID = "semantic:understand"
 
 # Controlled vocabularies. These are the *schema* the interpreter must speak — not phrase
 # rules. Adding a phrase here would violate the no-phrase-patch rule; adding a concept is a
 # schema change and belongs in a documented version bump.
 SERVICE_INTENT_VALUES = ("PREPURCHASE_INSPECTION",)
-READINESS_VALUES = ("SEARCHING_NOT_READY", "FUTURE_CONTACT_INTENDED", "HESITANT_OR_DEFERRED")
+# L4.7B.3: stance lives in `acceptance`. READINESS keeps only the process fact a stance
+# cannot express — "I have not chosen a car yet".
+READINESS_VALUES = ("SEARCHING_NOT_READY",)
+# No "mixed" sentinel: a burst with three questions carries three topics (L4.7B.2B).
 FAQ_TOPICS = ("service_scope", "report", "presence", "payment", "business_hours",
-              "duration", "coverage", "mixed")
+              "duration", "coverage")
 DAY_EXPRESSIONS = ("TODAY", "TOMORROW", "DAY_AFTER_TOMORROW", "MONDAY", "TUESDAY",
                    "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY", "EXPLICIT_DATE")
 
@@ -90,55 +93,201 @@ Tres capas, no las mezcles:
 NUNCA decidas ni menciones: precio, disponibilidad de agenda, reservas/turnos confirmados,
 estado del lead, ni si se crea un candidato. No inventes datos que el cliente no dijo.
 
-Reglas de interpretación:
-1. Si algo no fue dicho, no lo completes. Falta = ausente. NO devuelvas ítems vacíos:
-   una lista sin evidencia va vacía ([]), nunca con un objeto de campos en null.
-2. Si hay varias lecturas posibles, usá status AMBIGUOUS y listá alternativas. No elijas.
-3. Si dos afirmaciones se contradicen, usá conflicts y preservá ambos lados.
-4. Separá SIEMPRE dónde está el AUTO (INSPECTION_LOCATION) de dónde vive/está el CLIENTE
-   (CUSTOMER_ORIGIN) y de dónde está el VENDEDOR (SELLER_LOCATION). El orden en que se
-   mencionan no define el rol.
-5. Si el cliente ofrece varias opciones de día/horario, mantené el ORDEN: la primera es
-   PRIMARY, la siguiente FALLBACK. Un horario pertenece SOLO a la opción donde fue dicho.
-6. Distinguí aceptación (ACCEPT) de duda (HESITATE) y de rechazo (REJECT). Una pregunta
-   sola es QUESTION_ONLY. Si dice que va a volver/avisar/contactar MÁS ADELANTE, eso es
-   FUTURE_INTENT: nunca ACCEPT.
-7. Si menciona más de un vehículo, devolvé todos, en orden. Si corrigió uno por otro,
-   marcá el anterior con is_superseded=true y agregá la corrección.
-8. Preguntas frecuentes y evidencia de negocio COEXISTEN: responder una FAQ no borra el
-   vehículo, la ubicación ni el pedido de turno del mismo mensaje. Un mismo mensaje puede
-   tener FAQ y service_intent a la vez. Devolvé TODOS los temas consultados, uno por cada
-   pregunta distinta del mensaje; no elijas sólo el principal.
-9. Lenguaje con typos, audio transcripto o texto ruidoso: interpretá con prudencia. Si no
-   podés resolver, PROPOSED o AMBIGUOUS, nunca CONFIRMED.
-10. status válido: CONFIRMED (el cliente lo dijo claramente), PROPOSED (probable),
-    AMBIGUOUS (varias lecturas), CONFLICT (se contradice).
-11. TIEMPO: usá el CONTEXTO TEMPORAL sólo para mapear expresiones relativas al vocabulario
-    de días (TODAY / TOMORROW / DAY_AFTER_TOMORROW / nombre del día). NO devuelvas fechas
-    ISO: resolved_date no es tuyo, lo calcula la capa determinística. Un día sin hora es
-    día sin hora; no inventes horario.
-12. NÚMEROS DEL VEHÍCULO: si aparecen dos números y uno nombra el modelo y el otro el año,
-    conservá LOS DOS. Nunca descartes uno. Si no podés decidir cuál es cuál, devolvé
-    status AMBIGUOUS con las alternativas y dejá el año en year_status AMBIGUOUS.
-13. CATÁLOGO: todo lo que agregues y el cliente NO haya dicho literalmente (marca deducida
-    del modelo, categoría, modelo normalizado) es como máximo PROPOSED, y va también en
-    catalog_candidate. El catálogo determinístico decide después.
-14. INTENCIÓN: emitida cuando este mensaje dice algo sobre EL SERVICIO — pedirlo, preguntar
-    su precio (QUOTE_REQUEST), ofrecer logística (LOGISTICS_OFFER), o decir que todavía no
-    está listo / que avisa más adelante (READINESS). Nombrar un auto, una zona, un día o
-    aceptar una propuesta NO es, por sí solo, intención de servicio. Pueden coexistir
-    varias intenciones en un mismo mensaje.
-15. DÍAS ABREVIADOS O MAL ESCRITOS: resolvé a la expresión relativa o al día de la semana
-    sólo si la abreviatura es inequívoca; si no lo es, AMBIGUOUS con las alternativas.
-    Nunca elijas un día de la semana cuando lo dicho apunta a una expresión relativa.
-16. Si un dato no se conoce, va en null: NUNCA escribas "UNKNOWN", "N/A", "-" ni similares
-    como si fueran valores.
+═══ REGLAS GENERALES ═══
+G1. Si algo no fue dicho, no lo completes. Falta = ausente. Las listas sin evidencia van
+    vacías ([]); nunca devuelvas un objeto con todos los campos en null.
+G2. Varias lecturas posibles → status AMBIGUOUS + alternatives. No elijas por el cliente.
+G3. Dos afirmaciones que se contradicen → conflicts, con ambos lados.
+G4. status: CONFIRMED (lo dijo claramente) | PROPOSED (probable, o texto ruidoso) |
+    AMBIGUOUS (varias lecturas) | CONFLICT (se contradice). Con typos, audio transcripto o
+    texto muy ruidoso: PROPOSED o AMBIGUOUS, nunca CONFIRMED. Pero el ruido NO borra la
+    evidencia: si a través de los errores de tipeo se entiende lo que pide, emitilo con
+    status PROPOSED en lugar de devolver nada.
+G5. Todo COEXISTE. Un mismo mensaje puede tener FAQ + intención + vehículo + ubicación +
+    postura + pedido de día. Contestar una cosa no borra las otras. Ninguna categoría
+    tiene prioridad sobre otra.
+G6. Nada de valores de relleno: si no se sabe, va null. NUNCA "UNKNOWN", "N/A", "-".
+G7. Recorré TODOS los slots por separado — intenciones, vehículos, ubicaciones, postura,
+    día/hora, correcciones, temas de FAQ — y completá cada uno con lo que le corresponda.
+    No elijas "lo más importante" del mensaje: un mensaje corto puede llenar dos o tres
+    slots a la vez, y omitir uno es perder evidencia que el cliente sí dio.
+
+═══ 1. SEÑALES DEL MENSAJE (service_intents) — pueden convivir varias ═══
+Este array no es sólo "lo que quiere": también lleva HECHOS de su proceso de compra.
+Cuatro kinds, con su disparador y su value:
+
+  kind=INSPECTION        value="PREPURCHASE_INSPECTION"
+    El mensaje habla DEL SERVICIO o de CHEQUEAR EL ESTADO de un auto: lo pide, pregunta si
+    lo hacemos, qué incluye, cómo funciona, qué informe entrega, si van al lugar; u ofrece
+    un auto concreto (o dónde está) dentro de una pregunta sobre el servicio (status
+    PROPOSED); o dice que quiere conocer la condición de un auto antes de comprarlo.
+
+  kind=QUOTE_REQUEST     value=true   ← el value SIEMPRE va, es exactamente true
+    El mensaje pregunta CUÁNTO CUESTA o pide una cotización/presupuesto: precio, costo,
+    valor, cuánto sale, cuánto cobran, cuánto salía. SIEMPRE va acá, nunca como tema de
+    FAQ. Si además nombra el servicio, emití TAMBIÉN INSPECTION.
+
+  kind=READINESS         value="SEARCHING_NOT_READY"
+    El cliente dice que todavía NO ELIGIÓ / NO TIENE el auto: sigue buscando, mirando,
+    consultando por ahora, no decidió cuál, "cuando lo tenga", "cuando decida", "cuando lo
+    vaya a ver". Es un HECHO de su proceso de compra, no una postura, y es OBLIGATORIO
+    emitirlo cada vez que aparece — incluso (y sobre todo) cuando en el mismo mensaje ya
+    emitiste una postura como FUTURE_INTENT. Los dos ítems, siempre.
+    PERO: si ya nombró un auto concreto (marca, modelo o ambos), YA ELIGIÓ: en ese caso NO
+    emitas SEARCHING_NOT_READY, aunque hable de plazos futuros.
+
+  kind=LOGISTICS_OFFER   value="CUSTOMER_OFFERS_TRANSPORT"
+    El cliente ofrece logística propia: tiene movilidad, puede llevar o acercar el auto.
+
+NO emitas ninguna intención por: saludar, agradecer, ser amable, escribirnos, prometer que
+vuelve más adelante, o contar que está buscando un auto (eso último es READINESS, no
+INSPECTION). El canal no es evidencia.
+Contraste:
+  "estoy buscando un auto, cuando decida te aviso"   → READINESS, sin INSPECTION
+  "¿ustedes revisan autos usados?"                   → INSPECTION
+  "quiero ver en qué estado está antes de comprarlo"  → INSPECTION
+  "¿cuánto sale?"                                     → QUOTE_REQUEST (sin FAQ)
+  "¿cuánto sale la revisión?"                         → QUOTE_REQUEST + INSPECTION
+  "¿tengo que estar presente? el auto está en <zona>" → INSPECTION (PROPOSED) + FAQ + ubicación
+
+═══ 2. POSTURA DEL CLIENTE (acceptance) — una sola por mensaje ═══
+acceptance.signal describe la postura frente a algo que YA le propusimos:
+  ACCEPT        acepta AHORA y explícitamente avanzar.
+  REJECT        dice que no.
+  HESITATE      duda, lo va a pensar, le parece caro, no decidió, "capaz", "no sé".
+  FUTURE_INTENT promete volver / avisar / escribir / consultar MÁS ADELANTE.
+  QUESTION_ONLY el mensaje es sólo una pregunta, sin postura.
+Si el cliente expresa CONFORMIDAD con avanzar — aunque sea con una sola palabra
+afirmativa — es ACCEPT. La regla de cortesía excluye sólo el agradecimiento o el saludo que
+NO expresan conformidad: agradecer o saludar sin aceptar nada no es ACCEPT. Elegir o
+corregir un día tampoco es una postura: eso es un pedido de turno.
+Cada vez que emitas FUTURE_INTENT, preguntate también si el cliente dijo que todavía no
+tiene el auto: si NO nombró ningún auto concreto y sigue buscando/mirando/consultando, van
+LOS DOS ítems (READINESS + FUTURE_INTENT). Si nombró un auto, va sólo la postura.
+FUTURE_INTENT exige una promesa explícita de volver/avisar/escribir. La simple indecisión
+("no lo decidí", "no sé", "lo pienso") es HESITATE, no FUTURE_INTENT. Y si la promesa viene
+con duda ("capaz", "quizás", "puede ser", "no sé si"), manda la DUDA: es HESITATE.
+Contraste:
+  "lo voy a pensar"        → HESITATE          "dale, avancemos"     → ACCEPT
+  "si me cierra te escribo" → FUTURE_INTENT    "gracias!"            → sin acceptance
+  "por ahora no"           → REJECT            "¿cuándo pueden?"     → ACCEPT si acepta avanzar
+Además, si el cliente dice que TODAVÍA NO ELIGIÓ / NO TIENE el auto (sigue buscando,
+mirando, no decidió cuál, "cuando lo tenga", "cuando decida"), emití SIEMPRE
+service_intents kind=READINESS value=SEARCHING_NOT_READY. Eso es un HECHO sobre su proceso
+de compra y CONVIVE con la postura; emitir la postura no te exime de emitir el hecho:
+"sigo buscando, cuando encuentre te aviso" = READINESS SEARCHING_NOT_READY +
+acceptance FUTURE_INTENT (los dos, no uno).
+
+═══ 3. DÍA Y HORA ═══
+S1. Si el cliente usó una expresión RELATIVA (hoy, mañana, pasado mañana — incluso
+    abreviada o mal escrita), devolvé TODAY / TOMORROW / DAY_AFTER_TOMORROW. NUNCA la
+    conviertas en el nombre del día que da la cuenta: el CONTEXTO TEMPORAL sirve para
+    ENTENDER, no para convertir. Tampoco devuelvas fechas ISO: resolved_date lo calcula la
+    capa determinística.
+S2. Si ofrece varias opciones, mantené el ORDEN: la primera es PRIMARY, la siguiente
+    FALLBACK. Cada hora pertenece SÓLO a la opción donde fue dicha; si una opción no trae
+    hora, va time=null y flexible_time=true. Nunca traslades la hora de una opción a otra
+    ni fusiones dos opciones en una.
+S3. Si el cliente NOMBRA un día de la semana, ese es el día: no lo cambies por una
+    expresión relativa. La regla de abreviaturas aplica SÓLO cuando la palabra está
+    abreviada o mal escrita y no puede leerse como el nombre de un día: en ese caso, si
+    apunta a hoy / mañana / pasado mañana, devolvé la expresión relativa correspondiente.
+S4. Un día sin hora es un día sin hora: no inventes horario.
+S5. Una FRANJA del día (por la mañana, a la tarde, temprano, al mediodía) NO es una hora:
+    time=null y flexible_time=true. Sólo un horario concreto va en time, en formato HH:MM.
+S6. Un número suelto junto a un día es la HORA de esa opción ("jueves 11" = jueves 11:00).
+S7. Preguntar CUÁNDO podemos, qué horarios tenemos o qué disponibilidad hay NO es proponer
+    un día: no inventes scheduling_requests para una pregunta de disponibilidad.
+
+═══ 4. UBICACIONES: EL ROL NO DEPENDE DEL ORDEN ═══
+L1. Una localidad dicha SOBRE EL AUTO ("está en X", "el auto está en X", "es un <modelo>
+    en X", "lo tengo en X", "queda en X") es INSPECTION_LOCATION.
+L2. Sólo es CUSTOMER_ORIGIN si la frase habla DEL CLIENTE ("yo soy de X", "vivo en X",
+    "estoy en X", "me manejo desde X", "trabajo en X").
+L3. Si se nombra UNA sola localidad y la frase es sobre el auto o sobre la COMPRA del auto
+    ("estoy por comprar un usado en X", "lo vamos a ver en X"), es INSPECTION_LOCATION: ahí
+    está el auto. NO inventes un origen del cliente. Si de verdad no podés decidir el rol,
+    usá UNKNOWN_LOCATION_ROLE, no adivines.
+L4. SÓLO son ubicaciones los NOMBRES DE LUGAR. Una expresión de tiempo, una muletilla o una
+    palabra que no reconocés como localidad NO es una ubicación: si no estás seguro de que
+    el token nombra un lugar, no emitas ninguna ubicación. En texto ruidoso, preferí omitir
+    la ubicación antes que inventarla.
+L5. Ojo con "en": introduce lugares PERO TAMBIÉN TIEMPO. "en breves", "en un rato", "en
+    unos días" son expresiones de TIEMPO, no localidades. Nunca emitas una ubicación cuya
+    palabra sea una expresión temporal, por más que venga precedida de "en".
+Contraste:
+  "El auto está en Berazategui"                → Berazategui INSPECTION_LOCATION
+  "Está en Berazategui, pero yo soy de Tigre"  → Berazategui INSPECTION_LOCATION +
+                                                  Tigre CUSTOMER_ORIGIN
+  "Yo vivo en Tigre"                           → sólo Tigre CUSTOMER_ORIGIN
+
+═══ 5. CORRECCIONES ═══
+C1. Cuando el cliente REEMPLAZA o CORRIGE algo dicho antes (en este mensaje o en el turno
+    anterior del mismo ciclo que figura en el contexto), devolvé DOS cosas: la corrección
+    en corrections[] Y el valor corregido como evidencia normal (vehículo, año, localidad,
+    día). El valor viejo va con is_superseded=true si es un vehículo.
+C1b. El disparador es semántico: si el mensaje CONTRAPONE algo nuevo con algo anterior —
+    lo descarta, lo rectifica, lo cambia, prefiere otra cosa o vuelve a una anterior —
+    ESO ES una corrección, y el ítem en corrections[] es obligatorio aunque el valor viejo
+    no aparezca escrito en el mensaje. Emitir sólo el valor nuevo es perder la corrección.
+C2. relation: CORRECT_EXISTING (arregla un dato del mismo auto: año, localidad, día) |
+    REPLACE_CANDIDATE (pasa a otro auto) | SWITCH_TO_PRIOR_CANDIDATE (vuelve a un auto
+    anterior, sólo si el contexto del ciclo actual lo respalda) | ADD_SECOND_CANDIDATE.
+C3. Nunca uses historia de ciclos anteriores: sólo lo que está en el contexto de este ciclo.
+C4. Toda corrección lleva SIEMPRE su ítem en corrections[], incluso cuando lo corregido es
+    sólo un año, sólo una localidad o sólo un día, y aunque no haya vehículo en el mensaje.
+C5. Volver a un auto mencionado antes también NOMBRA ese auto: emitilo en vehicles[] además
+    de la corrección.
+Contraste:
+  "es 2015, no 2014"           → correction CORRECT_EXISTING + year 2015
+  "no, es un <otro modelo>"    → correction REPLACE_CANDIDATE + vehículo nuevo +
+                                  vehículo anterior is_superseded
+  "mejor el jueves"            → correction CORRECT_EXISTING + scheduling THURSDAY
+
+═══ 6. PEDIDO DE PRECIO ═══
+Q1. Emití kind=QUOTE_REQUEST value=true SÓLO si el mensaje pregunta por dinero: precio,
+    costo, valor, cotización, presupuesto, cuánto sale / cuánto cobran.
+Q2. NO lo deduzcas de: dar un auto, dar una zona, preguntar por el servicio, mostrar
+    interés, ni aceptar avanzar. Preguntar "¿hacen esto?" NO es pedir precio.
+Q2b. La palabra "cuánto" sola no alcanza: "cuánto tarda" es DURACIÓN (tema de FAQ) y
+    "cuánto falta" es tiempo. Sólo es QUOTE_REQUEST si pregunta por DINERO.
+Q3. El dinero NO es un tema de FAQ. En el vocabulario de faq_topics no existe ningún tema
+    de precio ni de cotización: una pregunta por plata va SIEMPRE en QUOTE_REQUEST y en
+    ningún tema. (El tema `payment` es CÓMO se paga — medios de pago, antes o después —
+    nunca CUÁNTO cuesta.)
+
+═══ 7. TEMAS DE FAQ ═══
+F1. Devolvé TODOS los temas consultados: recorré el mensaje pregunta por pregunta y emití
+    un tema por cada una. Un tema no suprime a otro; tres preguntas son tres temas.
+F2. Usá sólo el vocabulario de temas. No existe un tema genérico, y NO existe ningún tema
+    de precio: `payment` es CÓMO o CUÁNDO se paga (medio de pago, antes o después), nunca
+    CUÁNTO cuesta. Una pregunta por plata no es una FAQ: es QUOTE_REQUEST.
+F3. Una FAQ NO borra el vehículo, la ubicación, la intención ni el pedido de día. Y al
+    revés: una pregunta al final de un mensaje que empieza aceptando SIGUE siendo una FAQ —
+    la postura y el tema conviven.
+
+═══ 8. VEHÍCULO Y CATÁLOGO ═══
+V1. Si menciona más de un vehículo, devolvé todos, en orden.
+V1b. Hay modelos que se llaman con cifras. Si el número nombra un modelo conocido,
+    completá igual su marca (status PROPOSED) además del modelo: un modelo numérico sin
+    marca no identifica nada.
+V2. Dos números donde uno nombra el modelo y el otro el año: conservá LOS DOS. Nunca
+    descartes uno. Si no podés decidir cuál es cuál: status AMBIGUOUS + alternatives y
+    year_status AMBIGUOUS.
+V3. SIEMPRE devolvé el auto que el cliente nombró. Si el modelo implica una única marca,
+    completá make con esa marca (y repetila en catalog_candidate). Lo que vos agregues y el
+    cliente no haya dicho literalmente va como máximo con status PROPOSED — pero se
+    devuelve, no se omite. El catálogo determinístico confirma después.
+V4. El vehículo que QUEDA vigente va en vehicles[] con is_superseded=false. El que fue
+    descartado va con is_superseded=true. No los inviertas: lo último que el cliente eligió
+    es lo vigente.
 
 Vocabulario permitido:
 - service_intents[].kind: INSPECTION | QUOTE_REQUEST | READINESS | LOGISTICS_OFFER | OTHER
 - service_intents[].value para INSPECTION: {SERVICE_INTENT_VALUES[0]}
 - service_intents[].value para READINESS: {" | ".join(READINESS_VALUES)}
 - service_intents[].value para QUOTE_REQUEST: true
+- service_intents[].value para LOGISTICS_OFFER: CUSTOMER_OFFERS_TRANSPORT
 - locations[].role: INSPECTION_LOCATION | CUSTOMER_ORIGIN | SELLER_LOCATION | UNKNOWN_LOCATION_ROLE
 - faq_topics: {" | ".join(FAQ_TOPICS)}
 - scheduling_requests[].day_expression: {" | ".join(DAY_EXPRESSIONS)}
@@ -146,6 +295,32 @@ Vocabulario permitido:
 - acceptance.signal: {" | ".join(ACCEPTANCE_VALUES)}
 - corrections[].relation: CORRECT_EXISTING | REPLACE_CANDIDATE | SWITCH_TO_PRIOR_CANDIDATE
   | ADD_SECOND_CANDIDATE | UNKNOWN_RELATION
+
+═══ EJEMPLOS DE SALIDA (forma, no vocabulario de superficie) ═══
+Pregunta por plata:
+  {{"service_intents": [{{"kind": "QUOTE_REQUEST", "value": true, "status": "CONFIRMED"}}]}}
+Sigue buscando y promete volver (DOS ítems, uno de proceso y uno de postura):
+  {{"service_intents": [{{"kind": "READINESS", "value": "SEARCHING_NOT_READY",
+                        "status": "CONFIRMED"}}],
+   "acceptance": {{"signal": "FUTURE_INTENT", "status": "CONFIRMED"}}}}
+Dos opciones de día, la hora pertenece sólo a la primera:
+  {{"scheduling_requests": [
+     {{"priority": "PRIMARY",  "day_expression": "TOMORROW", "time": "15:00",
+      "flexible_time": false, "rank": 1, "status": "CONFIRMED"}},
+     {{"priority": "FALLBACK", "day_expression": "THURSDAY", "time": null,
+      "flexible_time": true,  "rank": 2, "status": "CONFIRMED"}}]}}
+Reemplazo de vehículo (el vigente sin marca de superseded, el descartado con ella):
+  {{"corrections": [{{"relation": "REPLACE_CANDIDATE", "from_value": "<auto viejo>",
+                    "to_value": "<auto nuevo>", "status": "CONFIRMED"}}],
+   "vehicles": [{{"make": "<marca nueva>", "model": "<modelo nuevo>", "is_superseded": false,
+                "status": "CONFIRMED"}},
+                {{"make": "<marca vieja>", "model": "<modelo viejo>", "is_superseded": true,
+                "status": "CONFIRMED"}}]}}
+Corrección de un dato (la corrección Y el valor corregido):
+  {{"corrections": [{{"relation": "CORRECT_EXISTING", "from_value": 2014, "to_value": 2015,
+                    "status": "CONFIRMED"}}],
+   "vehicles": [{{"model": null, "year": 2015, "status": "CONFIRMED",
+                "year_status": "CONFIRMED"}}]}}
 
 Respondé SOLO con este JSON (las listas van vacías si no hay evidencia; los objetos, null):
 {{
@@ -175,6 +350,18 @@ Forma de cada ítem cuando SÍ hay evidencia:
 - faq_topics[]: strings del vocabulario de arriba, uno por cada pregunta del mensaje
 - identity[]: {{"kind", "value", "status"}}
 - handoff: {{"requested", "status", "reason"}}
+
+ANTES DE RESPONDER, repasá slot por slot:
+- ¿El cliente dijo que todavía no tiene o no eligió NINGÚN auto? → falta READINESS
+  (si ya nombró un auto, NO va).
+- ¿Ofreció movilidad propia o llevar el auto? → falta LOGISTICS_OFFER.
+- ¿El modelo que nombró es un número? → la marca de ese modelo tiene que estar igual.
+- ¿Preguntó por dinero? → falta QUOTE_REQUEST (y no va como tema de FAQ).
+- ¿Corrigió, reemplazó o descartó algo dicho antes? → falta el ítem en corrections[],
+  ADEMÁS del valor nuevo y del viejo marcado is_superseded.
+- ¿Hay más de una pregunta? → falta un tema de FAQ por cada una.
+- ¿Usó una expresión relativa de día? → tiene que quedar relativa, no un día de la semana.
+- ¿Alguna ubicación que emitiste podría ser una expresión de tiempo? → quitala.
 
 No devuelvas ítems cuyos campos estén todos en null. Sin texto fuera del JSON."""
 
@@ -284,6 +471,15 @@ def _alternatives(raw: Any) -> tuple[Alternative, ...]:
 
 _PLACEHOLDERS = {"unknown", "n/a", "na", "null", "none", "-", "?", "desconocido",
                  "sin datos", "no especificado"}
+
+# The controlled constant each intent kind carries when the interpreter names the kind but
+# leaves the value out. Not a phrase rule: one value per schema kind.
+_KIND_DEFAULT_VALUE = {
+    "INSPECTION": SERVICE_INTENT_VALUES[0],
+    "QUOTE_REQUEST": True,
+    "READINESS": READINESS_VALUES[0],
+    "LOGISTICS_OFFER": "CUSTOMER_OFFERS_TRANSPORT",
+}
 
 
 def _clean(value: Any) -> Optional[Any]:
@@ -490,8 +686,14 @@ class SemanticTurnInterpreter:
             field = {"INSPECTION": "service_intent", "READINESS": "readiness",
                      "QUOTE_REQUEST": "quote_request",
                      "LOGISTICS_OFFER": "customer_logistics_offer"}.get(kind.value, "service_intent")
+            # L4.7B.3: for these kinds the KIND is the evidence and the value is a controlled
+            # constant. When the model names the kind but omits the value, the item used to
+            # be dropped as "semantically empty" — a silent loss, not an interpretation.
+            value = _clean(raw.get("value"))
+            if value is None:
+                value = _KIND_DEFAULT_VALUE.get(kind.value)
             intents.append(ServiceIntentEvidence(
-                field=field, kind=kind, value=_clean(raw.get("value")),
+                field=field, kind=kind, value=value,
                 status=_status(raw.get("status")), reason=raw.get("reason"),
                 confidence=_confidence(raw.get("confidence")), provenance=prov))
 

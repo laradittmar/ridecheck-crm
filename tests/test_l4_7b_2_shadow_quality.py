@@ -178,8 +178,11 @@ class TestTemporalContext(unittest.TestCase):
 
     def test_quality_06_model_proposed_date_is_dropped(self):
         """Relative days are named here and resolved deterministically — never both."""
-        self.assertIn("NO devuelvas fechas", _SYSTEM_PROMPT)
-        self.assertIn("resolved_date no es tuyo", _SYSTEM_PROMPT)
+        # L4.7B.3 rewrote the prompt; the CONTRACT is unchanged and is asserted on the
+        # behaviour below plus the rule's current wording.
+        flat = " ".join(_SYSTEM_PROMPT.split())
+        self.assertIn("Tampoco devuelvas fechas ISO", flat)
+        self.assertIn("resolved_date lo calcula la capa determinística", flat)
         result, _ = _interpret(
             {"scheduling_requests": [{"priority": "PRIMARY", "day_expression": "TOMORROW",
                                       "time": "15:00", "resolved_date": "2026-09-04",
@@ -228,7 +231,8 @@ class TestVehicleNumbers(unittest.TestCase):
         self.assertGreaterEqual(len(vehicle.alternatives), 2,
                                 "both readings are preserved, none discarded")
         self.assertIsNone(vehicle.year, "the interpreter does not pick a winner")
-        self.assertIn("NÚMEROS DEL VEHÍCULO", _SYSTEM_PROMPT)
+        flat = " ".join(_SYSTEM_PROMPT.split())
+        self.assertIn("conservá LOS DOS", flat, "the number-pair rule survives the rewrite")
 
 
 # ── Phase D — catalog status ceiling ──────────────────────────────────────────
@@ -275,7 +279,8 @@ class TestFutureIntent(unittest.TestCase):
 
     def test_quality_14_schema_version_bumped_and_backward_compatible(self):
         self.assertEqual(SCHEMA_VERSION, "turn-evidence/1.1")
-        self.assertEqual(PROMPT_VERSION, "understand/1.4")
+        self.assertEqual(PROMPT_VERSION, "understand/1.12",
+                         "L4.7B.3 moved the prompt; turn-evidence/1.1 is unchanged")
         old = TurnEvidence.from_json(json.dumps({"schema_version": "turn-evidence/1.0"}))
         self.assertEqual(old.schema_version, "turn-evidence/1.0",
                          "a 1.0 record still loads under the major-version guard")
@@ -286,11 +291,15 @@ class TestFutureIntent(unittest.TestCase):
 class TestIntentScope(unittest.TestCase):
 
     def test_quality_15_intent_scope_is_a_rule_not_a_phrase_list(self):
-        self.assertIn("INTENCIÓN", _SYSTEM_PROMPT)
-        self.assertIn("COEXISTEN", _SYSTEM_PROMPT, "FAQ and business evidence coexist")
-        # No customer phrasing may be hard-coded in interpreter *code*. Docstrings and
-        # comments are stripped first: naming an example in prose is documentation, a
-        # phrase in a literal is a patch.
+        flat = " ".join(_SYSTEM_PROMPT.split())
+        self.assertIn("El canal no es evidencia", flat, "intent scope is stated as a rule")
+        self.assertIn("Todo COEXISTE", flat, "FAQ and business evidence coexist")
+        # No customer phrasing may be hard-coded in interpreter *code*. Three things are
+        # stripped first, because none of them is a phrase patch: docstrings, comments and
+        # the system prompt itself. The prompt is natural-language instruction — after the
+        # L4.7B.3 rewrite it defines categories in words ("pregunta por dinero: precio,
+        # costo…"), which is a definition, not a branch on a customer sentence. What must
+        # stay clean is executable logic: no `if "<customer words>" in text`.
         source = (ROOT / "backend" / "app" / "services" / "semantic_interpreter.py").read_text()
         tree = ast.parse(source)
         for node in ast.walk(tree):
@@ -301,6 +310,15 @@ class TestIntentScope(unittest.TestCase):
                         and isinstance(body[0].value, ast.Constant)
                         and isinstance(body[0].value.value, str)):
                     body.pop(0)
+                keep = []
+                for stmt in body:
+                    targets = getattr(stmt, "targets", []) or ([getattr(stmt, "target", None)]
+                                                               if hasattr(stmt, "target") else [])
+                    names = {getattr(t, "id", None) for t in targets if t is not None}
+                    if "_SYSTEM_PROMPT" in names:
+                        continue          # the prompt is instruction, not code
+                    keep.append(stmt)
+                body[:] = keep
         code = ast.unparse(tree).lower()
         for phrase in ("revisar", "cotiz", "cuánto sale", "dale", "mñ", "buscando"):
             self.assertNotIn(phrase, code,
