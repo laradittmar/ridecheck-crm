@@ -872,6 +872,46 @@ Next: **L4.7B.4-COMPANION-EVIDENCE** (finite: lift groups I and L over the 0.70 
 without disturbing the nine passing lines), then **L4.7C-SEMANTIC-RECONCILER-DESIGN** as an
 audit/design pass. Wild clean count **0/3**. OUTBOUND OFF.
 
+### Phase B.14 — L4.7B.4-COMPANION-EVIDENCE (2026-09-03) — **COMPLETE; GATE FAILS ONE LINE; PROMPT WORK EXHAUSTED**
+
+Closeout: `2026-09-03_RIDECHECK_CRM_L4.7B.4-COMPANION-EVIDENCE_CLOSEOUT_FINAL-SHADOW-GATE.md`
+
+Companion evidence — a value and the relation that explains it — is now guaranteed
+**deterministically** where a guarantee is possible: a correction with a real relation can no
+longer be pruned as empty; a named superseded vehicle yields the replacement relation; a
+year-moving correction yields the corrected year. Neither derivation infers anything about
+the customer, and a template echo derives nothing (a guard added after an intermediate
+revision manufactured a false correction on two Wild cases).
+
+Shipped `understand/1.18`, **model unchanged** (`gpt-4o-mini`). Two draws:
+
+| | draw 1 | draw 2 |
+|---|---|---|
+| precision / recall, overall | **0.950 / 0.898** | 0.942 / 0.890 |
+| precision / recall, REAL | **0.897 / 0.867** | 0.897 / 0.867 |
+| unsupported · role · ambiguity | 0.000 · 1.000 · 1.000 | 0.000 · 1.000 · 1.000 |
+| group I recall | 0.737 | 0.684 |
+| group L recall | 0.636 | 0.636 |
+| clean cases · false ACCEPT | 133 · 0.000 | 132 · 0.000 |
+
+**Quality gate: FAIL on one line** — every group A–L recall ≥ 0.70. Group I rose from 0.632
+and now straddles the floor; group L sits at 0.636. Nine lines pass on both draws, REAL
+precision and recall among them. **L4.7C does not start.**
+
+Critical cases in both draws: REAL-001/003/004 clean, WILD-A-04 clean, WILD-B-02 clean,
+WILD-B-01 keeps Peugeot 2008 + 2014, zero unsupported inference everywhere, false ACCEPT
+0.000. Live probe produced both companion pairs in one turn.
+
+**Per the milestone contract no further broad semantic milestone is proposed.** The residual
+is classified for an explicit owner decision: group L = MODEL_LIMIT (six prompt formulations
+across two milestones never held ≥0.70) with a CORPUS_LIMIT alternative; group I remainder,
+`quote_request` on a service question and HESITATE = PROMPT_LIMIT; REAL-002 = MODEL_LIMIT.
+Options: accept the gate as met in substance and go to **L4.7C-SEMANTIC-RECONCILER-DESIGN**;
+authorise one shadow model comparison for the companion-emission class; or revisit the two
+group-L labels. Tests 16/16; regression 3 392 / 60 / 9 — identical to baseline.
+Image `ridecheck-crm-backend:l4.7b4-companion-c33ab79`, crm_test only, OUTBOUND OFF.
+Wild clean count **0/3**.
+
 ### Phase C — Infrastructure resilience (INFRA-OOM-01)
 
 **Host OOM incident, 2026-09-01 18:30:37Z — CONFIRMED, MEDIUM, launch-relevant.**
