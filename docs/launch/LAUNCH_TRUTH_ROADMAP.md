@@ -1149,6 +1149,49 @@ untouched. C2 and C3B unchanged; booking authority unchanged. Wild clean count *
 
 Next: **L4.7C.5-DERIVED-STATE-INVALIDATION** — not automatic.
 
+### Phase B.21 — L4.7C.4A-LIVE-SEMANTIC-SCHEDULING (2026-09-03) — **PASS**
+
+Closeout: `2026-09-03_RIDECHECK_CRM_L4.7C.4A-LIVE-SEMANTIC-SCHEDULING_CLOSEOUT_SAME-TURN-EVIDENCE.md`
+
+Closes the single condition B.20 recorded. The semantic interpretation of a burst is now
+available to the turn it is about, through one single-flight provider
+(`semantic_turn_evidence.py`) shared by the turn, the claim projection, the reconciler and the
+shadow recorder — **at most one model call per inbound burst**, proven on 16/16 live bursts
+and by a four-thread race. The rejected alternative (a sync call for CE plus the async shadow
+call) would have let the forensic record disagree with the decision it records.
+
+Live value: legacy vs reconciled **14 AGREE / 2 NEW_SAFER / 0 LEGACY_SAFER / 0 UNEXPLAINED**.
+"mañana 15 o jueves" — where the parser dropped the PRIMARY entirely — now keeps
+[2026-09-01 15:00, 2026-09-03 open]; "mañana 15 o jueves 10" keeps both branches each with its
+**own** time. WILD-A-04 PASS same-turn on the deployed image. Nothing invented where nothing
+was said: five non-scheduling utterances produce no request on both paths.
+
+Precedence is **not** "the model wins": `reconcile.scheduling_preference.v2` accepts the
+semantic reading only while it is a faithful enrichment of the deterministic one (same dates,
+same relative order; a missing time is not a contradiction). A contradicted time, a lost
+branch or a reordering keeps the certified deterministic reading as
+`source=deterministic_conflict`.
+
+Failure is absence: timeout (6.0 s ≈ 2.9× measured p95), model error, invalid schema and a
+full shadow queue all degrade to deterministic-only — no retry, no guess, no late result
+applied to a decided turn. Latency: semantic call mean 1 700 ms / p50 1 767 / p95 2 055;
+added wait at the chokepoint mean 1 717 ms / p50 1 477 / p95 4 548 (that p95 **is** the single
+cold-start observation — 2 263 ms excluding it). Only scheduling turns wait.
+
+**C2 and C3B consume deterministic evidence only (answer B) and are NOT materially affected:**
+neither was certified on a claim that it read semantic evidence, so no gate they passed is
+invalidated. Scope was not broadened; using the same interface there is a later decision.
+
+Tests 27/27 (LIVESEM-01…18). Regression **3 553 / 59 / 9**, failure sets identical between all
+flags ON and all OFF, 0 new. Image `ridecheck-crm-backend:l4.7c4a-livesem-4ec8c43`, parity
+MATCH ×5, restarts 0, crm_test only, OUTBOUND OFF, production untouched, crm_test rows
+unchanged (0/6/0). Booking authority unchanged.
+
+**Travel fallback still an owner decision:** brief says missing-group 30; certified code
+returns 0 for a missing group and 90 for an unknown pair. Unchanged here. PENDING.
+
+Wild clean count **0/3**. Next: **L4.7C.5-DERIVED-STATE-INVALIDATION** — not automatic.
+
 ### Phase C — Infrastructure resilience (INFRA-OOM-01)
 
 **Host OOM incident, 2026-09-01 18:30:37Z — CONFIRMED, MEDIUM, launch-relevant.**
