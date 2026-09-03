@@ -1039,6 +1039,43 @@ OUTBOUND OFF, production untouched. Wild clean count **0/3**.
 Next: **L4.7C.3-INTENT-STANCE-ACCEPTANCE-RECONCILIATION** — the high-risk family; not
 automatic.
 
+### Phase B.18 — L4.7C.3A-ACCEPTANCE-AUTHORIZATION-SHADOW (2026-09-03) — **PASS (shadow only)**
+
+Closeout: `2026-09-03_RIDECHECK_CRM_L4.7C.3A-ACCEPTANCE-AUTHORIZATION-SHADOW_CLOSEOUT_AUTHORIZATION-PROOF.md`
+
+The highest-risk transition now has a deterministic predicate, proven before it is trusted.
+`authorize_quote_acceptance` ALLOWs only with an ACCEPT stance read from the customer (never
+derived), ASSERTED + PRESENT + FACTUAL, a quote that exists **and was delivered** (its amount
+present in the outbound ledger — computing a price is not telling the customer), acceptance
+and quote in the current cycle, and the quote's inputs unchanged. `SEARCHING_NOT_READY`,
+candidate conflict and location conflict are blockers: they block when present and prove
+nothing when absent — readiness is never a prerequisite for ALLOW.
+
+**Quote identity needs no migration**: it is derived from what the quote was computed from
+(cycle · revision · candidate · category · zone · amount), so any input change is a staleness
+signal.
+
+Legacy vs new over the corpus, four quote scenarios: AGREE_DENY 119 · AGREE_ALLOW 14 ·
+NEW_SAFER 54 · **LEGACY_SAFER 0** · **UNEXPLAINED 0**. Safety metrics all zero: false
+progression, stale-quote progression, prior-cycle progression, computed-but-undelivered
+acceptance, unsupported authorization. Valid acceptance coverage **19/21 = 90.5 %**.
+
+Found by running the two side by side: the legacy `_has_acceptance_word` guard fires on
+"**Bueno**, quería revisar una 2008…" — a false-progression risk in the system as it stands.
+Two conservative misses recorded: an unaccented "Si avancemos" reads as conditional
+(WILD-A-03; first item for C3B), and "Ok, cuándo pueden?" produced no stance at all.
+
+Legacy acceptance paths mapped and classified (EVIDENCE_PRODUCER / BUSINESS_PRECONDITION /
+WRITE_PATH / TEMPORARY_COMPATIBILITY / RETIRE_IN_C6). Nothing changed: CE remains
+authoritative, `conversation_engine.py` does not reference the authorizer at all, and a test
+asserts it.
+
+Tests 27/27 (AUTH-01…20). Regression 3 475 / 60 / 9 — identical to baseline. Image
+`ridecheck-crm-backend:l4.7c3a-authshadow-c3e82ec`, crm_test only, C2 vehicle/location
+authority still ON, OUTBOUND OFF, production untouched. Wild clean count **0/3**.
+
+Next: **L4.7C.3B-ACCEPTANCE-AUTHORITY-CUTOVER** — not automatic.
+
 ### Phase C — Infrastructure resilience (INFRA-OOM-01)
 
 **Host OOM incident, 2026-09-01 18:30:37Z — CONFIRMED, MEDIUM, launch-relevant.**
