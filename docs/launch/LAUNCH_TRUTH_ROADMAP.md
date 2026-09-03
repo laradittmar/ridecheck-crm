@@ -964,6 +964,43 @@ complete. OUTBOUND OFF · Wild clean count **0/3**.
 
 Next: **L4.7C.1-RECONCILER-PRIMITIVES (phase C1)** — shadow only, changes nothing.
 
+### Phase B.16 — L4.7C.1-RECONCILER-PRIMITIVES (2026-09-03) — **PASS (shadow only)**
+
+Closeout: `2026-09-03_RIDECHECK_CRM_L4.7C.1-RECONCILER-PRIMITIVES_CLOSEOUT_SHADOW-CLAIMS.md`
+
+Phase C1 of the L4.7C design is implemented **in shadow**: `ClaimEvidence` (polarity,
+evidence class, explicitness, temporality, modality, cycle scope, supersedes, content-hash
+id), the four-valued information state where **absence is never false**, projection from both
+producers into one claim space, and a versioned reconciler that records a decision without
+taking one. `turn-evidence/1.2` extends `ReconciliationRecord` additively;
+`shadow-record/1.2` carries the summary.
+
+**C1 PASS means the primitives exist in shadow. It does NOT mean semantic authority
+migrated.** No canonical write, no business action, no class-D parser retired, CE fully
+authoritative.
+
+Corpus observation (162 cases, 275 claims): TRUE_ONLY 256 · BOTH 7 · FALSE_ONLY 2; outcomes
+ACCEPT 257 · CLARIFY 7 · HOLD 1; producer comparison AGREE 249 · DETERMINISTIC_ONLY 43 ·
+SEMANTIC_ONLY 7 · CONFLICT 9. Disagreement is now counted instead of being resolved by
+whichever code path ran first.
+
+Critical scenarios: Berazategui/Tigre split into two claims with two roles; *"si me cierra te
+hablo"* projects FUTURE+CONDITIONAL and reconciles to **HOLD with no canonical value**; the
+year correction carries both sides; ordered scheduling survives as one claim; a model-only
+"Fox" yields EXPLICIT_CUSTOMER model and SEMANTIC_INFERRED make, with CATALOG_CONFIRMED only
+from the deterministic producer.
+
+Live probe on `ridecheck-crm-backend:l4.7c1-claims-8b91117` (crm_test, OUTBOUND OFF):
+7 claims from **both** producers, all ACCEPT, no `quote_accepted` claim for the conditional
+sentence, `whatsapp_messages` 6 → 6, candidates 0 → 0, no raw text stored.
+
+Tests 30/30 (CLAIM-01…18) including a static no-authority proof over the three new modules.
+Regression 3 422 passed / 60 failed / 9 errors — identical to baseline; launch-gate suites
+443 passed. A third instance of the module-reload identity hazard was found and fixed.
+
+Next: **L4.7C.2-VEHICLE-LOCATION-RECONCILIATION** — not started automatically.
+Wild clean count **0/3**.
+
 ### Phase C — Infrastructure resilience (INFRA-OOM-01)
 
 **Host OOM incident, 2026-09-01 18:30:37Z — CONFIRMED, MEDIUM, launch-relevant.**
