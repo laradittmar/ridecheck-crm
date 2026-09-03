@@ -1001,6 +1001,44 @@ Regression 3 422 passed / 60 failed / 9 errors — identical to baseline; launch
 Next: **L4.7C.2-VEHICLE-LOCATION-RECONCILIATION** — not started automatically.
 Wild clean count **0/3**.
 
+### Phase B.17 — L4.7C.2-VEHICLE-LOCATION-RECONCILIATION (2026-09-03) — **PASS (first authority cutover)**
+
+Closeout: `2026-09-03_RIDECHECK_CRM_L4.7C.2-VEHICLE-LOCATION-RECONCILIATION_CLOSEOUT_FIELD-CUTOVER.md`
+
+Vehicle identity and inspection location are now written by a named rule that records why,
+instead of by whichever code path reached the field first. Flag-guarded
+(`RECONCILER_VEHICLE_AUTHORITY_ENABLED`, `RECONCILER_LOCATION_AUTHORITY_ENABLED`, default OFF,
+set only in crm_test) and reversible: with the flags off the write path is the legacy
+assignment byte for byte.
+
+Authority is per claim, never per producer: the customer's words say WHICH car and the
+**catalog** says what it is called and what category it is; the semantic layer reads the
+location ROLE and the **zone resolver** says whether the locality exists. An inferred make is
+a catalog *probe*, never authority. An origin claim can never populate the inspection
+location — enforced by claim type, not by ordering.
+
+Single write path: 5 vehicle and 8 location assignment sites routed through two chokepoints,
+with AST tests that fail if any candidate field is assigned outside them.
+
+Shadow-vs-authority over the corpus: vehicle 32 AGREE / 1 CLARIFY, location 31 AGREE / 0
+refusals, origin-only writes 0. The single disagreement is a bare numeric model the catalog
+cannot place — the authority asks instead of guessing.
+
+Two defects found by first real use and fixed: `information_state` treated any negation as
+contradicting any assertion, so "es un Ka… no, un Kuga" read as BOTH (a replacement is not a
+contradiction); and justifications lived only in the log stream, now appended to
+`reconciliation_records.jsonl` — append-only, no new table, no migration.
+
+Unchanged: pricing, scheduling, availability, booking, acceptance, handoff, lead lifecycle,
+the `state.home_zone_*` pre-candidate buffer, and every class-D parser (retirement is C6).
+
+Tests 26/26 (VL-01…18). Regression 3 448 / 60 / 9 with flags off **and** on — failure set
+identical to baseline. Image `ridecheck-crm-backend:l4.7c2-fieldauth-7d61c40`, crm_test only,
+OUTBOUND OFF, production untouched. Wild clean count **0/3**.
+
+Next: **L4.7C.3-INTENT-STANCE-ACCEPTANCE-RECONCILIATION** — the high-risk family; not
+automatic.
+
 ### Phase C — Infrastructure resilience (INFRA-OOM-01)
 
 **Host OOM incident, 2026-09-01 18:30:37Z — CONFIRMED, MEDIUM, launch-relevant.**
