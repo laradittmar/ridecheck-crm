@@ -285,6 +285,17 @@ class CorrectionEvidence(EvidenceItem):
     to_value: Any = None
     target_ref: Optional[str] = None          # ref of the item being corrected
 
+    def is_semantically_empty(self) -> bool:
+        # L4.7B.4: the RELATION is evidence on its own. "He replaced the car" is a fact
+        # even when the discarded car was never named, so a relation-only correction must
+        # survive sanitation — dropping it loses the only record that a change happened.
+        # Compared by value, not identity: an enum member that survived a round-trip (or a
+        # module reload in a test) is still the same relation.
+        relation = getattr(self.relation, "value", self.relation)
+        if relation != CorrectionRelation.UNKNOWN_RELATION.value:
+            return False
+        return super().is_semantically_empty()
+
 
 class IdentityEvidence(EvidenceItem):
     field: str = "identity"

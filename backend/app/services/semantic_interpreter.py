@@ -61,7 +61,7 @@ from ..schemas.turn_evidence import (
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "understand/1.12"
+PROMPT_VERSION = "understand/1.18"
 INTERPRETER_ID = "semantic:understand"
 
 # Controlled vocabularies. These are the *schema* the interpreter must speak — not phrase
@@ -107,6 +107,11 @@ G5. Todo COEXISTE. Un mismo mensaje puede tener FAQ + intención + vehículo + u
     postura + pedido de día. Contestar una cosa no borra las otras. Ninguna categoría
     tiene prioridad sobre otra.
 G6. Nada de valores de relleno: si no se sabe, va null. NUNCA "UNKNOWN", "N/A", "-".
+G7b. EVIDENCIA ACOMPAÑANTE: cuando el mensaje implica a la vez UN DATO y LA RELACIÓN que
+    explica cómo ese dato cambia lo que ya se sabía, devolvé LOS DOS. Un valor corregido
+    viene con su corrección; un auto que reemplaza a otro viene con la relación de
+    reemplazo y con el anterior marcado; un hecho del proceso de compra convive con la
+    postura. Emitir sólo la mitad más visible es perder evidencia que el cliente dio.
 G7. Recorré TODOS los slots por separado — intenciones, vehículos, ubicaciones, postura,
     día/hora, correcciones, temas de FAQ — y completá cada uno con lo que le corresponda.
     No elijas "lo más importante" del mensaje: un mensaje corto puede llenar dos o tres
@@ -154,7 +159,8 @@ Contraste:
 acceptance.signal describe la postura frente a algo que YA le propusimos:
   ACCEPT        acepta AHORA y explícitamente avanzar.
   REJECT        dice que no.
-  HESITATE      duda, lo va a pensar, le parece caro, no decidió, "capaz", "no sé".
+  HESITATE      duda sobre LA PROPUESTA: lo va a pensar, lo tiene que ver, le parece caro,
+                no decidió, "capaz", "no sé". Pensarlo o mirarlo es duda, no promesa.
   FUTURE_INTENT promete volver / avisar / escribir / consultar MÁS ADELANTE.
   QUESTION_ONLY el mensaje es sólo una pregunta, sin postura.
 Si el cliente expresa CONFORMIDAD con avanzar — aunque sea con una sola palabra
@@ -236,6 +242,8 @@ C2. relation: CORRECT_EXISTING (arregla un dato del mismo auto: año, localidad,
 C3. Nunca uses historia de ciclos anteriores: sólo lo que está en el contexto de este ciclo.
 C4. Toda corrección lleva SIEMPRE su ítem en corrections[], incluso cuando lo corregido es
     sólo un año, sólo una localidad o sólo un día, y aunque no haya vehículo en el mensaje.
+    Y al revés: el ítem de corrección NO reemplaza al valor corregido — si corregiste un
+    año, el año corregido tiene que estar también como evidencia de vehículo.
 C5. Volver a un auto mencionado antes también NOMBRA ese auto: emitilo en vehicles[] además
     de la corrección.
 Contraste:
@@ -653,6 +661,57 @@ class SemanticTurnInterpreter:
             return InterpretationResult(evidence=None, ok=False, latency_ms=latency,
                                         model=model, error=f"{type(exc).__name__}: {exc}")
 
+    # ── companion evidence (L4.7B.4) ──────────────────────────────────────────
+
+    @staticmethod
+    def _derive_companions(
+        vehicles: list, corrections: list, prov: Provenance,
+    ) -> tuple[list, list]:
+        """Pair a fact with the relation that explains it, using only what was said.
+
+        Two derivations, both strictly downstream of the interpreter's own output:
+
+        * a vehicle marked `is_superseded` IS a replacement — if no correction accompanies
+          it, the relation is recorded (the discarded car is the `from`, the surviving one
+          the `to`);
+        * a correction that moves a YEAR carries the corrected year — if no vehicle carries
+          a year, the year becomes vehicle evidence.
+
+        Nothing is invented: with no superseded vehicle and no year correction, both lists
+        come back untouched.
+        """
+        # Only a REAL superseded mention counts. A template echo — an empty row that merely
+        # carries is_superseded=true — is pruned a moment later as semantically empty, and
+        # deriving a replacement from it would invent a correction the customer never made.
+        # A replacement needs a NAMED car on the discarded side. A row that only carries
+        # `is_superseded=true` with no value is a template echo, and deriving a correction
+        # from it would invent a change the customer never made.
+        superseded = [v for v in vehicles if v.is_superseded and v.value]
+        current = [v for v in vehicles if not v.is_superseded and v.value]
+        if superseded and not corrections:
+            corrections = list(corrections) + [CorrectionEvidence(
+                value=True,
+                relation=CorrectionRelation.REPLACE_CANDIDATE,
+                from_value=superseded[0].value,
+                to_value=(current[0].value if current else None),
+                status=superseded[0].status,
+                reason="derived from a superseded vehicle mention",
+                provenance=prov)]
+
+        if not any(v.year is not None for v in vehicles):
+            for correction in corrections:
+                year = _coerce_year(correction.to_value)
+                if year is None:
+                    continue
+                vehicles = list(vehicles) + [VehicleEvidence(
+                    value=None, year=year, year_status=correction.status,
+                    status=correction.status,
+                    reason="corrected year carried by a correction",
+                    mention_index=len(vehicles), provenance=prov)]
+                break
+
+        return list(vehicles), list(corrections)
+
     # ── mapping into the typed schema ─────────────────────────────────────────
 
     def _to_turn_evidence(
@@ -676,6 +735,19 @@ class SemanticTurnInterpreter:
         burst_years = _year_candidates(texts)
 
         intents: list[ServiceIntentEvidence] = []
+        # L4.7B.4: the process fact may arrive in its own slot or inside the intents array.
+        # Both spellings mean the same thing and map to the same evidence item.
+        raw_readiness = payload.get("readiness")
+        if isinstance(raw_readiness, dict):
+            intents.append(ServiceIntentEvidence(
+                field="readiness", kind=ServiceIntentKind.READINESS,
+                value=(_clean(raw_readiness.get("value")) or READINESS_VALUES[0]),
+                status=_status(raw_readiness.get("status")),
+                reason=raw_readiness.get("reason"), provenance=prov))
+        elif isinstance(raw_readiness, str) and _clean(raw_readiness):
+            intents.append(ServiceIntentEvidence(
+                field="readiness", kind=ServiceIntentKind.READINESS,
+                value=_clean(raw_readiness), provenance=prov))
         for raw in payload.get("service_intents") or []:
             if not isinstance(raw, dict):
                 continue
@@ -696,6 +768,16 @@ class SemanticTurnInterpreter:
                 field=field, kind=kind, value=value,
                 status=_status(raw.get("status")), reason=raw.get("reason"),
                 confidence=_confidence(raw.get("confidence")), provenance=prov))
+
+        seen_readiness = 0
+        deduped: list[ServiceIntentEvidence] = []
+        for item in intents:
+            if item.field == "readiness":
+                seen_readiness += 1
+                if seen_readiness > 1:
+                    continue
+            deduped.append(item)
+        intents = deduped
 
         vehicles: list[VehicleEvidence] = []
         for index, raw in enumerate(payload.get("vehicles") or []):
@@ -821,7 +903,9 @@ class SemanticTurnInterpreter:
                 relation = CorrectionRelation.UNKNOWN_RELATION
             from_value, to_value = raw.get("from_value"), raw.get("to_value")
             corrections.append(CorrectionEvidence(
-                value=(True if (from_value or to_value or raw.get("target_ref")) else None),
+                value=(True if (from_value or to_value or raw.get("target_ref")
+                                or relation.value != CorrectionRelation.UNKNOWN_RELATION.value)
+                       else None),
                 relation=relation, from_value=from_value,
                 to_value=to_value, status=_status(raw.get("status")),
                 reason=raw.get("reason"), provenance=prov))
@@ -858,6 +942,12 @@ class SemanticTurnInterpreter:
             for raw in (payload.get("conflicts") or []) if isinstance(raw, dict)
         )
         notes = tuple(str(n) for n in (payload.get("notes") or []) if isinstance(n, str))
+
+        # ── L4.7B.4: companion evidence ──────────────────────────────────────
+        # A turn that carries a fact AND the relation explaining how it changes prior state
+        # must carry both. These derivations add nothing about the customer: they reshape
+        # what the interpreter itself already said into the slot the schema keeps for it.
+        vehicles, corrections = self._derive_companions(vehicles, corrections, prov)
 
         return TurnEvidence(
             interpreter=f"{INTERPRETER_ID}:{PROMPT_VERSION}",
