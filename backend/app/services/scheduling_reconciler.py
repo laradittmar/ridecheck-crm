@@ -17,6 +17,11 @@ Two invariants carry over from the semantic work and are enforced here rather th
   and no later stage may reorder it;
 * **a time belongs to its own clause** — "mañana 15 o el jueves" asks for 15:00 tomorrow and
   *any* time on Thursday, never 15:00 twice.
+
+L4.7C.4A adds the third: two producers read the *same* burst, so recency cannot decide
+between them. The semantic reading is authoritative while it is a faithful enrichment of the
+deterministic one; a real contradiction keeps the certified deterministic reading and is
+recorded rather than resolved in the model's favour (`semantic_covers_deterministic`).
 """
 from __future__ import annotations
 
@@ -30,7 +35,7 @@ from ..schemas.claims import ClaimEvidence, ClaimType, EvidenceClass, Informatio
 logger = logging.getLogger(__name__)
 
 RULE_ID = "reconcile.scheduling_preference"
-RULE_VERSION = "v1"
+RULE_VERSION = "v2"          # v2 (L4.7C.4A): same-turn producer precedence
 
 # The controlled day vocabulary. Weekday names carry their Python weekday index.
 RELATIVE_DAYS = {"TODAY": 0, "TOMORROW": 1, "DAY_AFTER_TOMORROW": 2}
@@ -125,6 +130,56 @@ def _branch_from_mapping(raw: Any, index: int, today: date) -> Optional[Schedule
         time_band=raw.get("time_band"))
 
 
+def _is_semantic(claim: ClaimEvidence) -> bool:
+    """Compared by value: an enum that survived a module reload is still the same class."""
+    actual = getattr(claim.evidence_class, "value", claim.evidence_class)
+    return actual == EvidenceClass.SEMANTIC_INFERRED.value
+
+
+def _branches_of(claim: ClaimEvidence, today: date) -> list[ScheduledBranch]:
+    out: list[ScheduledBranch] = []
+    for index, raw in enumerate(claim.value or ()):
+        branch = _branch_from_mapping(raw, index, today)
+        if branch is not None:
+            out.append(branch)
+    return out
+
+
+def semantic_covers_deterministic(semantic: list[ScheduledBranch],
+                                  deterministic: list[ScheduledBranch]) -> bool:
+    """Is the semantic reading a faithful *enrichment* of the deterministic one?
+
+    L4.7C.4A precedence rule. Two producers read the SAME burst, so neither is "later" —
+    "last writer wins" would be meaningless here. The question that can actually be answered
+    is whether they disagree:
+
+    * every deterministic branch must appear in the semantic reading, on the same resolved
+      date, in the same relative order;
+    * a deterministic branch with no time is satisfied by any time — **absence is never a
+      contradiction**, the same invariant the information-state model rests on;
+    * a deterministic branch with a *different* stated time is a real contradiction.
+
+    Enrichment (the semantic reading adds a branch the parser dropped) is accepted. Any
+    contradiction, or a deterministic branch the model lost, is not silently resolved in the
+    model's favour — the caller keeps the certified deterministic reading.
+    """
+    cursor = 0
+    for det in deterministic:
+        matched = -1
+        for index in range(cursor, len(semantic)):
+            sem = semantic[index]
+            if det.resolved_date and sem.resolved_date != det.resolved_date:
+                continue
+            if det.time is not None and sem.time != det.time:
+                continue
+            matched = index
+            break
+        if matched < 0:
+            return False
+        cursor = matched + 1
+    return True
+
+
 def reconcile_scheduling(
     claims: Iterable[ClaimEvidence],
     *,
@@ -139,6 +194,23 @@ def reconcile_scheduling(
     # correction ("mejor el jueves") never erases what it replaced.
     current = claims[-1]
     superseded_claims = claims[:-1]
+    conflict = False
+
+    # L4.7C.4A — when BOTH producers spoke about this same burst, recency is meaningless.
+    # The richer semantic reading is authoritative only while it does not contradict the
+    # deterministic one; otherwise the certified deterministic reading stands.
+    semantic_claims = [c for c in claims if _is_semantic(c)]
+    other_claims = [c for c in claims if not _is_semantic(c)]
+    if semantic_claims and other_claims:
+        sem_claim, det_claim = semantic_claims[-1], other_claims[-1]
+        if semantic_covers_deterministic(_branches_of(sem_claim, today),
+                                         _branches_of(det_claim, today)):
+            current = sem_claim
+            superseded_claims = [c for c in claims if c is not sem_claim]
+        else:
+            conflict = True
+            current = det_claim
+            superseded_claims = [c for c in claims if c is not det_claim]
     branches: list[ScheduledBranch] = []
     for index, raw in enumerate(current.value or ()):
         branch = _branch_from_mapping(raw, index, today)
@@ -157,13 +229,15 @@ def reconcile_scheduling(
                                   superseded=tuple(superseded),
                                   evidence_ids=tuple(c.claim_id for c in claims if c.claim_id))
 
-    source = ("semantic" if current.evidence_class is EvidenceClass.SEMANTIC_INFERRED
-              else "deterministic")
+    source = "semantic" if _is_semantic(current) else "deterministic"
+    if conflict:
+        source = "deterministic_conflict"
     return SchedulingDecision(
         branches=tuple(branches), superseded=tuple(superseded),
         information_state=InformationState.TRUE_ONLY.value,
         source=source,
-        reason="ordered preference preserved; dates resolved deterministically",
+        reason=("producers disagree; certified deterministic reading kept" if conflict
+                else "ordered preference preserved; dates resolved deterministically"),
         evidence_ids=tuple(c.claim_id for c in claims if c.claim_id))
 
 

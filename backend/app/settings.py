@@ -42,6 +42,11 @@ class Settings:
     reconciler_acceptance_authority_enabled: bool = False
     # L4.7C.4 — scheduling-language interpretation. Default OFF everywhere.
     reconciler_scheduling_authority_enabled: bool = False
+    # L4.7C.4A — same-turn semantic evidence. When false the interpretation stays behind the
+    # turn exactly as in L4.7C.4; when true a scheduling turn waits for the ONE interpretation
+    # already dispatched for this burst. Never a second model call. Default OFF everywhere.
+    semantic_same_turn_enabled: bool = False
+    semantic_same_turn_timeout_seconds: float = 6.0
     shadow_evidence_path: str = ""
     conversation_engine_direct_webhook_enabled: bool = False
     openai_chat_model: str = "gpt-4o-mini"
@@ -69,6 +74,15 @@ class Settings:
 
 def _getenv(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
+
+
+def _float_env(name: str, default: float) -> float:
+    """A bad or missing value falls back to the safe default rather than failing boot."""
+    try:
+        raw = _getenv(name, "")
+        return float(raw) if raw else default
+    except (TypeError, ValueError):
+        return default
 
 
 def _parse_quarantined_wa_ids() -> tuple[str, ...]:
@@ -119,6 +133,10 @@ def get_settings() -> Settings:
             _getenv("RECONCILER_ACCEPTANCE_AUTHORITY_ENABLED", "false").lower() == "true"),
         reconciler_scheduling_authority_enabled=(
             _getenv("RECONCILER_SCHEDULING_AUTHORITY_ENABLED", "false").lower() == "true"),
+        semantic_same_turn_enabled=(
+            _getenv("SEMANTIC_SAME_TURN_ENABLED", "false").lower() == "true"),
+        semantic_same_turn_timeout_seconds=_float_env(
+            "SEMANTIC_SAME_TURN_TIMEOUT_SECONDS", 6.0),
         shadow_evidence_path=_getenv("SHADOW_EVIDENCE_PATH"),
         conversation_engine_direct_webhook_enabled=_getenv("CONVERSATION_ENGINE_DIRECT_WEBHOOK_ENABLED", "false").lower() in ("1", "true", "yes"),
         openai_chat_model=_getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),

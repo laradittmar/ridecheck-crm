@@ -256,8 +256,14 @@ def claims_from_turn_evidence(
 
     # scheduling — the ordered branches travel as ONE claim, order intact
     if evidence.scheduling_requests:
-        branches = tuple({"priority": s.priority.value, "day": s.day_expression,
-                          "time": s.time, "flexible": s.flexible_time, "rank": s.rank}
+        # Priority by value and flexibility by fact: a branch with no stated time IS
+        # flexible whatever the model said about it, and an enum that survived a module
+        # reload is still the same priority.
+        branches = tuple({"priority": getattr(s.priority, "value", s.priority),
+                          "day": s.day_expression,
+                          "time": s.time,
+                          "flexible": bool(s.flexible_time or s.time is None),
+                          "rank": s.rank}
                          for s in evidence.scheduling_requests)
         add(ClaimType.SCHEDULING_PREFERENCE, branches,
             status=evidence.scheduling_requests[0].status,

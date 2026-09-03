@@ -4202,12 +4202,14 @@ class ConversationEngine:
         queue, unwritable log — degrades to "do nothing". This method returns None, writes
         no state and raises nothing.
         """
+        self._turn_semantic = None
         try:
             # Strict identity check: only a real boolean True enables the shadow path, so a
             # MagicMock settings object in a test can never trigger a model call.
             if getattr(self.settings, "shadow_understand_enabled", False) is not True:
                 return
             from .semantic_interpreter import SemanticTurnInterpreter
+            from .semantic_turn_evidence import TurnSemanticEvidence
             from .shadow_recorder import build_record, record_shadow
             from ..schemas.turn_evidence import BurstReconstruction
             from .outbound_path_registry import get_deployment_id
@@ -4240,8 +4242,11 @@ class ConversationEngine:
                            or getattr(ctx.state, "current_cycle_started_at", None) or "")
             revision_id = getattr(ctx.state, "current_revision_id", None)
 
-            def _work() -> None:
-                result = interpreter.interpret(
+            # L4.7C.4A — the ONE interpretation of this burst. Every consumer (the customer
+            # turn, the claim projection, the reconciler, the recorder below) reads this same
+            # provider, so same-turn authority costs no extra model call.
+            def _interpret():
+                return interpreter.interpret(
                     burst_texts,
                     thread_id=thread_id,
                     burst_id=burst_id,
@@ -4249,7 +4254,17 @@ class ConversationEngine:
                     reconstruction=BurstReconstruction.LIVE_DEBOUNCE,
                     context=context,
                 )
-                # ── shadow claim projection + reconciliation (writes nothing) ──
+
+            provider = TurnSemanticEvidence(_interpret, thread_id=thread_id,
+                                            burst_id=burst_id)
+            self._turn_semantic = provider
+            self._turn_semantic_texts = list(burst_texts)
+
+            def _work() -> None:
+                result = provider.get()
+                if result is None:
+                    return
+                # ── shadow claim projection + reconciliation (writes nothing) ──  # noqa
                 reconciliation = None
                 try:
                     from .claim_projection import project_all
@@ -4284,9 +4299,22 @@ class ConversationEngine:
 
             if self._shadow_async():
                 from .shadow_worker import ShadowJob, get_worker
-                get_worker().submit(ShadowJob(run=_work, thread_id=thread_id,
-                                              burst_id=burst_id))
+                worker = get_worker()
+
+                # ONE job for the burst: it runs the single interpretation and then records
+                # it. A customer turn that needs the evidence waits on the interpretation
+                # (which sets its event as soon as the model answers) and not on the
+                # append-only write behind it.
+                def _dispatch(run) -> bool:
+                    def _job() -> None:
+                        run()
+                        _work()
+                    return worker.submit(ShadowJob(run=_job, thread_id=thread_id,
+                                                   burst_id=burst_id))
+
+                provider.start(submit=_dispatch)
             else:
+                provider.start()
                 _work()
         except Exception as exc:   # shadow must never break a customer turn
             try:
@@ -4298,6 +4326,63 @@ class ConversationEngine:
     def _shadow_async(self) -> bool:
         """Async dispatch is opt-in and strictly boolean, like the shadow flag itself."""
         return getattr(self.settings, "shadow_understand_async", False) is True
+
+    # ── L4.7C.4A — the same interpretation, available to the turn it is about ─
+
+    def _same_turn_semantic_on(self) -> bool:
+        """Strictly boolean, so MagicMock settings can never make a turn wait on a model."""
+        return getattr(self.settings, "semantic_same_turn_enabled", False) is True
+
+    def _semantic_sync_timeout(self) -> float:
+        from .semantic_turn_evidence import DEFAULT_SYNC_TIMEOUT
+        try:
+            value = float(getattr(self.settings, "semantic_same_turn_timeout_seconds",
+                                  DEFAULT_SYNC_TIMEOUT))
+        except (TypeError, ValueError):
+            return DEFAULT_SYNC_TIMEOUT
+        return value if value > 0 else DEFAULT_SYNC_TIMEOUT
+
+    def _semantic_turn_evidence(self):
+        """This burst's TurnEvidence, or None. Bounded wait, no second call, no guessing.
+
+        Only a turn that actually needs semantic evidence for an authoritative field ever
+        calls this — every FAQ, vehicle, location and acceptance turn returns without
+        waiting, because it never gets here. A timeout, a failed call or an unparseable
+        response all return None, which means *no semantic evidence*: the caller then has
+        deterministic evidence only, exactly as in L4.7C.4.
+        """
+        if not self._same_turn_semantic_on():
+            return None
+        provider = getattr(self, "_turn_semantic", None)
+        if provider is None:
+            return None
+        result = provider.get(timeout=self._semantic_sync_timeout())
+        if result is None or not getattr(result, "ok", False):
+            return None
+        return getattr(result, "evidence", None)
+
+    def _semantic_scheduling_claims(self, state) -> list:
+        """Project this burst's semantic reading into scheduling claims. Never mutates."""
+        evidence = self._semantic_turn_evidence()
+        if evidence is None:
+            return []
+        try:
+            from ..schemas.claims import ClaimType
+            from .claim_projection import claims_from_turn_evidence
+            revision_id = getattr(state, "current_revision_id", None)
+            claims = claims_from_turn_evidence(
+                evidence,
+                texts=list(getattr(self, "_turn_semantic_texts", ()) or ()),
+                cycle_id=self._reconciler_cycle_id(state),
+                revision_id=(revision_id if isinstance(revision_id, int) else None))
+            return [c for c in claims
+                    if c.claim_type == ClaimType.SCHEDULING_PREFERENCE]
+        except Exception as exc:      # a projection failure is absent evidence, never a guess
+            try:
+                logger.warning("L4.7C.4A semantic scheduling projection failed: %s", exc)
+            except Exception:
+                pass
+            return []
 
     # ── L4.7C.2 — the single canonical write path for vehicle and location ────
     #
@@ -4656,15 +4741,23 @@ class ConversationEngine:
 
         from .scheduling_reconciler import reconcile_scheduling, to_record
 
-        claims = self._scheduling_claims_from_texts(texts, state, today)
+        # Both producers, one reconciliation. The deterministic parse stays evidence (and a
+        # validator); the semantic reading of the SAME burst joins it, and the reconciler —
+        # not the caller, and not recency — decides which one survives a disagreement.
+        claims = (self._scheduling_claims_from_texts(texts, state, today)
+                  + self._semantic_scheduling_claims(state))
         decision = reconcile_scheduling(claims, today=today)
         try:
             record = to_record(decision,
                                cycle_id=self._reconciler_cycle_id(state),
                                revision_id=getattr(state, "current_revision_id", None))
-            logger.info("L4.7C.4 SCHEDULING thread_id=%s source=%s branches=%s rule=%s@%s",
+            provider = getattr(self, "_turn_semantic", None)
+            logger.info("L4.7C.4 SCHEDULING thread_id=%s source=%s branches=%s rule=%s@%s "
+                        "semantic_calls=%s semantic_timeout=%s",
                         getattr(ctx.thread, "id", None), decision.source,
-                        record["branches"], decision.rule_id, decision.rule_version)
+                        record["branches"], decision.rule_id, decision.rule_version,
+                        (provider.calls if provider is not None else 0),
+                        (provider.timed_out if provider is not None else False))
         except Exception:
             pass
         return [SchedulingRequest(day_iso=b.resolved_date, time_str=b.time)
