@@ -149,6 +149,14 @@ class TestLegacyFalsePositive(unittest.TestCase):
         self.assertNotEqual(decision.result, ALLOW)
         self.assertIsNone(decision.stance, "a greeting carries no stance at all")
 
+    def test_the_gate_requires_real_stance_not_a_word_match(self):
+        """CE builds an acceptance claim only when the turn is acceptance throughout."""
+        self.assertIn("if _is_acceptance(texts):", CE_SOURCE)
+        self.assertIn("stance and therefore no claim", CE_SOURCE)
+        # a single acceptance-shaped word in a longer sentence is not a stance
+        self.assertTrue(_has_acceptance_word([self.GREETING]))
+        self.assertFalse(_is_acceptance([self.GREETING]))
+
     def test_the_fix_is_structural_not_a_phrase_block(self):
         authorizer = (ROOT / "backend" / "app" / "services"
                       / "acceptance_authorizer.py").read_text().lower()

@@ -4537,11 +4537,17 @@ class ConversationEngine:
 
         temporality, modality = turn_modality(texts)
         cycle_id = self._reconciler_cycle_id(state)
-        claims = [ClaimEvidence(
-            claim_type=ClaimType.QUOTE_ACCEPTED, value=True, polarity=Polarity.ASSERTED,
-            evidence_class=EvidenceClass.DETERMINISTIC_EXTRACTED,
-            producer="ce:_is_acceptance", explicitness=Explicitness.IMPLIED,
-            temporality=temporality, modality=modality, cycle_id=cycle_id).with_id()]
+        # The stance is EVIDENCE, not an assumption of the caller. A turn qualifies only
+        # when it is acceptance throughout (`_is_acceptance`); a single acceptance-shaped
+        # word inside a longer sentence — the "Bueno, quería revisar…" class — carries no
+        # stance and therefore no claim, so the predicate has nothing to authorise.
+        claims = []
+        if _is_acceptance(texts):
+            claims.append(ClaimEvidence(
+                claim_type=ClaimType.QUOTE_ACCEPTED, value=True, polarity=Polarity.ASSERTED,
+                evidence_class=EvidenceClass.DETERMINISTIC_EXTRACTED,
+                producer="ce:_is_acceptance", explicitness=Explicitness.IMPLIED,
+                temporality=temporality, modality=modality, cycle_id=cycle_id).with_id())
         decision = authorize_quote_acceptance(claims, self._commercial_state(ctx, state))
         self._record_authorization(ctx, decision, state)
         return decision
