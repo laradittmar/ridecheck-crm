@@ -1111,6 +1111,44 @@ ON there, OUTBOUND OFF, production untouched. Wild clean count **0/3**.
 
 Next: **L4.7C.4-SCHEDULING-INTERFACE** — not automatic.
 
+### Phase B.20 — L4.7C.4-SCHEDULING-INTERFACE (2026-09-03) — **CONDITIONAL_PASS**
+
+Closeout: `2026-09-03_RIDECHECK_CRM_L4.7C.4-SCHEDULING-INTERFACE_CLOSEOUT_SCHEDULING-CUTOVER.md`
+
+Scheduling *language* interpretation now runs through one reconciled path with one
+deterministic resolver, flag-guarded (`RECONCILER_SCHEDULING_AUTHORITY_ENABLED`, crm_test
+only) and reversible. Ordered branches, clause-local time, flexible-time default, time bands
+and corrections live in `scheduling_reconciler.py`, which imports no ScheduleService, no
+travel and no booking symbol — it cannot express availability or a booking.
+
+**The condition:** the semantic interpreter runs asynchronously off the customer turn, so the
+synchronous evidence producer is still the deterministic parser. The interpretation *path* is
+authoritative; semantic-only readings (bare "mañana" beside a weekday) are not yet realised
+live. Unchanged behaviour, not a regression, and named as the first item for whoever makes
+the semantic producer synchronous.
+
+Legacy vs reconciled: **16 AGREE, 0 LEGACY_SAFER, 0 UNEXPLAINED**. Resolver verified across
+Saturday→Sunday, month, year and leap-day boundaries and the weekday-never-today rule.
+**WILD-A-04 PASS** on the deployed image: PRIMARY 2026-09-01 15:00 (not flexible), FALLBACK
+2026-09-03 flexible. "qué horarios tienen?" and "después te confirmo" produce no request.
+
+Business config preserved and asserted against the implementation (SERVICE_MINUTES 45, the
+weekday table, travel 30/60/90). **Discrepancy reported, not silently fixed:** the brief says
+missing-group travel falls back to 30; the certified code returns 0 ("no constraint"), with 90
+for an unknown pair. Out of scope here; needs a deliberate decision.
+
+A fourth module-reload identity defect was found and fixed: the stance projection compared
+`AcceptanceSignal` by identity, so after a reload every stance vanished and a valid
+acceptance returned HOLD. Caught only because the full-suite run disagreed with the isolated
+run.
+
+Tests 22/22 (SCHEDCUT-01…20). Regression 3 525 / 60 / 9 with the flag off and with all four
+authority flags on — identical to baseline. Image
+`ridecheck-crm-backend:l4.7c4-schedint-10d6cbd`, crm_test only, OUTBOUND OFF, production
+untouched. C2 and C3B unchanged; booking authority unchanged. Wild clean count **0/3**.
+
+Next: **L4.7C.5-DERIVED-STATE-INVALIDATION** — not automatic.
+
 ### Phase C — Infrastructure resilience (INFRA-OOM-01)
 
 **Host OOM incident, 2026-09-01 18:30:37Z — CONFIRMED, MEDIUM, launch-relevant.**
