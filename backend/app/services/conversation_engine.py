@@ -2841,7 +2841,8 @@ class ConversationEngine:
             period = _detect_time_period(ai_input_messages)
             # L4.3: the customer may offer two days at once ("mñ 15hs? o el jueves").
             # Evaluate the explicit PRIMARY preference before the FALLBACK.
-            sched_requests = _parse_scheduling_requests(ai_input_messages, date.today())
+            sched_requests = self._reconciled_scheduling_requests(
+                    ctx, state, ai_input_messages, date.today())
             if len(sched_requests) >= 2 and _progression_allowed:
                 lead.flag = "ACEPTADO"
                 state.last_stage = STAGE_SCHEDULING
@@ -2966,7 +2967,8 @@ class ConversationEngine:
             # L4.3: multi-branch scheduling utterance — PRIMARY is evaluated first and
             # the FALLBACK only when the primary cannot be satisfied.
             if _pure_sched:
-                sched_requests = _parse_scheduling_requests(ai_input_messages, date.today())
+                sched_requests = self._reconciled_scheduling_requests(
+                    ctx, state, ai_input_messages, date.today())
                 if len(sched_requests) >= 2:
                     logger.info(
                         "L4.3 ordered scheduling branches thread_id=%s branches=%s",
@@ -4597,6 +4599,76 @@ class ConversationEngine:
                 handle.write(_json.dumps(payload, ensure_ascii=False) + "\n")
         except Exception:
             pass
+
+    # ── L4.7C.4 — the single scheduling interpretation path ───────────────────
+    #
+    # One place decides what the customer ASKED FOR. Deterministic extraction remains the
+    # evidence producer; the reconciler owns order, clause-local time, flexibility and — the
+    # part no model may touch — the calendar arithmetic. Availability is still
+    # ScheduleService's word and booking is still the Flow's; neither is reachable from here.
+
+    def _scheduling_authority_on(self) -> bool:
+        return getattr(self.settings, "reconciler_scheduling_authority_enabled",
+                       False) is True
+
+    def _scheduling_claims_from_texts(self, texts: list[str], state, today: "date"):
+        """Project the deterministic extraction into scheduling claims.
+
+        The semantic interpreter produces the same shape, but it runs asynchronously off the
+        customer turn (L4.7B.2) and is therefore not available synchronously here. When it
+        becomes available it feeds this same interface as a SEMANTIC_INFERRED claim and the
+        reconciler treats it identically — the ordering, clause-locality and resolution rules
+        live in one place either way.
+        """
+        from ..schemas.claims import ClaimEvidence, ClaimType, EvidenceClass, Explicitness
+
+        legacy = _parse_scheduling_requests(texts, today)
+        if not legacy:
+            return []
+        period = _detect_time_period(texts)
+        branches = []
+        for index, request in enumerate(legacy):
+            branches.append({
+                "priority": ("PRIMARY" if index == 0
+                             else "FALLBACK" if index == 1 else "ADDITIONAL"),
+                "rank": index + 1,
+                "resolved_date": request.day_iso,
+                "day_expression": None,
+                "time": request.time_str,
+                "flexible": request.time_str is None,
+                "time_band": (period if request.time_str is None else None),
+            })
+        return [ClaimEvidence(
+            claim_type=ClaimType.SCHEDULING_PREFERENCE, value=tuple(branches),
+            evidence_class=EvidenceClass.DETERMINISTIC_EXTRACTED,
+            producer="ce:_parse_scheduling_requests", explicitness=Explicitness.STATED,
+            cycle_id=self._reconciler_cycle_id(state)).with_id()]
+
+    def _reconciled_scheduling_requests(self, ctx: "_Context", state, texts: list[str],
+                                        today: "date") -> list:
+        """Canonical requested branches for this turn, in the customer's own order.
+
+        Flag OFF: the legacy parse, unchanged. Flag ON: the same evidence, reconciled once,
+        with dates resolved by the single deterministic resolver.
+        """
+        if not self._scheduling_authority_on():
+            return _parse_scheduling_requests(texts, today)
+
+        from .scheduling_reconciler import reconcile_scheduling, to_record
+
+        claims = self._scheduling_claims_from_texts(texts, state, today)
+        decision = reconcile_scheduling(claims, today=today)
+        try:
+            record = to_record(decision,
+                               cycle_id=self._reconciler_cycle_id(state),
+                               revision_id=getattr(state, "current_revision_id", None))
+            logger.info("L4.7C.4 SCHEDULING thread_id=%s source=%s branches=%s rule=%s@%s",
+                        getattr(ctx.thread, "id", None), decision.source,
+                        record["branches"], decision.rule_id, decision.rule_version)
+        except Exception:
+            pass
+        return [SchedulingRequest(day_iso=b.resolved_date, time_str=b.time)
+                for b in decision.branches if b.resolved_date]
 
     # ── L4.7D — canonical response validation ────────────────────────────────
 

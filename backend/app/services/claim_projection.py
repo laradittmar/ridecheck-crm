@@ -231,7 +231,14 @@ def claims_from_turn_evidence(
 
     # stance
     if evidence.acceptance is not None:
-        signal = evidence.acceptance.signal
+        # Compared by VALUE, not identity: a module reload in another test suite splits the
+        # enum class, and an identity check would silently drop every stance. Fourth
+        # occurrence of this hazard in the programme — see AcceptanceSignal (L4.7B.2),
+        # CorrectionRelation (L4.7B.4) and the record classes (L4.7C.1).
+        signal_value = getattr(evidence.acceptance.signal, "value",
+                               evidence.acceptance.signal)
+        signal = AcceptanceSignal(signal_value) if signal_value in {
+            s.value for s in AcceptanceSignal} else AcceptanceSignal.UNKNOWN
         if signal is AcceptanceSignal.ACCEPT:
             add(ClaimType.QUOTE_ACCEPTED, True, status=evidence.acceptance.status,
                 evidence_class=EvidenceClass.SEMANTIC_INFERRED,

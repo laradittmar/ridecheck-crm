@@ -322,9 +322,15 @@ class TestBoundaries(unittest.TestCase):
                       "booking still happens only on the Flow path")
 
     def test_scheduling_interpretation_unchanged(self):
-        """C3B gates progression; it does not read days or times differently."""
+        """C3B gated progression without reading days differently.
+
+        L4.7C.4 then routed the multi-branch parse through its own chokepoint, so the
+        assertion moved with that cutover: the deterministic parsers still produce the
+        branches, and C3B still only gates the progression that follows them.
+        """
         self.assertIn("sched_day_iso, sched_time_str = _parse_scheduling_text(", CE_SOURCE)
-        self.assertIn("sched_requests = _parse_scheduling_requests(", CE_SOURCE)
+        self.assertIn("_parse_scheduling_requests(texts, today)", CE_SOURCE)
+        self.assertIn("sched_requests = self._reconciled_scheduling_requests(", CE_SOURCE)
 
 
 # ── justification and downstream ──────────────────────────────────────────────
