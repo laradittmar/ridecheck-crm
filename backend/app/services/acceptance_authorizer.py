@@ -302,3 +302,51 @@ def to_shadow_record(decision: AuthorizationDecision, state: CommercialState,
         "legacy_decision": legacy_decision, "comparison": comparison,
         "shadow": True,
     }
+
+
+def authorize_scheduling_progression(state: CommercialState) -> AuthorizationDecision:
+    """May a concrete scheduling request advance commercial state?
+
+    A customer proposing a day after a quote is an implicit acceptance, and the deterministic
+    prerequisites are the same as for an explicit one — a delivered, current, same-cycle
+    quote. What is NOT required is a stance claim: the trigger here is a parsed day/time,
+    which the scheduling layer owns and this milestone does not touch. The point of routing
+    it through the same gate is that a day proposal can no longer advance on a stale,
+    undelivered or previous-cycle quote.
+    """
+    satisfied: list[str] = []
+    failed: list[str] = []
+    blockers: list[str] = []
+
+    def decide(result: str, reason: str) -> AuthorizationDecision:
+        return AuthorizationDecision(
+            result=result, reason=reason, stance="SCHEDULING_REQUEST",
+            stance_state=InformationState.TRUE_ONLY.value,
+            quote_identity=state.quote_identity(), satisfied=tuple(satisfied),
+            failed=tuple(failed), blockers=tuple(blockers),
+            rule_id="authorize.scheduling_progression")
+
+    if state.candidate_conflict:
+        blockers.append("candidate_conflict")
+        return decide(CLARIFY, "unresolved candidate conflict")
+    if state.location_conflict:
+        blockers.append("location_conflict")
+        return decide(CLARIFY, "unresolved inspection-location conflict")
+    if state.quote_total is None:
+        failed.append("quote_exists")
+        return decide(DENY, "no quote exists to progress from")
+    satisfied.append("quote_exists")
+    if not state.quote_is_delivered():
+        failed.append("quote_delivered")
+        return decide(DENY, "the quote was computed but never delivered to the customer")
+    satisfied.append("quote_delivered")
+    if (state.quote_cycle_id is not None and state.cycle_id is not None
+            and state.quote_cycle_id != state.cycle_id):
+        failed.append("quote_in_current_cycle")
+        return decide(DENY, "the quote belongs to a previous cycle")
+    satisfied.append("quote_in_current_cycle")
+    if not state.quote_inputs_unchanged():
+        failed.append("quote_inputs_unchanged")
+        return decide(DENY, "the quote is stale: candidate, category or zone changed since")
+    satisfied.append("quote_inputs_unchanged")
+    return decide(ALLOW, "concrete scheduling request against a delivered, current quote")

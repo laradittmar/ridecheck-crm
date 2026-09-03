@@ -343,13 +343,17 @@ class TestShadowOnly(unittest.TestCase):
         self.assertNotIn("Berazategui", blob)
         self.assertNotIn("Peugeot", blob)
 
-    def test_legacy_acceptance_path_is_untouched(self):
-        """C3A changes no CE branch: the legacy acceptance path is still the authority."""
+    def test_the_legacy_acceptance_branch_still_exists_and_is_flag_guarded(self):
+        """C3A wired nothing. L4.7C.3B then wired the gate, deliberately and behind a flag.
+
+        The assertion moved with the cutover: what must remain true is that the legacy
+        branch is still there and still reachable, so turning the flag off restores it.
+        """
         ce = (ROOT / "backend" / "app" / "services" / "conversation_engine.py").read_text()
         self.assertIn("if state.last_stage == STAGE_QUOTED and _is_acceptance(", ce)
         self.assertIn("return self._handle_quoted_acceptance(ctx, state)", ce)
-        self.assertNotIn("authorize_quote_acceptance", ce,
-                         "C3A must not wire the authorizer into a write path")
+        self.assertIn("if not self._acceptance_authority_on():", ce,
+                      "the legacy path must remain reachable with the flag off")
 
 
 if __name__ == "__main__":

@@ -47,8 +47,19 @@ PROJECTION_VERSION = "claim-projection/1.0"
 # Language cues for temporality and modality. These are *grammatical* markers — tense and
 # conditionality — not business phrases: they say nothing about vehicles, prices or zones,
 # and they are applied uniformly to every claim of a turn (no-phrase-patch rule §6.1).
-_CONDITIONAL = re.compile(r"\b(si|cuando|en cuanto|apenas|siempre que|capaz|quiz[aá]s?|"
-                          r"tal vez|puede que)\b", re.IGNORECASE)
+# "si" is the hard case in Spanish: unaccented it can introduce a condition, and it is also
+# how people write the affirmative "sí" without the accent. The invariant is grammatical, not
+# lexical: **a conditional needs a consequence**. "si me cierra te hablo" has a protasis and
+# an apodosis; "si avancemos" is a bare affirmation followed by a hortative. So a `si` clause
+# counts as conditional only when something follows it that could be the consequence.
+_CONDITIONAL_MARKERS = re.compile(r"\b(cuando|en cuanto|apenas|siempre que|capaz|quiz[aá]s?|"
+                                  r"tal vez|puede que)\b", re.IGNORECASE)
+_SI_CLAUSE = re.compile(r"\bsi\b(?![\s,]*$)", re.IGNORECASE)
+_ACCENTED_SI = re.compile(r"\bs[íi]\b", re.IGNORECASE)
+# How many words must follow a `si` before the sentence can carry a consequence. One or two
+# ("si avancemos", "si dale") is an affirmation; three or more ("si me cierra te hablo") is a
+# conditional with its apodosis.
+_SI_CONSEQUENCE_WORDS = 3
 _HYPOTHETICAL = re.compile(r"\b(hipot[eé]tic\w*|supongamos|imaginate|en teor[ií]a)\b",
                            re.IGNORECASE)
 _FUTURE = re.compile(r"\b(voy a|vamos a|te aviso|te escribo|te hablo|te digo|te consulto|"
@@ -65,6 +76,24 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
+def _si_is_conditional(text: str) -> bool:
+    """True when a `si` in this text introduces a condition rather than agreeing.
+
+    Grammatical, not lexical: an accented "sí" is always affirmative, and an unaccented "si"
+    is conditional only when enough follows it to be a consequence. "si avancemos" and
+    "si dale" agree; "si me cierra te hablo" and "si consigo el auto avanzamos" condition.
+    An approximation, and a deliberately conservative one — it errs toward reading a long
+    si-clause as conditional, which withholds authorization rather than granting it.
+    """
+    for match in re.finditer(r"\bsi\b", text, re.IGNORECASE):
+        if match.group(0) != "si":            # "sí" with the accent is never a condition
+            continue
+        remainder = text[match.end():].strip(" ,.;:!?")
+        if len(remainder.split()) >= _SI_CONSEQUENCE_WORDS:
+            return True
+    return False
+
+
 def turn_modality(texts: Iterable[str]) -> tuple[Temporality, Modality]:
     """Read tense and conditionality off the burst.
 
@@ -78,7 +107,7 @@ def turn_modality(texts: Iterable[str]) -> tuple[Temporality, Modality]:
     modality = Modality.FACTUAL
     if _HYPOTHETICAL.search(combined):
         modality = Modality.HYPOTHETICAL
-    elif _CONDITIONAL.search(combined):
+    elif _CONDITIONAL_MARKERS.search(combined) or _si_is_conditional(combined):
         modality = Modality.CONDITIONAL
     temporality = Temporality.PRESENT
     if _FUTURE.search(combined):

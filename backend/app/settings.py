@@ -38,6 +38,8 @@ class Settings:
     # turning a flag off restores the legacy write path exactly.
     reconciler_vehicle_authority_enabled: bool = False
     reconciler_location_authority_enabled: bool = False
+    # L4.7C.3B — acceptance / commercial-progression authority. Default OFF everywhere.
+    reconciler_acceptance_authority_enabled: bool = False
     shadow_evidence_path: str = ""
     conversation_engine_direct_webhook_enabled: bool = False
     openai_chat_model: str = "gpt-4o-mini"
@@ -111,6 +113,8 @@ def get_settings() -> Settings:
             _getenv("RECONCILER_VEHICLE_AUTHORITY_ENABLED", "false").lower() == "true"),
         reconciler_location_authority_enabled=(
             _getenv("RECONCILER_LOCATION_AUTHORITY_ENABLED", "false").lower() == "true"),
+        reconciler_acceptance_authority_enabled=(
+            _getenv("RECONCILER_ACCEPTANCE_AUTHORITY_ENABLED", "false").lower() == "true"),
         shadow_evidence_path=_getenv("SHADOW_EVIDENCE_PATH"),
         conversation_engine_direct_webhook_enabled=_getenv("CONVERSATION_ENGINE_DIRECT_WEBHOOK_ENABLED", "false").lower() in ("1", "true", "yes"),
         openai_chat_model=_getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),

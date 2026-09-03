@@ -2743,7 +2743,10 @@ class ConversationEngine:
             # the FAQ but never advances flag to ACEPTADO, leaving the customer stuck.
             # Uses _has_acceptance_word (weaker than _is_acceptance) so "Dale, hagamos ese."
             # suppresses Layer D even though "hagamos"/"ese" are not acceptance keywords.
-            and not (state.last_stage == STAGE_QUOTED and _has_acceptance_word(ai_input_messages))
+            and not (state.last_stage == STAGE_QUOTED
+                     and _has_acceptance_word(ai_input_messages)
+                     and (not self._acceptance_authority_on()
+                          or self._authorize_acceptance(ctx, state, ai_input_messages).allows))
         ):
             return self._handle_general_information_ai(ctx, event, ai_input_messages)
 
@@ -2809,7 +2812,17 @@ class ConversationEngine:
         # skip the AI entirely: set flag=ACEPTADO, stage=SCHEDULING, and ask
         # for day/time only.  No revision, no Flow, no re-quoting.
         if state.last_stage == STAGE_QUOTED and _is_acceptance(ai_input_messages):
-            return self._handle_quoted_acceptance(ctx, state)
+            # L4.7C.3B: a language match no longer advances commercial state on its own.
+            # With the flag ON the deterministic predicate decides; with it OFF this is the
+            # legacy path, unchanged.
+            if not self._acceptance_authority_on():
+                return self._handle_quoted_acceptance(ctx, state)
+            _auth = self._authorize_acceptance(ctx, state, ai_input_messages)
+            if _auth.allows:
+                return self._handle_quoted_acceptance(ctx, state)
+            logger.info(
+                "L4.7C.3B acceptance NOT authorized thread_id=%s result=%s reason=%s",
+                ctx.thread.id, _auth.result, _auth.reason)
 
         # ── Deterministic QUOTED + date proposal (pre-AI) ────────────────
         # User proposes a day (with or without exact time) while still in QUOTED
@@ -2817,12 +2830,19 @@ class ConversationEngine:
         # advance flag to ACEPTADO and immediately check availability.
         # Sunday / closed days → rejection message with alternatives.
         if state.last_stage == STAGE_QUOTED and not state.needs_human:
+            # L4.7C.3B: a day proposal after a quote is an implicit acceptance, so it must
+            # clear the same deterministic prerequisites — delivered, current, same-cycle
+            # quote. Scheduling INTERPRETATION is untouched (that is C4): only the
+            # commercial progression is gated.
+            _sched_auth = (self._authorize_scheduling_progression(ctx, state)
+                           if self._acceptance_authority_on() else None)
+            _progression_allowed = (_sched_auth is None or _sched_auth.allows)
             sched_day_iso, sched_time_str = _parse_scheduling_text(ai_input_messages, date.today())
             period = _detect_time_period(ai_input_messages)
             # L4.3: the customer may offer two days at once ("mñ 15hs? o el jueves").
             # Evaluate the explicit PRIMARY preference before the FALLBACK.
             sched_requests = _parse_scheduling_requests(ai_input_messages, date.today())
-            if len(sched_requests) >= 2:
+            if len(sched_requests) >= 2 and _progression_allowed:
                 lead.flag = "ACEPTADO"
                 state.last_stage = STAGE_SCHEDULING
                 logger.info(
@@ -2832,7 +2852,7 @@ class ConversationEngine:
                 result = self._handle_ordered_scheduling_requests(ctx, state, sched_requests)
                 if result is not None:
                     return result
-            if sched_day_iso and sched_time_str:
+            if sched_day_iso and sched_time_str and _progression_allowed:
                 lead.flag = "ACEPTADO"
                 state.last_stage = STAGE_SCHEDULING
                 logger.info(
@@ -2842,7 +2862,7 @@ class ConversationEngine:
                 result = self._try_schedule_and_flow(ctx, state, sched_day_iso, sched_time_str, "")
                 if result is not None:
                     return result
-            elif sched_day_iso:
+            elif sched_day_iso and _progression_allowed:
                 # Day only (e.g. "okay, puede ser sábado?") — list available slots.
                 lead.flag = "ACEPTADO"
                 state.last_stage = STAGE_SCHEDULING
@@ -4449,6 +4469,128 @@ class ConversationEngine:
         target.zone_group = decision.value.zone_group or zone_group
         target.zone_detail = decision.value.zone_detail or zone_detail
         return True
+
+    # ── L4.7C.3B — the single acceptance / commercial-progression gate ────────
+    #
+    # With the flag OFF the legacy behaviour is returned untouched. With it ON, no language
+    # match may advance commercial state on its own: the deterministic predicate proven in
+    # C3A decides, and its justification is recorded.
+
+    def _acceptance_authority_on(self) -> bool:
+        return getattr(self.settings, "reconciler_acceptance_authority_enabled",
+                       False) is True
+
+    def _delivered_quote_amounts(self, ctx: "_Context") -> tuple[int, ...]:
+        """Amounts actually presented to the customer in this cycle's outbound messages.
+
+        A computed price is not a delivered quote. `ctx.db_messages` is cycle-scoped, so
+        this is the outbound-ledger proof the authorization predicate requires.
+        """
+        amounts: list[int] = []
+        try:
+            for message in (ctx.db_messages or []):
+                if getattr(message, "direction", None) != "out" or not getattr(message, "text", None):
+                    continue
+                for raw in _PRICE_RE.findall(message.text):
+                    value = int(re.sub(r"\D", "", raw) or 0)
+                    if value and value not in amounts:
+                        amounts.append(value)
+        except Exception:
+            return ()
+        return tuple(amounts)
+
+    def _commercial_state(self, ctx: "_Context", state) -> "CommercialState":
+        """Snapshot the deterministic facts acceptance depends on. Read-only."""
+        from .acceptance_authorizer import CommercialState
+
+        focus = self._focus_candidate(ctx)
+        zone_group, zone_detail = self._get_active_inspection_location(ctx, state)
+        quote = getattr(self, "_turn_price_quote", None)
+        if quote is None and state is not None:
+            try:
+                quote = self._compute_price_quote(ctx, state)
+            except Exception:
+                quote = None
+        cycle_id = self._reconciler_cycle_id(state)
+        return CommercialState(
+            cycle_id=cycle_id,
+            revision_id=getattr(state, "current_revision_id", None),
+            candidate_id=(focus.id if focus is not None else None),
+            quote_total=(quote.precio_total if quote is not None else None),
+            quote_tipo_vehiculo=(focus.tipo_vehiculo if focus is not None else None),
+            quote_zone_group=zone_group, quote_zone_detail=zone_detail,
+            quote_candidate_id=(focus.id if focus is not None else None),
+            quote_cycle_id=cycle_id,
+            current_tipo_vehiculo=(focus.tipo_vehiculo if focus is not None else None),
+            current_zone_group=zone_group, current_zone_detail=zone_detail,
+            delivered_amounts=self._delivered_quote_amounts(ctx),
+            quote_delivered=False,          # proof comes from the ledger, not from a flag
+            lead_flag=getattr(ctx.lead, "flag", None),
+            stage=getattr(state, "last_stage", None))
+
+    def _authorize_acceptance(self, ctx: "_Context", state, texts: list[str]):
+        """Decide whether this turn may advance commercially. Returns a decision or None."""
+        from ..schemas.claims import (ClaimEvidence, ClaimType, EvidenceClass, Explicitness,
+                                      Modality, Polarity, Temporality)
+        from .acceptance_authorizer import authorize_quote_acceptance
+        from .claim_projection import turn_modality
+
+        temporality, modality = turn_modality(texts)
+        cycle_id = self._reconciler_cycle_id(state)
+        claims = [ClaimEvidence(
+            claim_type=ClaimType.QUOTE_ACCEPTED, value=True, polarity=Polarity.ASSERTED,
+            evidence_class=EvidenceClass.DETERMINISTIC_EXTRACTED,
+            producer="ce:_is_acceptance", explicitness=Explicitness.IMPLIED,
+            temporality=temporality, modality=modality, cycle_id=cycle_id).with_id()]
+        decision = authorize_quote_acceptance(claims, self._commercial_state(ctx, state))
+        self._record_authorization(ctx, decision, state)
+        return decision
+
+    def _authorize_scheduling_progression(self, ctx: "_Context", state):
+        from .acceptance_authorizer import authorize_scheduling_progression
+        decision = authorize_scheduling_progression(self._commercial_state(ctx, state))
+        self._record_authorization(ctx, decision, state)
+        return decision
+
+    def _record_authorization(self, ctx: "_Context", decision, state) -> None:
+        """Append the authorization justification. Decisions and ids only, never text."""
+        import json as _json
+        import pathlib as _pathlib
+        from datetime import datetime as _dt, timezone as _tz
+        try:
+            logger.info(
+                "L4.7C.3B AUTHORIZE thread_id=%s result=%s rule=%s@%s stance=%s quote=%s "
+                "satisfied=%s failed=%s blockers=%s reason=%s",
+                getattr(ctx.thread, "id", None), decision.result, decision.rule_id,
+                decision.rule_version, decision.stance, decision.quote_identity,
+                list(decision.satisfied), list(decision.failed), list(decision.blockers),
+                decision.reason)
+            raw_path = getattr(self.settings, "shadow_evidence_path", "")
+            if not isinstance(raw_path, str) or not raw_path:
+                return
+            target = _pathlib.Path(raw_path).with_name("authorization_records.jsonl")
+            payload = {
+                "record_version": "authorization-record/1.0",
+                "recorded_at": _dt.now(_tz.utc).isoformat(timespec="milliseconds"),
+                "thread_id": getattr(ctx.thread, "id", None),
+                "result": decision.result, "reason": decision.reason,
+                "rule_id": decision.rule_id, "rule_version": decision.rule_version,
+                "risk_tier": decision.risk_tier, "stance": decision.stance,
+                "quote_identity": decision.quote_identity,
+                "satisfied": list(decision.satisfied), "failed": list(decision.failed),
+                "blockers": list(decision.blockers),
+                "evidence_ids": list(decision.evidence_ids),
+                "cycle_id": self._reconciler_cycle_id(state),
+                "revision_id": getattr(state, "current_revision_id", None),
+                "candidate_id": getattr(self._focus_candidate(ctx), "id", None),
+                "stage": getattr(state, "last_stage", None),
+                "authority": self._acceptance_authority_on(),
+            }
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open("a", encoding="utf-8") as handle:
+                handle.write(_json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
 
     # ── L4.7D — canonical response validation ────────────────────────────────
 
