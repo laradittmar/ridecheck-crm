@@ -172,6 +172,21 @@ class TestVehicleAuthority(unittest.TestCase):
         self.assertEqual(decision.outcome, ReconciliationOutcome.CLARIFY)
         self.assertIsNone(decision.value)
 
+    def test_a_lone_year_refines_an_established_identity(self):
+        """A year arriving for a car already identified is a refinement, not a new decision."""
+        decision = reconcile_vehicle_identity([claim(ClaimType.VEHICLE_YEAR, 2014)],
+                                              catalog_lookup=lambda text: None)
+        self.assertTrue(decision.accepted)
+        self.assertEqual(decision.value.anio, 2014)
+        self.assertIsNone(decision.value.modelo, "the identity is not re-litigated")
+
+    def test_contradictory_year_refinement_clarifies(self):
+        decision = reconcile_vehicle_identity(
+            [claim(ClaimType.VEHICLE_YEAR, 2014), claim(ClaimType.VEHICLE_YEAR, 2015)],
+            catalog_lookup=lambda text: None)
+        self.assertEqual(decision.outcome, ReconciliationOutcome.CLARIFY)
+        self.assertIsNone(decision.value)
+
     def test_vl_05_correction_supersession_is_carried(self):
         superseding = claim(ClaimType.VEHICLE_MODEL, "Kuga", supersedes=("claim-ka",))
         decision = reconcile_vehicle_identity([superseding],

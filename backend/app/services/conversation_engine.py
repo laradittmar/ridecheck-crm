@@ -4310,6 +4310,38 @@ class ConversationEngine:
                 getattr(ctx.thread, "id", None), record.claim_type, record.outcome,
                 record.rule_id, record.rule_version, record.information_state,
                 record.canonical_value, list(record.evidence_ids), record.reason)
+            # Durable justification: append-only JSONL beside the shadow record. No new
+            # table and no migration (L4.7C.2 Part 16); a decision must survive the log
+            # buffer to be auditable at all.
+            self._append_reconciliation_record(ctx, record)
+        except Exception:
+            pass
+
+    def _append_reconciliation_record(self, ctx, record) -> None:
+        """Append one justification. Never raises; a write failure loses no canonical state."""
+        import json as _json
+        import pathlib as _pathlib
+        from datetime import datetime as _dt, timezone as _tz
+        raw_path = getattr(self.settings, "shadow_evidence_path", "")
+        if not isinstance(raw_path, str) or not raw_path:
+            return
+        target = _pathlib.Path(raw_path).with_name("reconciliation_records.jsonl")
+        payload = {
+            "record_version": "reconciliation-record/1.0",
+            "recorded_at": _dt.now(_tz.utc).isoformat(timespec="milliseconds"),
+            "thread_id": getattr(ctx.thread, "id", None),
+            "claim_type": record.claim_type, "outcome": record.outcome,
+            "information_state": record.information_state, "risk_tier": record.risk_tier,
+            "rule_id": record.rule_id, "rule_version": record.rule_version,
+            "evidence_ids": list(record.evidence_ids), "reason": record.reason,
+            "cycle_id": record.cycle_id, "revision_id": record.revision_id,
+            "depends_on": list(record.depends_on), "supersedes": list(record.supersedes),
+            "shadow": record.shadow,
+        }
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open("a", encoding="utf-8") as handle:      # append-only
+                handle.write(_json.dumps(payload, ensure_ascii=False) + "\n")
         except Exception:
             pass
 

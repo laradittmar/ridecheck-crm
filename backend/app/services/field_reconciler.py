@@ -109,6 +109,36 @@ class VehicleIdentity:
     tipo_vehiculo: Optional[str] = None
 
 
+def _refine_without_identity(year_claims: list, category_claims: list,
+                             evidence_ids: tuple) -> Optional[FieldDecision]:
+    """Accept a lone year or category for a car whose identity is already established."""
+    for claims_, field_name in ((year_claims, "anio"), (category_claims, "tipo_vehiculo")):
+        if not claims_:
+            continue
+        state = information_state(claims_)
+        if state is InformationState.TRUE_ONLY:
+            value = _first_value(claims_, EvidenceClass.HUMAN_CONFIRMED,
+                                 EvidenceClass.CATALOG_CONFIRMED,
+                                 EvidenceClass.EXPLICIT_CUSTOMER,
+                                 EvidenceClass.DETERMINISTIC_EXTRACTED,
+                                 EvidenceClass.SEMANTIC_INFERRED)
+            identity = VehicleIdentity(**{field_name: value})
+            return FieldDecision(
+                outcome=ReconciliationOutcome.ACCEPT, value=identity,
+                reason=f"{field_name} refinement on an established identity",
+                rule_id=VEHICLE_RULE_ID, information_state=state.value,
+                evidence_ids=evidence_ids, candidate_values=(value,),
+                depends_on=(ClaimType.VEHICLE_MODEL,))
+        if state is InformationState.BOTH:
+            return FieldDecision(
+                outcome=ReconciliationOutcome.CLARIFY,
+                reason=f"contradictory {field_name} evidence",
+                rule_id=VEHICLE_RULE_ID, information_state=state.value,
+                evidence_ids=evidence_ids,
+                candidate_values=tuple(c.value for c in claims_ if c.value))
+    return None
+
+
 def reconcile_vehicle_identity(
     claims: Iterable[ClaimEvidence],
     *,
@@ -153,6 +183,14 @@ def reconcile_vehicle_identity(
     inferred_make = _first_value(make_claims, EvidenceClass.SEMANTIC_INFERRED)
 
     if stated_model is None and stated_make is None and inferred_make is None:
+        # A refinement, not an identity decision: a year or a category arriving for a car
+        # whose identity is already canonical. The identity is not re-litigated; the single
+        # field is accepted on its own evidence, or held when it is contradictory.
+        refinement = _refine_without_identity(year_claims,
+                                              _of_type(claims, ClaimType.VEHICLE_CATEGORY),
+                                              evidence_ids)
+        if refinement is not None:
+            return refinement
         return FieldDecision(outcome=ReconciliationOutcome.HOLD, reason="no vehicle evidence",
                              rule_id=VEHICLE_RULE_ID,
                              information_state=InformationState.NEITHER.value,
