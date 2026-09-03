@@ -1076,6 +1076,41 @@ authority still ON, OUTBOUND OFF, production untouched. Wild clean count **0/3**
 
 Next: **L4.7C.3B-ACCEPTANCE-AUTHORITY-CUTOVER** — not automatic.
 
+### Phase B.19 — L4.7C.3B-ACCEPTANCE-AUTHORITY-CUTOVER (2026-09-03) — **PASS (second authority cutover)**
+
+Closeout: `2026-09-03_RIDECHECK_CRM_L4.7C.3B-ACCEPTANCE-AUTHORITY-CUTOVER_CLOSEOUT_ACCEPTANCE-CUTOVER.md`
+
+Quote acceptance and commercial progression now require the deterministic predicate proven in
+C3A. Flag-guarded (`RECONCILER_ACCEPTANCE_AUTHORITY_ENABLED`, default OFF, crm_test only) and
+reversible: with the flag off the legacy branch is reached unchanged, and the regression is
+identical to baseline in both positions.
+
+**The unaccented "si" is fixed as a grammatical invariant**, not a phrase patch: a conditional
+needs a consequence, so "si avancemos" / "si dale" / "si coordinemos" are affirmations while
+"si me cierra te hablo" / "si puedo te aviso" stay FUTURE + CONDITIONAL. Coverage 19/21 →
+**20/21 = 95.2 %**.
+
+Four QUOTED progression sites gated: the explicit acceptance branch, the weaker
+`_has_acceptance_word` guard, and the three day-proposal transitions (via
+`authorize_scheduling_progression`, which shares the quote prerequisites without requiring a
+stance). Scheduling **interpretation** untouched — that is C4. Booking untouched.
+
+**A defect was caught by the live probe and fixed:** the first build assumed a stance because
+the caller had matched acceptance language, which would have let *"Bueno, quería revisar una
+2008…"* through the predicate — the very false positive being closed. The stance is now
+evidence, not an assumption: a claim exists only when the turn is acceptance throughout.
+
+Gate: false progression 0 · stale-quote 0 · prior-cycle 0 · computed-not-delivered 0 ·
+unsupported authorization 0 · LEGACY_SAFER 0 · unexplained 0 · single acceptance write path
+YES · WILD-A-03 PASS · "Bueno…" SAFE. The one coverage miss, "Ok, cuándo pueden?", is audited
+and HOLD is the correct outcome: genuinely ambiguous between agreeing and asking.
+
+Tests 28/28 (CUT-01…20). Regression 3 503 / 60 / 9 flag off and on. Image
+`ridecheck-crm-backend:l4.7c3b-acceptauth-8aca1f4`, crm_test only, all three authority flags
+ON there, OUTBOUND OFF, production untouched. Wild clean count **0/3**.
+
+Next: **L4.7C.4-SCHEDULING-INTERFACE** — not automatic.
+
 ### Phase C — Infrastructure resilience (INFRA-OOM-01)
 
 **Host OOM incident, 2026-09-01 18:30:37Z — CONFIRMED, MEDIUM, launch-relevant.**

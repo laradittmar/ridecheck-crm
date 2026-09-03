@@ -32,7 +32,7 @@
 
 services:
   backend:
-    image: ridecheck-crm-backend:l4.7c3a-authshadow-c3e82ec
+    image: ridecheck-crm-backend:l4.7c3b-acceptauth-8aca1f4
     # L4.3 Phase G: steady state measured 2026-09-01 — backend 116 MiB, n8n 326 MiB,
     # postgres 93 MiB on a 3.8 GiB host. Limits are ~3-8x steady state: they contain a
     # runaway container instead of letting it trigger a HOST-wide OOM that picks an
@@ -58,12 +58,14 @@ services:
       # the legacy write path exactly; production must never set these.
       RECONCILER_VEHICLE_AUTHORITY_ENABLED: "true"
       RECONCILER_LOCATION_AUTHORITY_ENABLED: "true"
+      # L4.7C.3B — acceptance authority, crm_test ONLY. Flag off restores legacy.
+      RECONCILER_ACCEPTANCE_AUTHORITY_ENABLED: "true"
       # L4.3 Phase C: the published RideCheck Booking Flow is the authoritative
       # booking UX. Pinned explicitly so the runtime never depends on a code default.
       WHATSAPP_BOOKING_FLOW_ID: "28104222025943520"
       # L4.3 Phase F: real deployment attribution in the outbound ledger
       # (was persisted as 'unknown' during Wild A — finding FOR-01).
-      GIT_SHA: "${GIT_SHA:-c3e82ec}"
+      GIT_SHA: "${GIT_SHA:-8aca1f4}"
     volumes:
       - /opt/ridecheck-secrets:/run/secrets:ro
       - /opt/ridecheck-crm-forensics:/run/forensics
