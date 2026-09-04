@@ -32,7 +32,7 @@
 
 services:
   backend:
-    image: ridecheck-crm-backend:l4.7c4a-livesem-4ec8c43
+    image: ridecheck-crm-backend:l4.7w1f2-fuzzygov-e142a50
     # L4.3 Phase G: steady state measured 2026-09-01 — backend 116 MiB, n8n 326 MiB,
     # postgres 93 MiB on a 3.8 GiB host. Limits are ~3-8x steady state: they contain a
     # runaway container instead of letting it trigger a HOST-wide OOM that picks an
@@ -72,7 +72,7 @@ services:
       WHATSAPP_BOOKING_FLOW_ID: "28104222025943520"
       # L4.3 Phase F: real deployment attribution in the outbound ledger
       # (was persisted as 'unknown' during Wild A — finding FOR-01).
-      GIT_SHA: "${GIT_SHA:-4ec8c43}"
+      GIT_SHA: "${GIT_SHA:-e142a50}"
     volumes:
       - /opt/ridecheck-secrets:/run/secrets:ro
       - /opt/ridecheck-crm-forensics:/run/forensics
