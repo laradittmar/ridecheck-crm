@@ -2537,7 +2537,7 @@
     },
     {
       "parameters": {
-        "url": "=https://maps.googleapis.com/maps/api/distancematrix/json?origins={{encodeURIComponent($json[\"origin_used\"])}}&destinations={{encodeURIComponent($json[\"address\"])}}&mode=driving&key=AIzaSyB6XkInd9zNlycyBTNig0cbi8bPJ_61r18",
+        "url": "=https://maps.googleapis.com/maps/api/distancematrix/json?origins={{encodeURIComponent($json[\"origin_used\"])}}&destinations={{encodeURIComponent($json[\"address\"])}}&mode=driving&key={{ $env.GOOGLE_MAPS_API_KEY }}",
         "options": {}
       },
       "type": "n8n-nodes-base.httpRequest",

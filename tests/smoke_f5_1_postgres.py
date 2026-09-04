@@ -13,6 +13,7 @@ Cases:
   Business-authority contracts (5 checks)
 """
 from __future__ import annotations
+from pg_dsn import pg_dsn  # SEC: no credential literal
 
 import json
 import os
@@ -25,7 +26,7 @@ from typing import Any
 # ── Env ────────────────────────────────────────────────────────────────────────
 DB_URL = os.environ.get(
     "DATABASE_URL",
-    "postgresql+psycopg://crm:crm@postgres:5432/crm_test",
+    pg_dsn("crm_test", "postgres"),
 )
 os.environ["DATABASE_URL"] = DB_URL
 os.environ["OUTBOUND_ENABLED"] = "false"

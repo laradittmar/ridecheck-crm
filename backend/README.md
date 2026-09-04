@@ -7,8 +7,13 @@ The CRM now uses cookie-based login for UI routes.
 Set these environment variables:
 
 - `ADMIN_EMAIL` (default: `admin@ridecheck.local`)
-- `ADMIN_PASSWORD` (default: `admin123`)
-- `AUTH_SECRET_KEY` (recommended in production)
+- `ADMIN_PASSWORD` — **required**. There is no default. When it is unset, environment
+  admin login is disabled and a configuration error is logged; the application never
+  falls back to a password that is readable in this repository (SEC-03).
+- `AUTH_SECRET_KEY` (or `SECRET_KEY`) — **required**. There is no default. Without it no
+  session can be signed or verified, so authentication fails closed. A predictable
+  signing key is a full authentication bypass, because the signed cookie *is* the
+  credential (SEC-04).
 
 UI access is protected for:
 

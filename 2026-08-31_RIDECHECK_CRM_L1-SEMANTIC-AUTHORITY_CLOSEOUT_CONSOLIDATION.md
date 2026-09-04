@@ -367,7 +367,7 @@ Excluded from regression scope (pre-existing infrastructure failures):
 
 ```
 Container: ridecheck-crm-backend:l1-semantic-820f4d6
-Database: crm_test (DATABASE_URL=postgresql+psycopg://crm:crm@postgres:5432/crm_test)
+Database: crm_test (DATABASE_URL=postgresql+psycopg://crm:${POSTGRES_PASSWORD}@postgres:5432/crm_test)
 GET /api/ops/summary → {"outbound_enabled": false, ...}
 ```
 

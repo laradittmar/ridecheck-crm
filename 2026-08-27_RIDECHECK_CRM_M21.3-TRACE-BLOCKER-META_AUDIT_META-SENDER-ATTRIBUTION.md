@@ -71,7 +71,7 @@ without a WABA-scoped token. WABA ID is resolvable from Meta Business Manager UI
 | sha256 prefix | `3f3b0ae51a859cb3` (first 16 hex chars of sha256) |
 | Raw value | MASKED — `EAAW5PLcFtPsB...` (first 8 chars) |
 | WHATSAPP_APP_SECRET | `""` (empty — signature verification disabled) |
-| WHATSAPP_VERIFY_TOKEN | `ridecheck_whatsapp_verify_2026` |
+| WHATSAPP_VERIFY_TOKEN | `${WHATSAPP_VERIFY_TOKEN}` |
 
 ---
 
@@ -643,7 +643,7 @@ services:
   backend:
     image: ridecheck-crm-backend:wild04r-f6-fd73611
     environment:
-      DATABASE_URL: postgresql+psycopg://crm:crm@postgres:5432/crm_test
+      DATABASE_URL: postgresql+psycopg://crm:${POSTGRES_PASSWORD}@postgres:5432/crm_test
       OUTBOUND_ENABLED: "${BETA_OUTBOUND_ENABLED:-false}"
       CLOSED_BETA_ALLOWED_WA_IDS: "5491153368330"
       QUARANTINED_TEST_WA_IDS: ""

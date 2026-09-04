@@ -41,7 +41,7 @@ services:
     mem_reservation: 256m
     restart: unless-stopped
     environment:
-      DATABASE_URL: postgresql+psycopg://crm:crm@postgres:5432/crm_test
+      DATABASE_URL: postgresql+psycopg://crm:${POSTGRES_PASSWORD}@postgres:5432/crm_test
       OUTBOUND_ENABLED: "${BETA_OUTBOUND_ENABLED:-false}"
       CLOSED_BETA_ALLOWED_WA_IDS: "5491153368330"
       QUARANTINED_TEST_WA_IDS: ""

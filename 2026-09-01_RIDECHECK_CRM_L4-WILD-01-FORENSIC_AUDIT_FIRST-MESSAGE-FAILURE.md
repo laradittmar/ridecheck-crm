@@ -289,7 +289,7 @@ Runs under the existing L3 test infrastructure:
 
 Run command:
 ```bash
-DATABASE_URL="postgresql+psycopg://crm:crm@localhost:5432/crm_test" \
+DATABASE_URL="postgresql+psycopg://crm:${POSTGRES_PASSWORD}@localhost:5432/crm_test" \
 PYTHONPATH=/var/lib/containerd/.../snapshots/4288/fs/usr/local/lib/python3.12/site-packages:/opt/ridecheck-crm-release-candidate/backend \
 python3 -m pytest tests/test_l4_wild01_repro.py -v
 ```

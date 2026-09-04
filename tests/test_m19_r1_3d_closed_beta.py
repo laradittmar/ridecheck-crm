@@ -29,6 +29,7 @@ Section 4 — Allowlist parser returns stable tuple type
   4b: duplicate entries preserved as-is (no dedup — keeps parity with quarantine parser)
 """
 from __future__ import annotations
+from pg_dsn import pg_dsn  # SEC: no credential literal
 
 import os
 import subprocess
@@ -239,7 +240,7 @@ class TestResetScriptGuards(unittest.TestCase):
         """Run without --confirm (default)."""
         env = {k: v for k, v in os.environ.items()}
         env["CLOSED_BETA_TEST_WA_ID"] = _TESTER_WA_ID
-        env["TEST_DATABASE_URL"] = "postgresql+psycopg://crm:crm@localhost:5432/crm_test"
+        env["TEST_DATABASE_URL"] = pg_dsn("crm_test", "localhost")
         env.pop("OUTBOUND_ENABLED", None)
         if extra_env:
             env.update(extra_env)
@@ -249,7 +250,7 @@ class TestResetScriptGuards(unittest.TestCase):
     def _run_with_confirm(self, extra_env: dict | None = None) -> subprocess.CompletedProcess:
         env = {k: v for k, v in os.environ.items()}
         env["CLOSED_BETA_TEST_WA_ID"] = _TESTER_WA_ID
-        env["TEST_DATABASE_URL"] = "postgresql+psycopg://crm:crm@localhost:5432/crm_test"
+        env["TEST_DATABASE_URL"] = pg_dsn("crm_test", "localhost")
         env.pop("OUTBOUND_ENABLED", None)
         if extra_env:
             env.update(extra_env)
@@ -284,7 +285,7 @@ class TestResetScriptGuards(unittest.TestCase):
 
     def test_3d_wrong_db_name_aborts(self):
         result = self._run_with_confirm({
-            "TEST_DATABASE_URL": "postgresql+psycopg://crm:crm@localhost:5432/crm"
+            "TEST_DATABASE_URL": pg_dsn("crm", "localhost")
         })
         self.assertNotEqual(result.returncode, 0)
         combined = result.stdout + result.stderr
@@ -294,7 +295,7 @@ class TestResetScriptGuards(unittest.TestCase):
 
     def test_3e_missing_wa_id_aborts(self):
         env = {k: v for k, v in os.environ.items()}
-        env["TEST_DATABASE_URL"] = "postgresql+psycopg://crm:crm@localhost:5432/crm_test"
+        env["TEST_DATABASE_URL"] = pg_dsn("crm_test", "localhost")
         env.pop("CLOSED_BETA_TEST_WA_ID", None)
         env.pop("OUTBOUND_ENABLED", None)
         cmd = [sys.executable, _RESET_SCRIPT, "--confirm"]

@@ -204,7 +204,7 @@ Pre-existing failures (DATABASE_URL setup errors in older test files, missing st
 ## RUNTIME PROOF
 
 Container: `ridecheck-crm-backend:m21.6-wild01-820f4d6`
-Database: `crm_test` (DATABASE_URL=postgresql+psycopg://crm:crm@postgres:5432/crm_test)
+Database: `crm_test` (DATABASE_URL=postgresql+psycopg://crm:${POSTGRES_PASSWORD}@postgres:5432/crm_test)
 Compose: `docker compose -f docker-compose.yml -f docker-compose.beta.yml up -d --force-recreate backend`
 
 Runtime check:

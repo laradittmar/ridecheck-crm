@@ -4,9 +4,17 @@
     environment:
       POSTGRES_DB: crm
       POSTGRES_USER: crm
-      POSTGRES_PASSWORD: crm
+      # SEC-02: no literal, and deliberately no default. A default would put the real
+      # password back into tracked source, which is the whole problem. Supply the
+      # EXISTING value via .env — this milestone does not rotate anything.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
     ports:
-      - "5432:5432"
+      # SEC-02: bound to the loopback interface, not 0.0.0.0. backend and n8n reach
+      # PostgreSQL over the compose network as "postgres:5432" and never use this
+      # mapping; it exists only for host-side maintenance and the repository's
+      # localhost:5432 smoke tests. Publishing it globally exposed the database to the
+      # internet with a reusable password.
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -18,9 +26,11 @@
   backend:
     build: ./backend
     environment:
-      DATABASE_URL: postgresql+psycopg://crm:crm@postgres:5432/crm
+      DATABASE_URL: postgresql+psycopg://crm:${POSTGRES_PASSWORD}@postgres:5432/crm
       WHATSAPP_TOKEN: ${WHATSAPP_TOKEN}
-      WHATSAPP_VERIFY_TOKEN: "ridecheck_whatsapp_verify_2026"
+      # SEC: supplied from .env like every other secret; the literal was removed from
+      # tracked source. The external value is unchanged.
+      WHATSAPP_VERIFY_TOKEN: ${WHATSAPP_VERIFY_TOKEN}
       WHATSAPP_PHONE_NUMBER_ID: "1196075770246218"
       WHATSAPP_APP_SECRET: ""
       N8N_WEBHOOK_URL: "http://n8n:5678/webhook/ridecheck-inbound"

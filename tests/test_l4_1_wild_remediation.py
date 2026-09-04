@@ -18,6 +18,7 @@ L4R-09  Post-first-inbound canonical reset proof:
           historical candidate excluded, no quote, location question required.
 """
 from __future__ import annotations
+from pg_dsn import pg_dsn  # SEC: no credential literal
 
 import json
 from datetime import datetime, timezone
@@ -186,7 +187,7 @@ class TestCanonicalResetProof:
         from sqlalchemy import create_engine
         from sqlalchemy.orm import Session
 
-        pg_url = "postgresql+psycopg://crm:crm@localhost:5432/crm_test"
+        pg_url = pg_dsn("crm_test", "localhost")
         try:
             eng = create_engine(pg_url, connect_args={"connect_timeout": 3})
             with Session(eng) as db:

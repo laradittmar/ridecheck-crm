@@ -9,6 +9,7 @@ CASE B: Canonical-reset state (cycle_reset_pending=True, zone cleared after rese
 These are read-only invariant checks.  No DB writes to crm or crm_test.
 """
 from __future__ import annotations
+from pg_dsn import pg_dsn  # SEC: no credential literal
 
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
@@ -145,7 +146,7 @@ class TestCaseAIncidentState:
         from sqlalchemy.orm import Session
 
         from app.db import Base as AppBase
-        pg_url = "postgresql+psycopg://crm:crm@localhost:5432/crm_test"
+        pg_url = pg_dsn("crm_test", "localhost")
         try:
             eng = create_engine(pg_url, connect_args={"connect_timeout": 3})
             with Session(eng) as real_db:
@@ -231,7 +232,7 @@ class TestCaseBCanonicalReset:
         from sqlalchemy import create_engine
         from sqlalchemy.orm import Session
 
-        pg_url = "postgresql+psycopg://crm:crm@localhost:5432/crm_test"
+        pg_url = pg_dsn("crm_test", "localhost")
         try:
             eng = create_engine(pg_url, connect_args={"connect_timeout": 3})
             with Session(eng) as real_db:

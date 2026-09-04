@@ -7,12 +7,12 @@ the explicit --clear-beta-cooldown flag is also provided.
 
 Usage — standard reset:
     CLOSED_BETA_TEST_WA_ID=<wa_id> \\
-    TEST_DATABASE_URL=postgresql+psycopg://crm:crm@localhost:5432/crm_test \\
+    TEST_DATABASE_URL=postgresql+psycopg://crm:${POSTGRES_PASSWORD}@localhost:5432/crm_test \\
     python tests/reset_closed_beta_scenario.py --confirm
 
 Usage — cooldown reset (also clears tester's dedup records):
     CLOSED_BETA_TEST_WA_ID=<wa_id> \\
-    TEST_DATABASE_URL=postgresql+psycopg://crm:crm@localhost:5432/crm_test \\
+    TEST_DATABASE_URL=postgresql+psycopg://crm:${POSTGRES_PASSWORD}@localhost:5432/crm_test \\
     python tests/reset_closed_beta_scenario.py --confirm --clear-beta-cooldown
 
 Mandatory guards (all evaluated before any DB connection):

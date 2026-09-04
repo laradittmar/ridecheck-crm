@@ -29,6 +29,7 @@ from .auth import (
     SESSION_COOKIE,
     build_session,
     hash_password,
+    AuthConfigurationError,
     login_ok,
     sign_session,
     validate_password_rules,
@@ -275,7 +276,19 @@ def login_action(
     if not is_valid:
         return _render_login(request, error="Invalid credentials", status_code=401)
 
-    token = sign_session(build_session(email_norm))
+    # SEC-04: a session cookie is only as good as the key that signs it. With no key
+    # configured the credential check above is meaningless, so refuse to issue a session
+    # rather than sign one with a value that is readable in the source tree.
+    try:
+        token = sign_session(build_session(email_norm))
+    except AuthConfigurationError:
+        logger.error("login blocked email=%s reason=AUTH_SECRET_KEY_NOT_CONFIGURED",
+                     email_norm)
+        return _render_login(
+            request,
+            error="Authentication is not configured on this server. Contact the administrator.",
+            status_code=503,
+        )
     resp = RedirectResponse(url="/kanban", status_code=303)
     resp.set_cookie(
         SESSION_COOKIE,

@@ -5,7 +5,7 @@ Deletes only rows whose identifying key (wa_id or lead name) starts with
 production contact.
 
 Usage:
-    TEST_DATABASE_URL=postgresql+psycopg://crm:crm@localhost:5432/crm_test \
+    TEST_DATABASE_URL=postgresql+psycopg://crm:${POSTGRES_PASSWORD}@localhost:5432/crm_test \
         python tests/cleanup_smoketest_fixtures.py
 
 Guards (checked before any DB/app import):
@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 _TEST_DB_URL = os.environ.get("TEST_DATABASE_URL", "").strip()
 if not _TEST_DB_URL:
     sys.exit("ABORT: TEST_DATABASE_URL is required. "
-             "Set it to postgresql+psycopg://crm:crm@<host>:5432/crm_test")
+             "Set it to postgresql+psycopg://crm:${POSTGRES_PASSWORD}@<host>:5432/crm_test")
 
 _parsed_db = urlparse(_TEST_DB_URL)
 _db_name = _parsed_db.path.lstrip("/")

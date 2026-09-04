@@ -3,7 +3,7 @@
 Runs against the crm_test database only.
 
 Requires:
-  TEST_DATABASE_URL=postgresql+psycopg://crm:crm@<host>:5432/crm_test
+  TEST_DATABASE_URL=postgresql+psycopg://crm:${POSTGRES_PASSWORD}@<host>:5432/crm_test
   CLOSED_BETA_TEST_WA_ID is not required — tests use fixed TEST_CLOSED_BETA_* identifiers.
   OUTBOUND_ENABLED must NOT be "true" (not set in the default test environment).
 
@@ -40,6 +40,7 @@ Section D — Compile + regression
   D2: test_m19_r1_3d_closed_beta.py still passes (no regression)
 """
 from __future__ import annotations
+from pg_dsn import pg_dsn  # SEC: no credential literal
 
 import hashlib
 import os
@@ -622,7 +623,7 @@ class TestResetGuards(unittest.TestCase):
     def _run(self, extra_env: dict | None = None, args: list[str] | None = None,
              wa_id: str = _TESTER_WA_ID) -> subprocess.CompletedProcess:
         env = {k: v for k, v in os.environ.items() if k != "OUTBOUND_ENABLED"}
-        env["TEST_DATABASE_URL"] = _TEST_DB_URL or "postgresql+psycopg://crm:crm@localhost:5432/crm_test"
+        env["TEST_DATABASE_URL"] = _TEST_DB_URL or pg_dsn("crm_test", "localhost")
         env["CLOSED_BETA_TEST_WA_ID"] = wa_id
         if extra_env:
             env.update(extra_env)
@@ -643,7 +644,7 @@ class TestResetGuards(unittest.TestCase):
 
     def test_c2_crm_target_rejected(self):
         result = self._run(extra_env={
-            "TEST_DATABASE_URL": "postgresql+psycopg://crm:crm@localhost:5432/crm"
+            "TEST_DATABASE_URL": pg_dsn("crm", "localhost")
         })
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("crm_test", result.stderr)
@@ -651,7 +652,7 @@ class TestResetGuards(unittest.TestCase):
 
     def test_c3_missing_confirm_rejected(self):
         env = {k: v for k, v in os.environ.items() if k != "OUTBOUND_ENABLED"}
-        env["TEST_DATABASE_URL"] = _TEST_DB_URL or "postgresql+psycopg://crm:crm@localhost:5432/crm_test"
+        env["TEST_DATABASE_URL"] = _TEST_DB_URL or pg_dsn("crm_test", "localhost")
         env["CLOSED_BETA_TEST_WA_ID"] = _TESTER_WA_ID
         result = subprocess.run(
             [sys.executable, _RESET_SCRIPT],  # no --confirm
@@ -690,7 +691,7 @@ class TestResetGuards(unittest.TestCase):
 
     def test_c6_missing_closed_beta_test_wa_id_rejected(self):
         env = {k: v for k, v in os.environ.items() if k != "OUTBOUND_ENABLED"}
-        env["TEST_DATABASE_URL"] = _TEST_DB_URL or "postgresql+psycopg://crm:crm@localhost:5432/crm_test"
+        env["TEST_DATABASE_URL"] = _TEST_DB_URL or pg_dsn("crm_test", "localhost")
         env.pop("CLOSED_BETA_TEST_WA_ID", None)
         result = subprocess.run(
             [sys.executable, _RESET_SCRIPT, "--confirm"],

@@ -18,6 +18,7 @@ Section 3: Test-phone quarantine (settings + webhook handler)
   Tests 7a-7e: inbound_webhook quarantine behavior (static/unit tests)
 """
 from __future__ import annotations
+from pg_dsn import pg_dsn  # SEC: no credential literal
 
 import os
 import subprocess
@@ -84,7 +85,7 @@ class TestSmokeGuardsFallback(unittest.TestCase):
 
     def test_1b_refuses_production_database_name(self):
         result = _run_script(self.SCRIPT, {
-            "TEST_DATABASE_URL": "postgresql+psycopg://crm:crm@localhost:5432/crm",
+            "TEST_DATABASE_URL": pg_dsn("crm", "localhost"),
         })
         self.assertNotEqual(result.returncode, 0)
         combined = (result.stdout + result.stderr).lower()
@@ -93,7 +94,7 @@ class TestSmokeGuardsFallback(unittest.TestCase):
 
     def test_1c_refuses_outbound_enabled_true(self):
         result = _run_script(self.SCRIPT, {
-            "TEST_DATABASE_URL": "postgresql+psycopg://crm:crm@localhost:5432/crm_test",
+            "TEST_DATABASE_URL": pg_dsn("crm_test", "localhost"),
             "OUTBOUND_ENABLED": "true",
         })
         self.assertNotEqual(result.returncode, 0)
@@ -116,7 +117,7 @@ class TestSmokeGuardsWebsite(unittest.TestCase):
 
     def test_2b_refuses_production_database_name(self):
         result = _run_script(self.SCRIPT, {
-            "TEST_DATABASE_URL": "postgresql+psycopg://crm:crm@localhost:5432/crm",
+            "TEST_DATABASE_URL": pg_dsn("crm", "localhost"),
         })
         self.assertNotEqual(result.returncode, 0)
         combined = (result.stdout + result.stderr).lower()
@@ -125,7 +126,7 @@ class TestSmokeGuardsWebsite(unittest.TestCase):
 
     def test_2c_refuses_outbound_enabled_true(self):
         result = _run_script(self.SCRIPT, {
-            "TEST_DATABASE_URL": "postgresql+psycopg://crm:crm@localhost:5432/crm_test",
+            "TEST_DATABASE_URL": pg_dsn("crm_test", "localhost"),
             "OUTBOUND_ENABLED": "true",
         })
         self.assertNotEqual(result.returncode, 0)
@@ -148,7 +149,7 @@ class TestCleanupGuards(unittest.TestCase):
 
     def test_3b_refuses_production_database_name(self):
         result = _run_script(self.SCRIPT, {
-            "TEST_DATABASE_URL": "postgresql+psycopg://crm:crm@localhost:5432/crm",
+            "TEST_DATABASE_URL": pg_dsn("crm", "localhost"),
         })
         self.assertNotEqual(result.returncode, 0)
         combined = (result.stdout + result.stderr).lower()
@@ -157,7 +158,7 @@ class TestCleanupGuards(unittest.TestCase):
 
     def test_3c_refuses_outbound_enabled_true(self):
         result = _run_script(self.SCRIPT, {
-            "TEST_DATABASE_URL": "postgresql+psycopg://crm:crm@localhost:5432/crm_test",
+            "TEST_DATABASE_URL": pg_dsn("crm_test", "localhost"),
             "OUTBOUND_ENABLED": "true",
         })
         self.assertNotEqual(result.returncode, 0)
