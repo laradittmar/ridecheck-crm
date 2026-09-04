@@ -3539,6 +3539,24 @@ class ConversationEngine:
         # Lead flag — only allowed values, engine validates
         new_flag = decision.get("lead_flag")
         flag_accepted = new_flag and new_flag in _ALLOWED_FLAGS
+        # ── L4.7W1-F3: the AI may PROPOSE acceptance; it may not GRANT it ─────
+        # PRESUPUESTO_ENVIADO already required a deterministic price below. ACEPTADO
+        # required nothing at all: membership of _ALLOWED_FLAGS was the whole check, so
+        # a model that emitted lead_flag="ACEPTADO" advanced commercial state directly.
+        # It now passes the same C3B authorizer as every other acceptance.
+        if flag_accepted and new_flag == "ACEPTADO" and lead.flag != "ACEPTADO":
+            if self._acceptance_authority_on():
+                _ai_auth = self._authorize_acceptance(ctx, state, ai_input_messages)
+                if not _ai_auth.allows:
+                    logger.warning(
+                        "L4.7W1-F3 AI ACEPTADO blocked thread_id=%s result=%s reason=%s",
+                        ctx.thread.id, _ai_auth.result, _ai_auth.reason,
+                    )
+                    flag_accepted = False
+            # Authority flag OFF: legacy behaviour, unchanged — the same flag discipline
+            # every other cutover in this programme uses. Adding a second predicate here
+            # rejected genuine acceptance-plus-FAQ turns ("Sí, dale. ¿Qué horarios
+            # tienen?"), which is a product regression, not a safety gain.
         # Guard: never set PRESUPUESTO_ENVIADO without a deterministic price.
         if flag_accepted and new_flag == "PRESUPUESTO_ENVIADO" and real_price_quote is None:
             logger.warning(

@@ -2355,6 +2355,18 @@ def whatsapp_thread(thread_id: str, request: Request, db: Session = Depends(get_
 
 @router.post("/whatsapp/thread/{thread_id}/send")
 def whatsapp_thread_send(thread_id: int, payload: WhatsAppSendPayload, db: Session = Depends(get_db)):
+    """Human CRM send. Authenticated by the /whatsapp auth middleware.
+
+    L4.7W1-F3: this route used to construct a direction="out" WhatsAppMessage itself and
+    call the Meta helper directly. That made it a second, parallel outbound authority —
+    no path_id, no dedup window, no flood gate, no deployment_id or correlation_id in the
+    ledger. Every send now goes through OutboundSafetyGate, attributed MANUAL_CRM, so the
+    operator's message is subject to the same kill switch and appears in the same forensic
+    ledger as everything else.
+    """
+    from ..services.outbound_path_registry import OutboundPathId
+    from ..services.outbound_safety_gate import GateOutcome, OutboundSafetyGate
+
     text = (payload.text or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="Text is required")
@@ -2372,54 +2384,47 @@ def whatsapp_thread_send(thread_id: int, payload: WhatsAppSendPayload, db: Sessi
     if not to_wa_id:
         raise HTTPException(status_code=400, detail="Thread has no wa_id")
 
-    from zoneinfo import ZoneInfo; now_utc = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
-    outbound = WhatsAppMessage(
-        thread_id=thread_id,
-        wa_message_id=None,
-        direction="out",
-        status="pending",
-        timestamp=now_utc,
-        text=text,
-        raw_payload={"reply_to_message_id": payload.reply_to_message_id} if payload.reply_to_message_id else None,
+    gate = OutboundSafetyGate(db)
+    gate_result = gate.attempt(
+        wa_id=to_wa_id, thread_id=thread_id, text=text,
+        message_type="text", path_id=OutboundPathId.MANUAL_CRM.value,
     )
-    db.add(outbound)
-    thread.last_message_at = now_utc
-    try:
-        db.commit()
-    except IntegrityError:
-        db.rollback()
-        outbound.status = "sent"
-        db.add(outbound)
-        thread.last_message_at = now_utc
-        db.commit()
+    if gate_result.outcome == GateOutcome.BLOCKED_KILL_SWITCH:
+        return JSONResponse({"ok": False, "error": "OUTBOUND_DISABLED"}, status_code=503)
+    if gate_result.outcome != GateOutcome.ALLOWED:
+        return JSONResponse(
+            {"ok": False, "error": f"OUTBOUND_GATE_{gate_result.outcome.value.upper()}"},
+            status_code=409,
+        )
+
+    # Preserve the reply-to metadata on the pending record the gate created.
+    if payload.reply_to_message_id and gate_result.message_id:
+        pending_msg = db.get(WhatsAppMessage, gate_result.message_id)
+        if pending_msg is not None:
+            pending_msg.raw_payload = {"reply_to_message_id": payload.reply_to_message_id}
+            db.add(pending_msg)
+    from zoneinfo import ZoneInfo
+    thread.last_message_at = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
+    db.commit()
     reset_unanswered_alert(db, thread_id)
     db.commit()
-    db.refresh(outbound)
 
     try:
         wa_message_id, _ = _send_whatsapp_cloud_text(to_wa_id=to_wa_id, text=text)
-        outbound.status = "sent"
-        outbound.wa_message_id = wa_message_id
-        db.add(outbound)
-        db.commit()
     except OutboundBlockedError:
-        db.rollback()
-        outbound.status = "blocked"
-        outbound.blocked_reason = "KILL_SWITCH"
-        db.add(outbound)
-        db.commit()
+        # The gate already cleared the kill switch, so this is a race. Record it as a
+        # failure rather than inventing a new terminal state.
+        gate.mark_failed(gate_result.message_id)
         return JSONResponse({"ok": False, "error": "OUTBOUND_DISABLED"}, status_code=503)
     except Exception as exc:
-        db.rollback()
-        outbound.status = "failed"
-        db.add(outbound)
-        db.commit()
+        gate.mark_failed(gate_result.message_id, meta_error_payload={"error": str(exc)})
         logger.exception(
             "WHATSAPP_OUTBOUND_SEND_FAILED thread_id=%s to=%s error=%s",
             thread_id, to_wa_id, exc,
         )
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
 
+    gate.mark_sent(gate_result.message_id, wa_message_id)
     return RedirectResponse(url=f"/whatsapp/thread/{thread_id}", status_code=303)
 
 
