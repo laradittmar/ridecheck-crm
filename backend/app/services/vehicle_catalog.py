@@ -164,6 +164,59 @@ def _entry_to_match(entry: dict) -> VehicleMatch:
     )
 
 
+# ── L4.7W1-F2: fuzzy matching is anchored to catalog vocabulary ──────────────
+#
+# The controlled Wild proved what unanchored lexical similarity does to real speech:
+# "buen día. Bueno," normalises to the window "dia bueno", which scored 0.706 against
+# the catalog form "fiat uno" and beat the customer's actual vehicle. A greeting became
+# a car.
+#
+# The invariant that fixes that class — not that sentence — is:
+#
+#     fuzzy similarity may only be computed over text that actually contains catalog
+#     vocabulary, and the winning window must itself contain a catalog token.
+#
+# Ordinary prose contains no make and no model, so it can no longer reach the scorer at
+# all. A misspelt vehicle still can, because the *other* half of the phrase anchors it:
+# "renolt clio" anchors on the model, "ford ksl" anchors on the make. This is a property
+# of the catalog, not a list of blocked phrases.
+
+_CATALOG_TOKENS: frozenset[str] = frozenset(
+    token for form in _FULL_FORM_TO_ENTRY for token in form.split()
+)
+
+# How far a vehicle fragment may reach around its anchor. Two words each side covers
+# "<make> <model> <year>" and "<model> del <year>" without swallowing a sentence.
+FRAGMENT_RADIUS: int = 2
+
+
+def _has_catalog_token(fragment: str) -> bool:
+    return any(word in _CATALOG_TOKENS for word in fragment.split())
+
+
+def extract_vehicle_fragments(text: str) -> tuple[str, ...]:
+    """Bounded windows of `text` that could plausibly name a vehicle.
+
+    A fragment is a span around a token that appears in the catalog's own vocabulary —
+    any make token or any model token. Text with no catalog vocabulary anywhere yields
+    **no fragments**, and therefore cannot be fuzzy-matched against anything.
+    """
+    normalized = _norm(text)
+    words = normalized.split()
+    anchors = [i for i, word in enumerate(words) if word in _CATALOG_TOKENS]
+    if not anchors:
+        return ()
+    spans: list[list[int]] = []
+    for index in anchors:
+        low = max(0, index - FRAGMENT_RADIUS)
+        high = min(len(words), index + FRAGMENT_RADIUS + 1)
+        if spans and low <= spans[-1][1]:
+            spans[-1][1] = max(spans[-1][1], high)
+        else:
+            spans.append([low, high])
+    return tuple(" ".join(words[low:high]) for low, high in spans)
+
+
 def _best_ngram_score(n: str, form: str) -> float:
     """Best SequenceMatcher ratio between form and any same-length word window in n.
 
@@ -171,6 +224,10 @@ def _best_ngram_score(n: str, form: str) -> float:
     includes year/location tokens — e.g. "ford ksl 2019 en palermo" contains the
     2-word window "ford ksl" which scores 0.80 against "ford ka" (CONFIRM), while
     the full-text score of 0.45 would be UNRESOLVED.
+
+    L4.7W1-F2: a window that contains no catalog vocabulary is not a vehicle mention,
+    however well it happens to score. That single condition is what stopped a greeting
+    from outscoring the customer's car.
     """
     words_n = n.split()
     words_f = form.split()
@@ -180,6 +237,8 @@ def _best_ngram_score(n: str, form: str) -> float:
     best = 0.0
     for i in range(len(words_n) - k + 1):
         window = " ".join(words_n[i : i + k])
+        if not _has_catalog_token(window):
+            continue                     # prose is not a vehicle mention, at any score
         r = SequenceMatcher(None, window, form).ratio()
         if r > best:
             best = r
@@ -204,6 +263,15 @@ def fuzzy_lookup_vehicle(text: str) -> FuzzyLookupResult:
     # Short-token protection (VN-10): 1-2 char inputs are always UNRESOLVED.
     if len(n) <= 2:
         return _unresolved
+
+    # L4.7W1-F2: score only the parts of the message that carry catalog vocabulary.
+    # A message with none — a greeting, an FAQ question, small talk — is not a vehicle
+    # mention and never reaches the scorer. A vehicle fragment is unchanged by this:
+    # "ford ksl" and "renolt clio" are entirely inside their own fragment.
+    fragments = extract_vehicle_fragments(text)
+    if not fragments:
+        return _unresolved
+    n = max(fragments, key=len) if len(fragments) == 1 else " ".join(fragments)
 
     detected_make, make_constrained = _detect_make(n)
 

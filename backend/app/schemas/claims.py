@@ -53,6 +53,10 @@ class EvidenceClass(str, Enum):
     CATALOG_CONFIRMED = "CATALOG_CONFIRMED"            # the catalog resolved it
     SERVICE_COMPUTED = "SERVICE_COMPUTED"              # Pricing/Schedule produced it
     HUMAN_CONFIRMED = "HUMAN_CONFIRMED"                # an operator entered or approved it
+    # L4.7W1-F2: lexical similarity against the catalog. The WEAKEST class there is —
+    # a suggestion to be checked, never a fact. It may be reconciled and it may prompt a
+    # question; it may never write canonical state or win against any other class.
+    FUZZY_SUGGESTED = "FUZZY_SUGGESTED"
 
 
 class Explicitness(str, Enum):

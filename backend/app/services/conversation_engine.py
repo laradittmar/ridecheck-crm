@@ -2701,6 +2701,7 @@ class ConversationEngine:
         # clarification, fuzzy-confirmation and scheduling exits.
         # Shadow only: it proposes TurnEvidence, mutates nothing, and can never affect
         # routing, canonical state or customer-visible text. Disabled by default.
+        self._fuzzy_advisory = None      # L4.7W1-F2: advisory is per-turn, never sticky
         self._run_shadow_understand(ctx, event, ai_input_messages)
 
         # ── M21.1.1 Layer A: Motorcycle pre-gate (all stages) ─────────────
@@ -3099,7 +3100,8 @@ class ConversationEngine:
             _pending = getattr(state, "pending_fuzzy_catalog_key", None)
             if not _pending and not state.needs_human and not ctx.candidates:
                 _fuzzy = fuzzy_lookup_vehicle(current_turn_text)
-                if _fuzzy.outcome == "AUTO_ACCEPT":
+                if _fuzzy.outcome == "AUTO_ACCEPT" and self._fuzzy_identity_accepted(
+                        ctx, state, _fuzzy):
                     logger.info(
                         "M21.1.4 fuzzy AUTO_ACCEPT thread_id=%s hit=%s score=%.3f gap=%.3f",
                         ctx.thread.id,
@@ -3123,13 +3125,21 @@ class ConversationEngine:
                         getattr(state, "current_focus_candidate_id", None)
                     )
                     if not _has_candidate_ctx:
+                        # ── L4.7W1-F2 — ADVISORY ONLY ────────────────────────
+                        # This used to send "¿Es un <X>?" and RETURN, ending the turn
+                        # before any deterministic block or reconciliation could run.
+                        # That ordering is what let a greeting outrank the customer's
+                        # actual vehicle in the controlled Wild. The suggestion is now
+                        # carried forward as evidence and nothing else: no send, no
+                        # pending key, no early return.
+                        self._fuzzy_advisory = _fuzzy
                         logger.info(
-                            "M21.1.4 fuzzy CONFIRM thread_id=%s hit=%s score=%.3f gap=%.3f",
+                            "L4.7W1-F2 fuzzy ADVISORY thread_id=%s hit=%s score=%.3f "
+                            "gap=%.3f authority=none",
                             ctx.thread.id,
                             f"{_fuzzy.hit.marca} {_fuzzy.hit.modelo}" if _fuzzy.hit else "?",
                             _fuzzy.score, _fuzzy.gap,
                         )
-                        return self._handle_fuzzy_confirm(ctx, state, _fuzzy, current_turn_text)
                     # fall through to AI when established candidate context exists
                 # UNRESOLVED: fall through to existing unknown-vehicle path
 
@@ -3253,6 +3263,26 @@ class ConversationEngine:
                     anio=(ctx.candidates[0].anio if ctx.candidates else _mdy_year),
                     zone=(ctx.candidates[0].zone_detail if ctx.candidates else None),
                 )
+
+        # ── L4.7W1-F2: the single vehicle-clarification point ────────────────
+        # Reached only after exact catalog lookup, the numeric-model rule and the
+        # "model del year" extractor have all had their turn. A fuzzy suggestion may
+        # prompt a question here, and only here, and only once reconciliation has
+        # accepted it as catalog-supported; otherwise the customer is asked a neutral
+        # question instead of being offered a guess.
+        _advisory = getattr(self, "_fuzzy_advisory", None)
+        if (
+            _advisory is not None
+            and pre_detected_vehicle is None
+            and not ctx.candidates
+            and not state.needs_human
+            and not getattr(state, "pending_fuzzy_catalog_key", None)
+        ):
+            _clarify_out = self._ask_vehicle_clarification(
+                ctx, state, _advisory, current_turn_text
+            )
+            if _clarify_out is not None:
+                return _clarify_out
 
         # ── M21.1.1 Layer F: QUALIFYING intent gate (QUALIFYING/None only) ──
         # F12/transfer/repair handled by all-stage Layer C above.
@@ -5145,38 +5175,91 @@ class ConversationEngine:
             return _entry_to_match(entry)
         return None
 
-    def _handle_fuzzy_confirm(
-        self,
-        ctx: "_Context",
-        state: "WhatsAppThreadState",
-        result: "FuzzyLookupResult",
-        current_turn_text: str = "",
-    ) -> "ConversationHandleOut":
-        """M21.1.4 / M21.2: CONFIRM outcome — store pending key + originating burst text.
+    # ── L4.7W1-F2 — fuzzy is evidence, and reconciliation decides ────────────
 
-        Stores pending_fuzzy_catalog_key ("Marca||Modelo") for vehicle identity and
-        pending_turn_evidence_text (raw current_turn_text) so year and zone can be
-        re-extracted from the exact originating burst on acceptance (Design D).
+    def _fuzzy_claim(self, state, hit):
+        """A fuzzy hit expressed as claims in the weakest evidence class there is."""
+        from ..schemas.claims import (ClaimEvidence, ClaimType, EvidenceClass,
+                                      Explicitness)
+        cycle_id = self._reconciler_cycle_id(state)
+        claims = []
+        for claim_type, value in ((ClaimType.VEHICLE_MAKE, getattr(hit, "marca", None)),
+                                  (ClaimType.VEHICLE_MODEL, getattr(hit, "modelo", None))):
+            if value in (None, "", []):
+                continue
+            claims.append(ClaimEvidence(
+                claim_type=claim_type, value=value,
+                evidence_class=EvidenceClass.FUZZY_SUGGESTED,
+                producer="ce:fuzzy_lookup_vehicle", explicitness=Explicitness.IMPLIED,
+                cycle_id=cycle_id).with_id())
+        return claims
 
-        No candidate created, no pricing, no scheduling, no Flow (VN-12).
-        Kill-switch: returns vehicle_fuzzy_blocked when outbound is disabled (VN-14).
+    def _fuzzy_identity_accepted(self, ctx, state, result) -> bool:
+        """Would reconciliation accept this fuzzy identity as a canonical vehicle?
+
+        A fuzzy AUTO_ACCEPT used to write a candidate directly. It now has to survive the
+        same rule every other vehicle claim does, so lexical similarity can never become
+        canonical state on its own.
         """
+        if getattr(result, "hit", None) is None:
+            return False
+        if not self._vehicle_authority_on():
+            return True                  # flag off: legacy behaviour, unchanged
+        from .field_reconciler import reconcile_vehicle_identity
+        from .vehicle_catalog import lookup_vehicle
+        from ..schemas.claims import ClaimType
+        try:
+            decision = reconcile_vehicle_identity(self._fuzzy_claim(state, result.hit),
+                                                  catalog_lookup=lookup_vehicle)
+            self._record_reconciliation(ctx, decision, ClaimType.VEHICLE_MODEL, state)
+            return bool(decision.accepted)
+        except Exception as exc:         # a reconciliation failure is not an acceptance
+            logger.warning("L4.7W1-F2 fuzzy reconciliation failed thread_id=%s: %s",
+                           getattr(ctx.thread, "id", None), exc)
+            return False
+
+    def _ask_vehicle_clarification(self, ctx, state, result, current_turn_text: str):
+        """The one place a vehicle clarification is composed. Returns None to fall through.
+
+        Phase 6: an unresolved vehicle is never answered with a fabricated one. The
+        catalog-supported question is asked only when the suggestion survives
+        reconciliation *and* the catalog actually contains it; otherwise the customer
+        gets a neutral "which make and model?" instead of a guess to react to.
+        """
+        from .vehicle_catalog import lookup_vehicle
+        hit = getattr(result, "hit", None)
+        supported = False
+        if hit is not None and getattr(hit, "marca", None) and getattr(hit, "modelo", None):
+            supported = lookup_vehicle(f"{hit.marca} {hit.modelo}") is not None
+            if supported and self._vehicle_authority_on():
+                supported = self._fuzzy_identity_accepted(ctx, state, result)
+        question = (_FUZZY_CONFIRMATION_TEMPLATE.format(marca=hit.marca, modelo=hit.modelo)
+                    if supported else _FUZZY_ASK_VEHICLE_REPLY)
         self._answer_source = "VEHICLE_RESOLVER"
-        if result.hit is None:
-            return _out("replied", wa_message_id=None)
-        question = _FUZZY_CONFIRMATION_TEMPLATE.format(
-            marca=result.hit.marca, modelo=result.hit.modelo,
-        )
         try:
             sent_id = self._send_text_to_wa(ctx, question)
         except OutboundBlockedError:
             self.db.commit()
             return _out("vehicle_fuzzy_blocked", detail="outbound_disabled")
-        state.pending_fuzzy_catalog_key = f"{result.hit.marca}||{result.hit.modelo}"
-        # M21.2: store the originating burst so year/zone can be replayed on acceptance.
-        state.pending_turn_evidence_text = current_turn_text or None
+        if supported:
+            # The pending key is armed ONLY for a reconciled, catalog-supported identity,
+            # so a later "Sí" can never canonicalise something reconciliation rejected.
+            state.pending_fuzzy_catalog_key = f"{hit.marca}||{hit.modelo}"
+            state.pending_turn_evidence_text = current_turn_text or None
         self.db.commit()
+        self._decision_log(
+            ctx, "vehicle_clarification_armed",
+            source=("fuzzy_reconciled" if supported else "neutral_no_guess"),
+            marca=(hit.marca if supported else None),
+            modelo=(hit.modelo if supported else None),
+            pending_key=getattr(state, "pending_fuzzy_catalog_key", None),
+        )
         return _out("replied", wa_message_id=sent_id)
+
+    # L4.7W1-F2: _handle_fuzzy_confirm was DELETED, not merely unwired. It was the
+    # terminal path "fuzzy -> send -> return" that ended a turn before any
+    # deterministic block or reconciliation could run. Vehicle clarification now has
+    # exactly one composer, _ask_vehicle_clarification, reached after that work.
 
     def _handle_vehicle_inspectability_gate(
         self,
