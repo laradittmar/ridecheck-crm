@@ -15,7 +15,7 @@ Test index:
       needs_human remains False; 0 Meta calls.
   3.  Fallback-flow trigger path: qualifying state commits when location
       clarification is blocked; blocked audit exists; 0 Meta calls.
-  4.  Response format: action=blocked_dispatch; ok=False; handled=False;
+  4.  Response format: action=blocked_dispatch; ok=False; handled=True (F4);
       wa_message_id=None; no sent message row.
   5.  Production semantics unchanged: OUTBOUND_ENABLED=true → action=replied;
       ok=True; blocked_dispatch is not returned.
@@ -341,7 +341,11 @@ class TestBlockedDispatch3008Benavidez(unittest.TestCase):
         # Result must indicate blocked delivery, not hard error
         self.assertEqual(result.action, "blocked_dispatch")
         self.assertFalse(result.ok)
-        self.assertFalse(result.handled)
+        # L4.7W1-F4 REALIGNMENT: handled now means "CE owns this event", not
+        # "a message was delivered". blocked_dispatch is a CE DECISION (the kill
+        # switch), and returning handled=False handed Flow submissions to n8n's
+        # legacy booking chain. ok=False still reports that nothing was sent.
+        self.assertTrue(result.handled)
         self.assertIsNone(result.wa_message_id)
         self.assertIn("KILL_SWITCH", (result.detail or "").upper())
 
@@ -443,7 +447,11 @@ class TestBlockedDispatchFallbackFlow(unittest.TestCase):
         # Result must be blocked_dispatch (not "error")
         self.assertEqual(result.action, "blocked_dispatch")
         self.assertFalse(result.ok)
-        self.assertFalse(result.handled)
+        # L4.7W1-F4 REALIGNMENT: handled now means "CE owns this event", not
+        # "a message was delivered". blocked_dispatch is a CE DECISION (the kill
+        # switch), and returning handled=False handed Flow submissions to n8n's
+        # legacy booking chain. ok=False still reports that nothing was sent.
+        self.assertTrue(result.handled)
         self.assertIsNone(result.wa_message_id)
 
         # Qualifying state committed (dedup marker + candidate vehicle info)
@@ -502,8 +510,12 @@ class TestBlockedDispatchResponseFormat(unittest.TestCase):
                          "action must be 'blocked_dispatch', not 'replied' or 'error'")
         self.assertFalse(result.ok,
                          "ok must be False — delivery did not occur")
-        self.assertFalse(result.handled,
-                         "handled must be False — no message was delivered to customer")
+        # L4.7W1-F4 REALIGNMENT: handled now means "CE owns this event", not
+        # "a message was delivered". blocked_dispatch is a CE DECISION (the kill
+        # switch), and returning handled=False handed Flow submissions to n8n's
+        # legacy booking chain. ok=False still reports that nothing was sent.
+        self.assertTrue(result.handled,
+                        "handled=True — CE owns the event even when the kill switch blocks it")
         self.assertIsNone(result.wa_message_id,
                           "wa_message_id must be None — no WA message was sent")
 
@@ -573,11 +585,15 @@ class TestBlockedDispatchRegression(unittest.TestCase):
         os.environ.pop("OUTBOUND_ENABLED", None)
 
     def test_6a_out_helper_blocked_dispatch_ok_false(self):
-        """_out('blocked_dispatch') must produce ok=False, handled=False."""
+        """_out('blocked_dispatch') must produce ok=False, handled=True (L4.7W1-F4)."""
         from app.services.conversation_engine import _out
         r = _out("blocked_dispatch", detail="OUTBOUND_GATE_BLOCKED_KILL_SWITCH")
         self.assertFalse(r.ok)
-        self.assertFalse(r.handled)
+        # L4.7W1-F4 REALIGNMENT: handled now means "CE owns this event", not
+        # "a message was delivered". blocked_dispatch is a CE DECISION (the kill
+        # switch), and returning handled=False handed Flow submissions to n8n's
+        # legacy booking chain. ok=False still reports that nothing was sent.
+        self.assertTrue(r.handled)
         self.assertEqual(r.action, "blocked_dispatch")
         self.assertEqual(r.detail, "OUTBOUND_GATE_BLOCKED_KILL_SWITCH")
 
@@ -604,7 +620,9 @@ class TestBlockedDispatchRegression(unittest.TestCase):
         r = _out("skipped_dedup")
         self.assertTrue(r.ok)
         self.assertTrue(r.handled)
-        # "no_lead" → ok=True, handled=False
+        # "no_lead" → ok=True, handled=False — UNCHANGED by L4.7W1-F4. The M21.2.8
+        # rationale (no lead linked, so CE genuinely did not own the event) stands, and
+        # no evidence was found that it reaches a live authority.
         r = _out("no_lead")
         self.assertTrue(r.ok)
         self.assertFalse(r.handled)

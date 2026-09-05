@@ -790,7 +790,38 @@ def _faq_hours_answer() -> str:
     return business_hours_summary_es()
 _FAQ_REPORT_ANSWER = "Al finalizar la revisión te enviamos un informe detallado."
 _FAQ_PRESENCE_ANSWER = "No es necesario que estés presente durante la inspección."
-_FAQ_PAYMENT_ANSWER = "Aceptamos efectivo, transferencia bancaria y Mercado Pago."
+# L4.7W1-F4: the customer asked "¿Aceptan? ¿Debito?" and the old answer listed what we
+# take without answering what was actually asked. Business truth: transfer, Mercado Pago
+# and cash; debit is NOT accepted. An answer that omits the "no" is not an answer.
+_FAQ_PAYMENT_ANSWER = (
+    "Aceptamos efectivo, transferencia bancaria y Mercado Pago. "
+    "Con débito no estamos trabajando por el momento."
+)
+_FAQ_SCOPE_ANSWER = (
+    "Vamos hasta donde está el vehículo y hacemos la revisión pre-compra en el lugar. "
+    "Al terminar te enviamos el informe con todo lo que encontramos."
+)
+
+# ── L4.7W1-F4 — semantic topic → deterministic business answer ────────────────
+#
+# The semantic interpreter identifies WHAT the customer asked. It never supplies the
+# answer: every value below is RideCheck's own business truth, and business truth is
+# either a constant here or derived from ScheduleService.
+#
+# A topic with no authoritative answer is deliberately absent from this table. The
+# interpreter can emit `coverage` and `duration`; we do not have canonical answers for
+# them, and inventing one is exactly what this layer exists to prevent.
+_FAQ_TOPIC_ANSWERS: dict[str, object] = {
+    "business_hours": lambda: _faq_hours_answer(),
+    "report": lambda: _FAQ_REPORT_ANSWER,
+    "presence": lambda: _FAQ_PRESENCE_ANSWER,
+    "payment": lambda: _FAQ_PAYMENT_ANSWER,
+    "service_scope": lambda: _FAQ_SCOPE_ANSWER,
+}
+_FAQ_TOPIC_PROBES: dict[str, str] = {
+    "business_hours": "lunes", "report": "informe",
+    "presence": "presente", "payment": "efectivo", "service_scope": "revisión pre-compra",
+}
 
 # F3 duplicate-answer probes — key phrases checked in normalized primary reply.
 # If found, the corresponding FAQ was already answered; no supplement appended.
@@ -2033,6 +2064,43 @@ class ConversationEngine:
             "Si te parece bien, podemos avanzar."
         )
 
+    def _semantic_faq_topics(self) -> set:
+        """FAQ topics the semantic interpreter found in THIS burst. Never an answer.
+
+        L4.7W1-F4: the deterministic detectors are literal phrase sets, and the real Wild
+        proved how narrow that is — "¿Mandan un informe?" misses `mandan informe`,
+        "¿Deben estar presentes?" misses `tengo que estar presente`, and "¿Aceptan?
+        ¿Debito?" splits `aceptan debito` across two sentences. All four were understood
+        correctly by the interpreter. This method contributes ONLY the topic label; the
+        answer still comes from RideCheck's own business truth.
+        """
+        evidence = self._semantic_turn_evidence()
+        if evidence is None:
+            return set()
+        topics = set()
+        for intent in getattr(evidence, "faq_intents", ()) or ():
+            topic = getattr(intent, "topic", None) or getattr(intent, "value", None)
+            topic = getattr(topic, "value", topic)
+            if isinstance(topic, str) and topic in _FAQ_TOPIC_ANSWERS:
+                topics.add(topic)
+        return topics
+
+    def _faq_topics_for_burst(self, text: str) -> set:
+        """Every topic asked in this burst — deterministic phrases OR semantic reading."""
+        n = _norm_lower(text)
+        topics = set()
+        for topic, phrases in (("business_hours", _HOURS_FAQ_DETECTION),
+                               ("report", _REPORT_FAQ_DETECTION),
+                               ("presence", _PRESENCE_FAQ_DETECTION),
+                               ("payment", _PAYMENT_FAQ_DETECTION)):
+            if any(p in n for p in phrases):
+                topics.add(topic)
+        try:
+            topics |= self._semantic_faq_topics()
+        except Exception as exc:      # semantic absence is never an error path
+            logger.warning("L4.7W1-F4 semantic FAQ topics unavailable: %s", exc)
+        return topics
+
     def _build_faq_supplement(self, text: str) -> str:
         """WILD-04R-F2: detect FAQ signals in burst text, return canonical answers.
 
@@ -2040,17 +2108,8 @@ class ConversationEngine:
         one coherent response. Returns empty string when no FAQ signal is found.
         Sources: _HOURS_FAQ_DETECTION / _REPORT_FAQ_DETECTION / etc. constants.
         """
-        n = _norm_lower(text)
-        parts: list[str] = []
-        if any(p in n for p in _HOURS_FAQ_DETECTION):
-            parts.append(_faq_hours_answer())
-        if any(p in n for p in _REPORT_FAQ_DETECTION):
-            parts.append(_FAQ_REPORT_ANSWER)
-        if any(p in n for p in _PRESENCE_FAQ_DETECTION):
-            parts.append(_FAQ_PRESENCE_ANSWER)
-        if any(p in n for p in _PAYMENT_FAQ_DETECTION):
-            parts.append(_FAQ_PAYMENT_ANSWER)
-        return " ".join(parts)
+        topics = self._faq_topics_for_burst(text)
+        return " ".join(_FAQ_TOPIC_ANSWERS[t]() for t in _FAQ_TOPIC_ANSWERS if t in topics)
 
     def _compose_secondary_answers(self, primary_reply: str, burst_text: str) -> str:
         """F3: append unanswered same-burst FAQ signals to an already-composed reply.
@@ -2060,17 +2119,15 @@ class ConversationEngine:
         when _faq_reconciliation_burst is armed for the current turn.
         Does NOT alter state, price, candidate, zone, or scheduling.
         """
-        n_burst = _norm_lower(burst_text)
         n_primary = _norm_lower(primary_reply)
+        topics = self._faq_topics_for_burst(burst_text)
         parts: list[str] = []
-        if any(p in n_burst for p in _HOURS_FAQ_DETECTION) and _FAQ_HOURS_PROBE not in n_primary:
-            parts.append(_faq_hours_answer())
-        if any(p in n_burst for p in _REPORT_FAQ_DETECTION) and _FAQ_REPORT_PROBE not in n_primary:
-            parts.append(_FAQ_REPORT_ANSWER)
-        if any(p in n_burst for p in _PRESENCE_FAQ_DETECTION) and _FAQ_PRESENCE_PROBE not in n_primary:
-            parts.append(_FAQ_PRESENCE_ANSWER)
-        if any(p in n_burst for p in _PAYMENT_FAQ_DETECTION) and _FAQ_PAYMENT_PROBE not in n_primary:
-            parts.append(_FAQ_PAYMENT_ANSWER)
+        for topic in _FAQ_TOPIC_ANSWERS:          # stable order, not set order
+            if topic not in topics:
+                continue
+            if _norm_lower(_FAQ_TOPIC_PROBES.get(topic, "")) in n_primary:
+                continue                          # the primary reply already covers it
+            parts.append(_FAQ_TOPIC_ANSWERS[topic]())
         if not parts:
             return primary_reply
         self._contributing_sources = ["FAQ_RULE"]

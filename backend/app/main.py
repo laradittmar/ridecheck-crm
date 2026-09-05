@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import os
 import random
@@ -8,7 +9,7 @@ import time
 from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, Form, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
@@ -215,11 +216,65 @@ def _render_signup(request: Request, error: str | None = None, status_code: int 
     )
 
 
+# ── L4.7W1-F4 — the machine/human boundary ───────────────────────────────────
+#
+# /api/* was reachable anonymously while port 8000 is published and nginx proxies
+# crm.ridecheck.ar to it. That meant a generic network caller could invoke CE, send a
+# WhatsApp message, mutate a candidate or toggle the AI. Three classes now exist:
+#
+#   PUBLIC   Meta webhook + Flow data-exchange — the protocol requires reachability
+#   MACHINE  n8n transport: CE invocation, sends, thread/candidate/state mutation
+#   HUMAN    CRM UI actions — an authenticated session
+#
+# A MACHINE route accepts either a valid machine credential or a logged-in human, so
+# the CRM UI keeps working. Enforcement is flag-guarded: with the flag off this is
+# exactly the previous behaviour.
+_MACHINE_API_PREFIXES = (
+    "/api/conversation",
+    "/api/whatsapp",
+    "/api/revisions",
+    "/api/internal",
+    "/api/pricing",
+    "/api/schedule",
+    "/api/settings",
+    "/api/excluded-phones",
+    "/leads",
+)
+INTERNAL_AUTH_HEADER = "x-internal-auth"
+
+
+def _is_machine_api_path(path: str) -> bool:
+    return path.startswith(_MACHINE_API_PREFIXES)
+
+
+def _machine_auth_ok(request: Request) -> bool:
+    settings = get_settings()
+    secret = (getattr(settings, "internal_api_secret", "") or "").strip()
+    if not secret:
+        return False
+    supplied = (request.headers.get(INTERNAL_AUTH_HEADER) or "").strip()
+    return bool(supplied) and hmac.compare_digest(supplied.encode(), secret.encode())
+
+
+def _internal_auth_enforced() -> bool:
+    settings = get_settings()
+    return (getattr(settings, "internal_api_auth_enabled", False) is True
+            and bool((getattr(settings, "internal_api_secret", "") or "").strip()))
+
+
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     path = request.url.path or "/"
     if _is_public_path(path):
         return await call_next(request)
+
+    if _internal_auth_enforced() and _is_machine_api_path(path):
+        human = verify_session(request.cookies.get(SESSION_COOKIE))
+        if not _machine_auth_ok(request) and not (human and human.get("email")):
+            logger.warning("INTERNAL_API_UNAUTHENTICATED path=%s method=%s",
+                           path, request.method)
+            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+        request.state.machine_call = not (human and human.get("email"))
 
     if _is_protected_path(path):
         payload = verify_session(request.cookies.get(SESSION_COOKIE))

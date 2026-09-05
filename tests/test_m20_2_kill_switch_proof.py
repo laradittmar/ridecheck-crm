@@ -306,7 +306,8 @@ class TestRC45TextOutboundBlocked(unittest.TestCase):
             self.thread.id, "Hola, cuánto sale revisar un auto?", "wamid.rc45.b"
         ))
         self.assertFalse(result.ok)
-        self.assertFalse(result.handled)
+        # L4.7W1-F4: handled=True — CE owns a kill-switch decision.
+        self.assertTrue(result.handled)
         self.assertIsNone(result.wa_message_id)
 
     def test_rc45c_kill_switch_detail_in_response(self):
@@ -383,7 +384,8 @@ class TestRC46FlowOutboundBlocked(unittest.TestCase):
             self.thread.id, "El auto está en Villa Urquiza", "wamid.rc46.a"
         ))
         self.assertEqual(result.action, "blocked_dispatch")
-        self.assertFalse(result.handled)
+        # L4.7W1-F4: handled=True — CE owns a kill-switch decision.
+        self.assertTrue(result.handled)
 
     def test_rc46b_send_flow_button_never_called(self):
         """_send_flow_button is never called — kill switch fires before it."""

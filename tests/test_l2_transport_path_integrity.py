@@ -299,9 +299,15 @@ class TestSourceInspectionAllCallSites(unittest.TestCase):
                       "_store_outbound_and_send must declare path_id param")
         # Callers must pass path_id=OutboundPathId.MANUAL_CRM.value
         # (at least 3 occurrences: interactive, list, flow)
-        count = src.count("path_id=OutboundPathId.MANUAL_CRM.value")
+        # L4.7W1-F4: send-text is now attributed by CALLER identity — a
+        # machine-authenticated n8n send is CE_FLOW, an operator's is MANUAL_CRM — so the
+        # literal count dropped by one. What matters is that every send declares a path.
+        count = (src.count("path_id=OutboundPathId.MANUAL_CRM.value")
+                 + src.count("path_id=_caller_path_id(request)"))
         self.assertGreaterEqual(count, 4,
-                                f"Expected ≥4 MANUAL_CRM usages in whatsapp.py, found {count}")
+                                f"Expected ≥4 attributed sends in whatsapp.py, found {count}")
+        self.assertIn("def _caller_path_id", src,
+                      "caller-derived attribution must exist")
 
     def test_l2_path_08b_buscando_followup_has_system_notification(self):
         """buscando_followup.py: path_id=OutboundPathId.SYSTEM_NOTIFICATION.value present."""

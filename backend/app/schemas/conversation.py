@@ -15,7 +15,21 @@ HANDLED_ACTIONS = frozenset({
     # Semantics: CE retains ownership of the event; n8n must not fall back to another engine.
     # Does NOT imply customer received a reply. DB rollback still executes; error metadata preserved.
     "error",
+    # L4.7W1-F4: CE OWNS THE EVENT EVEN WHEN IT DECIDES NOT TO SEND.
+    # These two were the only outcomes that returned handled=false, and the consequence
+    # was not theoretical: n8n's `IF - Engine Handled? (Flow M18)` false branch runs a
+    # LEGACY BOOKING chain — Get Thread State (Flow) -> Create Revision2 (Flow) ->
+    # Booking Confirmed Reply (Flow) -> Send Whatsapp Reply (Flow). Because
+    # blocked_dispatch is emitted on EVERY turn while OUTBOUND_ENABLED != "true", the
+    # standing kill-switch state was silently handing Flow submissions to a second
+    # booking authority that bypasses _process_flow_response, C2 and C3B.
+    # "Blocked" and "no lead" are CE DECISIONS, not CE abdications.
+    "blocked_dispatch",
 })
+# NOT included, deliberately: "no_lead". M21.2.8 certified it as genuine non-ownership
+# (the thread has no lead, so CE could not act), the text-path false branch is empty, and
+# no evidence was found that it reaches a live authority. A certified decision is not
+# overturned without contradicting evidence.
 
 
 class ConversationHandleIn(BaseModel):

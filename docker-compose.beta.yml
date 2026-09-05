@@ -66,6 +66,11 @@ services:
       # Never a second model call: the same result feeds authority, projection and the
       # shadow record. crm_test ONLY; production must never set this.
       SEMANTIC_SAME_TURN_ENABLED: "true"
+      # L4.7W1-F4 — machine/human boundary on /api/*. crm_test ONLY. Enabling this in
+      # production additionally requires the n8n HTTP nodes to send X-Internal-Auth,
+      # which is an owner-authorised workflow rollout, not a code change.
+      INTERNAL_API_AUTH_ENABLED: "${INTERNAL_API_AUTH_ENABLED:-false}"
+      INTERNAL_API_SECRET: "${INTERNAL_API_SECRET:-}"
       SEMANTIC_SAME_TURN_TIMEOUT_SECONDS: "6.0"
       # L4.3 Phase C: the published RideCheck Booking Flow is the authoritative
       # booking UX. Pinned explicitly so the runtime never depends on a code default.

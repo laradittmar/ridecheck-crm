@@ -45,6 +45,11 @@ class Settings:
     # L4.7C.4A — same-turn semantic evidence. When false the interpretation stays behind the
     # turn exactly as in L4.7C.4; when true a scheduling turn waits for the ONE interpretation
     # already dispatched for this burst. Never a second model call. Default OFF everywhere.
+    # L4.7W1-F4 — machine/human boundary on /api/*. Enforced only when enabled AND a
+    # secret is configured, so turning it on is a deliberate, reversible act and an
+    # unconfigured deployment cannot silently lose its transport.
+    internal_api_auth_enabled: bool = False
+    internal_api_secret: str = ""
     semantic_same_turn_enabled: bool = False
     semantic_same_turn_timeout_seconds: float = 6.0
     shadow_evidence_path: str = ""
@@ -133,6 +138,9 @@ def get_settings() -> Settings:
             _getenv("RECONCILER_ACCEPTANCE_AUTHORITY_ENABLED", "false").lower() == "true"),
         reconciler_scheduling_authority_enabled=(
             _getenv("RECONCILER_SCHEDULING_AUTHORITY_ENABLED", "false").lower() == "true"),
+        internal_api_auth_enabled=(
+            _getenv("INTERNAL_API_AUTH_ENABLED", "false").lower() == "true"),
+        internal_api_secret=_getenv("INTERNAL_API_SECRET"),
         semantic_same_turn_enabled=(
             _getenv("SEMANTIC_SAME_TURN_ENABLED", "false").lower() == "true"),
         semantic_same_turn_timeout_seconds=_float_env(

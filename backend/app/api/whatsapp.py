@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from urllib import error, request as urlrequest
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -418,8 +418,24 @@ def patch_thread_candidate(
     return candidate
 
 
+def _caller_path_id(request) -> str:
+    """L4.7W1-F4: attribute a send to WHO asked for it, not to a fixed label.
+
+    Every caller of this endpoint used to be recorded as MANUAL_CRM, including n8n's
+    automated Flow-confirmation send. That put machine traffic in the ledger wearing a
+    human's name, which is a forensic lie in exactly the records the outbound invariants
+    depend on. A machine-authenticated caller is now attributed CE_FLOW; a logged-in
+    operator stays MANUAL_CRM.
+    """
+    from ..services.outbound_path_registry import OutboundPathId
+    if getattr(getattr(request, "state", None), "machine_call", False):
+        return OutboundPathId.CE_FLOW.value
+    return OutboundPathId.MANUAL_CRM.value
+
+
 @router.post("/thread/{thread_id}/send-text", response_model=WhatsAppSendTextOut)
-def send_thread_text(thread_id: int, payload: WhatsAppSendTextIn, db: Session = Depends(get_db)):
+def send_thread_text(thread_id: int, payload: WhatsAppSendTextIn,
+                     request: Request = None, db: Session = Depends(get_db)):
     text = (payload.text or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="Text is required")
@@ -446,7 +462,7 @@ def send_thread_text(thread_id: int, payload: WhatsAppSendTextIn, db: Session = 
     gate = OutboundSafetyGate(db)
     gate_result = gate.attempt(wa_id=to_wa_id, thread_id=thread_id, text=text,
                                message_type="text", now=now_utc,
-                               path_id=OutboundPathId.MANUAL_CRM.value)
+                               path_id=_caller_path_id(request))
     if gate_result.outcome == GateOutcome.BLOCKED_KILL_SWITCH:
         raise HTTPException(status_code=503, detail="OUTBOUND_DISABLED")
     if gate_result.outcome != GateOutcome.ALLOWED:
