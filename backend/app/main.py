@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import ipaddress
 import logging
 import os
 import random
@@ -247,19 +248,50 @@ def _is_machine_api_path(path: str) -> bool:
     return path.startswith(_MACHINE_API_PREFIXES)
 
 
+def _client_is_peer_container(request: Request) -> bool:
+    """True when the caller is another container on the trusted compose network.
+
+    Measured, not assumed: n8n reaches the backend as a peer container and presents its
+    own bridge address (172.18.0.3); everything arriving through nginx or the published
+    host port is SNATed to the bridge GATEWAY (172.18.0.1). Excluding the gateway is
+    therefore what separates "the transport" from "the internet", and it is why this can
+    be used as a machine credential without editing every n8n HTTP node.
+    """
+    cidr = (getattr(get_settings(), "internal_api_trusted_cidr", "") or "").strip()
+    if not cidr:
+        return False
+    host = getattr(getattr(request, "client", None), "host", None)
+    if not host:
+        return False
+    try:
+        network = ipaddress.ip_network(cidr, strict=False)
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if address not in network:
+        return False
+    gateway = next(network.hosts(), None)      # .1 — the bridge gateway
+    return address != gateway
+
+
 def _machine_auth_ok(request: Request) -> bool:
+    """A machine caller proves itself by shared secret OR by being a peer container."""
     settings = get_settings()
     secret = (getattr(settings, "internal_api_secret", "") or "").strip()
-    if not secret:
-        return False
-    supplied = (request.headers.get(INTERNAL_AUTH_HEADER) or "").strip()
-    return bool(supplied) and hmac.compare_digest(supplied.encode(), secret.encode())
+    if secret:
+        supplied = (request.headers.get(INTERNAL_AUTH_HEADER) or "").strip()
+        if supplied and hmac.compare_digest(supplied.encode(), secret.encode()):
+            return True
+    return _client_is_peer_container(request)
 
 
 def _internal_auth_enforced() -> bool:
+    """Enforce only when switched on AND at least one machine channel is configured."""
     settings = get_settings()
-    return (getattr(settings, "internal_api_auth_enabled", False) is True
-            and bool((getattr(settings, "internal_api_secret", "") or "").strip()))
+    if getattr(settings, "internal_api_auth_enabled", False) is not True:
+        return False
+    return bool((getattr(settings, "internal_api_secret", "") or "").strip()
+                or (getattr(settings, "internal_api_trusted_cidr", "") or "").strip())
 
 
 @app.middleware("http")

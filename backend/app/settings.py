@@ -50,6 +50,10 @@ class Settings:
     # unconfigured deployment cannot silently lose its transport.
     internal_api_auth_enabled: bool = False
     internal_api_secret: str = ""
+    # Container-network CIDR whose NON-GATEWAY addresses are trusted as machine callers.
+    # The gateway is excluded on purpose: everything arriving through nginx or the
+    # published port is SNATed to it, so only a peer container can satisfy this.
+    internal_api_trusted_cidr: str = ""
     semantic_same_turn_enabled: bool = False
     semantic_same_turn_timeout_seconds: float = 6.0
     shadow_evidence_path: str = ""
@@ -141,6 +145,7 @@ def get_settings() -> Settings:
         internal_api_auth_enabled=(
             _getenv("INTERNAL_API_AUTH_ENABLED", "false").lower() == "true"),
         internal_api_secret=_getenv("INTERNAL_API_SECRET"),
+        internal_api_trusted_cidr=_getenv("INTERNAL_API_TRUSTED_CIDR"),
         semantic_same_turn_enabled=(
             _getenv("SEMANTIC_SAME_TURN_ENABLED", "false").lower() == "true"),
         semantic_same_turn_timeout_seconds=_float_env(

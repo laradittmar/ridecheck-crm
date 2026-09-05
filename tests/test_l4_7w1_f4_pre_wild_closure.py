@@ -135,31 +135,64 @@ class TestInternalApiBoundary(unittest.TestCase):
 
     def test_prewild_06_machine_credential_is_compared_safely_and_needs_config(self):
         """PREWILD-06 — no secret configured means no machine caller is admitted."""
-        request = SimpleNamespace(headers={"x-internal-auth": "anything"})
+        request = SimpleNamespace(headers={"x-internal-auth": "anything"},
+                                  client=SimpleNamespace(host="203.0.113.9"))
         with patch.object(self.main, "get_settings",
                           return_value=SimpleNamespace(internal_api_secret="",
-                                                       internal_api_auth_enabled=True)):
+                                                       internal_api_auth_enabled=True,
+                                                       internal_api_trusted_cidr="")):
             self.assertFalse(self.main._machine_auth_ok(request))
             self.assertFalse(self.main._internal_auth_enforced())
         with patch.object(self.main, "get_settings",
                           return_value=SimpleNamespace(internal_api_secret="s3cret",
-                                                       internal_api_auth_enabled=True)):
+                                                       internal_api_auth_enabled=True,
+                                                       internal_api_trusted_cidr="")):
             self.assertTrue(self.main._internal_auth_enforced())
             self.assertTrue(self.main._machine_auth_ok(
-                SimpleNamespace(headers={"x-internal-auth": "s3cret"})))
+                SimpleNamespace(headers={"x-internal-auth": "s3cret"},
+                                client=SimpleNamespace(host="203.0.113.9"))))
             self.assertFalse(self.main._machine_auth_ok(
-                SimpleNamespace(headers={"x-internal-auth": "wrong"})))
-            self.assertFalse(self.main._machine_auth_ok(SimpleNamespace(headers={})))
+                SimpleNamespace(headers={"x-internal-auth": "wrong"},
+                                client=SimpleNamespace(host="203.0.113.9"))))
+            self.assertFalse(self.main._machine_auth_ok(SimpleNamespace(
+                headers={}, client=SimpleNamespace(host="203.0.113.9"))))
+
+    def test_prewild_06b_a_peer_container_is_a_machine_caller_the_gateway_is_not(self):
+        """The channel that admits n8n without editing 30 HTTP nodes.
+
+        Measured on the live runtime: n8n presents 172.18.0.3; anything through nginx or
+        the published port is SNATed to the gateway 172.18.0.1. Excluding the gateway is
+        what separates the transport from the internet.
+        """
+        def req(host):
+            return SimpleNamespace(headers={},
+                                   client=SimpleNamespace(host=host))
+        cfg = SimpleNamespace(internal_api_secret="", internal_api_auth_enabled=True,
+                              internal_api_trusted_cidr="172.18.0.0/16")
+        with patch.object(self.main, "get_settings", return_value=cfg):
+            self.assertTrue(self.main._machine_auth_ok(req("172.18.0.3")), "n8n admitted")
+            self.assertFalse(self.main._machine_auth_ok(req("172.18.0.1")), "gateway denied")
+            self.assertFalse(self.main._machine_auth_ok(req("127.0.0.1")), "loopback denied")
+            self.assertFalse(self.main._machine_auth_ok(req("203.0.113.9")), "internet denied")
+            self.assertFalse(self.main._machine_auth_ok(req(None)))
+            self.assertFalse(self.main._machine_auth_ok(req("not-an-ip")))
+        # with no CIDR configured the channel is closed entirely
+        cfg_off = SimpleNamespace(internal_api_secret="", internal_api_auth_enabled=True,
+                                  internal_api_trusted_cidr="")
+        with patch.object(self.main, "get_settings", return_value=cfg_off):
+            self.assertFalse(self.main._machine_auth_ok(req("172.18.0.3")))
 
     def test_prewild_07_enforcement_is_off_until_deliberately_enabled(self):
         """A configured secret alone does not switch enforcement on."""
         with patch.object(self.main, "get_settings",
                           return_value=SimpleNamespace(internal_api_secret="s3cret",
-                                                       internal_api_auth_enabled=False)):
+                                                       internal_api_auth_enabled=False,
+                                                       internal_api_trusted_cidr="")):
             self.assertFalse(self.main._internal_auth_enforced())
         from app.settings import Settings
         self.assertFalse(Settings().internal_api_auth_enabled)
         self.assertEqual(Settings().internal_api_secret, "")
+        self.assertEqual(Settings().internal_api_trusted_cidr, "")
 
 
 class TestFaqCutover(unittest.TestCase):

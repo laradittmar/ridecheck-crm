@@ -32,7 +32,7 @@
 
 services:
   backend:
-    image: ridecheck-crm-backend:l4.7w1f3-authority-eeec87d
+    image: ridecheck-crm-backend:l4.7w1f4-prewild-test
     # L4.3 Phase G: steady state measured 2026-09-01 — backend 116 MiB, n8n 326 MiB,
     # postgres 93 MiB on a 3.8 GiB host. Limits are ~3-8x steady state: they contain a
     # runaway container instead of letting it trigger a HOST-wide OOM that picks an
@@ -71,13 +71,14 @@ services:
       # which is an owner-authorised workflow rollout, not a code change.
       INTERNAL_API_AUTH_ENABLED: "${INTERNAL_API_AUTH_ENABLED:-false}"
       INTERNAL_API_SECRET: "${INTERNAL_API_SECRET:-}"
+      INTERNAL_API_TRUSTED_CIDR: "${INTERNAL_API_TRUSTED_CIDR:-172.18.0.0/16}"
       SEMANTIC_SAME_TURN_TIMEOUT_SECONDS: "6.0"
       # L4.3 Phase C: the published RideCheck Booking Flow is the authoritative
       # booking UX. Pinned explicitly so the runtime never depends on a code default.
       WHATSAPP_BOOKING_FLOW_ID: "28104222025943520"
       # L4.3 Phase F: real deployment attribution in the outbound ledger
       # (was persisted as 'unknown' during Wild A — finding FOR-01).
-      GIT_SHA: "${GIT_SHA:-eeec87d}"
+      GIT_SHA: "${GIT_SHA:-be3d93f}"
     volumes:
       - /opt/ridecheck-secrets:/run/secrets:ro
       - /opt/ridecheck-crm-forensics:/run/forensics
