@@ -651,6 +651,21 @@ def render_control_page(user_email: str) -> str:
       gap: 8px;
     }}
     .detailItem {{ display: flex; flex-direction: column; gap: 2px; }}
+    .traceSelect {{
+      font: inherit; padding: 4px 8px; border-radius: 6px;
+      border: 1px solid var(--border, #d0d5dd); background: #fff; max-width: 220px;
+    }}
+    .pathLegend {{
+      padding: 12px 16px; border-top: 1px solid var(--border, #e5e7eb);
+      background: #fafafa; font-size: 13px;
+    }}
+    .legendNote {{ color: #667085; margin-bottom: 8px; font-size: 12px; }}
+    .legendRow {{ display: grid; grid-template-columns: 190px 1fr; gap: 8px; padding: 6px 0;
+                 border-bottom: 1px dashed #e5e7eb; }}
+    .legendRow:last-child {{ border-bottom: none; }}
+    .legendWho {{ color: #475467; }}
+    .badgeInbound {{ background: #eef2f6; color: #475467; }}
+    .badgeUnattributed {{ background: #fee4e2; color: #b42318; font-weight: 600; }}
     .detailKey {{
       font-size: 10px;
       text-transform: uppercase;
@@ -854,6 +869,15 @@ def render_control_page(user_email: str) -> str:
             <button class="filterBtn active" data-dir="" onclick="setDir(this)">Todos</button>
             <button class="filterBtn" data-dir="in" onclick="setDir(this)">IN</button>
             <button class="filterBtn" data-dir="out" onclick="setDir(this)">OUT</button>
+            <select id="customerFilter" class="traceSelect" onchange="setCustomer(this.value)"
+                    title="Filtrar por cliente">
+              <option value="">Todos los clientes</option>
+            </select>
+            <select id="pathFilter" class="traceSelect" onchange="setPath(this.value)"
+                    title="Filtrar por camino de envío">
+              <option value="">Todos los caminos</option>
+            </select>
+            <button class="filterBtn" onclick="clearTraceFilters()" title="Quitar filtros">Limpiar</button>
           </div>
         </div>
         <div class="tableWrap">
@@ -888,6 +912,12 @@ def render_control_page(user_email: str) -> str:
       <div class="panel" id="panel-paths">
         <div class="panelHeader">
           <h2>Caminos de Envío</h2>
+          <button class="filterBtn" onclick="togglePathLegend()"
+                  title="Qué significa cada camino">¿Qué es cada camino?</button>
+        </div>
+        <div id="pathLegend" class="pathLegend" hidden>
+          <div class="legendNote">Leído del registro de caminos en ejecución.</div>
+          <div id="pathLegendBody">Cargando…</div>
         </div>
         <div class="tableWrap">
           <table id="paths-table">
@@ -1156,7 +1186,10 @@ def render_control_page(user_email: str) -> str:
             + '<td>' + (isWaitingCustomer ? '<span class="badge badgeLow">Sí</span>' : '—') + '</td>'
             + '<td>' + fmtAge(r.waiting_seconds !== undefined ? r.waiting_seconds : r.age_seconds) + '</td>'
             + '<td>' + health + '</td>'
-            + '<td>' + link + '</td>'
+            + '<td>' + link
+            + (r.contact_id ? (' · <a href="#panel-msgs" onclick="filterTraceByCustomer('
+                 + esc(r.contact_id) + ');return false;">Filtrar trazado</a>') : '')
+            + '</td>'
             + '</tr>';
         }}).join('');
       }});
@@ -1167,9 +1200,32 @@ def render_control_page(user_email: str) -> str:
     // -------------------------------------------------------------------------
     var _expandedRows = {{}};
 
+    // OPS-CONTROL: trace filters combine — customer AND direction AND path.
+    var currentContact = '';
+    var currentPath = '';
+
+    function setCustomer(v) {{ currentContact = v || ''; fetchMessages(); }}
+    function setPath(v) {{ currentPath = v || ''; fetchMessages(); }}
+    function clearTraceFilters() {{
+      currentContact = ''; currentPath = '';
+      var c = document.getElementById('customerFilter'); if (c) c.value = '';
+      var p = document.getElementById('pathFilter'); if (p) p.value = '';
+      fetchMessages();
+    }}
+    function filterTraceByCustomer(contactId, label) {{
+      currentContact = String(contactId || '');
+      var c = document.getElementById('customerFilter');
+      if (c) c.value = currentContact;
+      fetchMessages();
+      var panel = document.getElementById('panel-msgs');
+      if (panel && panel.scrollIntoView) panel.scrollIntoView({{ behavior: 'smooth' }});
+    }}
+
     function fetchMessages() {{
       var url = '/api/ops/messages?limit=100&window=' + encodeURIComponent(currentWindow);
       if (currentDir) url += '&direction=' + encodeURIComponent(currentDir);
+      if (currentContact) url += '&contact_id=' + encodeURIComponent(currentContact);
+      if (currentPath) url += '&path_id=' + encodeURIComponent(currentPath);
       apiFetch(url, function(data) {{
         var rows = Array.isArray(data) ? data : (data.items || data.messages || []);
         var tbody = document.getElementById('msgs-tbody');
@@ -1185,15 +1241,17 @@ def render_control_page(user_email: str) -> str:
           var preview = r.preview || r.text || r.body || r.content || '';
           if (preview.length > 80) preview = preview.substring(0, 80) + '…';
 
-          // Path badge
-          var pathLabel = esc(r.path_id || '—');
-          var pathBadge;
-          if (!r.path_id || String(r.path_id).toLowerCase() === 'unknown' ||
-              String(r.path_id).toLowerCase().indexOf('legacy') >= 0) {{
-            pathBadge = '<span class="badge badgeUnknown">' + pathLabel + '</span>';
-          }} else {{
-            pathBadge = '<span class="badge badgeLow">' + pathLabel + '</span>';
-          }}
+          // Path badge. An inbound message has no send path; an outbound one without a
+          // registered path is a finding. Neither may render as a bare dash.
+          var pathCls = r.path_class || (r.direction === 'out' ? 'unknown' : 'inbound');
+          var pathText = r.path_display || (r.direction === 'out'
+                          ? (r.path_id || 'UNATTRIBUTED') : 'INBOUND');
+          var badgeCls;
+          if (pathCls === 'inbound') badgeCls = 'badgeInbound';
+          else if (pathCls === 'authorized') badgeCls = 'badgeLow';
+          else if (pathCls === 'legacy') badgeCls = 'badgeCritical';
+          else badgeCls = 'badgeUnattributed';
+          var pathBadge = '<span class="badge ' + badgeCls + '">' + esc(pathText) + '</span>';
 
           // Status badge
           var st = r.status || '';
@@ -1278,6 +1336,78 @@ def render_control_page(user_email: str) -> str:
     }}
 
     // -------------------------------------------------------------------------
+    // OPS-CONTROL: filter option sources and the path legend
+    // -------------------------------------------------------------------------
+    function fetchCustomerOptions() {{
+      apiFetch('/api/ops/threads?window=7d&limit=200', function(data) {{
+        var rows = Array.isArray(data) ? data : (data.items || data.threads || []);
+        var sel = document.getElementById('customerFilter');
+        if (!sel) return;
+        var seen = {{}};
+        var opts = '<option value="">Todos los clientes</option>';
+        rows.forEach(function(r) {{
+          var id = r.contact_id;
+          if (!id || seen[id]) return;
+          seen[id] = true;
+          // Never render a full phone number: the API already masks it.
+          var label = r.display_name || r.wa_id_masked || ('Contacto ' + id);
+          opts += '<option value="' + esc(id) + '">' + esc(label) + '</option>';
+        }});
+        var keep = sel.value;
+        sel.innerHTML = opts;
+        if (keep) sel.value = keep;
+      }});
+    }}
+
+    function fetchPathRegistry() {{
+      apiFetch('/api/ops/path-registry', function(data) {{
+        var rows = (data && data.paths) || [];
+        var sel = document.getElementById('pathFilter');
+        if (sel) {{
+          var opts = '<option value="">Todos los caminos</option>';
+          rows.forEach(function(r) {{
+            opts += '<option value="' + esc(r.path_id) + '">' + esc(r.path_id) + '</option>';
+          }});
+          opts += '<option value="UNKNOWN">Sin camino (UNATTRIBUTED)</option>';
+          var keep = sel.value;
+          sel.innerHTML = opts;
+          if (keep) sel.value = keep;
+        }}
+        var body = document.getElementById('pathLegendBody');
+        if (!body) return;
+        if (!rows.length) {{ body.innerHTML = 'Sin caminos registrados.'; return; }}
+        body.innerHTML = rows.map(function(r) {{
+          var badge = r.authorized
+            ? '<span class="badge badgeLow">AUTORIZADO</span>'
+            : '<span class="badge badgeCritical">BLOQUEADO</span>';
+          var kind = r.kind === 'HUMAN'
+            ? '<span class="badge badgeInbound">HUMANO</span>'
+            : '<span class="badge badgeInbound">AUTOMÁTICO</span>';
+          return '<div class="legendRow">'
+            + '<div><strong>' + esc(r.path_id) + '</strong><br>' + badge + ' ' + kind + '</div>'
+            + '<div>' + esc(r.purpose)
+            + '<div class="legendWho">Inicia: ' + esc(r.initiator)
+            + ' · ' + esc(r.authority) + '</div></div>'
+            + '</div>';
+        }}).join('');
+      }});
+    }}
+
+    function togglePathLegend() {{
+      var el = document.getElementById('pathLegend');
+      if (el) el.hidden = !el.hidden;
+    }}
+
+    function filterTraceByPath(pathId) {{
+      currentPath = String(pathId || '');
+      var sel = document.getElementById('pathFilter');
+      if (sel) sel.value = currentPath;
+      fetchMessages();
+      var panel = document.getElementById('panel-msgs');
+      if (panel && panel.scrollIntoView) panel.scrollIntoView({{ behavior: 'smooth' }});
+    }}
+
+    // -------------------------------------------------------------------------
     // Path monitoring table
     // -------------------------------------------------------------------------
     function fetchPaths() {{
@@ -1294,8 +1424,10 @@ def render_control_page(user_email: str) -> str:
                          String(r.path_id).toLowerCase().indexOf('legacy') >= 0;
           var rowCls = isLegacy ? 'rowCritical' : '';
           return '<tr class="' + rowCls + '">'
-            + '<td><strong>' + esc(r.path_id || r.path) + '</strong></td>'
-            + '<td>' + (r.total !== null && r.total !== undefined ? r.total : '—') + '</td>'
+            + '<td><a href="#panel-msgs" onclick="filterTraceByPath(' + "'" + esc(r.path_id || r.path) + "'" + ');return false;"><strong>'
+                 + esc(r.path_id || r.path) + '</strong></a></td>'
+            + '<td>' + (r.total !== null && r.total !== undefined ? r.total
+                          : (r.count !== null && r.count !== undefined ? r.count : '—')) + '</td>'
             + '<td>' + (r.success_count !== null && r.success_count !== undefined ? r.success_count : '—') + '</td>'
             + '<td>' + (r.blocked_count !== null && r.blocked_count !== undefined ? r.blocked_count : '—') + '</td>'
             + '<td>' + (r.failed_count !== null && r.failed_count !== undefined ? r.failed_count : '—') + '</td>'
@@ -1315,6 +1447,8 @@ def render_control_page(user_email: str) -> str:
       fetchCritical();
       fetchPaths();
       document.getElementById('lastUpdated').textContent = nowHMS();
+      fetchCustomerOptions();
+      fetchPathRegistry();
     }}
 
     // -------------------------------------------------------------------------

@@ -131,12 +131,21 @@ class TestDeploymentPreflight(unittest.TestCase):
             self.assertIn("ADMIN_PASSWORD", result.stderr)
             self.assertNotIn("AUTH_SECRET_KEY=x", result.stderr, "values are never printed")
 
+            # Derive the required list FROM THE SCRIPT rather than restating it: the
+            # first version of this test hardcoded six names, the script later grew to
+            # eight, and the fixture silently went stale.
+            lines = self.SCRIPT.read_text(encoding="utf-8").splitlines()
+            start = next(i for i, l in enumerate(lines) if l.startswith("REQUIRED=("))
+            required = []
+            for line in lines[start + 1:]:
+                if line.strip() == ")":
+                    break
+                name = line.split("#")[0].strip()
+                if name:
+                    required.append(name)
+            self.assertGreaterEqual(len(required), 6)
             good = pathlib.Path(tmp) / "good.env"
-            good.write_text("\n".join(
-                f"{k}=value" for k in ("AUTH_SECRET_KEY", "ADMIN_PASSWORD",
-                                       "POSTGRES_PASSWORD", "WHATSAPP_VERIFY_TOKEN",
-                                       "WHATSAPP_TOKEN", "OPENAI_API_KEY")),
-                encoding="utf-8")
+            good.write_text("\n".join(f"{k}=value" for k in required), encoding="utf-8")
             ok = subprocess.run(["bash", str(self.SCRIPT), str(good)],
                                 capture_output=True, text=True)
             self.assertEqual(ok.returncode, 0, ok.stderr)

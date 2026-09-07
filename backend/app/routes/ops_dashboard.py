@@ -169,6 +169,7 @@ def _query_thread_health_rows(db: Session, cutoff: datetime) -> list:
             WhatsAppThread.last_message_at.label("last_message_at"),
             WhatsAppContact.display_name.label("display_name"),
             WhatsAppContact.wa_id.label("wa_id"),
+            WhatsAppThread.contact_id.label("contact_id"),
             WhatsAppMessage.id.label("latest_msg_id"),
             WhatsAppMessage.direction.label("latest_direction"),
             WhatsAppMessage.timestamp.label("latest_ts"),
@@ -305,11 +306,123 @@ def get_summary(
 # 2. GET /api/ops/messages
 # ---------------------------------------------------------------------------
 
+def _path_display(direction: str | None, path_id: str | None) -> str:
+    """What the CAMINO column should read. Never a bare dash for an outbound record."""
+    if direction != "out":
+        return "INBOUND"
+    if not path_id:
+        return "UNATTRIBUTED"
+    if path_id not in _KNOWN_PATHS:
+        return f"UNKNOWN ({path_id})"
+    return path_id
+
+
+def _path_class(direction: str | None, path_id: str | None) -> str:
+    """inbound | authorized | legacy | unknown — drives the badge, not the text."""
+    if direction != "out":
+        return "inbound"
+    if not path_id or path_id not in _KNOWN_PATHS:
+        return "unknown"
+    if path_id in LEGACY_PATHS:
+        return "legacy"
+    return "authorized"
+
+
+# ---------------------------------------------------------------------------
+# GET /api/ops/path-registry — the legend, read from the live registry
+# ---------------------------------------------------------------------------
+
+# Owner-facing descriptions. The SET of paths is never hardcoded here: it comes from
+# OutboundPathId at call time, so a path added to the registry appears automatically and
+# one described here but no longer registered simply never renders.
+_PATH_DOC: dict[str, dict] = {
+    "CE_TEXT": {
+        "label": "Respuesta de texto (motor)",
+        "initiator": "ConversationEngine",
+        "purpose": "Respuesta de texto generada automáticamente en la conversación.",
+        "kind": "AUTOMATED",
+    },
+    "CE_FLOW": {
+        "label": "Flow (motor)",
+        "initiator": "ConversationEngine",
+        "purpose": "Envío de un Flow de WhatsApp (vehículo o ubicación) por el motor.",
+        "kind": "AUTOMATED",
+    },
+    "CE_INTERACTIVE": {
+        "label": "Mensaje interactivo (motor)",
+        "initiator": "ConversationEngine",
+        "purpose": "Mensaje con botones interactivos.",
+        "kind": "AUTOMATED",
+    },
+    "CE_LIST": {
+        "label": "Lista (motor)",
+        "initiator": "ConversationEngine",
+        "purpose": "Mensaje de lista de opciones.",
+        "kind": "AUTOMATED",
+    },
+    "MANUAL_CRM": {
+        "label": "Envío manual del operador",
+        "initiator": "Operador con sesión iniciada en el CRM",
+        "purpose": "Mensaje escrito y enviado a mano desde el CRM.",
+        "kind": "HUMAN",
+    },
+    "BOOKING_FLOW": {
+        "label": "Flow de turno",
+        "initiator": "Servicio de reservas",
+        "purpose": "Flow de coordinación de turno, único camino que confirma una reserva.",
+        "kind": "AUTOMATED",
+    },
+    "SYSTEM_NOTIFICATION": {
+        "label": "Notificación del sistema",
+        "initiator": "Tarea programada",
+        "purpose": "Aviso automático determinista (seguimiento, recordatorio).",
+        "kind": "AUTOMATED",
+    },
+    "LEGACY_N8N_AI_PIPELINE": {
+        "label": "Camino legacy n8n (retirado)",
+        "initiator": "Pipeline de IA legacy en n8n",
+        "purpose": "Camino histórico. No autorizado: cualquier intento queda bloqueado.",
+        "kind": "AUTOMATED",
+    },
+}
+
+
+@router.get("/path-registry")
+def get_path_registry() -> dict:
+    """Every path currently registered in executable source, with its authority.
+
+    Read from `OutboundPathId` at call time rather than from a list written here, so the
+    legend cannot drift away from what the gate actually accepts.
+    """
+    from ..services.outbound_path_registry import OutboundPathId
+
+    entries = []
+    for member in OutboundPathId:
+        pid = member.value
+        doc = _PATH_DOC.get(pid, {})
+        authorized = pid in AUTHORIZED_PATHS
+        entries.append({
+            "path_id": pid,
+            "label": doc.get("label", pid),
+            "initiator": doc.get("initiator", "—"),
+            "purpose": doc.get("purpose", "Sin descripción registrada."),
+            "kind": doc.get("kind", "AUTOMATED"),
+            "authorized": authorized,
+            "legacy": pid in LEGACY_PATHS,
+            "authority": ("Autorizado — pasa por OutboundSafetyGate"
+                          if authorized else "BLOQUEADO — no autorizado para enviar"),
+        })
+    entries.sort(key=lambda e: (not e["authorized"], e["path_id"]))
+    return {"count": len(entries), "paths": entries}
+
+
 @router.get("/messages")
 def get_messages(
     window: str = Query("today", description="today | 24h | 7d"),
     direction: Optional[str] = Query(None, description="in | out"),
     thread_id: Optional[int] = Query(None),
+    contact_id: Optional[int] = Query(None, description="filter to one customer"),
+    path_id: Optional[str] = Query(None, description="outbound path, or UNKNOWN"),
     limit: int = Query(100, ge=1, le=500),
     db: Session = Depends(get_db),
 ) -> dict:
@@ -325,6 +438,7 @@ def get_messages(
             WhatsAppThread.lead_id.label("lead_id"),
             WhatsAppContact.display_name.label("display_name"),
             WhatsAppContact.wa_id.label("wa_id"),
+            WhatsAppThread.contact_id.label("contact_id"),
             WhatsAppMessage.direction,
             WhatsAppMessage.message_type,
             WhatsAppMessage.text,
@@ -356,6 +470,21 @@ def get_messages(
     if thread_id is not None:
         q = q.where(WhatsAppMessage.thread_id == thread_id)
 
+    # OPS-CONTROL: filters combine — customer AND direction AND path.
+    # These endpoints are also called directly (not through FastAPI) by the certified
+    # dashboard tests, where an unsupplied parameter arrives as a Query object rather
+    # than None. Type-check rather than truth-check so those callers keep working.
+    if isinstance(contact_id, int):
+        q = q.where(WhatsAppThread.contact_id == contact_id)
+
+    if isinstance(path_id, str) and path_id:
+        if path_id.upper() == "UNKNOWN":
+            # Unattributed outbound: the case that must never hide behind a dash.
+            q = q.where(WhatsAppMessage.direction == "out",
+                        WhatsAppMessage.path_id.is_(None))
+        else:
+            q = q.where(WhatsAppMessage.path_id == path_id)
+
     rows = db.execute(q).mappings().all()
 
     messages = []
@@ -365,6 +494,9 @@ def get_messages(
                 "id": row["id"],
                 "thread_id": row["thread_id"],
                 "lead_id": row["lead_id"],
+                # OPS-CONTROL: the trace filters by customer, so the dropdown
+                # needs a stable id that is not a phone number.
+                "contact_id": row["contact_id"],
                 "display_name": row["display_name"],
                 "wa_id": row["wa_id"],
                 "wa_id_masked": _mask_wa_id(row["wa_id"]),
@@ -380,6 +512,11 @@ def get_messages(
                 "deployment_id": row["deployment_id"],
                 "correlation_id": row["correlation_id"],
                 "is_path_critical": _is_path_critical(row["path_id"]),
+                # OPS-CONTROL: an inbound message HAS no send path, and an outbound one
+                # without a registered path is a forensic finding. The UI must be able to
+                # tell those apart without inferring from a dash.
+                "path_display": _path_display(row["direction"], row["path_id"]),
+                "path_class": _path_class(row["direction"], row["path_id"]),
                 "latency_ms": row["latency_ms"],
                 "meta_http_status": row["meta_http_status"],
                 "meta_error_payload": row["meta_error_payload"],
@@ -440,6 +577,7 @@ def get_threads(
             {
                 "thread_id": row["thread_id"],
                 "lead_id": row["lead_id"],
+                "contact_id": row["contact_id"],
                 "display_name": row["display_name"],
                 "wa_id_masked": _mask_wa_id(row["wa_id"]),
                 "health": health_label,
@@ -535,6 +673,9 @@ def get_paths(
             {
                 "path_id": pid,
                 "count": agg["count"],
+                # The dashboard reads `total`; it was never emitted, so the TOTAL column
+                # rendered a dash for every path. Same number, both names.
+                "total": agg["count"],
                 "success_count": agg["success_count"],
                 "blocked_count": agg["blocked_count"],
                 "failed_count": agg["failed_count"],
