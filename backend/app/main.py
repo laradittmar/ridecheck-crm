@@ -183,13 +183,38 @@ def _verify_reset_token(token: str | None) -> str | None:
     return email
 
 
+_AUTH_UNCONFIGURED_HTML = (
+    "<!doctype html><html lang=\"es\"><head><meta charset=\"utf-8\">"
+    "<title>RideCheck CRM — configuración pendiente</title></head><body>"
+    "<h1>Autenticación no configurada</h1>"
+    "<p>El servidor no tiene configurada la clave de sesión "
+    "(<code>AUTH_SECRET_KEY</code>). Por seguridad, el acceso permanece cerrado "
+    "hasta que un administrador la configure.</p></body></html>"
+)
+
+
+def _auth_unconfigured_response() -> HTMLResponse:
+    """503, not 500: an unconfigured server is a known state, not a crash.
+
+    OPS-CRM-500: the login page signs its own CAPTCHA token, so a missing signing key
+    took down the whole operator UI with a stack trace. Failing closed is correct and
+    stays; failing *incomprehensibly* was the defect.
+    """
+    return HTMLResponse(_AUTH_UNCONFIGURED_HTML, status_code=503)
+
+
 def _render_login(
     request: Request,
     error: str | None = None,
     message: str | None = None,
     status_code: int = 200,
 ) -> HTMLResponse:
-    question, token = _new_captcha()
+    try:
+        question, token = _new_captcha()
+    except AuthConfigurationError:
+        logger.error("AUTH_CONFIGURATION_ERROR path=/login reason=signing key absent — "
+                     "serving 503; set AUTH_SECRET_KEY to restore the CRM")
+        return _auth_unconfigured_response()
     return templates.TemplateResponse(
         "login.html",
         {
@@ -371,11 +396,7 @@ def login_action(
     except AuthConfigurationError:
         logger.error("login blocked email=%s reason=AUTH_SECRET_KEY_NOT_CONFIGURED",
                      email_norm)
-        return _render_login(
-            request,
-            error="Authentication is not configured on this server. Contact the administrator.",
-            status_code=503,
-        )
+        return _auth_unconfigured_response()
     resp = RedirectResponse(url="/kanban", status_code=303)
     resp.set_cookie(
         SESSION_COOKIE,
