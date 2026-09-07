@@ -79,7 +79,13 @@ from ..services.outbound_guard import OutboundBlockedError
 from ..services.outbound_path_registry import OutboundPathId
 from ..services.outbound_safety_gate import GateOutcome, OutboundSafetyGate
 from ..settings import Settings
-from ..ui.whatsapp_ui import MetaSendError, _send_whatsapp_cloud_flow, _send_whatsapp_cloud_text
+from ..ui.whatsapp_ui import (
+    FLOW_MODE_DATA_EXCHANGE,
+    FLOW_MODE_NAVIGATE,
+    MetaSendError,
+    _send_whatsapp_cloud_flow,
+    _send_whatsapp_cloud_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -6215,6 +6221,10 @@ class ConversationEngine:
                 initial_screen="APPOINTMENT",
                 path_id=OutboundPathId.BOOKING_FLOW.value,
                 cta_label="Reservar turno",
+                # The ONE endpoint-backed Flow: Meta must call handle_init, which returns
+                # the APPOINTMENT screen with ScheduleService-approved slots. Sent as
+                # NAVIGATE it is delivered and read but never renders (Wild W4).
+                mode=FLOW_MODE_DATA_EXCHANGE,
             )
             return _out("flow_button_sent", wa_message_id=sent_id)
         except OutboundBlockedError:
@@ -8073,7 +8083,15 @@ Respondé SOLO con JSON válido:
         initial_screen: str = "MAIN",
         path_id: str | None = None,
         cta_label: str = "Completar datos",
+        mode: str = FLOW_MODE_NAVIGATE,
     ) -> str:
+        """Dispatch a Flow. `mode` decides how Meta launches it — see `_flow_launch_fields`.
+
+        L4.7W4-F1: the default is NAVIGATE because every endpoint-less Flow uses it and
+        those are the majority. The Booking Flow is the one endpoint-backed Flow and it
+        passes FLOW_MODE_DATA_EXCHANGE explicitly; a static test asserts that it does, so
+        the default cannot silently reclaim it.
+        """
         if not flow_id:
             flow_id = (self.settings.whatsapp_flow_id or "").strip()
         if not flow_id:
@@ -8114,6 +8132,7 @@ Respondé SOLO con JSON válido:
                 body_text=body_text,
                 cta_label=cta_label,
                 initial_screen=initial_screen,
+                mode=mode,
             )
             gate.mark_sent(result.message_id, wa_message_id)
         except MetaSendError as exc:

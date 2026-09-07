@@ -153,10 +153,13 @@ def _capture_sends(eng):
         return "wamid.OUT.TEXT"
 
     def fake_flow(ctx, body, token, flow_id="", initial_screen="MAIN",
-                  path_id=None, cta_label="Completar datos"):
+                  path_id=None, cta_label="Completar datos", mode=None, **extra):
+        # **extra so a future kwarg on the real helper surfaces as a contract test
+        # failure here rather than as a swallowed TypeError inside the send.
         flows.append({
             "body": body, "token": token, "flow_id": flow_id,
             "screen": initial_screen, "path_id": path_id, "cta": cta_label,
+            "mode": mode, **extra,
         })
         return "wamid.OUT.FLOW"
 
@@ -454,6 +457,17 @@ class TestBookingFlowWiring(unittest.TestCase):
         finally:
             if previous is not None:
                 os.environ["WHATSAPP_BOOKING_FLOW_ID"] = previous
+
+    def test_flow_02c_booking_flow_is_launched_as_data_exchange(self):
+        """FLOW-02c the Booking Flow is endpoint-backed and must be launched as such.
+
+        Wild W4: sent as `navigate` it was delivered, read and opened, and Meta never
+        called the endpoint (64 data-exchange requests that session, all health-check
+        pings, zero INIT), so the APPOINTMENT screen had no slots to render.
+        """
+        from app.ui.whatsapp_ui import FLOW_MODE_DATA_EXCHANGE
+        self._book()
+        self.assertEqual(self.flows[0]["mode"], FLOW_MODE_DATA_EXCHANGE)
 
     def test_flow_03_send_uses_booking_flow_path_id(self):
         """FLOW-03 outbound attribution is path_id=BOOKING_FLOW."""

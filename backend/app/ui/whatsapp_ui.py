@@ -324,6 +324,28 @@ def _send_whatsapp_cloud_list(
     raise RuntimeError(f"Unexpected list response from WhatsApp Cloud API: {body}")
 
 
+FLOW_MODE_NAVIGATE = "navigate"
+FLOW_MODE_DATA_EXCHANGE = "data_exchange"
+_FLOW_MODES = (FLOW_MODE_NAVIGATE, FLOW_MODE_DATA_EXCHANGE)
+
+
+def _flow_launch_fields(mode: str, initial_screen: str) -> dict:
+    """The launch half of the Flow payload, decided by mode and nothing else.
+
+    In DATA_EXCHANGE mode no `screen` is sent: the endpoint's INIT response names the first
+    screen, and supplying one here would contradict it.
+    """
+    if mode == FLOW_MODE_DATA_EXCHANGE:
+        return {"flow_action": "data_exchange"}
+    if mode == FLOW_MODE_NAVIGATE:
+        return {"flow_action": "navigate",
+                "flow_action_payload": {"screen": initial_screen}}
+    raise ValueError(
+        f"flow mode must be one of {_FLOW_MODES!r}, got {mode!r}. An endpoint-backed Flow "
+        "sent as 'navigate' is delivered but cannot render (Wild W4)."
+    )
+
+
 def _send_whatsapp_cloud_flow(
     to_wa_id: str,
     flow_id: str,
@@ -331,8 +353,27 @@ def _send_whatsapp_cloud_flow(
     body_text: str,
     cta_label: str = "Completar datos",
     initial_screen: str = "MAIN",
+    mode: str = None,          # REQUIRED — see the docstring; no safe default exists
 ) -> tuple[str, int]:
-    """M17 — Send a WhatsApp Flow button message (data-collection mode, no back-end)."""
+    """Send a WhatsApp Flow button message. The launch mode is REQUIRED, never assumed.
+
+    L4.7W4-F1. There are two kinds of Flow and they launch differently:
+
+      NAVIGATE       endpoint-less. Meta renders `flow_action_payload.screen` on the device
+                     and never calls us. Correct for the vehicle / location / website
+                     data-collection Flows, which have no back end.
+      DATA_EXCHANGE  endpoint-backed. Meta calls the Flow endpoint with `action: "INIT"` and
+                     the ENDPOINT supplies the first screen. Correct for the Booking Flow,
+                     whose `handle_init` returns the APPOINTMENT screen with real slots.
+
+    Wild W4 sent the Booking Flow in NAVIGATE mode. The message was delivered and read, the
+    customer opened it, and Meta never contacted the endpoint: 64 data-exchange requests
+    that session, every one a health-check `ping`, not a single INIT. The Flow could not
+    render because nothing had asked the back end for anything.
+
+    `mode` is positional-by-keyword with no default precisely so a new caller cannot inherit
+    the endpoint-less behaviour by omission, which is how W4 happened.
+    """
     enforce_outbound_enabled("whatsapp_ui._send_whatsapp_cloud_flow", "flow", to_wa_id, text=body_text)
     settings = get_settings()
     token = (settings.whatsapp_token or "").strip()
@@ -363,8 +404,7 @@ def _send_whatsapp_cloud_flow(
                     "flow_token": flow_token,
                     "flow_id": flow_id,
                     "flow_cta": cta_label,
-                    "flow_action": "navigate",
-                    "flow_action_payload": {"screen": initial_screen},
+                    **_flow_launch_fields(mode, initial_screen),
                 },
             },
         },
