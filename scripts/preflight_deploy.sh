@@ -24,6 +24,11 @@ REQUIRED=(
   WHATSAPP_VERIFY_TOKEN  # Meta webhook verification
   WHATSAPP_TOKEN
   OPENAI_API_KEY
+  # OPS-CRM-500: the F4 internal-API boundary was silently disabled by a deploy that
+  # read only .env, because enablement lived in a shell variable someone had to remember
+  # to type. Configuration that exists only in a person's memory is not configuration.
+  INTERNAL_API_AUTH_ENABLED
+  INTERNAL_API_TRUSTED_CIDR
 )
 
 if [[ ! -f "$ENV_FILE" ]]; then
@@ -47,4 +52,23 @@ if (( ${#missing[@]} > 0 )); then
   exit 1
 fi
 
-echo "PREFLIGHT PASS — ${#REQUIRED[@]} required variables present in ${ENV_FILE}."
+# Presence in .env is NOT the same as presence in the container: compose only injects a
+# variable the service declares. This gap is what kept /login at 503 even after the values
+# were configured, so the compose wiring is checked too.
+COMPOSE_FILE="${2:-/opt/ridecheck-crm-release-candidate/docker-compose.beta.yml}"
+if [[ -f "$COMPOSE_FILE" ]]; then
+  undeclared=()
+  for key in AUTH_SECRET_KEY ADMIN_PASSWORD; do
+    grep -qE "^[[:space:]]*${key}:" "$COMPOSE_FILE" || undeclared+=("$key")
+  done
+  if (( ${#undeclared[@]} > 0 )); then
+    echo "PREFLIGHT FAIL — deployment STOPPED before container replacement." >&2
+    echo "Present in ${ENV_FILE} but NOT declared in ${COMPOSE_FILE}," >&2
+    echo "so the container would start without them:" >&2
+    for key in "${undeclared[@]}"; do echo "  - ${key}" >&2; done
+    exit 1
+  fi
+fi
+
+echo "PREFLIGHT PASS — ${#REQUIRED[@]} required variables present in ${ENV_FILE}"
+echo "                 and declared in $(basename "${COMPOSE_FILE}")."

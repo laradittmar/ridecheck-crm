@@ -32,7 +32,7 @@
 
 services:
   backend:
-    image: ridecheck-crm-backend:l4.7w2f1-voiceloc-3f18f63
+    image: ridecheck-crm-backend:ops500-loginfix-afdb8b1
     # L4.3 Phase G: steady state measured 2026-09-01 — backend 116 MiB, n8n 326 MiB,
     # postgres 93 MiB on a 3.8 GiB host. Limits are ~3-8x steady state: they contain a
     # runaway container instead of letting it trigger a HOST-wide OOM that picks an
@@ -49,6 +49,12 @@ services:
       INTERNAL_BOOKING_EMAIL_REPLY_TO: "ridecheckassistance@gmail.com"
       FLOW_BOOKING_PRIVATE_KEY_PATH: /run/secrets/flow_booking_private.pem
       SMTP_PASSWORD: ""
+      # OPS-CRM-500: the hardened auth code requires these, and .env presence is NOT the
+      # same thing as container environment — compose only injects what is declared here.
+      # That gap is what left /login at 503 after the credentials were configured.
+      AUTH_SECRET_KEY: "${AUTH_SECRET_KEY:?AUTH_SECRET_KEY must be set in .env}"
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD:?ADMIN_PASSWORD must be set in .env}"
+      ADMIN_EMAIL: "${ADMIN_EMAIL:-admin@ridecheck.local}"
       # L4.7B: shadow UNDERSTAND — crm_test ONLY, never production. Proposes TurnEvidence
       # in parallel with the live path and mutates nothing.
       SHADOW_UNDERSTAND_ENABLED: "true"
@@ -78,7 +84,7 @@ services:
       WHATSAPP_BOOKING_FLOW_ID: "28104222025943520"
       # L4.3 Phase F: real deployment attribution in the outbound ledger
       # (was persisted as 'unknown' during Wild A — finding FOR-01).
-      GIT_SHA: "${GIT_SHA:-3f18f63}"
+      GIT_SHA: "${GIT_SHA:-afdb8b1}"
     volumes:
       - /opt/ridecheck-secrets:/run/secrets:ro
       - /opt/ridecheck-crm-forensics:/run/forensics
