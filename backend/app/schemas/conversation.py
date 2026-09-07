@@ -25,6 +25,8 @@ HANDLED_ACTIONS = frozenset({
     # booking authority that bypasses _process_flow_response, C2 and C3B.
     # "Blocked" and "no lead" are CE DECISIONS, not CE abdications.
     "blocked_dispatch",
+    # L4.7W2-F1: a locality proposal suppressed by the kill switch is still a CE decision.
+    "location_proposal_blocked",
 })
 # NOT included, deliberately: "no_lead". M21.2.8 certified it as genuine non-ownership
 # (the thread has no lead, so CE could not act), the text-path false branch is empty, and

@@ -642,6 +642,12 @@ _FUZZY_REJECTION_RE = re.compile(
     r'\b(?:no(?:\s+es|\s+era|\s+ese)?|nada\s+que\s+ver|incorrecto|equivocado)\b',
     re.IGNORECASE,
 )
+# L4.7W2-F1: an approximate locality is confirmed, never assumed.
+_LOCALITY_CONFIRMATION_TEMPLATE = "¿El auto está en {zone}?"
+_LOCALITY_ASK_AGAIN_REPLY = (
+    "Perdón, no te entendí bien. ¿En qué localidad está el auto?"
+)
+
 _FUZZY_ASK_VEHICLE_REPLY = (
     "Para cotizarte la revisión necesito saber qué vehículo tenés. "
     "¿Me podés indicar la marca y el modelo?"
@@ -2421,6 +2427,19 @@ class ConversationEngine:
         )
         zone_known = _snap.location_known()
 
+        # ── L4.7W2-F1: bounded locality recovery, BEFORE the generic Location Flow ──
+        # Wild W2: the customer named the locality and ASR mangled it, so the deterministic
+        # resolver found nothing and CE asked a question the customer had just answered.
+        # A recovered locality is a PROPOSAL — it is confirmed, never written here.
+        if vehicle_known and not zone_known and not self._pending_location_proposal(state):
+            _loc = self._recover_locality(ctx, state, combined)
+            if _loc is not None and _loc.needs_confirmation and _loc.best is not None:
+                _proposal = self._propose_locality(ctx, state, _loc)
+                if _proposal is not None:
+                    return _proposal, False
+            # NONE / AMBIGUOUS / EXACT-but-unresolved all fall through to the certified
+            # Location Flow. Safety before forced recovery.
+
         # Priority 2 — vehicle known + concern + zone missing → concern-aware Location Flow.
         # Concern takes precedence over FAQ/soft-close; cannot be suppressed by the FAQ check.
         if vehicle_known and not zone_known and not state.location_fallback_flow_sent:
@@ -3049,6 +3068,39 @@ class ConversationEngine:
             elif sched_day_iso and _pure_sched:
                 # Day only (or day + period like "mañana a la tarde") — list available slots.
                 return self._handle_day_only_request(ctx, state, sched_day_iso, period=period)
+
+        # ── L4.7W2-F1: pending locality confirmation ──────────────────────
+        # Runs before vehicle detection so an explicit new locality this turn wins, and
+        # only inside the cycle that armed it. Nothing canonical exists until here.
+        _pending_loc = self._pending_location_proposal(state)
+        if _pending_loc is not None and not state.needs_human:
+            _explicit_zone = self._extract_zone_from_text(current_turn_text)
+            if _explicit_zone is not None:
+                # The customer named a locality outright — correction wins, proposal dies.
+                self._clear_location_proposal(state)
+                self.db.commit()
+            elif _FUZZY_ACCEPTANCE_RE.search(current_turn_text):
+                _group, _detail = _pending_loc
+                self._clear_location_proposal(state)
+                _target = self._focus_candidate(ctx) or state
+                self._apply_inspection_zone(ctx, _target, zone_group=_group,
+                                            zone_detail=_detail, source="flow",
+                                            role="INSPECTION_LOCATION", state=state)
+                self._normalize_zone_from_db(ctx, state)
+                self.db.commit()
+                self._decision_log(ctx, "location_proposal_confirmed",
+                                   zone=_detail, group=_group, source="customer_confirmation")
+            elif _FUZZY_REJECTION_RE.search(current_turn_text):
+                self._clear_location_proposal(state)
+                self.db.commit()
+                self._decision_log(ctx, "location_proposal_rejected", zone=_pending_loc[1])
+                self._answer_source = "LOCATION_RESOLVER"
+                try:
+                    _sent = self._send_text_to_wa(ctx, _LOCALITY_ASK_AGAIN_REPLY)
+                    return _out("replied", wa_message_id=_sent)
+                except OutboundBlockedError:
+                    return _out("location_proposal_blocked", detail="outbound_disabled")
+            # anything else: leave the proposal armed and continue normally
 
         # ── M21.1.4: Pending fuzzy confirmation handler ───────────────────
         # Intercepts the turn when a CONFIRM vehicle proposal is outstanding.
@@ -4465,6 +4517,102 @@ class ConversationEngine:
         if result is None or not getattr(result, "ok", False):
             return None
         return getattr(result, "evidence", None)
+
+    # ── L4.7W2-F1 — bounded locality recovery from imperfect speech ──────────
+
+    def _semantic_location_fragment(self, burst_text: str):
+        """This burst's proposed inspection-location span, or None. No extra model call.
+
+        Reads the SAME TurnSemanticEvidence provider that C4A already dispatches for
+        scheduling, so the interpretation is shared and `calls` stays at 1. Wild W2 proved
+        the evidence was there and simply had no consumer: the interpreter reported
+        `{"value": "Tegui", "role": "INSPECTION_LOCATION"}` 2 s after CE had already
+        answered, and nothing read it.
+        """
+        from .locality_resolver import LocationFragment
+        evidence = self._semantic_turn_evidence()
+        if evidence is None:
+            return None
+        for mention in getattr(evidence, "location_mentions", ()) or ():
+            role = getattr(mention, "role", None)
+            role = str(getattr(role, "value", role) or "").upper()
+            value = getattr(mention, "value", None)
+            # An origin mention is never a candidate for the inspection locality.
+            fragment = LocationFragment.from_evidence(
+                text=str(value or ""), role=role,
+                producer="semantic:understand", source_text=burst_text or "")
+            if fragment is not None and fragment.is_inspection_role:
+                return fragment
+        return None
+
+    def _recover_locality(self, ctx: "_Context", state, burst_text: str):
+        """Try to recover a locality the deterministic resolver could not match.
+
+        Returns a `LocalityMatch` or None. Writes nothing: an APPROXIMATE result is a
+        proposal that the customer must confirm, because a confident match on a corrupted
+        token is still a guess about what was said.
+        """
+        from sqlalchemy import select as _select
+        from .locality_resolver import resolve_locality_fragment
+        fragment = self._semantic_location_fragment(burst_text)
+        if fragment is None:
+            return None
+        try:
+            catalog = list(self.db.execute(_select(ViaticosZone)).scalars().all())
+            match = resolve_locality_fragment(fragment, catalog)
+        except Exception as exc:
+            logger.warning("L4.7W2-F1 locality recovery failed thread_id=%s: %s",
+                           getattr(ctx.thread, "id", None), exc)
+            return None
+        logger.info(
+            "L4.7W2-F1 LOCALITY thread_id=%s fragment=%r role=%s status=%s best=%s "
+            "score=%.3f rule=%s@%s",
+            getattr(ctx.thread, "id", None), fragment.text, fragment.role, match.status,
+            (match.best.zone_detail if match.best else None),
+            (match.best.score if match.best else 0.0), match.rule_id, match.rule_version)
+        return match
+
+    def _location_proposal_key(self, state, zone_group, zone_detail) -> str:
+        return f"{zone_group or ''}||{zone_detail or ''}||{self._reconciler_cycle_id(state) or ''}"
+
+    def _pending_location_proposal(self, state):
+        """The locality awaiting confirmation IN THIS CYCLE, or None.
+
+        A proposal from a finished cycle is not evidence about this one — the cycle id is
+        part of the stored key, so a stale "Sí" can never confirm it.
+        """
+        raw = getattr(state, "pending_location_proposal", None)
+        if not raw:
+            return None
+        parts = str(raw).split("||")
+        if len(parts) != 3:
+            return None
+        group, detail, cycle = parts
+        if cycle != (self._reconciler_cycle_id(state) or ""):
+            return None
+        return (group or None, detail or None)
+
+    def _clear_location_proposal(self, state) -> None:
+        if getattr(state, "pending_location_proposal", None):
+            state.pending_location_proposal = None
+
+    def _propose_locality(self, ctx: "_Context", state, match):
+        """Ask the customer to confirm an approximate locality. Writes no canonical value."""
+        best = match.best
+        state.pending_location_proposal = self._location_proposal_key(
+            state, best.zone_group, best.zone_detail)
+        self.db.commit()
+        self._answer_source = "LOCATION_RESOLVER"
+        question = _LOCALITY_CONFIRMATION_TEMPLATE.format(zone=best.zone_detail)
+        try:
+            sent_id = self._send_text_to_wa(ctx, question)
+        except OutboundBlockedError:
+            self.db.commit()
+            return _out("location_proposal_blocked", detail="outbound_disabled")
+        self._decision_log(ctx, "location_proposal_armed", source="semantic_bounded",
+                           zone=best.zone_detail, group=best.zone_group,
+                           score=round(best.score, 3))
+        return _out("replied", wa_message_id=sent_id)
 
     def _semantic_scheduling_claims(self, state) -> list:
         """Project this burst's semantic reading into scheduling claims. Never mutates."""
@@ -6990,6 +7138,7 @@ Respondé SOLO con JSON válido:
         state.inspectability_clarification_sent = False
         state.pending_fuzzy_catalog_key = None
         state.pending_turn_evidence_text = None
+        state.pending_location_proposal = None
         state.cycle_reset_pending = False  # consume the one-shot signal
 
         # Clear Lead ACTIVE_REVISION fields
