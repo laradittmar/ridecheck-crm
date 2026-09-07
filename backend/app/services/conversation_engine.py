@@ -2091,8 +2091,8 @@ class ConversationEngine:
                 topics.add(topic)
         return topics
 
-    def _faq_topics_for_burst(self, text: str) -> set:
-        """Every topic asked in this burst — deterministic phrases OR semantic reading."""
+    def _explicit_faq_topics(self, text: str) -> set:
+        """Topics the customer asked in so many words. A literal ask is never suppressed."""
         n = _norm_lower(text)
         topics = set()
         for topic, phrases in (("business_hours", _HOURS_FAQ_DETECTION),
@@ -2101,10 +2101,87 @@ class ConversationEngine:
                                ("payment", _PAYMENT_FAQ_DETECTION)):
             if any(p in n for p in phrases):
                 topics.add(topic)
+        return topics
+
+    def _topics_already_answered_this_cycle(self, ctx) -> set:
+        """Topics whose canonical answer already went out in this cycle.
+
+        L4.7W3-F1: de-duplication used to inspect only the message being composed, so the
+        weekday table could be sent twice one turn apart — which is exactly what Wild W3
+        did. Bounded to outbound messages of the CURRENT cycle, and matched on the answer
+        text itself rather than a single probe word, so it is topic identity rather than a
+        substring coincidence.
+        """
+        answered = set()
         try:
-            topics |= self._semantic_faq_topics()
+            cycle_start = getattr(ctx.state, "current_cycle_start_message_db_id", None)
+            for message in reversed(list(getattr(ctx, "db_messages", []) or [])[-12:]):
+                if getattr(message, "direction", None) != "out":
+                    continue
+                # Compare only when both are integers: message id 0 is legitimate, and a
+                # cycle marker may be a timestamp string rather than a row id.
+                mid = getattr(message, "id", None)
+                if (isinstance(cycle_start, int) and isinstance(mid, int)
+                        and mid < cycle_start):
+                    continue
+                body = _norm_lower(getattr(message, "text", "") or "")
+                if not body:
+                    continue
+                for topic, answer in _FAQ_TOPIC_ANSWERS.items():
+                    try:
+                        canonical = _norm_lower(answer())
+                    except Exception:
+                        continue
+                    # A distinctive slice of the canonical answer, not one common word.
+                    if canonical and canonical[:40] in body:
+                        answered.add(topic)
+        except Exception as exc:
+            logger.warning("L4.7W3-F1 recent FAQ context unavailable: %s", exc)
+        return answered
+
+    def _faq_topics_for_burst(self, text: str, ctx=None, state=None) -> set:
+        """Topics this burst genuinely asks, after reconciliation against context.
+
+        A semantic FAQ label is a PROPOSAL. Wild W3: "¿Qué tenés mañana?" in
+        stage=SCHEDULING was labelled `business_hours` and the full weekday table was
+        appended — but that turn is a request for availability, and the hours had been
+        given one message earlier. Three reconciliations, none of them a phrase blocklist:
+
+        1. an explicit literal ask always wins and is never suppressed;
+        2. a semantic `business_hours` proposal loses to a concurrent scheduling request
+           (the customer is asking what is FREE, not when we open);
+        3. a topic already answered in this cycle is not repeated unless asked again.
+        """
+        explicit = self._explicit_faq_topics(text)
+        proposed = set()
+        try:
+            proposed = self._semantic_faq_topics()
         except Exception as exc:      # semantic absence is never an error path
             logger.warning("L4.7W1-F4 semantic FAQ topics unavailable: %s", exc)
+
+        state = state if state is not None else getattr(ctx, "state", None)
+        stage = getattr(state, "last_stage", None)
+
+        # (2) availability beats opening-hours when the turn is a scheduling request.
+        if "business_hours" in (proposed - explicit):
+            scheduling_now = bool(getattr(self, "_turn_scheduling_requested", False))
+            if scheduling_now or stage in (STAGE_SCHEDULING, STAGE_FLOW_SENT):
+                proposed.discard("business_hours")
+                logger.info(
+                    "L4.7W3-F1 FAQ RECONCILE thread_id=%s topic=business_hours "
+                    "outcome=deferred_to_scheduling stage=%s scheduling_evidence=%s",
+                    getattr(getattr(ctx, "thread", None), "id", None), stage, scheduling_now)
+
+        topics = explicit | proposed
+
+        # (3) do not answer the same business truth twice in one cycle.
+        if ctx is not None:
+            repeated = (topics - explicit) & self._topics_already_answered_this_cycle(ctx)
+            if repeated:
+                logger.info("L4.7W3-F1 FAQ RECONCILE thread_id=%s already_answered=%s",
+                            getattr(getattr(ctx, "thread", None), "id", None),
+                            sorted(repeated))
+                topics -= repeated
         return topics
 
     def _build_faq_supplement(self, text: str) -> str:
@@ -2114,7 +2191,7 @@ class ConversationEngine:
         one coherent response. Returns empty string when no FAQ signal is found.
         Sources: _HOURS_FAQ_DETECTION / _REPORT_FAQ_DETECTION / etc. constants.
         """
-        topics = self._faq_topics_for_burst(text)
+        topics = self._faq_topics_for_burst(text, ctx=getattr(self, "_turn_ctx", None))
         return " ".join(_FAQ_TOPIC_ANSWERS[t]() for t in _FAQ_TOPIC_ANSWERS if t in topics)
 
     def _compose_secondary_answers(self, primary_reply: str, burst_text: str) -> str:
@@ -2126,7 +2203,7 @@ class ConversationEngine:
         Does NOT alter state, price, candidate, zone, or scheduling.
         """
         n_primary = _norm_lower(primary_reply)
-        topics = self._faq_topics_for_burst(burst_text)
+        topics = self._faq_topics_for_burst(burst_text, ctx=getattr(self, "_turn_ctx", None))
         parts: list[str] = []
         for topic in _FAQ_TOPIC_ANSWERS:          # stable order, not set order
             if topic not in topics:
@@ -2778,6 +2855,8 @@ class ConversationEngine:
         # Shadow only: it proposes TurnEvidence, mutates nothing, and can never affect
         # routing, canonical state or customer-visible text. Disabled by default.
         self._fuzzy_advisory = None      # L4.7W1-F2: advisory is per-turn, never sticky
+        self._turn_ctx = ctx             # L4.7W3-F1: FAQ reconciliation needs this turn
+        self._turn_scheduling_requested = False
         self._run_shadow_understand(ctx, event, ai_input_messages)
 
         # ── M21.1.1 Layer A: Motorcycle pre-gate (all stages) ─────────────
@@ -4888,9 +4967,46 @@ class ConversationEngine:
                 evidence_class=EvidenceClass.DETERMINISTIC_EXTRACTED,
                 producer="ce:_is_acceptance", explicitness=Explicitness.IMPLIED,
                 temporality=temporality, modality=modality, cycle_id=cycle_id).with_id())
+        # ── L4.7W3-F1: the semantic stance is evidence too ───────────────────
+        # Wild W3: "Bueno dale avancemos" arrived in a burst that also asked an FAQ.
+        # `_is_acceptance` requires the turn to be acceptance THROUGHOUT, so it returned
+        # False and C3B logged stance=None for a turn where the customer plainly said yes.
+        # The interpreter had it right. It now contributes its stance as a claim — and
+        # nothing more: every prerequisite (quote exists, delivered, same cycle, inputs
+        # unchanged, no conflicting evidence) still decides, and a HESITATE / FUTURE_INTENT
+        # / QUESTION_ONLY reading contributes no acceptance claim at all.
+        claims.extend(self._semantic_acceptance_claims(state, texts))
         decision = authorize_quote_acceptance(claims, self._commercial_state(ctx, state))
         self._record_authorization(ctx, decision, state)
         return decision
+
+    def _semantic_acceptance_claims(self, state, texts) -> list:
+        """Stance-bearing claims from this burst's TurnEvidence. Never a decision.
+
+        Reuses `claims_from_turn_evidence`, so the ACCEPT / REJECT / FUTURE_INTENT /
+        HESITATE distinctions and their polarity come from the projection that the corpus
+        already measures — no second stance interpreter, and no new model call.
+        """
+        evidence = self._semantic_turn_evidence()
+        if evidence is None:
+            return []
+        try:
+            from ..schemas.claims import ClaimType
+            from .claim_projection import claims_from_turn_evidence
+            revision_id = getattr(state, "current_revision_id", None)
+            projected = claims_from_turn_evidence(
+                evidence, texts=list(texts or ()),
+                cycle_id=self._reconciler_cycle_id(state),
+                revision_id=(revision_id if isinstance(revision_id, int) else None))
+            # Only the claim families the acceptance authorizer reasons about. A stance
+            # the projection did not produce (hesitation, a bare question) contributes
+            # nothing, which is the safe default rather than an absence to interpret.
+            wanted = {ClaimType.QUOTE_ACCEPTED, ClaimType.FUTURE_INTENT,
+                      ClaimType.SEARCHING_NOT_READY}
+            return [c for c in projected if c.claim_type in wanted]
+        except Exception as exc:      # a projection failure is no evidence, never a yes
+            logger.warning("L4.7W3-F1 semantic acceptance projection failed: %s", exc)
+            return []
 
     def _authorize_scheduling_progression(self, ctx: "_Context", state):
         from .acceptance_authorizer import authorize_scheduling_progression
@@ -5013,8 +5129,13 @@ class ConversationEngine:
                         (provider.timed_out if provider is not None else False))
         except Exception:
             pass
-        return [SchedulingRequest(day_iso=b.resolved_date, time_str=b.time)
-                for b in decision.branches if b.resolved_date]
+        requests = [SchedulingRequest(day_iso=b.resolved_date, time_str=b.time)
+                    for b in decision.branches if b.resolved_date]
+        # L4.7W3-F1: record that this turn asked about availability, so the FAQ layer can
+        # tell "what do you have tomorrow?" from "what are your opening hours?".
+        if requests:
+            self._turn_scheduling_requested = True
+        return requests
 
     # ── L4.7D — canonical response validation ────────────────────────────────
 
@@ -6289,6 +6410,13 @@ class ConversationEngine:
             # "el primero" refer to what the user actually sees, not a hidden subset.
             shown = filtered
             state.last_visible_slots = json.dumps(shown)
+            # L4.7W3-F1: same owner decision as the day path — a bounded period with real
+            # availability opens the Flow rather than reciting the times.
+            _flow_out = self._dispatch_booking_flow_for_day(
+                ctx, state, day_iso=str(state.active_requested_date),
+                date_human=date_human, slots=shown, period_label=period_label)
+            if _flow_out is not None:
+                return _flow_out
             if len(shown) >= 2:
                 slot_list = ", ".join(shown[:-1]) + f" o {shown[-1]}"
             else:
@@ -6302,6 +6430,57 @@ class ConversationEngine:
             )
         sent_id = self._send_text_to_wa(ctx, msg)
         return _out("replied", wa_message_id=sent_id)
+
+    def _dispatch_booking_flow_for_day(self, ctx, state, *, day_iso: str, date_human: str,
+                                       slots: list, period_label: str | None = None):
+        """Open the Booking Flow as the slot picker. Returns None to fall back to text.
+
+        The Flow is offered ONLY when ScheduleService returned at least one valid slot for
+        the requested day/period: an empty Flow would be a dead end, and inventing a slot
+        to fill it would be worse. Opening the Flow is not a booking — BookingFlowService
+        still revalidates and owns the atomic write, and the booked revision is still
+        produced by the Flow-response handler alone. Nothing here writes booking state.
+        """
+        if not slots:
+            return None
+        booking_flow_id = (getattr(self.settings, "booking_flow_id", "") or "").strip()
+        if not booking_flow_id:
+            return None
+        # A booking picker is a commercial step, not a calendar widget. It opens only when
+        # the same authorizer that governs every other scheduling progression says so —
+        # a delivered quote, in this cycle, with unchanged inputs. Without this a bare
+        # "¿qué tenés mañana?" before any quote would open a booking Flow.
+        if self._acceptance_authority_on():
+            progression = self._authorize_scheduling_progression(ctx, state)
+            if progression is not None and not progression.allows:
+                logger.info(
+                    "L4.7W3-F1 FLOW-FIRST withheld thread_id=%s reason=%s",
+                    getattr(ctx.thread, "id", None), getattr(progression, "reason", "?"))
+                return None
+        # Availability is ScheduleService's word, recorded as REQUESTED-day + AVAILABLE
+        # slots. Neither is a booking, and neither is asserted as one to the customer.
+        state.active_requested_date = day_iso
+        state.last_visible_slots = json.dumps(list(slots))
+        self.db.commit()
+        window = f" por la {period_label}" if period_label else ""
+        prefix = (f"Para {date_human}{window} tengo {len(slots)} "
+                  f"{'horario disponible' if len(slots) == 1 else 'horarios disponibles'}. "
+                  "Elegí el que te sirva y confirmá el turno acá:")
+        try:
+            out = self._send_booking_flow(ctx, state, booking_flow_id, body_prefix=prefix)
+        except OutboundBlockedError:
+            raise
+        except Exception as exc:
+            logger.warning("L4.7W3-F1 booking flow dispatch failed thread_id=%s: %s",
+                           getattr(ctx.thread, "id", None), exc)
+            return None
+        if out is not None:
+            self._decision_log(ctx, "booking_flow_offered", source="flow_first_day_request",
+                               day=day_iso, period=(period_label or "-"), slots=len(slots))
+            logger.info(
+                "L4.7W3-F1 FLOW-FIRST thread_id=%s day=%s period=%s slots=%d dispatched",
+                getattr(ctx.thread, "id", None), day_iso, period_label or "-", len(slots))
+        return out
 
     # ── Day-only request: user gives a day but no time ────────────────────
 
@@ -6364,6 +6543,18 @@ class ConversationEngine:
             shown = display_slots  # show all filtered; period filter already limits scope
             state.last_visible_slots = json.dumps(shown)
             slot_list = ", ".join(shown[:-1]) + f" o {shown[-1]}" if len(shown) >= 2 else shown[0]
+            # ── L4.7W3-F1 FLOW-FIRST (owner decision) ────────────────────────
+            # A day request with real availability opens the Booking Flow as the slot
+            # picker instead of reciting five times in prose. Wild W3 answered
+            # "¿Qué tenés mañana?" with a sentence full of times and a question — a picker
+            # rendered as text. The slots handed to the Flow are exactly what
+            # ScheduleService approved for this candidate, location and cycle: opening the
+            # Flow shows availability, it does not book anything.
+            flow_out = self._dispatch_booking_flow_for_day(
+                ctx, state, day_iso=day_iso, date_human=date_human,
+                slots=shown, period_label=period_label)
+            if flow_out is not None:
+                return flow_out
             if period_label:
                 msg = f"Para {date_human} por la {period_label} tengo: {slot_list}. ¿A qué hora te viene bien?"
             else:

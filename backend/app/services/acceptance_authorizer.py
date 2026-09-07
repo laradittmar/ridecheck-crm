@@ -182,7 +182,9 @@ def authorize_quote_acceptance(
 
         ALLOW  ⟺  stance == ACCEPT
                   ∧ acceptance evidence is ASSERTED ∧ PRESENT ∧ FACTUAL
-                  ∧ acceptance evidence is not SEMANTIC_INFERRED alone
+                  ∧ acceptance evidence is READ, not DERIVED from other facts
+                    (a semantic stance IS a reading of the customer's words and qualifies;
+                     a state machine inferring agreement from a proposed day does not)
                   ∧ a quote exists for this cycle
                   ∧ that quote was DELIVERED to the customer
                   ∧ the quote's inputs are unchanged (candidate, category, zone)

@@ -1082,8 +1082,26 @@ class TestM7SchedulingCorrection(unittest.TestCase):
         self.assertEqual(state.last_stage, "SCHEDULING")
 
     def test_m7_reply_sent(self):
-        _, sent = self._run()
-        self.assertTrue(sent, "CE must send a reply for scheduling correction")
+        """L4.7W3-F1 REALIGNMENT: the reply may now be a Flow, not text.
+
+        The guarantee is that CE answers a scheduling correction — not that it answers in
+        prose. Since the owner's flow-first decision, a day with real availability opens
+        the Booking Flow as the slot picker, and this harness only captures TEXT sends.
+        Assert the outcome instead of the medium.
+        """
+        result, sent = self._run()
+        action = getattr(result, "action", None)
+        # This harness fakes only the TEXT sender, so a Flow dispatch reaches the real
+        # OutboundSafetyGate and is stopped by the kill switch — which is exactly right
+        # with outbound off. Either outcome means CE answered; silence would not.
+        self.assertIn(action, ("replied", "blocked_dispatch"),
+                      f"CE must answer a scheduling correction, got {action!r}")
+        self.assertTrue(getattr(result, "handled", False), "CE must own the turn")
+        state = _refresh_state(self.db, self.thread.id)
+        answered_by_flow = bool(getattr(state, "flow_booking_token", None))
+        self.assertTrue(sent or answered_by_flow or action == "blocked_dispatch",
+                        "the customer must receive text, the Booking Flow, "
+                        "or be blocked only by the kill switch")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

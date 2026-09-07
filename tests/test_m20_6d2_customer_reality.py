@@ -2561,23 +2561,28 @@ class TestRC29FullSlotVisibility(unittest.TestCase):
         self.assertTrue(blocked, "A reply must be sent")
         reply = blocked[0]
 
-        # All 9 slots must appear — none should be hidden
+        # L4.7W3-F1 REALIGNMENT — the GUARANTEE is unchanged, the MEDIUM changed.
+        # Owner decision: a day request with real availability opens the Booking Flow as
+        # the slot picker instead of reciting the times in prose. RC29 exists to prove
+        # that NO SLOT IS HIDDEN, and that is still asserted — on the slot set handed to
+        # the customer, which is now carried by the Flow rather than by the sentence.
+        import json as _json
+        visible = _json.loads(self.state.last_visible_slots or "[]")
+
+        # All 9 slots must be offered — none should be hidden
         for slot in _SATURDAY_SLOTS:
-            self.assertIn(slot, reply,
-                          f"Slot {slot} must appear in reply. Got: {reply!r}")
+            self.assertIn(slot, visible,
+                          f"Slot {slot} must be offered. Got: {visible!r}")
 
         # 13:00–14:00 specifically must NOT be hidden
         for slot in ("13:00", "13:30", "14:00"):
-            self.assertIn(slot, reply,
-                          f"Afternoon slot {slot} was hidden — must be visible. Got: {reply!r}")
+            self.assertIn(slot, visible,
+                          f"Afternoon slot {slot} was hidden — must be offered. Got: {visible!r}")
 
-        # Reply uses the full slot list
-        self.assertIn(_SATURDAY_SLOT_LIST, reply,
-                      f"Full slot list not in reply.\n  WANT: {_SATURDAY_SLOT_LIST!r}\n  GOT:  {reply!r}")
-
-        # Ends with scheduling question
-        self.assertIn("¿A qué hora", reply,
-                      f"Reply must ask for time preference. Got: {reply!r}")
+        # And the customer is still asked to choose, without a prose slot dump
+        self.assertTrue(reply, "A reply must still be produced")
+        self.assertNotIn(_SATURDAY_SLOT_LIST, reply,
+                         "flow-first: the slot list must not be recited in prose")
 
         # Slots stored for follow-up
         self.assertIsNotNone(self.state.last_offered_slots,
