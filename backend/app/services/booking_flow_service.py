@@ -37,7 +37,9 @@ from ..models import (
     WhatsAppThreadCandidate,
     WhatsAppThreadState,
 )
+from ..repositories.pricing_repository import PricingRepository
 from ..schemas.schedule import ScheduleCheckIn
+from ..services.pricing import PricingService
 from ..services.schedule import ScheduleService
 
 logger = logging.getLogger(__name__)
@@ -216,6 +218,10 @@ class BookingFlowService:
     def __init__(self, db: Session):
         self.db = db
         self._sched = ScheduleService(db)
+        # The SAME pricing authority the conversation used to produce the accepted quote.
+        # Booking must not own a second one: a booking that prices itself is a booking that
+        # can disagree with what the customer was told.
+        self._pricing = PricingService(repository=PricingRepository())
 
     # ── Context resolution ────────────────────────────────────────────────────
 
@@ -628,6 +634,50 @@ class BookingFlowService:
         self.db.add(crm_rev)
         self.db.flush()
 
+        # ── L4.7W4-F3: preserve the accepted commercial quote ──────────────────
+        # W4-F2 produced a correct booking with "Total presupuestado: -": the Revision was
+        # created without precio_base/viaticos/precio_total, so the price the customer had
+        # already accepted existed nowhere in the CRM.
+        #
+        # The quote has no stored identity — it is a deterministic function of
+        # (tipo_vehiculo, zone_group, zone_detail) over the pricing catalog, and the
+        # Revision persists all three beside the price. So the quote identity IS those
+        # inputs, and stamping from them through the same PricingService reproduces the
+        # accepted amount exactly rather than inventing or re-estimating one.
+        #
+        # The inputs are read from the live cycle-bounded focus candidate (resolve_context),
+        # which is the same candidate CE priced. The check below is defence in depth: if the
+        # Revision were ever built from something other than that candidate, the price must
+        # not be written at all rather than written from mismatched commercial inputs.
+        price_inputs_ok = candidate is not None and (
+            crm_rev.tipo_vehiculo == candidate.tipo_vehiculo
+            and crm_rev.zone_group == zone_group
+            and crm_rev.zone_detail == zone_detail
+        )
+        if not price_inputs_ok:
+            _log_event(
+                self.db, ctx.thread.id, "BOOKING_PRICE_INPUT_MISMATCH",
+                booking_token=booking_token,
+                extra={"crm_rev_id": crm_rev.id,
+                       "rev_tipo": crm_rev.tipo_vehiculo,
+                       "rev_zone_group": crm_rev.zone_group,
+                       "rev_zone_detail": crm_rev.zone_detail},
+            )
+        else:
+            self._pricing.recalculate_revision_if_possible(db=self.db, revision=crm_rev)
+            if crm_rev.precio_total is None:
+                # Priceable inputs that the catalog cannot price is a real commercial gap,
+                # not a silent "-". Recorded so it is visible without reading the booking.
+                _log_event(
+                    self.db, ctx.thread.id, "BOOKING_PRICE_UNRESOLVED",
+                    booking_token=booking_token,
+                    extra={"crm_rev_id": crm_rev.id,
+                           "tipo_vehiculo": crm_rev.tipo_vehiculo,
+                           "zone_group": crm_rev.zone_group,
+                           "zone_detail": crm_rev.zone_detail},
+                )
+            self.db.flush()
+
         # Lead state
         lead = ctx.lead
         lead.estado = "COORDINAR_DISPONIBILIDAD"
@@ -655,6 +705,7 @@ class BookingFlowService:
                 "crm_rev_id": crm_rev.id,
                 "date": date_str,
                 "time": time_str,
+                "precio_total": crm_rev.precio_total,
             },
         )
 

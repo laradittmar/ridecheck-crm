@@ -213,6 +213,7 @@ class OutboundSafetyGate:
         kill_result = self._check_kill_switch(
             wa_id=wa_id, thread_id=thread_id, text=text, fp=fp,
             message_type=message_type, now=now,
+            path_id=path_id, deployment_id=deployment_id,
         )
         if kill_result is not None:
             return kill_result
@@ -227,6 +228,7 @@ class OutboundSafetyGate:
             flood_result = self._check_flood(
                 gate_db, wa_id=wa_id, thread_id=thread_id,
                 now=now, text=text, fp=fp, message_type=message_type,
+                path_id=path_id, deployment_id=deployment_id,
             )
             if flood_result is not None:
                 return flood_result  # gate_db already committed inside _check_flood
@@ -236,6 +238,7 @@ class OutboundSafetyGate:
                 gate_db, wa_id=wa_id, thread_id=thread_id,
                 fp=fp, message_type=message_type, now=now, text_content=text,
                 causal_inbound_wa_message_id=causal_inbound_wa_message_id,
+                path_id=path_id, deployment_id=deployment_id,
             )
             if dedup_result is not None:
                 return dedup_result  # gate_db already committed inside _check_dedup
@@ -455,6 +458,7 @@ class OutboundSafetyGate:
     def _check_kill_switch(
         self, wa_id: str, thread_id: int, text: str, fp: str,
         message_type: str, now: datetime,
+        path_id: Optional[str] = None, deployment_id: Optional[str] = None,
     ) -> Optional[GateResult]:
         """Return a blocked result when OUTBOUND_ENABLED != 'true', else None.
 
@@ -478,6 +482,10 @@ class OutboundSafetyGate:
                 automated=True,
                 content_fingerprint=fp,
                 blocked_reason=reason,
+                # L4.7W4-F3: a block is still an attempt — keep its attribution so
+                # Control shows "BOOKING_FLOW — BLOCKED", not a blank row.
+                path_id=path_id,
+                deployment_id=deployment_id,
             )
             _audit.add(_blocked)
             _audit.flush()
@@ -502,6 +510,8 @@ class OutboundSafetyGate:
         text: str,
         fp: str,
         message_type: str,
+        path_id: Optional[str] = None,
+        deployment_id: Optional[str] = None,
     ) -> Optional[GateResult]:
         """Count distinct dedup slots in the rolling flood window.
 
@@ -536,6 +546,9 @@ class OutboundSafetyGate:
             automated=True,
             content_fingerprint=fp,
             blocked_reason=reason,
+            # L4.7W4-F3: see above — blocked attempts keep the attempted path.
+            path_id=path_id,
+            deployment_id=deployment_id,
         )
         db.add(blocked)
 
@@ -576,6 +589,8 @@ class OutboundSafetyGate:
         now: datetime,
         text_content: str,
         causal_inbound_wa_message_id: Optional[str] = None,
+        path_id: Optional[str] = None,
+        deployment_id: Optional[str] = None,
     ) -> Optional[GateResult]:
         """Rolling-window dedup check.
 
@@ -619,6 +634,9 @@ class OutboundSafetyGate:
             automated=True,
             content_fingerprint=fp,
             blocked_reason=reason,
+            # L4.7W4-F3: see above — blocked attempts keep the attempted path.
+            path_id=path_id,
+            deployment_id=deployment_id,
         )
         db.add(blocked)
         db.flush()

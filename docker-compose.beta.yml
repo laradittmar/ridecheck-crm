@@ -84,7 +84,9 @@ services:
       WHATSAPP_BOOKING_FLOW_ID: "28104222025943520"
       # L4.3 Phase F: real deployment attribution in the outbound ledger
       # (was persisted as 'unknown' during Wild A — finding FOR-01).
-      GIT_SHA: "${GIT_SHA:-d5f89b3}"
+      # L4.7W4-F3: deliberately NOT set here. compose `environment:` overrides the
+      # image ENV, so any value here — including a stale default — would win over
+      # the SHA the image was actually built from. The image is the authority.
     volumes:
       - /opt/ridecheck-secrets:/run/secrets:ro
       - /opt/ridecheck-crm-forensics:/run/forensics
