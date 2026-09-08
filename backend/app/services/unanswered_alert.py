@@ -132,6 +132,69 @@ def reset_unanswered_alert(db: Session, thread_id: int) -> None:
     db.execute(_RESET_ALERT_SQL, {"thread_id": thread_id})
 
 
+
+# OPS-AUDIO-TRANSCRIPTION-RESILIENCE — the gap that hid three lost voice notes.
+#
+# The per-turn SLA check above can only see events CE has already touched: it requires
+# reply_required AND alert_eligible, and those flags are written by ConversationEngine.
+# On 2026-09-08 the n8n workflow died at the transcription node, so CE was never invoked,
+# the flags stayed NULL, and three customer messages were invisible to alerting for hours —
+# discovered only because the owner asked why nobody had answered.
+#
+# `status='triggered'` is exactly the missing state: the backend accepted the message and
+# handed it to n8n, and nothing ever came back. No new table, no new process, no new
+# threshold machinery — the same loop, the same de-duplication column.
+STALLED_TRANSPORT_THRESHOLD_SECONDS = 180
+
+
+def _check_forwarded_but_unfinished(db: Session) -> list[int]:
+    """Alert on inbound events forwarded to n8n that CE never completed.
+
+    Returns the event ids alerted on. Message content is never logged — thread id,
+    wa_message_id and the stalled stage are enough to find the execution in n8n.
+    """
+    try:
+        rows = db.execute(
+            text(
+                f"""
+                SELECT ae.id AS event_id, ae.thread_id, ae.wa_message_id, wc.wa_id
+                FROM ai_events ae
+                JOIN whatsapp_threads wt ON wt.id = ae.thread_id
+                JOIN whatsapp_contacts wc ON wc.id = wt.contact_id
+                WHERE
+                    ae.status = 'triggered'
+                    AND ae.unanswered_alert_sent_at IS NULL
+                    AND ae.created_at < NOW() - INTERVAL '{STALLED_TRANSPORT_THRESHOLD_SECONDS} seconds'
+                    AND wc.wa_id NOT IN (SELECT phone FROM excluded_phones)
+                ORDER BY ae.id
+                """
+            )
+        ).fetchall()
+    except Exception:
+        logger.exception("stalled_transport check query failed")
+        return []
+
+    alerted: list[int] = []
+    for row in rows:
+        try:
+            logger.error(
+                "STALLED_TRANSPORT event_id=%s thread_id=%s wa_message_id=%s "
+                "stage=forwarded_to_n8n_no_ce_completion age_threshold=%ds",
+                row.event_id, row.thread_id, row.wa_message_id,
+                STALLED_TRANSPORT_THRESHOLD_SECONDS,
+            )
+            db.execute(_MARK_EVENT_ALERTED_SQL, {"event_id": row.event_id})
+            db.commit()
+            alerted.append(int(row.event_id))
+        except Exception:
+            db.rollback()
+            logger.exception("stalled_transport alert failed event_id=%s", row.event_id)
+
+    if alerted:
+        logger.error("STALLED_TRANSPORT_SUMMARY count=%s event_ids=%s", len(alerted), alerted)
+    return alerted
+
+
 def _run_check() -> None:
     db = SessionLocal()
     try:
@@ -167,6 +230,8 @@ def _run_check() -> None:
             _ALERT_THRESHOLD_SECONDS,
             event_ids if event_ids else "none",
         )
+
+        _check_forwarded_but_unfinished(db)
 
         for row in event_rows:
             event_id: int = row.event_id

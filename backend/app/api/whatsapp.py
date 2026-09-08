@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import mimetypes
+import time as _time
 from datetime import datetime, timezone
 from urllib import error, request as urlrequest
 from uuid import uuid4
@@ -168,6 +170,43 @@ def _guess_media_filename(media_id: str, mime_type: str | None) -> str:
     return f"{media_id}{extension}"
 
 
+logger = logging.getLogger(__name__)
+
+# Bounded: 3 attempts total. A customer is waiting on the other end of this call, and an
+# upstream that is still failing on the third try is not going to be rescued by a fourth.
+TRANSCRIPTION_MAX_ATTEMPTS = 3
+TRANSCRIPTION_BACKOFF_SECONDS = (0.5, 1.5)
+
+# Permanent conditions retry cannot repair — an exhausted balance, a revoked key, a payload
+# the API refuses. Everything else (5xx, true rate limiting, transport) is worth one more try.
+_PERMANENT_TRANSCRIPTION_CODES = frozenset({
+    "insufficient_quota", "credit_balance_exhausted", "invalid_api_key",
+    "account_deactivated", "billing_hard_limit_reached",
+})
+
+
+def _classify_transcription_error(http_code: int, body: str) -> tuple[str, str]:
+    """Return (kind, code) where kind is 'permanent' or 'transient'.
+
+    A 429 is ambiguous and must be read, not assumed: real rate limiting clears on its own,
+    while `insufficient_quota` never does. Treating them alike is what turned an unpaid
+    OpenAI balance into what looked like a transport outage.
+    """
+    code = ""
+    try:
+        err = json.loads(body or "{}").get("error") or {}
+        code = str(err.get("code") or err.get("type") or "")
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        code = ""
+    if code in _PERMANENT_TRANSCRIPTION_CODES:
+        return "permanent", code
+    if http_code in (401, 403):
+        return "permanent", code or f"http_{http_code}"
+    if http_code == 429 or http_code >= 500:
+        return "transient", code or f"http_{http_code}"
+    return "permanent", code or f"http_{http_code}"
+
+
 def _transcribe_audio_bytes(media_id: str, audio_bytes: bytes, mime_type: str | None) -> str:
     api_key = _require_openai_api_key()
     boundary = f"----CodexBoundary{uuid4().hex}"
@@ -197,14 +236,55 @@ def _transcribe_audio_bytes(media_id: str, audio_bytes: bytes, mime_type: str | 
             "Content-Length": str(len(body)),
         },
     )
-    try:
-        with urlrequest.urlopen(req, timeout=60) as resp:
-            response_body = resp.read().decode("utf-8", errors="replace")
-    except error.HTTPError as exc:
-        err_body = exc.read().decode("utf-8", errors="replace")
-        raise HTTPException(status_code=502, detail=f"OpenAI transcription failed: HTTP {exc.code}: {err_body}") from exc
-    except error.URLError as exc:
-        raise HTTPException(status_code=502, detail=f"OpenAI transcription failed: {exc.reason}") from exc
+    # OPS-AUDIO-TRANSCRIPTION-RESILIENCE: three owner voice notes were lost on 2026-09-08
+    # because a single upstream failure ended the n8n workflow before ConversationEngine was
+    # ever reached. Two separate defects were involved and both are fixed here:
+    #
+    #   1. no retry at all — one blip killed the customer turn;
+    #   2. every upstream failure was reported as a bare 502, so an OpenAI 429
+    #      "credit_balance_exhausted" was indistinguishable from a transient gateway error.
+    #      That masking is what sent the first investigation after a non-existent n8n wedge.
+    #
+    # Retrying an exhausted credit balance or a bad key is pointless and only delays the
+    # customer, so retries are limited to genuinely transient conditions.
+    response_body = ""
+    last_exc: Exception | None = None
+    for attempt in range(TRANSCRIPTION_MAX_ATTEMPTS):
+        try:
+            with urlrequest.urlopen(req, timeout=60) as resp:
+                response_body = resp.read().decode("utf-8", errors="replace")
+            break
+        except error.HTTPError as exc:
+            err_body = exc.read().decode("utf-8", errors="replace")
+            kind, code = _classify_transcription_error(exc.code, err_body)
+            last_exc = exc
+            if kind == "permanent" or attempt == TRANSCRIPTION_MAX_ATTEMPTS - 1:
+                logger.error(
+                    "TRANSCRIPTION_FAILED media_id=%s attempt=%s/%s http=%s kind=%s code=%s",
+                    media_id, attempt + 1, TRANSCRIPTION_MAX_ATTEMPTS, exc.code, kind, code,
+                )
+                raise HTTPException(
+                    status_code=502,
+                    detail=(f"OpenAI transcription failed: HTTP {exc.code} "
+                            f"[{kind}/{code}]: {err_body}"),
+                ) from exc
+            logger.warning(
+                "TRANSCRIPTION_RETRY media_id=%s attempt=%s/%s http=%s code=%s",
+                media_id, attempt + 1, TRANSCRIPTION_MAX_ATTEMPTS, exc.code, code,
+            )
+        except error.URLError as exc:
+            last_exc = exc
+            if attempt == TRANSCRIPTION_MAX_ATTEMPTS - 1:
+                logger.error("TRANSCRIPTION_FAILED media_id=%s attempt=%s/%s transport=%s",
+                             media_id, attempt + 1, TRANSCRIPTION_MAX_ATTEMPTS, exc.reason)
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"OpenAI transcription failed: [transient/transport]: {exc.reason}",
+                ) from exc
+            logger.warning("TRANSCRIPTION_RETRY media_id=%s attempt=%s/%s transport=%s",
+                           media_id, attempt + 1, TRANSCRIPTION_MAX_ATTEMPTS, exc.reason)
+        _time.sleep(TRANSCRIPTION_BACKOFF_SECONDS[
+            min(attempt, len(TRANSCRIPTION_BACKOFF_SECONDS) - 1)])
 
     try:
         payload = json.loads(response_body) if response_body.strip() else {}
