@@ -146,6 +146,17 @@ def reset_unanswered_alert(db: Session, thread_id: int) -> None:
 # threshold machinery — the same loop, the same de-duplication column.
 STALLED_TRANSPORT_THRESHOLD_SECONDS = 180
 
+# L4.7W5-F1: the first version of this check alerted on ANY event left at 'triggered', and
+# immediately produced false positives on a real 3-message burst. n8n debounces a burst for
+# ~20 s and calls CE once, with the LAST message: the earlier events stay 'triggered' for
+# ever, by design, and were answered perfectly well. "Old and triggered" is not "stalled".
+#
+# An event is explained — not stalled — when a LATER event on the same thread reached CE
+# within the debounce window. The window is generous against the 20 s debounce so that a
+# slow burst is still recognised as a burst, and short enough that a genuine failure an hour
+# later is never excused by an unrelated conversation.
+DEBOUNCE_SUCCESSOR_WINDOW_SECONDS = 120
+
 
 def _check_forwarded_but_unfinished(db: Session) -> list[int]:
     """Alert on inbound events forwarded to n8n that CE never completed.
@@ -166,6 +177,17 @@ def _check_forwarded_but_unfinished(db: Session) -> list[int]:
                     AND ae.unanswered_alert_sent_at IS NULL
                     AND ae.created_at < NOW() - INTERVAL '{STALLED_TRANSPORT_THRESHOLD_SECONDS} seconds'
                     AND wc.wa_id NOT IN (SELECT phone FROM excluded_phones)
+                    -- a later event on the same thread that DID reach CE inside the
+                    -- debounce window explains this one: it was aggregated, not lost.
+                    AND NOT EXISTS (
+                        SELECT 1 FROM ai_events later
+                        WHERE later.thread_id = ae.thread_id
+                          AND later.id > ae.id
+                          AND later.status = 'processed'
+                          AND later.created_at >= ae.created_at
+                          AND later.created_at <= ae.created_at
+                              + INTERVAL '{DEBOUNCE_SUCCESSOR_WINDOW_SECONDS} seconds'
+                    )
                 ORDER BY ae.id
                 """
             )
