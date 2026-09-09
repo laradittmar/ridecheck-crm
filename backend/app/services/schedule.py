@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import unicodedata
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
@@ -31,6 +32,23 @@ ZERO_MELO = "Melo y Panamericana"
 # CANCELADO: appointment cancelled.
 # REPROGRAMAR: appointment to be rescheduled (slot effectively vacated).
 _NON_OCCUPYING_ESTADOS: frozenset[str] = frozenset({"CANCELADO", "REPROGRAMAR"})
+
+
+# L4.7W5-F2: the forward-search horizon deliberately matches the Booking Flow date picker
+# (BOOKING_HORIZON_DAYS in booking_flow_service). Offering an earliest date the Flow cannot
+# then display would be a dead end, so the two are kept equal and a test asserts it.
+logger = logging.getLogger(__name__)
+
+NEXT_AVAILABLE_HORIZON_DAYS = 14
+
+
+@dataclass(frozen=True)
+class NextAvailable:
+    """Result of a bounded forward search: the first day that actually has capacity."""
+    day: date
+    slots: list[str]
+    days_checked: int
+    skipped: list[tuple[str, str]]
 
 
 @dataclass(frozen=True)
@@ -284,6 +302,63 @@ class ScheduleService:
             )
 
         return sorted(appointments, key=lambda item: (item.time, item.source, item.address))
+
+    def find_next_available(
+        self,
+        *,
+        zone_group: str | None,
+        zone_detail: str | None,
+        start_day: date,
+        horizon_days: int = NEXT_AVAILABLE_HORIZON_DAYS,
+        exclude_revision_id: int | None = None,
+    ) -> "NextAvailable | None":
+        """First day from `start_day` with at least one valid slot for this zone.
+
+        L4.7W5-F2. During the complete Wild the customer said "decime vos cuando pueden"
+        and the system asked them to name another day — twice — because every scheduling
+        handler required a customer-named date. The information was one query away:
+        Berazategui had nothing on Thursday or Friday and two slots on Saturday.
+
+        Availability is asked of this service exactly as a named day would ask it, so
+        travel validity, occupancy, business hours and Sunday closure all apply unchanged.
+        Nothing here relaxes a rule to find an earlier answer; it only searches in order.
+        """
+        from ..schemas.schedule import ScheduleCheckIn
+
+        address = ", ".join(
+            part for part in (zone_detail, zone_group, "Buenos Aires, Argentina") if part
+        )
+        skipped: list[tuple[str, str]] = []
+        checked = 0
+
+        for offset in range(max(0, int(horizon_days))):
+            day = start_day + timedelta(days=offset)
+            checked += 1
+            hours = self._business_hours(day, False)
+            if hours.closed:
+                skipped.append((day.isoformat(), "closed"))
+                continue
+            try:
+                out = self.list_slots(ScheduleCheckIn(
+                    preferred_day=day,
+                    preferred_time=hours.start,
+                    address=address or "-",
+                    zone_group=zone_group,
+                    zone_detail=zone_detail,
+                    exclude_revision_id=exclude_revision_id,
+                    is_holiday=False,
+                ))
+            except Exception as exc:                # a failing day is not an available day
+                logger.warning("NEXT_AVAILABLE day=%s failed: %s", day, exc)
+                skipped.append((day.isoformat(), "error"))
+                continue
+            slots = sorted(s for s in (out.slots or []) if isinstance(s, str))
+            if slots:
+                return NextAvailable(day=day, slots=slots, days_checked=checked,
+                                     skipped=skipped)
+            skipped.append((day.isoformat(), "no_valid_slot"))
+
+        return None
 
     def _load_occupied_slots(
         self,

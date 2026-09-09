@@ -56,7 +56,7 @@ from ..schemas.conversation import (
 )
 from ..schemas.schedule import ScheduleCheckIn
 from ..services.pricing import PricingNotFoundError, PricingQuote, PricingService
-from ..services.schedule import ScheduleService
+from ..services.schedule import NEXT_AVAILABLE_HORIZON_DAYS, ScheduleService
 from ..services.unanswered_alert import reset_unanswered_alert
 from ..services.vehicle_catalog import (
     VehicleMatch, lookup_vehicle, fuzzy_lookup_vehicle, FuzzyLookupResult,
@@ -1153,6 +1153,58 @@ def _extract_year_from_text(text: str, exclude_token: str | None = None) -> int 
 
 # Phrases that indicate the customer is insisting on an unavailable slot or
 # rejecting all alternatives — triggers human handoff.
+# ── L4.7W5-F2: delegated / earliest scheduling intent ─────────────────────────
+#
+# Every scheduling handler required a customer-named day. During the complete Wild the
+# customer said "decime vos cuando pueden" and then "que sea lo antes posible porque me lo
+# venden", and the system answered by asking them to name another day — twice — while
+# Saturday sat free two days later. Delegating the choice is an ordinary thing for a
+# customer to do, and under time pressure it is the likeliest thing.
+#
+# These express two related meanings: the customer has handed the date choice to us, and/or
+# wants the earliest thing available. Either one triggers the same deterministic forward
+# search. Neither authorises a booking.
+_NEXT_AVAILABLE_PATTERNS: tuple[str, ...] = (
+    # delegated choice — "you tell me", "whenever you can/have"
+    r"\bdecime\s+(vos\s+)?cu[aá]ndo\b",
+    r"\bdec[ií](me|nos)\b[^.]{0,20}\bcu[aá]ndo\b",
+    r"\bcuando\s+(puedan|puedas|pueden|tengan|tengas|les\s+quede)\b",
+    r"\bcuando\s+(a\s+)?(ustedes|vos)\s+(les|te)\s+(sirva|quede|venga)\b",
+    r"\bel(ig[ií]|eg[ií])\w*\s+(vos|ustedes)\b",
+    r"\bfij[aá]\w*\s+(vos|ustedes)\b",
+    r"\bcomo\s+(a\s+)?(ustedes|vos)\s+les?\s+quede\b",
+    # earliest availability
+    r"\blo\s+antes\s+(posible|que\s+se\s+pueda)\b",
+    r"\bcuanto\s+antes\b",
+    r"\b(el\s+)?primer(o|a)?\s+(turno|horario|d[ií]a)\b",
+    r"\blo\s+primero\s+(que\s+(haya|tengan)|disponible)\b",
+    r"\bqu[eé]\s+es\s+lo\s+primero\s+disponible\b",
+    r"\bcu[aá]ndo\s+tienen\s+algo\b",
+    r"\bm[aá]s\s+cercano\b",
+    r"\bbusc[aá](me|nos)\b[^.]{0,25}\bantes\b",
+    r"\bme\s+sirve\s+(el\s+)?(primer|cualquier)\b",
+    r"\bcualquier\s+(horario|d[ií]a)\b",
+)
+
+# Urgency is a REASON, not a permission. It changes only the ordering objective — earliest
+# valid slot first — and never relaxes travel rules, occupancy, hours or revalidation.
+_URGENCY_PATTERNS: tuple[str, ...] = (
+    r"\burgente\b", r"\bme\s+lo\s+venden\b", r"\bme\s+lo\s+est[aá]n\s+por\s+vender\b",
+    r"\blo\s+necesito\s+(ya|hoy|urgente)\b", r"\bapur\w+\b", r"\bcorriendo\b",
+    r"\bpierdo\s+(el|la)\b", r"\bno\s+puedo\s+esperar\b",
+)
+
+# Dissatisfaction with what automation could actually offer. Only meaningful AFTER an
+# earliest option has been produced — before that it is just urgency.
+_EARLIEST_REJECTED_PATTERNS: tuple[str, ...] = (
+    r"\bes\s+muy\s+tarde\b", r"\bmuy\s+tarde\b", r"\bnecesito\s+antes\b",
+    r"\bno\s+me\s+sirve\b", r"\beso\s+no\s+me\s+sirve\b",
+    r"\bno\s+hay\s+(algo|nada)\s+antes\b", r"\balgo\s+antes\b",
+    r"\bm[aá]s\s+temprano\b", r"\bnecesito\s+resolver(lo)?\s+ya\b",
+    r"\bma[nñ]ana\s+ya\s+es\s+tarde\b", r"\blo\s+necesito\s+hoy\b",
+)
+
+
 _ESCALATION_KEYWORDS: frozenset[str] = frozenset({
     "solo puedo",
     "necesito a las",
@@ -3013,7 +3065,14 @@ class ConversationEngine:
         )
         _burst_db_texts = [m.text for m in _burst_msgs if m.text is not None]
         # Capture burst count and earliest inbound message for telemetry
-        self._burst_message_count = len(_burst_msgs) if _burst_msgs else 1
+        # L4.7W5-F2: _fetch_burst_messages returns [] on a thread's FIRST turn (no previous
+        # cursor to bound the range), so a 3-voice-note opening burst was recorded as 1.
+        # Telemetry only — the evidence list already held all three, which is why all three
+        # questions were answered — but a burst counter that reads 1 on the very burst an
+        # audit is examining is worse than no counter.
+        self._burst_message_count = (
+            len(_burst_msgs) if _burst_msgs else max(1, len(_current_evidence))
+        )
         self._burst_earliest_inbound_db_id = _burst_msgs[0].id if _burst_msgs else None
         _existing_evidence_set = set(_current_evidence)
         _missing_burst = [t for t in _burst_db_texts if t not in _existing_evidence_set]
@@ -3215,7 +3274,8 @@ class ConversationEngine:
                     "M18 QUOTED day-only proposal thread_id=%s day=%s",
                     ctx.thread.id, sched_day_iso,
                 )
-                return self._handle_day_only_request(ctx, state, sched_day_iso, period=period)
+                return self._handle_day_only_request(ctx, state, sched_day_iso,
+                                                     period=period, texts=ai_input_messages)
 
         # ── Flow-failure: user can't open the WhatsApp Flow form ────────────
         if state.flow_booking_token and _is_flow_failure(ai_input_messages):
@@ -3227,6 +3287,19 @@ class ConversationEngine:
             and not state.needs_human
             and not state.flow_booking_token
         ):
+            # 1a. L4.7W5-F2 — the earliest option we could actually offer does not solve
+            #     the customer's problem. Preconditions matter: this only counts once an
+            #     option has been produced (a day is on the table), otherwise urgency alone
+            #     would escalate before automation had even tried. Continuing to trade dates
+            #     against capacity that does not exist is worse than handing to a human.
+            if (state.active_requested_date
+                    and self._earliest_option_rejected(ai_input_messages)):
+                logger.info(
+                    "L4.7W5-F2 EARLIEST_REJECTED thread_id=%s offered=%s — human handoff",
+                    ctx.thread.id, state.active_requested_date)
+                return self._handle_scheduling_escalation(
+                    ctx, state, " ".join(ai_input_messages))
+
             # 1. Escalation: insistence on unavailable slot → human handoff
             if _should_escalate_scheduling_to_human(ai_input_messages, state):
                 return self._handle_scheduling_escalation(
@@ -3236,6 +3309,14 @@ class ConversationEngine:
             sched_day_iso, sched_time_str = _parse_scheduling_text(ai_input_messages, date.today())
             # Detect period once — used by both the period-only and day+period branches.
             period = _detect_time_period(ai_input_messages)
+
+            # 1b. L4.7W5-F2 — the customer delegated the date, or asked for the earliest
+            #     thing available. No day is named and none is needed: ScheduleService
+            #     searches forward and the Flow opens on the first day with capacity.
+            if not sched_day_iso and not sched_time_str:
+                forward = self._handle_next_available_request(ctx, state, ai_input_messages)
+                if forward is not None:
+                    return forward
 
             # 2. Period request: no explicit day/time in the message.
             #    Use active_requested_date (set by prior rejection) as the target date.
@@ -3334,7 +3415,8 @@ class ConversationEngine:
                     return result
             elif sched_day_iso and _pure_sched:
                 # Day only (or day + period like "mañana a la tarde") — list available slots.
-                return self._handle_day_only_request(ctx, state, sched_day_iso, period=period)
+                return self._handle_day_only_request(ctx, state, sched_day_iso,
+                                                     period=period, texts=ai_input_messages)
 
         # ── L4.7W2-F1: pending locality confirmation ──────────────────────
         # Runs before vehicle detection so an explicit new locality this turn wins, and
@@ -6676,12 +6758,101 @@ class ConversationEngine:
 
     # ── Day-only request: user gives a day but no time ────────────────────
 
+    # ── L4.7W5-F2 — delegated / earliest scheduling ──────────────────────────
+
+    @staticmethod
+    def _wants_next_available(texts: list[str]) -> bool:
+        """The customer handed us the date choice, or asked for the earliest thing."""
+        n = _norm_lower(" ".join(texts))
+        return any(re.search(pat, n) for pat in _NEXT_AVAILABLE_PATTERNS)
+
+    @staticmethod
+    def _urgency_signalled(texts: list[str]) -> bool:
+        n = _norm_lower(" ".join(texts))
+        return any(re.search(pat, n) for pat in _URGENCY_PATTERNS)
+
+    @staticmethod
+    def _earliest_option_rejected(texts: list[str]) -> bool:
+        """Customer says the option we produced does not solve their problem."""
+        n = _norm_lower(" ".join(texts))
+        return any(re.search(pat, n) for pat in _EARLIEST_REJECTED_PATTERNS)
+
+    def _handle_next_available_request(
+        self,
+        ctx: _Context,
+        state: WhatsAppThreadState,
+        texts: list[str],
+    ) -> ConversationHandleOut | None:
+        """Search forward for the first day with capacity and open the Booking Flow.
+
+        Returns None when this turn is not a delegated/earliest request, so the caller
+        falls through to the existing named-day handling untouched.
+
+        The customer never has to name a day. ScheduleService decides what exists; the
+        model only told us the customer wanted the earliest option.
+        """
+        if not self._wants_next_available(texts):
+            return None
+
+        self._answer_source = "SCHEDULING_SERVICE"
+        self._availability_checked = True
+        grp, det = self._get_active_inspection_location(ctx, state)
+        urgent = self._urgency_signalled(texts)
+
+        # Search starts tomorrow: same-day inspections are not offered by this path, and
+        # the Flow picker's own horizon is matched so an offered day is always displayable.
+        start = date.today() + timedelta(days=1)
+        found = self._schedule.find_next_available(
+            zone_group=grp, zone_detail=det, start_day=start,
+            exclude_revision_id=state.current_revision_id,
+        )
+
+        self._decision_log(
+            ctx, "next_available_search",
+            zone_group=grp or "-", zone_detail=det or "-",
+            search_start=start.isoformat(), horizon=NEXT_AVAILABLE_HORIZON_DAYS,
+            days_checked=(found.days_checked if found else NEXT_AVAILABLE_HORIZON_DAYS),
+            first_valid=(found.day.isoformat() if found else "none"),
+            slot_count=(len(found.slots) if found else 0),
+            urgency=urgent,
+        )
+
+        if found is None:
+            # Bounded search exhausted. Asking the customer to keep naming days would be
+            # an open-ended negotiation against capacity that does not exist.
+            logger.info(
+                "L4.7W5-F2 NEXT_AVAILABLE exhausted thread_id=%s zone=%s/%s horizon=%s",
+                ctx.thread.id, grp, det, NEXT_AVAILABLE_HORIZON_DAYS,
+            )
+            return self._handle_scheduling_escalation(ctx, state, " ".join(texts))
+
+        state.active_requested_date = found.day.isoformat()
+        state.last_offered_slots = json.dumps(list(found.slots))
+        self.db.commit()
+
+        date_human = _format_date_human(found.day.isoformat(), date.today())
+        prefix = (f"El primer turno disponible es el {date_human}."
+                  if not urgent else
+                  f"Lo antes que podemos es el {date_human}.")
+        flow_out = self._dispatch_booking_flow_for_day(
+            ctx, state, day_iso=found.day.isoformat(),
+            date_human=date_human, slots=list(found.slots))
+        if flow_out is not None:
+            return flow_out
+
+        # Flow could not open — fall back to naming the slots rather than going silent.
+        shown = ", ".join(found.slots[:5])
+        msg = f"{prefix} Tengo estos horarios: {shown}. ¿Cuál te sirve?"
+        sent_id = self._send_text_to_wa(ctx, msg)
+        return _out("replied", wa_message_id=sent_id)
+
     def _handle_day_only_request(
         self,
         ctx: _Context,
         state: WhatsAppThreadState,
         day_iso: str,
         period: str | None = None,
+        texts: list[str] | None = None,
     ) -> ConversationHandleOut:
         """User named a day (with optional time period) but no exact slot.
         Fetches full-day availability, stores sorted slots, and replies with options
@@ -6767,6 +6938,15 @@ class ConversationEngine:
                 "¿Qué otro día te funciona? De lunes a sábado estamos disponibles."
             )
         else:
+            # L4.7W5-F2: the Wild failure. The customer had named a day AND delegated the
+            # choice ("no se viernes? decime vos cuando pueden"); the named day was empty,
+            # and asking them to name another one ignored the half of the sentence that
+            # handed us the decision. Search forward instead — but only when they actually
+            # delegated, so a plain "¿el viernes?" still gets a plain answer.
+            if texts and self._wants_next_available(texts):
+                forward = self._handle_next_available_request(ctx, state, texts)
+                if forward is not None:
+                    return forward
             state.last_visible_slots = None
             msg = (
                 f"Para {date_human} no hay horarios libres en este momento. "
