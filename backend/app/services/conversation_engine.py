@@ -891,11 +891,22 @@ _FAQ_TOPIC_SATISFIED: dict[str, tuple[str, ...]] = {
         r"\bpod[eé]s\s+no\s+estar\b",
     ),
     "payment": (r"\befectivo\b.*\btransferencia\b", r"\btransferencia\b.*\befectivo\b"),
-    # Scope is satisfied by meaning, not by the exact phrase "revisión pre-compra": going to
-    # where the car is and sending a report afterwards IS the scope answer.
+    # Scope is satisfied by MEANING. The first attempt at this listed the verbs it expected
+    # — vamos / nos acercamos / se realiza / la hacemos — and the live Wild answered
+    # "Revisamos el auto en el lugar donde está", which matched none of them, so the
+    # canonical paragraph was appended on top of prose that had already said it. Enumerating
+    # verbs is the same brittleness that caused the original presence defect.
+    #
+    # The scope fact has exactly two halves: WE GO to wherever the vehicle is, and the
+    # inspection happens THERE. Match that shape — any first-person-plural service verb,
+    # near any expression of the vehicle's location — instead of a vocabulary list.
     "service_scope": (
-        r"\b(vamos|nos\s+acercamos|se\s+realiza|la\s+hacemos)\b[^.]{0,80}\b(donde|lugar)\b",
-        r"\ben\s+el\s+lugar\s+donde\s+est[aá]\s+el\s+(auto|veh[ií]culo)\b",
+        r"\b\w+(?:amos|imos)\b[^.]{0,60}\b(en\s+el\s+lugar|donde\s+est[aáeé]|"
+        r"a\s+domicilio|hasta\s+(donde|el\s+lugar))\b",
+        r"\b(en\s+el\s+lugar|donde\s+est[aáeé])\b[^.]{0,60}\b(el\s+)?(auto|veh[ií]culo)\b",
+        r"\b(el\s+)?(auto|veh[ií]culo)\b[^.]{0,40}\b(en\s+el\s+lugar|donde\s+est[aáeé])\b",
+        r"\bvamos\s+hasta\b",
+        r"\ba\s+domicilio\b",
     ),
 }
 def _strip_contradicting_sentences(reply: str, topic: str) -> str:
@@ -2202,16 +2213,11 @@ class ConversationEngine:
         name_display = buyer_first or state.customer_name or ""
         date_display = _format_date_human(sched_date.isoformat(), date.today()) if sched_date else None
         time_display = sched_time.strftime("%H:%M") if sched_time else None
-        if name_display and date_display and time_display:
-            opener = f"¡Listo, {name_display}! Recibimos tu solicitud para el {date_display} a las {time_display} 🎉"
-        elif name_display:
-            opener = f"¡Listo, {name_display}! Recibimos tu solicitud 🎉"
-        else:
-            opener = "¡Listo! Recibimos tu solicitud 🎉"
-        confirm_text = (
-            f"{opener}\n\n"
-            "Un asesor va a revisar los datos y te confirma el turno a la brevedad."
-        )
+        # L4.7W5-F3: one canonical wording, owned by booking_flow_service, so this legacy
+        # path and the endpoint-backed path can never drift into competing copy.
+        from .booking_flow_service import build_booking_receipt_message
+        confirm_text = build_booking_receipt_message(
+            name_display or None, date_display, time_display)
         sent_id = self._send_text_to_wa(ctx, confirm_text)
         return _out("booking_created", wa_message_id=sent_id)
 

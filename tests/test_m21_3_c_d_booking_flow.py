@@ -933,10 +933,19 @@ class TestBF29_TokenFormat(unittest.TestCase):
 
 
 class TestBF30_OutboundOff(unittest.TestCase):
-    """BF30 — handle_confirm_booking never creates a WhatsAppMessage (outbound off).
+    """BF30 — with outbound off, confirm_booking SENDS nothing.
 
-    Booking creation is purely DB-side (ThreadRevision + Revision + Lead state).
-    No WhatsAppMessage record is written, confirming outbound remains off.
+    L4.7W5-F3 changed the premise this test was written on. Booking used to be purely
+    DB-side, so "no WhatsAppMessage row exists" was an accurate proxy for "nothing was
+    sent". A successful booking now emits one canonical acknowledgement — the complete Wild
+    booked correctly and then went silent, which is the defect that change closes.
+
+    That acknowledgement goes through OutboundSafetyGate, and the gate records every
+    blocked attempt as a `status='blocked'` audit row. Under the M2 forensic model that row
+    is required, not tolerated: it is how an operator later proves the kill switch held.
+
+    So the assertion moves to the invariant that actually matters — nothing is SENT — and
+    additionally proves the block was recorded with its path attribution intact.
     """
 
     def setUp(self):
@@ -948,15 +957,40 @@ class TestBF30_OutboundOff(unittest.TestCase):
     def tearDown(self):
         self.db.close()
 
-    def test_bf30_no_whatsapp_message_created(self):
+    def test_bf30_nothing_is_sent_while_outbound_is_off(self):
         svc = BookingFlowService(self.db)
         _mock_sched_valid(svc)
         svc.handle_confirm_booking(self.token, _confirm_data(self.token))
         self.db.expire_all()
-        msg_count = self.db.query(WhatsAppMessage).filter_by(
-            thread_id=self.thread.id
-        ).count()
-        self.assertEqual(msg_count, 0, "No outbound WhatsApp message should be created by BookingFlowService")
+        messages = self.db.query(WhatsAppMessage).filter_by(thread_id=self.thread.id).all()
+
+        sent = [m for m in messages if m.status in ("sent", "delivered", "read")]
+        self.assertEqual(sent, [], "no message may be transmitted while outbound is off")
+        self.assertTrue(all(not m.wa_message_id for m in messages),
+                        "a blocked attempt never has a Meta message id")
+
+    def test_bf30_the_blocked_attempt_is_recorded_with_its_path(self):
+        """The kill switch must leave forensic evidence, not silence."""
+        svc = BookingFlowService(self.db)
+        _mock_sched_valid(svc)
+        svc.handle_confirm_booking(self.token, _confirm_data(self.token))
+        self.db.expire_all()
+        blocked = self.db.query(WhatsAppMessage).filter_by(
+            thread_id=self.thread.id, status="blocked").all()
+        self.assertEqual(len(blocked), 1)
+        self.assertEqual(blocked[0].direction, "out")
+        self.assertEqual(blocked[0].path_id, "BOOKING_FLOW")
+        self.assertIn("KILL_SWITCH", blocked[0].blocked_reason or "")
+
+    def test_bf30_the_booking_survives_a_blocked_acknowledgement(self):
+        """A delivery problem must never cast doubt on a booking that exists."""
+        svc = BookingFlowService(self.db)
+        _mock_sched_valid(svc)
+        svc.handle_confirm_booking(self.token, _confirm_data(self.token))
+        self.db.expire_all()
+        booked = self.db.query(ThreadRevision).filter_by(
+            thread_id=self.thread.id, status="booked").all()
+        self.assertEqual(len(booked), 1)
 
     def test_bf30_health_response_has_correct_structure(self):
         r = health_response()

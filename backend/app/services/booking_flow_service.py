@@ -205,6 +205,35 @@ def _format_appointment_summary(d: date, t: time) -> str:
     return f"{_date_title(d)} a las {t.strftime('%H:%M')}"
 
 
+def build_booking_receipt_message(
+    name: str | None, date_human: str | None, time_str: str | None
+) -> str:
+    """The one customer-facing acknowledgement of a completed Booking Flow.
+
+    L4.7W5-F3. The complete Wild booked successfully and then said nothing: WhatsApp showed
+    "Formulario completado" and the conversation stopped dead. The wording below already
+    existed inside ConversationEngine._process_flow_response, but that path no longer runs
+    for the endpoint-backed Flow — the booking is written by handle_confirm_booking, which
+    sets needs_human=True, and CE's human-takeover guard then returns skipped_human before
+    any reply is composed.
+
+    So this is the SAME copy, moved to where the booking actually happens, and imported back
+    by CE so the two paths can never drift into competing wording.
+
+    Deliberately says "solicitud" and "te confirma el turno", never "turno confirmado":
+    appointment_approval_status is PENDING at this moment and an operator still has to
+    approve it. Telling a customer their appointment is confirmed when it is not would be a
+    false business fact, which is the class of defect this project keeps closing.
+    """
+    if name and date_human and time_str:
+        opener = f"¡Listo, {name}! Recibimos tu solicitud para el {date_human} a las {time_str} 🎉"
+    elif name:
+        opener = f"¡Listo, {name}! Recibimos tu solicitud 🎉"
+    else:
+        opener = "¡Listo! Recibimos tu solicitud 🎉"
+    return f"{opener}\n\nUn asesor va a revisar los datos y te confirma el turno a la brevedad."
+
+
 def _format_customer_summary(name: str, phone: str) -> str:
     parts = [p for p in [name, phone] if p]
     return " · ".join(parts) if parts else ""
@@ -714,6 +743,11 @@ class BookingFlowService:
             ctx.thread.id, thread_rev.id, crm_rev.id, date_str, time_str,
         )
 
+        # The booking is committed above. The acknowledgement is best-effort BY DESIGN:
+        # a delivery problem must never roll back or cast doubt on a booking that exists.
+        self._send_booking_receipt(ctx, name=name, selected_date=selected_date,
+                                   selected_time=selected_time)
+
         # Return Flow SUCCESS completion
         return {
             "version": FLOW_VERSION,
@@ -726,6 +760,65 @@ class BookingFlowService:
                 }
             },
         }
+
+    def _send_booking_receipt(
+        self, ctx: BookingContext, *, name: str, selected_date: date, selected_time: time
+    ) -> None:
+        """Send the single canonical booking acknowledgement.
+
+        Exactly-once comes from the booking itself, not from a flag: the token is consumed
+        inside the same transaction that creates the booking, so a Meta retry or a duplicate
+        confirm_booking raises BookingTokenError in resolve_context and never reaches here.
+        The outbound gate's dedup window is a second line of defence, not the mechanism.
+
+        Routed through OutboundSafetyGate on the registered BOOKING_FLOW path — the same
+        path that dispatched the Flow — so the acknowledgement is attributed to the booking
+        that caused it and can never appear as MANUAL_CRM or unattributed.
+        """
+        from datetime import datetime as _dt
+        from zoneinfo import ZoneInfo
+
+        from ..ui.whatsapp_ui import MetaSendError, _send_whatsapp_cloud_text
+        from .outbound_path_registry import OutboundPathId, get_deployment_id
+        from .outbound_safety_gate import GateOutcome, OutboundSafetyGate
+
+        first_name = (name or "").strip().split(" ")[0] if name else ""
+        text = build_booking_receipt_message(
+            first_name or None, _date_title(selected_date),
+            selected_time.strftime("%H:%M"),
+        )
+        try:
+            gate = OutboundSafetyGate(self.db)
+            result = gate.attempt(
+                wa_id=ctx.contact.wa_id, thread_id=ctx.thread.id, text=text,
+                now=_dt.now(ZoneInfo("America/Argentina/Buenos_Aires")),
+                path_id=OutboundPathId.BOOKING_FLOW.value,
+                deployment_id=get_deployment_id(),
+            )
+            if result.outcome != GateOutcome.ALLOWED:
+                logger.warning(
+                    "BOOKING_RECEIPT not sent thread_id=%s outcome=%s — booking stands",
+                    ctx.thread.id, result.outcome.value)
+                return
+            try:
+                wa_message_id, _ = _send_whatsapp_cloud_text(
+                    to_wa_id=ctx.contact.wa_id, text=text)
+                gate.mark_sent(result.message_id, wa_message_id)
+                logger.info("BOOKING_RECEIPT sent thread_id=%s wamid=%s",
+                            ctx.thread.id, wa_message_id)
+            except MetaSendError as exc:
+                gate.mark_failed(result.message_id, meta_http_status=exc.http_status,
+                                 meta_error_payload=exc.to_payload())
+                logger.error("BOOKING_RECEIPT Meta send failed thread_id=%s: %s",
+                             ctx.thread.id, exc)
+            except Exception as exc:
+                gate.mark_failed(result.message_id)
+                logger.error("BOOKING_RECEIPT send failed thread_id=%s: %s",
+                             ctx.thread.id, exc)
+        except Exception as exc:
+            # The booking is already committed; nothing here may undo it.
+            logger.error("BOOKING_RECEIPT unexpected failure thread_id=%s: %s",
+                         ctx.thread.id, exc)
 
     # ── Concurrency / advisory lock ───────────────────────────────────────────
 
