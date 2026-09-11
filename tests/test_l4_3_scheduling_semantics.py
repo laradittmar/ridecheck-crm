@@ -32,6 +32,7 @@ WILD-A   full reproduction of the preserved Wild A scheduling turn
 from __future__ import annotations
 
 import types
+import json
 import unittest
 from datetime import date, time
 from unittest.mock import MagicMock, patch
@@ -518,12 +519,42 @@ class TestBookingFlowWiring(unittest.TestCase):
         thread_id, _issued = parse_booking_token(self.state.flow_booking_token)
         self.assertEqual(thread_id, self.ctx.thread.id)
 
-    def test_flow_05_invalid_slot_sends_no_flow(self):
-        """FLOW-05 an unavailable slot never dispatches the Flow."""
+    def test_flow_05_an_unavailable_slot_is_never_offered_or_booked(self):
+        """FLOW-05 — the requested unavailable time is never offered.
+
+        L4.7W5-F4 changed what happens NEXT. This asserted "no Flow at all", which was the
+        right proxy while a rejected exact time was answered with a prose slot list. The
+        live Wild showed the cost of that: the customer asked for Monday 18:00, was handed
+        seven times to read, typed "17hs", and only then did the Flow open and ask for a
+        time again. Flow-first now opens the picker on the same day when that day has real
+        availability.
+
+        The invariant that actually matters is unchanged and asserted directly: the
+        unavailable time itself is never offered and never booked. The Flow carries only
+        ScheduleService-approved slots, and confirm_booking revalidates regardless.
+        """
         out = self._book(day=WILD_FALLBACK, hhmm="15:00")   # Thursday closes at 14:00
+        self.assertEqual(out.action, "flow_button_sent")
+        self.assertEqual(len(self.flows), 1)
+        flow = self.flows[0]
+        self.assertEqual(flow["screen"], "APPOINTMENT")
+        self.assertEqual(flow["path_id"], "BOOKING_FLOW")
+        self.assertNotIn("15:00", flow["body"],
+                         "the time we just refused must not be offered back")
+        offered = json.loads(self.state.last_visible_slots or "[]")
+        self.assertNotIn("15:00", offered)
+        self.assertTrue(offered, "the Flow only opens when real slots exist")
+        self.assertTrue(all(s < "14:00" for s in offered),
+                        "every offered slot must fall inside business hours")
+
+    def test_flow_05b_an_empty_day_still_sends_no_flow(self):
+        """A day with no availability must not open an empty picker.
+
+        Sunday: the business is closed, so there is nothing for a picker to show and the
+        customer gets a text answer instead.
+        """
+        out = self._book(day="2026-09-06", hhmm="10:00")   # Sunday — closed
         self.assertEqual(self.flows, [])
-        self.assertEqual(len(self.texts), 1)
-        self.assertIsNone(self.state.flow_booking_token)
         self.assertEqual(out.action, "replied")
 
     def test_flow_06_accepted_quote_alone_sends_no_flow(self):

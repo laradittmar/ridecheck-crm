@@ -6411,6 +6411,26 @@ class ConversationEngine:
                 shown = all_slots[:12]
                 state.last_visible_slots = json.dumps(shown)
                 slot_list = ", ".join(shown[:-1]) + f" o {shown[-1]}" if len(shown) >= 2 else shown[0]
+                # ── L4.7W5-F4 FLOW-FIRST on a rejected exact time ─────────────
+                # The live Wild asked for Monday 18:00, was told 18:00 was unavailable, and
+                # got seven slots recited in prose — then had to type "17hs" so the Flow
+                # could open and ask for a time again. Flow-first already covers day
+                # requests and delegated requests; the rejected-exact-time branch was the
+                # one path still dumping a list. The day and its real slots are already in
+                # hand here, so the picker can open immediately.
+                # ...but NOT when this burst also owes the customer a canonical FAQ answer.
+                # The Flow body cannot carry one, and dropping "¿aceptan débito?" to save a
+                # round trip on slots is a bad trade: an unanswered question is worse than a
+                # list. Those turns keep the composed text reply, which carries both.
+                if not getattr(self, "_faq_reconciliation_burst", None):
+                    self.db.commit()
+                    flow_out = self._dispatch_booking_flow_for_day(
+                        ctx, state, day_iso=preferred_day_iso, date_human=date_human,
+                        slots=shown,
+                        period_label=None,
+                    )
+                    if flow_out is not None:
+                        return flow_out
                 msg = (
                     f"Para {date_human} a las {preferred_time_obj.strftime('%H:%M')} "
                     f"no tenemos disponibilidad{reason_suffix}. "

@@ -349,8 +349,28 @@ class BookingFlowService:
         candidate: Optional[WhatsAppThreadCandidate],
         state: WhatsAppThreadState,
     ) -> tuple[Optional[str], Optional[str]]:
-        if candidate:
-            return candidate.zone_group, candidate.zone_detail
+        """Canonical inspection location — the same hierarchy ConversationEngine uses.
+
+        L4.7W5-F4. This previously returned the candidate's zones whenever a candidate
+        existed, *even when both were NULL*, and only consulted thread state when there was
+        no candidate at all. In the live Wild the candidate existed with both zones NULL
+        while thread state held CABA / Paternal — the very location CE had just quoted
+        $150.000 from — so the booking was written with no zone, and PricingService could
+        not price it. The customer was told a number that exists nowhere in the CRM.
+
+        CE's `_get_active_inspection_location` had the correct rule all along: a candidate is
+        authoritative only when it actually HAS a location, and a missing half is filled from
+        state. Two near-duplicate implementations, and booking used the weaker one.
+
+        Customer origin is never used — only the candidate's and the thread's inspection
+        location, which is where the vehicle is.
+        """
+        if candidate is not None:
+            cand_group = candidate.zone_group or None
+            cand_detail = candidate.zone_detail or None
+            if cand_group or cand_detail:
+                return (cand_group or state.home_zone_group,
+                        cand_detail or state.home_zone_detail)
         return state.home_zone_group, state.home_zone_detail
 
     @staticmethod
@@ -412,6 +432,47 @@ class BookingFlowService:
         time_items: list[dict] = []
         is_date_enabled = bool(date_items)
         is_time_enabled = False
+
+        # ── L4.7W5-F4: do not ask again for a slot already agreed in conversation ──
+        #
+        # In the live Wild the customer negotiated Monday 17:00 in chat and the Flow then
+        # made them pick the day and the time over again from full lists.
+        #
+        # The published Flow (id 28104222025943520, v7.3) declares its Dropdowns WITHOUT an
+        # `init-value`, so nothing the back end sends can preselect them — that needs a Flow
+        # republish on Meta, which is an owner action. What IS available to us is the option
+        # list itself: when an exact slot is already agreed AND still free, the picker is
+        # narrowed to that one date and that one time. The customer confirms rather than
+        # re-chooses, the date→time round trip disappears, and a wrong slot cannot be picked.
+        #
+        # Only when a slot is genuinely agreed. A day-only or NEXT_AVAILABLE dispatch keeps
+        # the full picker, because there the choice is still real (Part 9).
+        agreed_day = (getattr(ctx.state, "preferred_day", None) or "").strip()
+        agreed_time = (getattr(ctx.state, "preferred_time", None) or "").strip()
+        if agreed_day and agreed_time and not selected_date_str:
+            try:
+                agreed_date = date.fromisoformat(agreed_day)
+            except (ValueError, TypeError):
+                agreed_date = None
+            if agreed_date is not None:
+                still_free = [i for i in self._slots_for_date(agreed_date, ctx.zone_group)
+                              if i.get("id") == agreed_time]
+                if still_free:
+                    # Narrowing is a UX convenience only — confirm_booking revalidates the
+                    # slot regardless, so a stale agreement is still caught there.
+                    return {
+                        "booking_token": ctx.booking_token,
+                        "vehicle_summary": ctx.vehicle_summary,
+                        "location_summary": ctx.location_summary,
+                        "date": [{"id": agreed_day, "title": _date_title(agreed_date)}],
+                        "is_date_enabled": True,
+                        "time": still_free,
+                        "is_time_enabled": True,
+                    }
+                logger.info(
+                    "BOOKING_FLOW agreed slot %s %s no longer free — full picker offered",
+                    agreed_day, agreed_time,
+                )
 
         if selected_date_str:
             try:
@@ -621,6 +682,33 @@ class BookingFlowService:
         candidate = ctx.candidate
         zone_group = ctx.zone_group
         zone_detail = ctx.zone_detail
+
+        # L4.7W5-F4: a booking with no canonical inspection location cannot be priced, and an
+        # appointment in the CRM with no money attached is a commercial defect — the operator
+        # sees a job and no figure, and the amount the customer was quoted lives nowhere.
+        # Better to send the customer back one screen than to write that record.
+        if not zone_group and not zone_detail:
+            _log_event(
+                self.db, ctx.thread.id, "BOOKING_REFUSED_NO_CANONICAL_LOCATION",
+                booking_token=booking_token,
+                extra={"date": date_str, "time": time_str,
+                       "candidate_id": getattr(candidate, "id", None)},
+            )
+            logger.error(
+                "BOOKING_REFUSED_NO_CANONICAL_LOCATION thread_id=%s — refusing to create "
+                "an unpriced booking", ctx.thread.id,
+            )
+            raise BookingSlotConflictError({
+                "version": FLOW_VERSION,
+                "screen": "APPOINTMENT",
+                "data": {
+                    **self._appointment_screen_data(ctx, selected_date_str=date_str),
+                    "slot_conflict_message": (
+                        "Necesitamos confirmar la zona donde está el vehículo antes de "
+                        "reservar el turno. Un asesor se contacta a la brevedad."
+                    ),
+                },
+            })
 
         thread_rev = ThreadRevision(
             thread_id=ctx.thread.id,
