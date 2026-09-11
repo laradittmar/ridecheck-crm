@@ -1,0 +1,96 @@
+--- PUBLISHED v7.3
++++ CANDIDATE v7.4-prefill
+@@ -87,4 +87,24 @@
+           "type": "boolean",
+           "__example__": false
++        },
++        "selected_date": {
++          "type": "string",
++          "__example__": ""
++        },
++        "selected_time": {
++          "type": "string",
++          "__example__": ""
++        },
++        "customer_name": {
++          "type": "string",
++          "__example__": ""
++        },
++        "contact_phone": {
++          "type": "string",
++          "__example__": "5491100000000"
++        },
++        "contact_phone_display": {
++          "type": "string",
++          "__example__": "…0000"
+         }
+       },
+@@ -122,5 +142,6 @@
+                     "date": "${form.date}"
+                   }
+-                }
++                },
++                "init-value": "${data.selected_date}"
+               },
+               {
+@@ -130,5 +151,6 @@
+                 "data-source": "${data.time}",
+                 "required": "${data.is_time_enabled}",
+-                "enabled": "${data.is_time_enabled}"
++                "enabled": "${data.is_time_enabled}",
++                "init-value": "${data.selected_time}"
+               },
+               {
+@@ -146,5 +168,8 @@
+                     "location_summary": "${data.location_summary}",
+                     "date": "${form.date}",
+-                    "time": "${form.time}"
++                    "time": "${form.time}",
++                    "customer_name": "${data.customer_name}",
++                    "contact_phone": "${data.contact_phone}",
++                    "contact_phone_display": "${data.contact_phone_display}"
+                   }
+                 }
+@@ -178,4 +203,16 @@
+           "type": "string",
+           "__example__": "10:30"
++        },
++        "customer_name": {
++          "type": "string",
++          "__example__": ""
++        },
++        "contact_phone": {
++          "type": "string",
++          "__example__": "5491100000000"
++        },
++        "contact_phone_display": {
++          "type": "string",
++          "__example__": "…0000"
+         }
+       },
+@@ -195,12 +232,10 @@
+                 "label": "Nombre y apellido",
+                 "name": "name",
+-                "required": true
+-              },
+-              {
+-                "type": "TextInput",
+-                "label": "Teléfono",
+-                "name": "phone",
+-                "input-type": "phone",
+-                "required": true
++                "required": true,
++                "init-value": "${data.customer_name}"
++              },
++              {
++                "type": "TextCaption",
++                "text": "Te contactamos a este WhatsApp: ${data.contact_phone_display}"
+               },
+               {
+@@ -249,5 +284,5 @@
+                     "time": "${data.time}",
+                     "name": "${form.name}",
+-                    "phone": "${form.phone}",
++                    "phone": "${data.contact_phone}",
+                     "email": "${form.email}",
+                     "inspection_address": "${form.inspection_address}",

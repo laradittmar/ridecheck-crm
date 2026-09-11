@@ -205,6 +205,25 @@ def _format_appointment_summary(d: date, t: time) -> str:
     return f"{_date_title(d)} a las {t.strftime('%H:%M')}"
 
 
+def _mask_phone(wa_id: str | None) -> str:
+    """Last four digits only. A full number has no business in a screen we also log."""
+    digits = "".join(ch for ch in (wa_id or "") if ch.isdigit())
+    return f"…{digits[-4:]}" if len(digits) >= 4 else ""
+
+
+def _lead_display_name(lead) -> str:
+    """Customer name from the Lead, or empty.
+
+    L4.7W5-GATE-A: `nombre`/`apellido` are business identity — an operator typed them, or a
+    Flow submission persisted them. WhatsApp `display_name` is a profile label the customer
+    can set to anything, so it is deliberately NOT elevated into a verified name here. Empty
+    is an honest answer; an invented one is not.
+    """
+    first = (getattr(lead, "nombre", None) or "").strip()
+    last = (getattr(lead, "apellido", None) or "").strip()
+    return " ".join(p for p in (first, last) if p)
+
+
 def build_booking_receipt_message(
     name: str | None, date_human: str | None, time_str: str | None
 ) -> str:
@@ -463,6 +482,8 @@ class BookingFlowService:
                 if still_free:
                     # Narrowing is a UX convenience only — confirm_booking revalidates the
                     # slot regardless, so a stale agreement is still caught there.
+                    # GATE A: both selections are IDs that exist in their own data-source
+                    # above, which is what makes the Flow render them as chosen.
                     return {
                         "booking_token": ctx.booking_token,
                         "vehicle_summary": ctx.vehicle_summary,
@@ -471,6 +492,9 @@ class BookingFlowService:
                         "is_date_enabled": True,
                         "time": still_free,
                         "is_time_enabled": True,
+                        "selected_date": agreed_day,
+                        "selected_time": agreed_time,
+                        **self._identity_fields(ctx),
                     }
                 logger.info(
                     "BOOKING_FLOW agreed slot %s %s no longer free — full picker offered",
@@ -485,6 +509,11 @@ class BookingFlowService:
             except (ValueError, TypeError):
                 pass
 
+        # GATE A: a selection is offered ONLY when it exists in its own data-source. A day
+        # the customer named is selectable; a time they never chose is not, and preselecting
+        # the earliest would be us deciding for them.
+        selected_date = selected_date_str if any(
+            i.get("id") == selected_date_str for i in date_items) else ""
         data: dict = {
             "booking_token": ctx.booking_token,
             "vehicle_summary": ctx.vehicle_summary,
@@ -493,10 +522,29 @@ class BookingFlowService:
             "is_date_enabled": is_date_enabled,
             "time": time_items,
             "is_time_enabled": is_time_enabled,
+            "selected_date": selected_date or "",
+            "selected_time": "",
+            **self._identity_fields(ctx),
         }
         if error_message:
             data["slot_conflict_message"] = error_message
         return data
+
+    def _identity_fields(self, ctx: BookingContext) -> dict:
+        """Canonical identity carried to DETAILS through the navigate payload.
+
+        APPOINTMENT → DETAILS is client-side `navigate`: the back end is never called
+        between those screens, so anything DETAILS needs has to leave from here.
+
+        `contact_phone` is `wa_id` — the transport identity WhatsApp already proved. It is
+        carried as data, never as an editable field, and it is re-asserted server-side at
+        prepare_summary and confirm_booking so the UI is not the thing enforcing it.
+        """
+        return {
+            "customer_name": _lead_display_name(ctx.lead),
+            "contact_phone": ctx.contact.wa_id or "",
+            "contact_phone_display": _mask_phone(ctx.contact.wa_id),
+        }
 
     def _summary_screen_data(
         self,
@@ -580,7 +628,11 @@ class BookingFlowService:
             raise ValueError(f"Invalid time: {exc}") from exc
 
         name = str(data.get("name", "")).strip()
-        phone = str(data.get("phone", "")).strip()
+        # GATE A: the phone is not negotiable from the Flow. wa_id is the identity WhatsApp
+        # proved; a value arriving in the payload is at best a copy and at worst a typo that
+        # would become the number an operator calls. Enforced here, server-side, rather than
+        # trusting the screen not to offer an edit.
+        phone = (ctx.contact.wa_id or "").strip()
         if not name:
             raise ValueError("name is required")
         if not phone:
@@ -633,7 +685,11 @@ class BookingFlowService:
             raise ValueError(f"Invalid date/time: {exc}") from exc
 
         name = str(data.get("name", "")).strip()
-        phone = str(data.get("phone", "")).strip()
+        # GATE A: the phone is not negotiable from the Flow. wa_id is the identity WhatsApp
+        # proved; a value arriving in the payload is at best a copy and at worst a typo that
+        # would become the number an operator calls. Enforced here, server-side, rather than
+        # trusting the screen not to offer an edit.
+        phone = (ctx.contact.wa_id or "").strip()
         email = str(data.get("email", "")).strip()
         inspection_address = str(data.get("inspection_address", "")).strip()
         seller_name = str(data.get("seller_name", "")).strip()
@@ -668,6 +724,8 @@ class BookingFlowService:
                 "screen": "APPOINTMENT",
                 "data": {
                     **self._appointment_screen_data(ctx, selected_date_str=date_str),
+                    # the time they picked is exactly what became unavailable
+                    "selected_time": "",
                     "slot_conflict_message": (
                         "Justo ese horario dejó de estar disponible. "
                         "Elegí otro de los horarios actualizados."
@@ -931,10 +989,16 @@ class BookingFlowService:
                     self.db, 0, "BOOKING_CONCURRENCY_CONFLICT",
                     extra={"date": date_str, "lock_key": lock_key},
                 )
+                # GATE A: hand-built response — it must still satisfy the candidate schema,
+                # so the selection keys are present and empty (nothing is selected during a
+                # conflict, and a stale init-value pointing at a vanished option would be
+                # worse than none).
                 raise BookingSlotConflictError({
                     "version": FLOW_VERSION,
                     "screen": "APPOINTMENT",
                     "data": {
+                        "selected_date": "",
+                        "selected_time": "",
                         "slot_conflict_message": (
                             "Justo ese horario dejó de estar disponible. "
                             "Elegí otro de los horarios actualizados."

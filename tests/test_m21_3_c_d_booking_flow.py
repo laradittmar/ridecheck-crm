@@ -147,6 +147,12 @@ def _make_world(db: Session) -> tuple[WhatsAppThread, WhatsAppThreadState, Whats
     return thread, state, candidate, lead
 
 
+def _contact_of(db: Session, thread) -> WhatsAppContact:
+    """The fixture's contact. _make_world does not return it and other suites depend on
+    that signature, so it is looked up rather than threaded through."""
+    return db.get(WhatsAppContact, thread.contact_id)
+
+
 def _mock_sched_valid(svc: BookingFlowService, slots=None) -> None:
     """Patch ScheduleService on the service instance to always return slots."""
     if slots is None:
@@ -538,12 +544,27 @@ class TestBF15_PrepareSummaryValidation(unittest.TestCase):
         with self.assertRaises(ValueError, msg="name is required"):
             svc.handle_prepare_summary(self.token, data)
 
-    def test_bf15_missing_phone_raises(self):
+    def test_bf15_an_omitted_payload_phone_is_no_longer_a_customer_error(self):
+        """L4.7W5-GATE-A changed where the phone comes from.
+
+        It used to be a required TextInput, so an empty one was a validation failure. The
+        number now comes from `ctx.contact.wa_id` — the identity WhatsApp already proved —
+        and the payload value is ignored entirely. An absent payload phone is therefore not
+        an error; it is the normal case once the editable field is gone.
+        """
         svc = BookingFlowService(self.db)
         data = self._base_data()
         data["phone"] = ""
+        out = svc.handle_prepare_summary(self.token, data)
+        self.assertEqual(out["data"]["phone"], _contact_of(self.db, self.thread).wa_id)
+
+    def test_bf15_an_absent_canonical_identity_still_raises(self):
+        """The guard that matters now: no wa_id means no one to call."""
+        svc = BookingFlowService(self.db)
+        _contact_of(self.db, self.thread).wa_id = ""
+        self.db.commit()
         with self.assertRaises(ValueError, msg="phone is required"):
-            svc.handle_prepare_summary(self.token, data)
+            svc.handle_prepare_summary(self.token, self._base_data())
 
     def test_bf15_invalid_date_raises(self):
         svc = BookingFlowService(self.db)
@@ -672,7 +693,11 @@ class TestBF19_ThreadRevisionStatus(unittest.TestCase):
         self.db.expire_all()
         tr = self.db.query(ThreadRevision).filter_by(thread_id=self.thread.id).first()
         self.assertEqual(tr.buyer_name, "Juan Pérez")
-        self.assertEqual(tr.buyer_phone, "+5491155550000")
+        # L4.7W5-GATE-A: buyer_phone is canonical WhatsApp identity, not the payload value.
+        # The fixture submits "+5491155550000"; the booking records the wa_id the message
+        # actually arrived from, so a typo in a form can never become the number we call.
+        self.assertEqual(tr.buyer_phone, _contact_of(self.db, self.thread).wa_id)
+        self.assertNotEqual(tr.buyer_phone, "+5491155550000")
         self.assertEqual(tr.buyer_email, "juan@example.com")
 
 

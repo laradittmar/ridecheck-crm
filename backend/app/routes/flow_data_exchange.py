@@ -142,6 +142,14 @@ async def booking_flow_data_exchange(
                 "is_time_enabled": False,
                 "vehicle_summary": "",
                 "location_summary": "",
+                # L4.7W5-GATE-A: the candidate Flow declares these on APPOINTMENT, so an
+                # error screen must carry them too — empty, because an expired session has
+                # no selection and no identity to assert.
+                "selected_date": "",
+                "selected_time": "",
+                "customer_name": "",
+                "contact_phone": "",
+                "contact_phone_display": "",
             },
         }
         return _encrypt_and_return(error_response, aes_key, iv)

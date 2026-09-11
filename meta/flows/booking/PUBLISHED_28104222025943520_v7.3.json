@@ -1,0 +1,366 @@
+{
+  "version": "7.3",
+  "data_api_version": "3.0",
+  "routing_model": {
+    "APPOINTMENT": [
+      "DETAILS"
+    ],
+    "DETAILS": [
+      "SUMMARY"
+    ],
+    "SUMMARY": []
+  },
+  "screens": [
+    {
+      "id": "APPOINTMENT",
+      "title": "Elegí tu turno",
+      "data": {
+        "booking_token": {
+          "type": "string",
+          "__example__": "booking_context_token"
+        },
+        "vehicle_summary": {
+          "type": "string",
+          "__example__": "Peugeot 2008 2020"
+        },
+        "location_summary": {
+          "type": "string",
+          "__example__": "Palermo, CABA"
+        },
+        "date": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              }
+            }
+          },
+          "__example__": [
+            {
+              "id": "2026-08-28",
+              "title": "Viernes 28 de agosto"
+            },
+            {
+              "id": "2026-08-29",
+              "title": "Sábado 29 de agosto"
+            }
+          ]
+        },
+        "is_date_enabled": {
+          "type": "boolean",
+          "__example__": true
+        },
+        "time": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              }
+            }
+          },
+          "__example__": [
+            {
+              "id": "10:30",
+              "title": "10:30"
+            },
+            {
+              "id": "11:00",
+              "title": "11:00"
+            },
+            {
+              "id": "12:30",
+              "title": "12:30"
+            }
+          ]
+        },
+        "is_time_enabled": {
+          "type": "boolean",
+          "__example__": false
+        }
+      },
+      "layout": {
+        "type": "SingleColumnLayout",
+        "children": [
+          {
+            "type": "TextHeading",
+            "text": "Reservá tu revisión"
+          },
+          {
+            "type": "TextBody",
+            "text": "${data.vehicle_summary}"
+          },
+          {
+            "type": "TextBody",
+            "text": "${data.location_summary}"
+          },
+          {
+            "type": "Form",
+            "name": "appointment_form",
+            "children": [
+              {
+                "type": "Dropdown",
+                "label": "Día",
+                "name": "date",
+                "data-source": "${data.date}",
+                "required": "${data.is_date_enabled}",
+                "enabled": "${data.is_date_enabled}",
+                "on-select-action": {
+                  "name": "data_exchange",
+                  "payload": {
+                    "trigger": "date_selected",
+                    "booking_token": "${data.booking_token}",
+                    "date": "${form.date}"
+                  }
+                }
+              },
+              {
+                "type": "Dropdown",
+                "label": "Horario",
+                "name": "time",
+                "data-source": "${data.time}",
+                "required": "${data.is_time_enabled}",
+                "enabled": "${data.is_time_enabled}"
+              },
+              {
+                "type": "Footer",
+                "label": "Continuar",
+                "on-click-action": {
+                  "name": "navigate",
+                  "next": {
+                    "type": "screen",
+                    "name": "DETAILS"
+                  },
+                  "payload": {
+                    "booking_token": "${data.booking_token}",
+                    "vehicle_summary": "${data.vehicle_summary}",
+                    "location_summary": "${data.location_summary}",
+                    "date": "${form.date}",
+                    "time": "${form.time}"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "DETAILS",
+      "title": "Datos para coordinar",
+      "data": {
+        "booking_token": {
+          "type": "string",
+          "__example__": "booking_context_token"
+        },
+        "vehicle_summary": {
+          "type": "string",
+          "__example__": "Peugeot 2008 2020"
+        },
+        "location_summary": {
+          "type": "string",
+          "__example__": "Palermo, CABA"
+        },
+        "date": {
+          "type": "string",
+          "__example__": "2026-08-28"
+        },
+        "time": {
+          "type": "string",
+          "__example__": "10:30"
+        }
+      },
+      "layout": {
+        "type": "SingleColumnLayout",
+        "children": [
+          {
+            "type": "TextBody",
+            "text": "Completá los datos necesarios para coordinar la revisión."
+          },
+          {
+            "type": "Form",
+            "name": "details_form",
+            "children": [
+              {
+                "type": "TextInput",
+                "label": "Nombre y apellido",
+                "name": "name",
+                "required": true
+              },
+              {
+                "type": "TextInput",
+                "label": "Teléfono",
+                "name": "phone",
+                "input-type": "phone",
+                "required": true
+              },
+              {
+                "type": "TextInput",
+                "label": "Email",
+                "name": "email",
+                "input-type": "email",
+                "required": false
+              },
+              {
+                "type": "TextInput",
+                "label": "Dirección exacta donde está el vehículo",
+                "name": "inspection_address",
+                "required": true
+              },
+              {
+                "type": "TextInput",
+                "label": "Nombre del vendedor",
+                "name": "seller_name",
+                "required": false
+              },
+              {
+                "type": "TextInput",
+                "label": "Teléfono del vendedor",
+                "name": "seller_phone",
+                "input-type": "phone",
+                "required": false
+              },
+              {
+                "type": "TextInput",
+                "label": "Link de la publicación",
+                "name": "listing_url",
+                "required": false
+              },
+              {
+                "type": "Footer",
+                "label": "Revisar turno",
+                "on-click-action": {
+                  "name": "data_exchange",
+                  "payload": {
+                    "trigger": "prepare_summary",
+                    "booking_token": "${data.booking_token}",
+                    "vehicle_summary": "${data.vehicle_summary}",
+                    "location_summary": "${data.location_summary}",
+                    "date": "${data.date}",
+                    "time": "${data.time}",
+                    "name": "${form.name}",
+                    "phone": "${form.phone}",
+                    "email": "${form.email}",
+                    "inspection_address": "${form.inspection_address}",
+                    "seller_name": "${form.seller_name}",
+                    "seller_phone": "${form.seller_phone}",
+                    "listing_url": "${form.listing_url}"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "SUMMARY",
+      "title": "Confirmá tu solicitud",
+      "terminal": true,
+      "data": {
+        "booking_token": {
+          "type": "string",
+          "__example__": "booking_context_token"
+        },
+        "appointment_summary": {
+          "type": "string",
+          "__example__": "Peugeot 2008 2020\nPalermo, CABA\nViernes 28 de agosto a las 10:30"
+        },
+        "customer_summary": {
+          "type": "string",
+          "__example__": "Nombre: Juan Pérez\nTeléfono: 11 1234-5678\nDirección: Av. Santa Fe 1234"
+        },
+        "date": {
+          "type": "string",
+          "__example__": "2026-08-28"
+        },
+        "time": {
+          "type": "string",
+          "__example__": "10:30"
+        },
+        "name": {
+          "type": "string",
+          "__example__": "Juan Pérez"
+        },
+        "phone": {
+          "type": "string",
+          "__example__": "1112345678"
+        },
+        "email": {
+          "type": "string",
+          "__example__": "juan@example.com"
+        },
+        "inspection_address": {
+          "type": "string",
+          "__example__": "Av. Santa Fe 1234, Palermo"
+        },
+        "seller_name": {
+          "type": "string",
+          "__example__": "Carlos"
+        },
+        "seller_phone": {
+          "type": "string",
+          "__example__": "1198765432"
+        },
+        "listing_url": {
+          "type": "string",
+          "__example__": "https://example.com/vehiculo"
+        }
+      },
+      "layout": {
+        "type": "SingleColumnLayout",
+        "children": [
+          {
+            "type": "TextHeading",
+            "text": "Turno solicitado"
+          },
+          {
+            "type": "TextBody",
+            "text": "${data.appointment_summary}"
+          },
+          {
+            "type": "TextHeading",
+            "text": "Datos de coordinación"
+          },
+          {
+            "type": "TextBody",
+            "text": "${data.customer_summary}"
+          },
+          {
+            "type": "TextCaption",
+            "text": "El horario se valida nuevamente al confirmar para evitar superposiciones."
+          },
+          {
+            "type": "Footer",
+            "label": "Solicitar turno",
+            "on-click-action": {
+              "name": "data_exchange",
+              "payload": {
+                "trigger": "confirm_booking",
+                "booking_token": "${data.booking_token}",
+                "date": "${data.date}",
+                "time": "${data.time}",
+                "name": "${data.name}",
+                "phone": "${data.phone}",
+                "email": "${data.email}",
+                "inspection_address": "${data.inspection_address}",
+                "seller_name": "${data.seller_name}",
+                "seller_phone": "${data.seller_phone}",
+                "listing_url": "${data.listing_url}"
+              }
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
