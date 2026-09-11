@@ -394,7 +394,10 @@ class BookingFlowService:
         """Return date items for APPOINTMENT screen (14-day horizon, slots > 0)."""
         today = date.today()
         items: list[dict] = []
-        for delta in range(1, BOOKING_HORIZON_DAYS + 1):
+        # L4.7W5-F5: range starts at 0 so TODAY can be offered when it still has capacity.
+        # _slots_for_date asks ScheduleService, which applies the same-day now-cutoff, so a
+        # today with nothing left simply yields no items and is skipped.
+        for delta in range(0, BOOKING_HORIZON_DAYS + 1):
             d = today + timedelta(days=delta)
             payload = ScheduleCheckIn(
                 address="-",  # zone_group drives availability; address is not used for slot lookup

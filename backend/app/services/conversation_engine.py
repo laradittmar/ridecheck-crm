@@ -1857,6 +1857,31 @@ class _Context:
     inbound_wa_message_id: str | None = None  # WILD-01 FINDING-03: causal inbound for dedup
 
 
+# ── L4.7W5-F5: article-prefixed locality matching ────────────────────────────
+_ARTICLE_PREFIX_RE = re.compile(r"^(?:la|el|los|las)\s+")
+
+# A locality whose name is also a common noun is only a locality when the sentence places
+# something there. "en la boca" is a place; "me mordí la boca" is not.
+_LOCATIVE_MARKERS = r"(?:en|de|del|desde|hacia|para|por|zona|barrio|localidad|partido|ciudad|esta|estoy|queda|vivo)"
+
+
+def _locality_in_context(normalized_text: str, form: str) -> bool:
+    """True when `form` appears as a locality, not as incidental vocabulary.
+
+    Accepted when the form is preceded by a locative marker (optionally with its article),
+    or when it is effectively the whole message — a bare "paternal" answering "¿en qué zona
+    está el auto?" is a location, and demanding a preposition there would be pedantic.
+
+    Word boundaries throughout: an alias must never fire from inside a longer word.
+    """
+    escaped = re.escape(form)
+    if re.fullmatch(rf"(?:la|el|los|las)?\s*{escaped}\s*[.!?]*", normalized_text.strip()):
+        return True
+    pattern = rf"\b{_LOCATIVE_MARKERS}\b\s+(?:la|el|los|las)?\s*\b{escaped}\b"
+    return re.search(pattern, normalized_text) is not None
+
+
+
 class ConversationEngine:
     def __init__(self, db: Session, settings: Settings) -> None:
         self.db = db
@@ -6825,9 +6850,11 @@ class ConversationEngine:
         grp, det = self._get_active_inspection_location(ctx, state)
         urgent = self._urgency_signalled(texts)
 
-        # Search starts tomorrow: same-day inspections are not offered by this path, and
-        # the Flow picker's own horizon is matched so an offered day is always displayable.
-        start = date.today() + timedelta(days=1)
+        # L4.7W5-F5 (owner business decision): same-day booking is allowed and is roughly
+        # 60% of demand, so the search starts TODAY. ScheduleService decides what is left of
+        # today — it seeds from now plus a lead buffer, so a slot that has passed or cannot
+        # be reached is never returned. Today wins over any future day when it has capacity.
+        start = date.today()
         found = self._schedule.find_next_available(
             zone_group=grp, zone_detail=det, start_day=start,
             exclude_revision_id=state.current_revision_id,
@@ -8165,10 +8192,45 @@ Respondé SOLO con JSON válido:
         # The zone_detail="CABA" sentinel row (len=4) is checked here too, matching
         # "caba" as a substring in any user message that mentions CABA explicitly.
         zones_sorted = sorted(zones, key=lambda z: len(z.zone_detail or ""), reverse=True)
+
+        # ── L4.7W5-F5: localities whose name carries a grammatical article ──────────
+        #
+        # Two live failures, opposite directions, one cause: an article-prefixed locality
+        # is a common noun wearing a proper name.
+        #
+        #   "quiero revisar un auto en paternal"  -> None          (customer dropped "La")
+        #   "me mordí la boca"                    -> ('CABA','La Boca')   (pre-existing)
+        #
+        # Plain containment cannot separate those. The article itself is the signal that
+        # the name doubles as ordinary vocabulary, so for exactly these names a locative
+        # context is required — a preposition or zone word, or the locality standing alone
+        # as the whole answer. Proper-noun localities (Palermo, Berazategui, Villa Urquiza)
+        # are untouched and keep plain containment: they do not occur by accident.
+        #
+        # The bare alias is derived from the CANONICAL catalog entry, never by editing the
+        # customer's words, and an alias shared by two localities resolves to neither.
+        article_zones = [z for z in zones_sorted
+                         if z.zone_detail and _ARTICLE_PREFIX_RE.match(_n(z.zone_detail))]
+        alias_owners: dict[str, list] = {}
+        for zone in article_zones:
+            alias_owners.setdefault(_ARTICLE_PREFIX_RE.sub("", _n(zone.zone_detail)), []).append(zone)
+
+        for zone in article_zones:
+            canonical = _n(zone.zone_detail)
+            alias = _ARTICLE_PREFIX_RE.sub("", canonical)
+            forms = [canonical]
+            if len(alias_owners.get(alias, [])) == 1:      # ambiguous alias resolves to neither
+                forms.append(alias)
+            for form in forms:
+                if _locality_in_context(normalized_text, form):
+                    return zone
+
         for zone in zones_sorted:
             if not zone.zone_detail:
                 continue
             zone_norm = _n(zone.zone_detail)
+            if _ARTICLE_PREFIX_RE.match(zone_norm):
+                continue                                    # handled above, with context
             if zone_norm in normalized_text:
                 return zone
 

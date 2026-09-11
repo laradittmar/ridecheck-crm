@@ -346,7 +346,14 @@ class TestBF08_HorizonDays(unittest.TestCase):
         self.assertEqual(BOOKING_HORIZON_DAYS, 14)
 
     def test_bf08_available_dates_respects_horizon(self):
-        """Even with unlimited slots, no date beyond BOOKING_HORIZON_DAYS appears."""
+        """Even with unlimited slots, no date beyond BOOKING_HORIZON_DAYS appears.
+
+        L4.7W5-F5: this also asserted `d > today`, encoding a no-same-day rule that was
+        never a stated policy — the scheduler always evaluated today, only the picker and
+        the forward search excluded it. The owner's decision (2026-09-11) is that same-day
+        booking is allowed and is roughly 60% of demand, so today is now offerable when it
+        still has capacity. The horizon bound this test exists for is unchanged.
+        """
         _wipe()
         db = _fresh_db()
         try:
@@ -358,7 +365,7 @@ class TestBF08_HorizonDays(unittest.TestCase):
             today = date.today()
             for d_str in date_ids:
                 d = date.fromisoformat(d_str)
-                self.assertGreater(d, today)
+                self.assertGreaterEqual(d, today, "a past date must never be offered")
                 self.assertLessEqual(d, today + timedelta(days=BOOKING_HORIZON_DAYS))
         finally:
             db.close()

@@ -39,6 +39,11 @@ _NON_OCCUPYING_ESTADOS: frozenset[str] = frozenset({"CANCELADO", "REPROGRAMAR"})
 # then display would be a dead end, so the two are kept equal and a test asserts it.
 logger = logging.getLogger(__name__)
 
+# L4.7W5-F5: minutes of lead time before the first same-day slot may be offered. A slot
+# starting in five minutes is not a real offer; this keeps "today" honest without inventing
+# an operational cutoff the business has not stated.
+SAME_DAY_LEAD_MINUTES = 90
+
 NEXT_AVAILABLE_HORIZON_DAYS = 14
 
 
@@ -303,6 +308,15 @@ class ScheduleService:
 
         return sorted(appointments, key=lambda item: (item.time, item.source, item.address))
 
+    @staticmethod
+    def _local_now() -> datetime:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
+
+    @classmethod
+    def _local_today(cls) -> date:
+        return cls._local_now().date()
+
     def find_next_available(
         self,
         *,
@@ -443,7 +457,27 @@ class ScheduleService:
         jornada_start_dt = datetime.combine(preferred_day, hours.start)
         hard_end = datetime.combine(preferred_day, hours.end)
         zero_zone = self._zero_zone_group(preferred_day)
-        candidate = jornada_start_dt
+
+        # ── L4.7W5-F5: same day starts from NOW, not from opening time ─────────────
+        # Same-day booking is a core business rule (~60% of customers), so today must be
+        # searched — but a day already under way does not begin at 09:00. Seeding from the
+        # jornada start would offer a 09:00 slot at four in the afternoon: a time that has
+        # passed, which is worse than saying there is nothing left.
+        #
+        # The lead buffer keeps the first offer reachable rather than theoretical. Travel
+        # validity is then measured from this effective start too, so the operator is not
+        # assumed to be at the depot at a moment when the day is half spent.
+        effective_start = jornada_start_dt
+        if preferred_day == self._local_today():
+            now_local = self._local_now().replace(tzinfo=None)
+            earliest = now_local + timedelta(minutes=SAME_DAY_LEAD_MINUTES)
+            if earliest > effective_start:
+                # round up to the next 30-minute grid point the picker uses
+                minute = 0 if earliest.minute == 0 else (30 if earliest.minute <= 30 else 60)
+                effective_start = earliest.replace(minute=0, second=0, microsecond=0) + \
+                    timedelta(minutes=minute)
+
+        candidate = effective_start
         suggestions: list[str] = []
 
         while (
@@ -454,7 +488,7 @@ class ScheduleService:
                 candidate=candidate,
                 zone_group=zone_group,
                 occupied_slots=occupied_slots,
-                jornada_start=jornada_start_dt,
+                jornada_start=effective_start,
                 zero_zone=zero_zone,
             ):
                 suggestions.append(candidate.strftime("%H:%M"))
