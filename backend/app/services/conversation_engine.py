@@ -6187,9 +6187,9 @@ class ConversationEngine:
         texts = self._burst_texts_for_turn(ctx)
         if texts:
             try:
-                forward = self._handle_next_available_request(ctx, state, texts)
-                if forward is not None:
-                    return forward
+                consumed = self._consume_scheduling_intent(ctx, state, texts)
+                if consumed is not None:
+                    return consumed
             except OutboundBlockedError:
                 raise
             except Exception as exc:                 # never block acceptance on this
@@ -6199,6 +6199,33 @@ class ConversationEngine:
         reply = "¡Perfecto! ¿Qué día y horario te viene mejor para la revisión?"
         sent_id = self._send_text_to_wa(ctx, reply)
         return _out("replied", wa_message_id=sent_id)
+
+    def _consume_scheduling_intent(
+        self, ctx: "_Context", state: WhatsAppThreadState, texts: list[str]
+    ):
+        """Act on a scheduling intent the customer stated alongside the acceptance.
+
+        Routes from the intent, not from the stage. Covers every shape the customer may use
+        in the same breath as "si": an exact day and time, a named day (including "hoy",
+        which is core business), or a delegated / earliest request.
+
+        Returns None when the burst carries no scheduling intent, so the ordinary acceptance
+        reply still goes out. ScheduleService remains the availability authority and
+        _dispatch_booking_flow_for_day still applies the progression authorizer — this only
+        removes the round trip that made the customer repeat themselves.
+        """
+        # delegated / earliest first: it needs no date and answers "para cuando tenes"
+        forward = self._handle_next_available_request(ctx, state, texts)
+        if forward is not None:
+            return forward
+
+        day_iso, time_str = _parse_scheduling_text(texts, date.today())
+        if not day_iso:
+            return None
+        period = _detect_time_period(texts)
+        if time_str:
+            return self._try_schedule_and_flow(ctx, state, day_iso, time_str, "")
+        return self._handle_day_only_request(ctx, state, day_iso, period=period, texts=texts)
 
     def _burst_texts_for_turn(self, ctx: "_Context") -> list[str]:
         """The customer's words for this turn, as the reconcilers already saw them."""

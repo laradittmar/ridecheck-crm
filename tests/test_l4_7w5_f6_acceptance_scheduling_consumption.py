@@ -143,16 +143,16 @@ class TestConsumptionWiring(unittest.TestCase):
         what produced the loop."""
         fn = _fn(CE_SOURCE, "_handle_quoted_acceptance")
         self.assertIn("state.last_stage = STAGE_SCHEDULING", fn)
-        self.assertIn("_handle_next_available_request", fn)
+        self.assertIn("_consume_scheduling_intent", fn)
         i_stage = fn.index("state.last_stage = STAGE_SCHEDULING")
-        i_consume = fn.index("_handle_next_available_request")
+        i_consume = fn.index("_consume_scheduling_intent")
         self.assertLess(i_stage, i_consume, "the stage must advance before consumption")
 
     def test_sched_08_no_scheduling_intent_leaves_the_normal_reply(self):
         """SCHED-08 — _handle_next_available_request returns None when the turn carries no
         delegated/earliest intent, so the ordinary acceptance reply still goes out."""
         fn = _fn(CE_SOURCE, "_handle_quoted_acceptance")
-        self.assertIn("if forward is not None", fn)
+        self.assertIn("if consumed is not None", fn)
         self.assertIn("¿Qué día y horario te viene mejor", fn)
         handler = _fn(CE_SOURCE, "_handle_next_available_request")
         self.assertIn("if not self._wants_next_available(texts):", handler)
@@ -170,10 +170,10 @@ class TestConsumptionWiring(unittest.TestCase):
     def test_sched_10_and_part_12_exactly_one_execution(self):
         """SCHED-10 / Part 12 — one acceptance, one scheduling call, one outbound."""
         fn = _fn(CE_SOURCE, "_handle_quoted_acceptance")
-        self.assertEqual(fn.count("_handle_next_available_request"), 1)
+        self.assertEqual(fn.count("_consume_scheduling_intent"), 1)
         self.assertEqual(fn.replace("'", '"').count('lead.flag = "ACEPTADO"'), 1)
         # the early return prevents the generic reply from also being sent
-        self.assertIn("return forward", fn)
+        self.assertIn("return consumed", fn)
 
     def test_a_consumption_failure_never_blocks_the_acceptance(self):
         fn = _fn(CE_SOURCE, "_handle_quoted_acceptance")
@@ -210,7 +210,7 @@ class TestExactWildRegression(unittest.TestCase):
         self.eng._faq_reconciliation_burst = None
         self.eng.db = MagicMock()
         self.eng._send_text_to_wa = MagicMock(return_value="wamid.X")
-        self.eng._handle_next_available_request = MagicMock(return_value="SCHEDULED")
+        self.eng._consume_scheduling_intent = MagicMock(return_value="SCHEDULED")
         self.ctx = MagicMock()
         self.ctx.lead = MagicMock()
         self.state = MagicMock()
@@ -219,8 +219,8 @@ class TestExactWildRegression(unittest.TestCase):
         out = self.eng._handle_quoted_acceptance(self.ctx, self.state)
         self.assertEqual(out, "SCHEDULED")
         self.assertEqual(self.ctx.lead.flag, "ACEPTADO")
-        self.eng._handle_next_available_request.assert_called_once()
-        texts = self.eng._handle_next_available_request.call_args[0][2]
+        self.eng._consume_scheduling_intent.assert_called_once()
+        texts = self.eng._consume_scheduling_intent.call_args[0][2]
         self.assertEqual(texts, ["si", "para cuando tenes"])
         self.eng._send_text_to_wa.assert_not_called()   # no generic question returned
 
@@ -230,9 +230,23 @@ class TestExactWildRegression(unittest.TestCase):
         self.assertEqual(out, "SCHEDULED")
         self.eng._send_text_to_wa.assert_not_called()
 
+    def test_sched_02_03_04_an_explicit_day_is_routed_too(self):
+        """SCHED-02/03/04 — "para hoy que tenes?" is an explicit day, not a delegated
+        request, so _wants_next_available correctly declines it. Routing from the INTENT
+        means the named-day and exact-time paths are consumed as well; otherwise same-day
+        — core business — would still have been dropped."""
+        fn = _fn(CE_SOURCE, "_consume_scheduling_intent")
+        self.assertIn("_handle_next_available_request", fn)
+        self.assertIn("_parse_scheduling_text", fn)
+        self.assertIn("_try_schedule_and_flow", fn)
+        self.assertIn("_handle_day_only_request", fn)
+        i_delegated = fn.index("_handle_next_available_request")
+        i_named = fn.index("_parse_scheduling_text")
+        self.assertLess(i_delegated, i_named, "delegated needs no date and is tried first")
+
     def test_acceptance_without_scheduling_still_asks_once(self):
         self.eng._turn_burst_texts = ["si"]
-        self.eng._handle_next_available_request = MagicMock(return_value=None)
+        self.eng._consume_scheduling_intent = MagicMock(return_value=None)
         self.eng._handle_quoted_acceptance(self.ctx, self.state)
         self.eng._send_text_to_wa.assert_called_once()
         self.assertIn("¿Qué día y horario", self.eng._send_text_to_wa.call_args[0][1])
