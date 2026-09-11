@@ -1227,6 +1227,28 @@ _EARLIEST_REJECTED_PATTERNS: tuple[str, ...] = (
 )
 
 
+# L4.7W5-F7A: asking for a person. The escalation evidence covered only "hablá con Julián" —
+# a customer who happens to know the owner's name. Asking for "alguien", "una persona" or
+# "un humano" is the ordinary way to say it, and after an offer has been rejected it is the
+# likeliest thing a frustrated customer says. Matched by shape: a want/need verb plus a
+# person word, or a plain "pasame con…".
+_HUMAN_REQUEST_PATTERNS: tuple[str, ...] = (
+    r"\b(hablar|hablo|hable|comunicar\w*|contactar\w*)\s+(con\s+)?"
+    r"(un[ao]?\s+)?(persona|humano|alguien|asesor|operador|encargado|due[nñ]o|vendedor)\b",
+    r"\b(pasa|pas[aá]me|pasame|derivame|deriv[aá]me)\b[^.]{0,20}"
+    r"\b(persona|humano|alguien|asesor|operador|encargado)\b",
+    r"\bquiero\s+(hablar|que\s+me\s+llame|que\s+me\s+llamen)\b",
+    r"\b(atienda|atiende|me\s+atiende)\s+(un[ao]?\s+)?(persona|humano|alguien)\b",
+    r"\bno\s+(quiero|me\s+sirve)\s+(hablar\s+con\s+)?(un\s+)?(bot|robot|m[aá]quina)\b",
+)
+
+
+def _is_human_request(texts: list[str]) -> bool:
+    """The customer has asked to speak to a person."""
+    n = _norm_lower(" ".join(texts))
+    return any(re.search(pat, n) for pat in _HUMAN_REQUEST_PATTERNS)
+
+
 _ESCALATION_KEYWORDS: frozenset[str] = frozenset({
     "solo puedo",
     "necesito a las",
@@ -3328,30 +3350,60 @@ class ConversationEngine:
             return self._handle_flow_failure(ctx, state, " ".join(ai_input_messages))
 
         # ── Deterministic SCHEDULING day/time parse + escalation (pre-AI) ──
-        if (
-            state.last_stage == STAGE_SCHEDULING
-            and not state.needs_human
-            and not state.flow_booking_token
-        ):
-            # 1a. L4.7W5-F2 — the earliest option we could actually offer does not solve
-            #     the customer's problem. Preconditions matter: this only counts once an
-            #     option has been produced (a day is on the table), otherwise urgency alone
-            #     would escalate before automation had even tried. Continuing to trade dates
-            #     against capacity that does not exist is worse than handing to a human.
+        # ── L4.7W5-F7A: hearing the customer is not the same as scheduling them ─────
+        #
+        # A live customer rejected the slots we had just offered — "no me sirve mañana me lo
+        # venden" — and nothing happened. Every signal had fired: _earliest_option_rejected,
+        # _urgency_signalled, and "no me sirve" in the escalation evidence. None of them could
+        # be READ, because the whole deterministic block below is gated on
+        # `not state.flow_booking_token`, and the Flow dispatched 37 seconds earlier had set
+        # that token. The offer itself made the rejection of the offer inaudible.
+        #
+        # The token is technical lifecycle state: it exists to stop a second Flow going out
+        # while one is live, and to bind a submission to the offer that produced it. It is not
+        # evidence about what the customer wants, and it must not decide whether they were
+        # heard. So interpretation and rescue consumption move OUT of the dispatch guard;
+        # dispatch and scheduling progression stay inside it.
+        #
+        #   MAY_INTERPRET / MAY_CONSUME_RESCUE  -> here, token-independent
+        #   MAY_DISPATCH_NEW_FLOW               -> the guarded block below
+        #   MAY_CREATE_OR_CONFIRM_BOOKING       -> BookingFlowService only, unchanged
+        #
+        # needs_human still gates everything: once a human owns the thread the turn returns
+        # earlier (skipped_human), so a repeated urgent message cannot re-trigger the handoff.
+        if state.last_stage == STAGE_SCHEDULING and not state.needs_human:
+            # The offered option does not solve the customer's problem. Gated on an option
+            # actually having been offered, so urgency alone never escalates before
+            # automation has tried.
             if (state.active_requested_date
                     and self._earliest_option_rejected(ai_input_messages)):
                 logger.info(
-                    "L4.7W5-F2 EARLIEST_REJECTED thread_id=%s offered=%s — human handoff",
-                    ctx.thread.id, state.active_requested_date)
+                    "L4.7W5-F2 EARLIEST_REJECTED thread_id=%s offered=%s flow_token=%s "
+                    "— human handoff", ctx.thread.id, state.active_requested_date,
+                    bool(state.flow_booking_token))
                 return self._handle_scheduling_escalation(
                     ctx, state, " ".join(ai_input_messages))
 
-            # 1. Escalation: insistence on unavailable slot → human handoff
+            # An explicit request for a person is escalation evidence in its own right,
+            # independent of whether an option was ever offered.
+            if _is_human_request(ai_input_messages):
+                logger.info("L4.7W5-F7A HUMAN_REQUESTED thread_id=%s — human handoff",
+                            ctx.thread.id)
+                return self._handle_scheduling_escalation(
+                    ctx, state, " ".join(ai_input_messages))
+
+            # Insistence on an unavailable slot or a refusal — the existing escalation
+            # evidence, now audible with a Flow open.
             if _should_escalate_scheduling_to_human(ai_input_messages, state):
                 return self._handle_scheduling_escalation(
                     ctx, state, " ".join(ai_input_messages)
                 )
 
+        if (
+            state.last_stage == STAGE_SCHEDULING
+            and not state.needs_human
+            and not state.flow_booking_token
+        ):
             sched_day_iso, sched_time_str = _parse_scheduling_text(ai_input_messages, date.today())
             # Detect period once — used by both the period-only and day+period branches.
             period = _detect_time_period(ai_input_messages)
@@ -7145,6 +7197,20 @@ class ConversationEngine:
         lead.estado = "ATENCION_HUMANA"
         state.needs_human = True
         state.last_stage = STAGE_HUMAN
+
+        # ── L4.7W5-F7A: withdraw the offer the customer just rejected ────────────────
+        # One explicit lifecycle transition, not a convenience. The token binds a Flow
+        # submission to the offer that produced it; the customer has said that offer does
+        # not work. Leaving it live would let a tap on the old Flow book the very slot they
+        # rejected — after a human had taken the thread over. Consuming it makes a late
+        # submission fail token validation in resolve_context rather than create that
+        # booking. Bookings already confirmed are untouched: this only invalidates an
+        # OUTSTANDING offer.
+        if state.flow_booking_token:
+            logger.info(
+                "L4.7W5-F7A FLOW_OFFER_WITHDRAWN thread_id=%s — rejected offer's token "
+                "consumed at handoff", ctx.thread.id)
+            state.flow_booking_token = None
 
         thread_rev_id: int | None = state.current_revision_id
 

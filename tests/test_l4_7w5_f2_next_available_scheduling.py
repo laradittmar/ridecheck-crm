@@ -292,7 +292,10 @@ class TestHandoffRouting(unittest.TestCase):
     """HANDOFF-01..04 — preconditions, asserted where the routing decision lives."""
 
     def setUp(self):
-        self.routing = CE_SOURCE[CE_SOURCE.index("# 1a. L4.7W5-F2"):
+        # L4.7W5-F7A moved the rescue branches OUT of the token-gated block, so the old
+        # anchor ("# 1a. L4.7W5-F2") no longer exists. The assertions below are unchanged —
+        # only where the routing lives changed. Anchored on the F7A block instead.
+        self.routing = CE_SOURCE[CE_SOURCE.index("# ── L4.7W5-F7A"):
                                  CE_SOURCE.index("# 2. Period request")]
 
     def test_handoff_02_03_rejection_of_the_offered_option_escalates(self):
