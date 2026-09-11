@@ -1184,11 +1184,22 @@ _NEXT_AVAILABLE_PATTERNS: tuple[str, ...] = (
     r"\bel(ig[ií]|eg[ií])\w*\s+(vos|ustedes)\b",
     r"\bfij[aá]\w*\s+(vos|ustedes)\b",
     r"\bcomo\s+(a\s+)?(ustedes|vos)\s+les?\s+quede\b",
+    # asking what availability EXISTS, without naming a date. "para cuando tenes" is the
+    # plainest form of this in Argentine Spanish and matched nothing — the live customer
+    # asked it, was answered with the same question back, repeated it, and got the identical
+    # sentence again. Built from the shape "when/what + have/is there + (availability)"
+    # rather than from the sentences already observed, so the next phrasing is covered too.
+    r"\b(para\s+)?cu[aá]ndo\s+(ten[eé]s|tiene[ns]?|hay|pod[eé]s|pueden|puede)\b",
+    r"\bqu[eé]\s+(ten[eé]s|tiene[ns]?|hay)\b[^.]{0,24}\b(disponible|libre|turno|lugar|fecha|d[ií]a)\b",
+    r"\bqu[eé]\s+disponibilidad\b",
+    r"\bcu[aá]ndo\s+(hay|tienen)\s+(turno|lugar|disponibilidad)\b",
+    r"\bhay\s+(turno|lugar|disponibilidad)\b",
+    r"\bpara\s+cu[aá]ndo\s+(hay|ten[eé]s|tienen)\b",
     # earliest availability
     r"\blo\s+antes\s+(posible|que\s+se\s+pueda)\b",
     r"\bcuanto\s+antes\b",
     r"\b(el\s+)?primer(o|a)?\s+(turno|horario|d[ií]a)\b",
-    r"\blo\s+primero\s+(que\s+(haya|tengan)|disponible)\b",
+    r"\blo\s+primero\s+(que\s+(haya|tengan|teng[aá]s|ten[eé]s|tiene[ns]?)|disponible)\b",
     r"\bqu[eé]\s+es\s+lo\s+primero\s+disponible\b",
     r"\bcu[aá]ndo\s+tienen\s+algo\b",
     r"\bm[aá]s\s+cercano\b",
@@ -1926,6 +1937,7 @@ class ConversationEngine:
         self._burst_message_count = 1
         self._burst_earliest_inbound_db_id = None
         self._faq_reconciliation_burst = None
+        self._turn_burst_texts = []
         _ce_t0 = _time.perf_counter()
         try:
             out = self._handle(event)
@@ -3125,6 +3137,9 @@ class ConversationEngine:
             ai_input_messages = event.unanswered_recent_user_messages
         else:
             ai_input_messages = _current_evidence
+        # L4.7W5-F6: the turn's customer words, so a handler reached later (acceptance, for
+        # one) can consume an intent the customer already stated instead of asking again.
+        self._turn_burst_texts = list(ai_input_messages or [])
 
         # ── L4.7B: SHADOW UNDERSTAND ──────────────────────────────────────
         # Runs on the complete raw burst BEFORE any deterministic gate can early-return,
@@ -6155,9 +6170,45 @@ class ConversationEngine:
         # state.current_revision_id stays null
         # state.needs_human stays false
 
+        # ── L4.7W5-F6: consume scheduling intent the customer already expressed ──────
+        #
+        # The live deadlock: "si" + "para cuando tenes" accepted the quote and asked when,
+        # and the answer was "¿Qué día y horario te viene mejor?" — the customer's question
+        # returned to them as a question. They repeated it and got the identical sentence.
+        #
+        # The scheduling capability was reachable only from `last_stage == SCHEDULING`, and
+        # the stage advances on THIS line — so an intent stated in the same breath as the
+        # acceptance always arrived one turn too early. Asking someone to repeat what they
+        # just said is not a safety property; the intent is consumed here instead.
+        #
+        # ScheduleService still owns availability, and the handler below applies the same
+        # progression authorization as any other scheduling turn. Nothing is bypassed —
+        # only the round trip.
+        texts = self._burst_texts_for_turn(ctx)
+        if texts:
+            try:
+                forward = self._handle_next_available_request(ctx, state, texts)
+                if forward is not None:
+                    return forward
+            except OutboundBlockedError:
+                raise
+            except Exception as exc:                 # never block acceptance on this
+                logger.warning("L4.7W5-F6 scheduling consumption failed thread_id=%s: %s",
+                               getattr(ctx.thread, "id", None), exc)
+
         reply = "¡Perfecto! ¿Qué día y horario te viene mejor para la revisión?"
         sent_id = self._send_text_to_wa(ctx, reply)
         return _out("replied", wa_message_id=sent_id)
+
+    def _burst_texts_for_turn(self, ctx: "_Context") -> list[str]:
+        """The customer's words for this turn, as the reconcilers already saw them."""
+        for attr in ("_turn_burst_texts", "_faq_reconciliation_burst"):
+            value = getattr(self, attr, None)
+            if isinstance(value, str) and value.strip():
+                return [value]
+            if isinstance(value, (list, tuple)) and value:
+                return [t for t in value if isinstance(t, str)]
+        return []
 
     # ── Website form handler ──────────────────────────────────────────────
 

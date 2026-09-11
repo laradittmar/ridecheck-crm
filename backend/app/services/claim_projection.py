@@ -117,6 +117,55 @@ def turn_modality(texts: Iterable[str]) -> tuple[Temporality, Modality]:
     return temporality, modality
 
 
+def acceptance_modality(
+    texts: Iterable[str], has_scheduling_evidence: bool
+) -> tuple[Temporality, Modality]:
+    """Temporality/modality for an ACCEPTANCE claim, scoped to the clause that accepts.
+
+    L4.7W5-F6. `turn_modality` is deliberately coarse — one reading shared by every claim in
+    the turn — and that is right for most evidence. It is wrong for acceptance when the same
+    burst also asks about scheduling:
+
+        "si"  +  "para cuando tenes"
+            -> combined: FUTURE / CONDITIONAL   ("cuando" and the trailing clause)
+            -> the QUOTE_ACCEPTED claim is not actionable_now
+            -> authorize.quote_acceptance HOLDs, stage never leaves QUOTED
+
+    A live customer answered "si" to "¿podemos avanzar?" and asked when — twice — and the
+    conversation deadlocked. The "si" was as present and factual as acceptance gets; the
+    future tense belonged to a different sentence.
+
+    The relaxation is deliberately narrow. It applies ONLY when the turn carries separate
+    scheduling evidence, because that is what EXPLAINS the future/conditional markers as
+    belonging to something other than the acceptance. Without it the coarse reading stands,
+    so "si consigo la plata" followed by an unrelated "hola" is still conditional.
+
+    Scope is the clause, not the message: "si, para cuando tenes?" arrives as one message and
+    must behave like the two-message form.
+    """
+    if not has_scheduling_evidence:
+        return turn_modality(texts)
+
+    clauses: list[str] = []
+    for text in texts:
+        if not isinstance(text, str):
+            continue
+        clauses.extend(part for part in re.split(r"[,.;!?]| pero | aunque ", text)
+                       if part and part.strip())
+    if not clauses:
+        return turn_modality(texts)
+
+    # The acceptance is actionable if ANY clause states it in the present, as fact. Other
+    # clauses may legitimately be about the future — that is the scheduling question.
+    best = turn_modality(texts)
+    for clause in clauses:
+        temporality, modality = turn_modality([clause])
+        if (temporality in (Temporality.PRESENT, Temporality.UNKNOWN)
+                and modality in (Modality.FACTUAL, Modality.UNKNOWN)):
+            return temporality, modality
+    return best
+
+
 def _explicitness(value: Any, haystack: str) -> Explicitness:
     """STATED only when the value can be found in what the customer actually wrote."""
     if not isinstance(value, str) or not value.strip():
@@ -240,9 +289,14 @@ def claims_from_turn_evidence(
         signal = AcceptanceSignal(signal_value) if signal_value in {
             s.value for s in AcceptanceSignal} else AcceptanceSignal.UNKNOWN
         if signal is AcceptanceSignal.ACCEPT:
+            # L4.7W5-F6: scoped to the accepting clause, so a scheduling question in the
+            # same burst cannot make the acceptance future or conditional.
+            acc_temporality, acc_modality = acceptance_modality(
+                texts, bool(getattr(evidence, "scheduling_requests", ())))
             add(ClaimType.QUOTE_ACCEPTED, True, status=evidence.acceptance.status,
                 evidence_class=EvidenceClass.SEMANTIC_INFERRED,
-                explicitness=Explicitness.IMPLIED, confidence=evidence.acceptance.confidence)
+                explicitness=Explicitness.IMPLIED, confidence=evidence.acceptance.confidence,
+                temporality_override=acc_temporality, modality_override=acc_modality)
         elif signal is AcceptanceSignal.REJECT:
             add(ClaimType.QUOTE_ACCEPTED, True, status=evidence.acceptance.status,
                 evidence_class=EvidenceClass.SEMANTIC_INFERRED,
