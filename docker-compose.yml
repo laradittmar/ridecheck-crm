@@ -32,7 +32,7 @@
       # tracked source. The external value is unchanged.
       WHATSAPP_VERIFY_TOKEN: ${WHATSAPP_VERIFY_TOKEN}
       WHATSAPP_PHONE_NUMBER_ID: "1196075770246218"
-      WHATSAPP_APP_SECRET: ""
+      WHATSAPP_APP_SECRET: "${WHATSAPP_APP_SECRET}"
       N8N_WEBHOOK_URL: "http://n8n:5678/webhook/ridecheck-inbound"
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       TZ: "America/Argentina/Buenos_Aires"

@@ -135,13 +135,35 @@ class TestDeploymentGating(unittest.TestCase):
         self.assertIn("WHATSAPP_APP_SECRET", [n for n in names if n])
 
     def test_compose_interpolates_from_the_env_file(self):
-        """An empty literal in compose would override .env and silently disable
-        verification — which is how this ended up unset in the first place."""
-        compose = pathlib.Path("/opt/ridecheck-crm/docker-compose.yml")
-        if not compose.exists():          # not present in a CI checkout
-            self.skipTest("base compose not on this host")
-        line = [l for l in compose.read_text().splitlines() if "WHATSAPP_APP_SECRET" in l][0]
-        self.assertIn("${WHATSAPP_APP_SECRET}", line)
+        """An empty literal in compose overrides .env and silently disables verification —
+        which is exactly how this ended up unset in production.
+
+        Both tracked compose files are asserted, the override included. The deployed stack
+        is an overlay of a base compose and docker-compose.beta.yml; for a while the
+        declaration existed ONLY as an uncommitted edit to the base file in another
+        worktree, so any checkout there would have restored the empty literal with nothing
+        to catch it. Declaring it in the override that ships with this branch is what makes
+        the guarantee survive a checkout, and this test is what keeps it declared.
+        """
+        for name in ("docker-compose.yml", "docker-compose.beta.yml"):
+            compose = ROOT / name
+            self.assertTrue(compose.exists(), f"{name} missing from the repository")
+            lines = [l for l in compose.read_text(encoding="utf-8").splitlines()
+                     if "WHATSAPP_APP_SECRET" in l and not l.strip().startswith("#")]
+            self.assertEqual(len(lines), 1, f"{name}: expected exactly one declaration")
+            self.assertIn("${WHATSAPP_APP_SECRET}", lines[0], f"{name}: not interpolated")
+            self.assertNotIn('WHATSAPP_APP_SECRET: ""', lines[0], f"{name}: empty literal")
+
+    def test_preflight_checks_the_secret_is_declared_in_compose(self):
+        """Presence in .env is not presence in the container: compose only injects a
+        variable the service declares. Preflight checked .env presence for this key but
+        verified compose declaration only for AUTH_SECRET_KEY/ADMIN_PASSWORD — the precise
+        gap its own comment warns about."""
+        text = (ROOT / "scripts" / "preflight_deploy.sh").read_text(encoding="utf-8")
+        # The literal-name loop, not one of the "${array[@]}" expansions.
+        loop = [l for l in text.splitlines() if "for key in" in l and "${" not in l]
+        self.assertEqual(len(loop), 1, "compose-declaration loop not found")
+        self.assertIn("WHATSAPP_APP_SECRET", loop[0])
 
     def test_no_real_secret_appears_in_this_suite(self):
         text = pathlib.Path(__file__).read_text(encoding="utf-8")

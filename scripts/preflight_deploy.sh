@@ -62,7 +62,7 @@ fi
 COMPOSE_FILE="${2:-/opt/ridecheck-crm-release-candidate/docker-compose.beta.yml}"
 if [[ -f "$COMPOSE_FILE" ]]; then
   undeclared=()
-  for key in AUTH_SECRET_KEY ADMIN_PASSWORD; do
+  for key in AUTH_SECRET_KEY ADMIN_PASSWORD WHATSAPP_APP_SECRET; do
     grep -qE "^[[:space:]]*${key}:" "$COMPOSE_FILE" || undeclared+=("$key")
   done
   if (( ${#undeclared[@]} > 0 )); then

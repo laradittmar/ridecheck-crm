@@ -82,6 +82,12 @@ services:
       # L4.3 Phase C: the published RideCheck Booking Flow is the authoritative
       # booking UX. Pinned explicitly so the runtime never depends on a code default.
       WHATSAPP_BOOKING_FLOW_ID: "28104222025943520"
+      # L4.7W5-APPSEC: webhook signature verification. Declared HERE, in the override that
+      # ships with the release branch, not only in the base compose — the base carries this
+      # as an uncommitted edit in the main worktree, so a checkout there would silently
+      # restore the empty literal and disable verification. Value comes from .env only.
+      # Unset renders as "", which the route treats as fail-closed, never as skip.
+      WHATSAPP_APP_SECRET: "${WHATSAPP_APP_SECRET}"
       # L4.3 Phase F: real deployment attribution in the outbound ledger
       # (was persisted as 'unknown' during Wild A — finding FOR-01).
       # L4.7W4-F3: deliberately NOT set here. compose `environment:` overrides the
