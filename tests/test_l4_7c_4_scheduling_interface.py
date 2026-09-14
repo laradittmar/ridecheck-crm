@@ -364,7 +364,8 @@ class TestCutover(unittest.TestCase):
 
     def test_schedcut_19_c3b_acceptance_unchanged(self):
         self.assertIn("_authorize_acceptance", CE_SOURCE)
-        self.assertIn("if _is_acceptance(texts):", CE_SOURCE)
+        # L4.7W5-F7B: acceptance evidence comes from the canonical producer now.
+        self.assertIn("acceptance_claims", CE_SOURCE)
         self.assertIn("authorize.quote_acceptance",
                       (ROOT / "backend" / "app" / "services"
                        / "acceptance_authorizer.py").read_text())

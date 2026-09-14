@@ -151,8 +151,13 @@ class TestLegacyFalsePositive(unittest.TestCase):
 
     def test_the_gate_requires_real_stance_not_a_word_match(self):
         """CE builds an acceptance claim only when the turn is acceptance throughout."""
-        self.assertIn("if _is_acceptance(texts):", CE_SOURCE)
-        self.assertIn("stance and therefore no claim", CE_SOURCE)
+        # L4.7W5-F7B: the engine no longer builds acceptance claims — the canonical
+        # producer does. The strictness this test guards moved with it: a clause counts
+        # only when it is acceptance THROUGHOUT, which is what stops a single
+        # acceptance-shaped word in a longer sentence from becoming a stance.
+        from app.services.acceptance_lexicon import clause_is_acceptance
+        self.assertFalse(clause_is_acceptance(self.GREETING))
+        self.assertTrue(clause_is_acceptance("dale"))
         # a single acceptance-shaped word in a longer sentence is not a stance
         self.assertTrue(_has_acceptance_word([self.GREETING]))
         self.assertFalse(_is_acceptance([self.GREETING]))

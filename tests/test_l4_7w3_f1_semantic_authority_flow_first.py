@@ -15,6 +15,7 @@ W3-REPRO-01..04  the session that produced all three
 from __future__ import annotations
 
 import ast
+import inspect
 import json
 import pathlib
 import sys
@@ -114,16 +115,16 @@ def out_msg(mid, text):
 class TestSemanticAcceptance(unittest.TestCase):
 
     def authorize(self, sem, texts, state=None):
-        eng, ctx = engine(sem=sem)
-        claims = eng._semantic_acceptance_claims(ctx.state, texts)
-        if _is_acceptance(texts):
-            from app.schemas.claims import (ClaimEvidence, ClaimType, EvidenceClass,
-                                            Explicitness, Polarity)
-            claims.append(ClaimEvidence(
-                claim_type=ClaimType.QUOTE_ACCEPTED, value=True, polarity=Polarity.ASSERTED,
-                evidence_class=EvidenceClass.DETERMINISTIC_EXTRACTED,
-                producer="ce:_is_acceptance", explicitness=Explicitness.IMPLIED,
-                cycle_id="c1").with_id())
+        """L4.7W5-F7B: one canonical producer.
+
+        This helper used to call `_semantic_acceptance_claims` and then re-create the
+        engine's own deterministic QUOTE_ACCEPTED claim itself — a third copy of the
+        duplicate authority, which is why these tests passed while the live path
+        deadlocked. It now calls the single canonical producer, the same one
+        `_authorize_acceptance` calls.
+        """
+        from app.services.claim_projection import acceptance_claims
+        claims = acceptance_claims(list(texts), sem, cycle_id="c1")
         return authorize_quote_acceptance(claims, state or quoted_state())
 
     def test_sem_auth_01_mixed_accept_plus_faq(self):
@@ -176,12 +177,15 @@ class TestSemanticAcceptance(unittest.TestCase):
 
     def test_the_projection_is_reused_not_reimplemented(self):
         eng, ctx = engine(sem=evidence(AcceptanceSignal.ACCEPT))
-        claims = eng._semantic_acceptance_claims(ctx.state, [W3_ACCEPT])
+        from app.services.claim_projection import acceptance_claims
+        claims = acceptance_claims([W3_ACCEPT], evidence(AcceptanceSignal.ACCEPT), cycle_id="c1")
         self.assertTrue(claims)
         direct = claims_from_turn_evidence(evidence(AcceptanceSignal.ACCEPT), texts=[W3_ACCEPT])
         self.assertTrue(any(c.claim_type == claims[0].claim_type for c in direct))
-        fn = next(ast.unparse(n) for n in ast.walk(ast.parse(CE_SOURCE))
-                  if isinstance(n, ast.FunctionDef) and n.name == "_semantic_acceptance_claims")
+        # The canonical producer delegates the semantic stance rather than re-reading it.
+        import app.services.claim_projection as _cp
+        fn = next(ast.unparse(n) for n in ast.walk(ast.parse(inspect.getsource(_cp)))
+                  if isinstance(n, ast.FunctionDef) and n.name == "acceptance_claims")
         self.assertIn("claims_from_turn_evidence", fn)
         self.assertNotIn("SemanticTurnInterpreter", fn)
 
@@ -320,7 +324,10 @@ class TestW3Reproduction(unittest.TestCase):
     def test_w3_repro_01_acceptance_is_authorized_by_acceptance(self):
         """W3-REPRO-01 — ACEPTADO for the right reason, not incidental progression."""
         eng, ctx = engine(sem=evidence(AcceptanceSignal.ACCEPT, ("business_hours",)))
-        claims = eng._semantic_acceptance_claims(ctx.state, [W3_ACCEPT, W3_FAQ])
+        from app.services.claim_projection import acceptance_claims
+        claims = acceptance_claims([W3_ACCEPT, W3_FAQ],
+                                   evidence(AcceptanceSignal.ACCEPT, ("business_hours",)),
+                                   cycle_id="c1")
         decision = authorize_quote_acceptance(claims, quoted_state())
         self.assertEqual(decision.result, "ALLOW")
         self.assertEqual(decision.rule_id, "authorize.quote_acceptance")

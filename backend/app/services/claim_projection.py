@@ -117,6 +117,57 @@ def turn_modality(texts: Iterable[str]) -> tuple[Temporality, Modality]:
     return temporality, modality
 
 
+# ── L4.7W5-F7B: deterministic acceptance, read from the lexicon module ────────
+# The vocabulary deliberately does NOT live here: L4.7C-3B holds this module to a
+# grammatical invariant — no phrase lists in executable code — and a test enforces it.
+from .acceptance_lexicon import (          # noqa: E402
+    ACCEPTANCE_KEYWORDS,
+    acceptance_clauses as _acceptance_clauses,
+    clause_is_acceptance as _clause_is_acceptance,
+    declines as _declines,
+)
+
+
+def deterministic_acceptance(texts: Iterable[str], has_scheduling_evidence: bool) -> bool:
+    """Acceptance readable from the words alone, scoped to the accepting clause.
+
+    L4.7W5-F7B. `_is_acceptance` required the WHOLE burst to be acceptance words, so the
+    Wild burst "si" + "para cuando tenes" produced no deterministic acceptance at all:
+    the scheduling clause is not acceptance vocabulary, so the predicate failed on the
+    very turn the customer said yes. Acceptance was then readable ONLY by the semantic
+    interpreter, and when that call was unavailable the authorizer saw no stance,
+    answered HOLD, and the conversation deadlocked — what the customer experienced.
+
+    Scoping fixes that without widening what counts as a yes:
+
+      * some clause must be acceptance THROUGHOUT — the same strictness as before;
+      * that clause must itself read as present and factual, so a conditional yes is
+        still conditional and still does not accept;
+      * if other clauses exist they must be EXPLAINED by scheduling evidence in the same
+        turn, which is the F6 rule applied to evidence rather than to modality;
+      * any declining clause in the burst suppresses the whole thing, so an acceptance
+        cannot advance merely by having arrived first.
+    """
+    clauses = _acceptance_clauses(texts)
+    if not clauses:
+        return False
+    if _declines(texts):
+        return False
+    accepting = [c for c in clauses if _clause_is_acceptance(c)]
+    if not accepting:
+        return False
+    if not any(_is_actionable(*turn_modality([clause])) for clause in accepting):
+        return False
+    if len(accepting) == len(clauses):
+        return True            # the whole burst is acceptance — the historical rule
+    return bool(has_scheduling_evidence)
+
+
+def _is_actionable(temporality: Temporality, modality: Modality) -> bool:
+    return (temporality in (Temporality.PRESENT, Temporality.UNKNOWN)
+            and modality in (Modality.FACTUAL, Modality.UNKNOWN))
+
+
 def acceptance_modality(
     texts: Iterable[str], has_scheduling_evidence: bool
 ) -> tuple[Temporality, Modality]:
@@ -439,3 +490,89 @@ def in_cycle(claims: Iterable[ClaimEvidence], cycle_id: Optional[str]) -> list[C
     if cycle_id is None:
         return [c for c in claims if c.cycle_id is None]
     return [c for c in claims if c.cycle_id == cycle_id]
+
+
+# ── L4.7W5-F7B: THE canonical acceptance producer ─────────────────────────────
+
+# Claim families the acceptance authorizer reasons about. A stance outside this set
+# (hesitation, a bare question) contributes nothing, which is the safe default.
+ACCEPTANCE_CLAIM_TYPES = (ClaimType.QUOTE_ACCEPTED, ClaimType.FUTURE_INTENT,
+                          ClaimType.SEARCHING_NOT_READY)
+
+
+def acceptance_claims(
+    texts: Iterable[str],
+    evidence: Optional[TurnEvidence] = None,
+    *,
+    cycle_id: Optional[str] = None,
+    revision_id: Optional[int] = None,
+    has_scheduling_evidence: Optional[bool] = None,
+) -> list[ClaimEvidence]:
+    """The single canonical producer of acceptance evidence for authorization.
+
+    ONE BUSINESS CLAIM, ONE CANONICAL PRODUCER. Before F7B, `conversation_engine`
+    assembled its own QUOTE_ACCEPTED claim with its own modality classifier
+    (`turn_modality`) while the projection used the F6-scoped `acceptance_modality`.
+    The two never actually disagreed — `_is_acceptance` required the whole burst to be
+    acceptance words, so it could not fire on the very bursts where the classifiers
+    differ — but that is a coincidence of their firing conditions, not a guarantee. One
+    regex widened on either side and they diverge silently, with the authorizer taking
+    whichever claim happens to be actionable.
+
+    Worse, that disjointness WAS the live defect: for "si" + "para cuando tenes" the
+    deterministic side produced nothing, so acceptance depended entirely on a semantic
+    model call. When that call was unavailable the authorizer saw no stance at all and
+    answered HOLD — the deadlock the customer hit, reachable again on any timeout.
+
+    So both readings now converge here:
+
+      * deterministic — clause-scoped, model-independent, and therefore able to read
+        "si" + "para cuando tenes" with no model call at all;
+      * semantic — the projection F6 corrected, unchanged and still authoritative for
+        REJECT / FUTURE_INTENT / SEARCHING_NOT_READY.
+
+    Both are stamped by ONE modality policy (`acceptance_modality`). This function never
+    decides, never mutates state and never sends: it returns evidence for
+    `authorize.quote_acceptance@v1`, which remains the only authority.
+    """
+    texts = [t for t in (texts or ()) if isinstance(t, str)]
+    if has_scheduling_evidence is None:
+        has_scheduling_evidence = bool(getattr(evidence, "scheduling_requests", ()) or ())
+
+    # 1. Semantic stance, from the projection F6 fixed. Unchanged and not reclassified.
+    out: list[ClaimEvidence] = []
+    if evidence is not None:
+        projected = claims_from_turn_evidence(
+            evidence, texts=texts, cycle_id=cycle_id, revision_id=revision_id)
+        out.extend(c for c in projected if c.claim_type in ACCEPTANCE_CLAIM_TYPES)
+
+    # 2. An explicit rejection anywhere in the burst withdraws deterministic acceptance.
+    #    Same-burst conflict must not resolve by whichever evidence was produced first.
+    rejected = any(c.claim_type == ClaimType.QUOTE_ACCEPTED
+                   and c.polarity is Polarity.NEGATED for c in out)
+
+    # 3. Deterministic stance — the model-independent floor. It is a FLOOR, not a second
+    #    opinion: when the semantic reading already asserted acceptance, adding a
+    #    deterministic duplicate would put two QUOTE_ACCEPTED claims in front of the
+    #    authorizer for one burst. Exactly one canonical claim leaves this function.
+    already_accepted = any(c.claim_type == ClaimType.QUOTE_ACCEPTED
+                           and c.polarity is Polarity.ASSERTED for c in out)
+    if (not rejected and not already_accepted
+            and deterministic_acceptance(texts, has_scheduling_evidence)):
+        temporality, modality = acceptance_modality(texts, has_scheduling_evidence)
+        out.append(ClaimEvidence(
+            claim_type=ClaimType.QUOTE_ACCEPTED, value=True, polarity=Polarity.ASSERTED,
+            # Deterministic extraction: the accepting words are literally present, so the
+            # reading is not a proposal to be confirmed later.
+            status=EvidenceStatus.CONFIRMED,
+            evidence_class=EvidenceClass.DETERMINISTIC_EXTRACTED,
+            producer="canonical:deterministic_acceptance",
+            explicitness=Explicitness.IMPLIED,
+            temporality=temporality, modality=modality,
+            cycle_id=cycle_id, revision_id=revision_id).with_id())
+    elif rejected:
+        # Keep only the rejection and any non-acceptance stance: an ASSERTED acceptance
+        # from the same burst cannot outvote an explicit "no" by ordering.
+        out = [c for c in out if not (c.claim_type == ClaimType.QUOTE_ACCEPTED
+                                      and c.polarity is Polarity.ASSERTED)]
+    return out

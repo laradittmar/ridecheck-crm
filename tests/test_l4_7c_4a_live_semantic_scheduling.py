@@ -517,8 +517,17 @@ class TestBoundaries(unittest.TestCase):
 
     def test_livesem_16_c3b_acceptance_unchanged(self):
         source = function_source("_authorize_acceptance")
-        self.assertNotIn("_semantic_turn_evidence", source)
-        self.assertIn("if _is_acceptance(texts):", source)
+        # L4.7W5-F7B: `_authorize_acceptance` now reads the turn's semantic evidence
+        # directly instead of via the removed `_semantic_acceptance_claims`, so the name
+        # appears here where it used to sit one frame down. The invariant this test
+        # protects is unchanged and is asserted below: the provider is SINGLE-FLIGHT, so
+        # reading it does not dispatch a model call — `get` returns the one result the
+        # burst already has. Code shape moved; the call budget did not.
+        self.assertIn("_semantic_turn_evidence", source)
+        self.assertIn("acceptance_claims", source)
+        from app.services.claim_projection import acceptance_claims as _ac
+        import inspect as _inspect
+        self.assertNotIn("interpret", _inspect.getsource(_ac))
         from app.services.conversation_engine import _is_acceptance
         self.assertFalse(_is_acceptance(["Bueno, quería revisar una 2008"]),
                          "an acceptance-shaped word inside a longer sentence is not a stance")

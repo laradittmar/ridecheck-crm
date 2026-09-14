@@ -98,11 +98,11 @@ STAGE_FLOW_SENT = "FLOW_SENT"
 STAGE_BOOKED = "BOOKED"
 STAGE_HUMAN = "HUMAN_REQUIRED"
 
-_ACCEPTANCE_KEYWORDS = frozenset({
-    "sí", "si", "yes", "ok", "okay", "dale", "perfecto", "avancemos",
-    "listo", "buenísimo", "me sirve", "bueno", "claro",
-    "de acuerdo", "por supuesto", "quiero avanzar",
-})
+# L4.7W5-F7B: the canonical set lives in claim_projection, with the acceptance producer
+# that uses it. Imported back here so `_is_acceptance` and `_has_acceptance_word` keep
+# working unchanged — one definition, no second copy to drift.
+from .acceptance_lexicon import (ACCEPTANCE_KEYWORDS as _ACCEPTANCE_KEYWORDS,
+                                 may_be_acceptance as _may_be_acceptance)
 
 
 def _is_acceptance(texts: list[str]) -> bool:
@@ -3282,7 +3282,17 @@ class ConversationEngine:
         # When the client is in QUOTED stage and sends a clear acceptance word,
         # skip the AI entirely: set flag=ACEPTADO, stage=SCHEDULING, and ask
         # for day/time only.  No revision, no Flow, no re-quoting.
-        if state.last_stage == STAGE_QUOTED and _is_acceptance(ai_input_messages):
+        # L4.7W5-F7B: route on the permissive question, decide with the authorizer.
+        # `_is_acceptance` requires the whole burst to be acceptance words, so the Wild
+        # burst "si" + "para cuando tenes" never entered this branch and the authorizer
+        # was never consulted — the canonical producer was unreachable however correct it
+        # was. Widening applies ONLY with the authority on, because the flag-off branch
+        # below accepts without authorizing: widening it there would let "si consigo la
+        # plata" advance unchecked. Flag off keeps the historical predicate exactly.
+        _acceptance_candidate = (_may_be_acceptance(ai_input_messages)
+                                 if self._acceptance_authority_on()
+                                 else _is_acceptance(ai_input_messages))
+        if state.last_stage == STAGE_QUOTED and _acceptance_candidate:
             # L4.7C.3B: a language match no longer advances commercial state on its own.
             # With the flag ON the deterministic predicate decides; with it OFF this is the
             # legacy path, unchanged.
@@ -5316,65 +5326,58 @@ class ConversationEngine:
             stage=getattr(state, "last_stage", None))
 
     def _authorize_acceptance(self, ctx: "_Context", state, texts: list[str]):
-        """Decide whether this turn may advance commercially. Returns a decision or None."""
-        from ..schemas.claims import (ClaimEvidence, ClaimType, EvidenceClass, Explicitness,
-                                      Modality, Polarity, Temporality)
-        from .acceptance_authorizer import authorize_quote_acceptance
-        from .claim_projection import turn_modality
+        """Decide whether this turn may advance commercially. Returns a decision or None.
 
-        temporality, modality = turn_modality(texts)
-        cycle_id = self._reconciler_cycle_id(state)
-        # The stance is EVIDENCE, not an assumption of the caller. A turn qualifies only
-        # when it is acceptance throughout (`_is_acceptance`); a single acceptance-shaped
-        # word inside a longer sentence — the "Bueno, quería revisar…" class — carries no
-        # stance and therefore no claim, so the predicate has nothing to authorise.
-        claims = []
-        if _is_acceptance(texts):
-            claims.append(ClaimEvidence(
-                claim_type=ClaimType.QUOTE_ACCEPTED, value=True, polarity=Polarity.ASSERTED,
-                evidence_class=EvidenceClass.DETERMINISTIC_EXTRACTED,
-                producer="ce:_is_acceptance", explicitness=Explicitness.IMPLIED,
-                temporality=temporality, modality=modality, cycle_id=cycle_id).with_id())
-        # ── L4.7W3-F1: the semantic stance is evidence too ───────────────────
-        # Wild W3: "Bueno dale avancemos" arrived in a burst that also asked an FAQ.
-        # `_is_acceptance` requires the turn to be acceptance THROUGHOUT, so it returned
-        # False and C3B logged stance=None for a turn where the customer plainly said yes.
-        # The interpreter had it right. It now contributes its stance as a claim — and
-        # nothing more: every prerequisite (quote exists, delivered, same cycle, inputs
-        # unchanged, no conflicting evidence) still decides, and a HESITATE / FUTURE_INTENT
-        # / QUESTION_ONLY reading contributes no acceptance claim at all.
-        claims.extend(self._semantic_acceptance_claims(state, texts))
+        L4.7W5-F7B. This used to assemble a QUOTE_ACCEPTED claim itself — its own
+        `_is_acceptance` predicate stamped with its own `turn_modality` reading — beside
+        the claim the projection produced with the F6-scoped `acceptance_modality`. Two
+        producers of one HIGH-risk business claim, either able to make it actionable.
+
+        It now gathers nothing and classifies nothing. `claim_projection.acceptance_claims`
+        is the single canonical producer; this method only hands its result to the
+        authorizer, which remains the only thing that decides.
+        """
+        from .claim_projection import acceptance_claims
+        from .acceptance_authorizer import authorize_quote_acceptance
+
+        evidence = self._semantic_turn_evidence()
+        revision_id = getattr(state, "current_revision_id", None)
+        claims = acceptance_claims(
+            list(texts or ()), evidence,
+            cycle_id=self._reconciler_cycle_id(state),
+            revision_id=(revision_id if isinstance(revision_id, int) else None),
+            has_scheduling_evidence=self._turn_has_scheduling_evidence(texts, evidence))
+
         decision = authorize_quote_acceptance(claims, self._commercial_state(ctx, state))
         self._record_authorization(ctx, decision, state)
         return decision
 
-    def _semantic_acceptance_claims(self, state, texts) -> list:
-        """Stance-bearing claims from this burst's TurnEvidence. Never a decision.
+    def _turn_has_scheduling_evidence(self, texts, evidence) -> bool:
+        """Does this burst ask about scheduling at all? Deterministic when it must be.
 
-        Reuses `claims_from_turn_evidence`, so the ACCEPT / REJECT / FUTURE_INTENT /
-        HESITATE distinctions and their polarity come from the projection that the corpus
-        already measures — no second stance interpreter, and no new model call.
+        L4.7W5-F7B. This is what EXPLAINS the future-tense words in an accepting burst as
+        belonging to a different sentence, so the acceptance stays present and factual.
+        Reading it only from the semantic interpreter would have rebuilt the original
+        defect one level down: with no model evidence the answer was always False, the
+        deterministic floor could not fire on "si" + "para cuando tenes", and the turn
+        deadlocked exactly as before — a fix that works only while the model answers is
+        not a fix. The deterministic readers below are the ones F6 already certified.
         """
-        evidence = self._semantic_turn_evidence()
-        if evidence is None:
-            return []
+        if getattr(evidence, "scheduling_requests", ()) or ():
+            return True
+        texts = [t for t in (texts or ()) if isinstance(t, str)]
+        if not texts:
+            return False
         try:
-            from ..schemas.claims import ClaimType
-            from .claim_projection import claims_from_turn_evidence
-            revision_id = getattr(state, "current_revision_id", None)
-            projected = claims_from_turn_evidence(
-                evidence, texts=list(texts or ()),
-                cycle_id=self._reconciler_cycle_id(state),
-                revision_id=(revision_id if isinstance(revision_id, int) else None))
-            # Only the claim families the acceptance authorizer reasons about. A stance
-            # the projection did not produce (hesitation, a bare question) contributes
-            # nothing, which is the safe default rather than an absence to interpret.
-            wanted = {ClaimType.QUOTE_ACCEPTED, ClaimType.FUTURE_INTENT,
-                      ClaimType.SEARCHING_NOT_READY}
-            return [c for c in projected if c.claim_type in wanted]
-        except Exception as exc:      # a projection failure is no evidence, never a yes
-            logger.warning("L4.7W3-F1 semantic acceptance projection failed: %s", exc)
-            return []
+            if self._wants_next_available(texts):
+                return True
+        except Exception:
+            pass
+        try:
+            day_iso, time_str = _parse_scheduling_text(texts, date.today())
+            return bool(day_iso or time_str)
+        except Exception:
+            return False
 
     def _authorize_scheduling_progression(self, ctx: "_Context", state):
         from .acceptance_authorizer import authorize_scheduling_progression

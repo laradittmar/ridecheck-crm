@@ -181,11 +181,14 @@ class TestNoRegression(unittest.TestCase):
                           else "if _flow_out is not None", caller)
 
     def test_bf_dx_13_acceptance_path_untouched(self):
-        self.assertIn("_semantic_acceptance_claims", CE_SOURCE)
+        # L4.7W5-F7B: `_semantic_acceptance_claims` was removed with the duplicate
+        # producer. The acceptance path still routes through the authorizer, but its
+        # evidence now comes from the single canonical producer.
         fn = next(ast.unparse(n) for n in ast.walk(ast.parse(CE_SOURCE))
                   if isinstance(n, ast.FunctionDef) and n.name == "_authorize_acceptance")
-        self.assertIn("self._semantic_acceptance_claims(state, texts)", fn)
+        self.assertIn("acceptance_claims", fn)
         self.assertIn("authorize_quote_acceptance", fn)
+        self.assertNotIn("_semantic_acceptance_claims", CE_SOURCE)
 
     def test_bf_dx_14_faq_reconciliation_untouched(self):
         from app.services.conversation_engine import _FAQ_TOPIC_ANSWERS

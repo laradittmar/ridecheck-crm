@@ -350,10 +350,20 @@ class TestShadowOnly(unittest.TestCase):
         branch is still there and still reachable, so turning the flag off restores it.
         """
         ce = (ROOT / "backend" / "app" / "services" / "conversation_engine.py").read_text()
-        self.assertIn("if state.last_stage == STAGE_QUOTED and _is_acceptance(", ce)
         self.assertIn("return self._handle_quoted_acceptance(ctx, state)", ce)
         self.assertIn("if not self._acceptance_authority_on():", ce,
                       "the legacy path must remain reachable with the flag off")
+        # L4.7W5-F7B widened the ROUTING predicate so the authorizer is actually reached
+        # for an accepting burst that also asks about scheduling. The widening is gated on
+        # the authority being ON, because the flag-off branch accepts without authorizing:
+        # with the flag off the historical `_is_acceptance` predicate must still decide.
+        import ast as _ast
+        guard = next(_ast.unparse(n) for n in _ast.walk(_ast.parse(ce))
+                     if isinstance(n, _ast.Assign)
+                     and "_acceptance_candidate" in _ast.unparse(n.targets[0]))
+        self.assertIn("_is_acceptance(ai_input_messages)", guard)
+        self.assertIn("_acceptance_authority_on()", guard)
+        self.assertIn("_may_be_acceptance(ai_input_messages)", guard)
 
 
 if __name__ == "__main__":

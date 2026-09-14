@@ -109,8 +109,25 @@ class TestAcceptanceScoping(unittest.TestCase):
         self.assertIn("re.split", fn)      # clause scope, not message scope
 
     def test_other_claims_keep_the_coarse_turn_reading(self):
-        """Only the acceptance claim is scoped; nothing else changes."""
-        self.assertEqual(CP_SOURCE.count("acceptance_modality("), 2)  # def + one call site
+        """Only the acceptance claim is scoped; nothing else changes.
+
+        This used to count occurrences of "acceptance_modality(" in the source and expect
+        exactly two. L4.7W5-F7B legitimately added a second call site — the canonical
+        producer — and the count broke while the invariant it stood for held perfectly.
+        The invariant is asserted directly now: the scoped reading is used only by
+        functions that stamp acceptance, and every other claim still takes turn_modality.
+        """
+        import ast as _ast
+        tree = _ast.parse(CP_SOURCE)
+        callers = set()
+        for fn in [n for n in _ast.walk(tree)
+                   if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef))]:
+            for node in _ast.walk(fn):
+                if (isinstance(node, _ast.Call)
+                        and getattr(node.func, "id", None) == "acceptance_modality"):
+                    callers.add(fn.name)
+        self.assertEqual(callers, {"claims_from_turn_evidence", "acceptance_claims"},
+                         "the scoped acceptance reading leaked to another claim family")
 
 
 class TestSchedulingIntent(unittest.TestCase):
