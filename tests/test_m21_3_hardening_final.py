@@ -592,11 +592,24 @@ class T24_WebhookSignatureVerification(unittest.TestCase):
         secret = "my_app_secret_123"
         self.assertFalse(self._verify_signature(body, None, secret))
 
-    def test_t24d_empty_secret_dev_mode_skips_verification(self):
-        """Empty app_secret → dev mode: verification skipped (returns True)."""
+    def test_t24d_empty_secret_fails_closed(self):
+        """An absent app_secret rejects every request.
+
+        L4.7W5-APPSEC reversed this. It previously asserted the "dev mode" skip — an empty
+        secret returned True — which meant one missing .env line silently disabled webhook
+        authentication, announced by a single INFO log. The secret was in fact unset in this
+        deployment, so verification had been off in practice.
+
+        Accepting unsigned traffic is now an explicit, loudly logged opt-in
+        (WHATSAPP_WEBHOOK_ALLOW_UNSIGNED=true), never the default.
+        """
+        import os
+        from unittest.mock import patch as _patch
         body = b'{"any": "payload"}'
-        self.assertTrue(self._verify_signature(body, None, ""))
-        self.assertTrue(self._verify_signature(body, "sha256=wrong", ""))
+        with _patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("WHATSAPP_WEBHOOK_ALLOW_UNSIGNED", None)
+            self.assertFalse(self._verify_signature(body, None, ""))
+            self.assertFalse(self._verify_signature(body, "sha256=wrong", ""))
 
     def test_t24e_wrong_algorithm_prefix_rejected(self):
         body = b'{"test": "payload"}'

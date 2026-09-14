@@ -53,10 +53,33 @@ def _parse_wa_timestamp(value: object) -> datetime | None:
 
 
 def _verify_signature(raw_body: bytes, signature_header: str | None, app_secret: str) -> bool:
+    """Validate Meta's X-Hub-Signature-256 over the RAW request body.
+
+    L4.7W5-APPSEC: this used to return True when the secret was absent — a "dev mode" skip.
+    The intent was convenience; the effect was that forgetting one .env line silently turned
+    webhook authentication off, with nothing but an INFO line to say so. That is the same
+    shape as OPS-CRM-500, where a security control was disabled because a variable never
+    reached the container and no gate noticed.
+
+    It now fails CLOSED. An absent secret means no request can be authenticated, so none is
+    accepted. Local development that genuinely needs unsigned posts must set
+    WHATSAPP_WEBHOOK_ALLOW_UNSIGNED=true deliberately — and every such request is logged at
+    WARNING, so it can never be mistaken for a secured deployment.
+    """
     secret = (app_secret or "").strip()
     if not secret:
-        logger.info("Webhook signature skipped (dev mode)")
-        return True
+        import os as _os
+        if _os.environ.get("WHATSAPP_WEBHOOK_ALLOW_UNSIGNED", "").strip().lower() == "true":
+            logger.warning(
+                "WEBHOOK_SIGNATURE_UNVERIFIED — WHATSAPP_APP_SECRET is unset and "
+                "WHATSAPP_WEBHOOK_ALLOW_UNSIGNED=true. This request was NOT authenticated."
+            )
+            return True
+        logger.error(
+            "WEBHOOK_SIGNATURE_FAIL_CLOSED — WHATSAPP_APP_SECRET is not configured, so no "
+            "request can be authenticated. Rejecting."
+        )
+        return False
 
     header_value = str(signature_header or "").strip()
     if not header_value:

@@ -17,6 +17,7 @@ Edge cases covered:
 """
 from __future__ import annotations
 
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -24,6 +25,14 @@ from unittest.mock import patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+
+# L4.7W5-APPSEC: webhook signature verification now fails closed when WHATSAPP_APP_SECRET is
+# unset. These suites exercise ingestion and storage, not authentication, and post unsigned
+# payloads. They opt in explicitly — the same deliberate, logged escape hatch an operator
+# would have to set — so that a missing secret still fails closed everywhere else.
+# Signature behaviour itself is covered by tests/test_l4_7w5_appsec_webhook_signature.py.
+os.environ.setdefault("WHATSAPP_WEBHOOK_ALLOW_UNSIGNED", "true")
+
 
 ROOT_DIR = Path(__file__).resolve().parents[3]
 BACKEND_DIR = ROOT_DIR / "backend"

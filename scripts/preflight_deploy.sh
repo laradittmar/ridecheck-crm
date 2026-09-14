@@ -27,6 +27,10 @@ REQUIRED=(
   # OPS-CRM-500: the F4 internal-API boundary was silently disabled by a deploy that
   # read only .env, because enablement lived in a shell variable someone had to remember
   # to type. Configuration that exists only in a person's memory is not configuration.
+  # L4.7W5-APPSEC: webhook authentication fails CLOSED without this, so a deploy that
+  # omits it takes inbound down rather than silently accepting unsigned requests. Better
+  # to stop here than to discover it from a customer.
+  WHATSAPP_APP_SECRET
   INTERNAL_API_AUTH_ENABLED
   INTERNAL_API_TRUSTED_CIDR
 )
