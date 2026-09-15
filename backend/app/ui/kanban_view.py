@@ -4033,6 +4033,8 @@ def render_calendar_page(
       .agendaCobrarBtn[disabled] { background: #9ca3af; cursor: not-allowed; }
       .agendaPaidBox { display: inline-flex; align-items: center; gap: 6px; border-radius: 8px; padding: 5px 10px; background: #dcfce7; color: #166534; font-size: 12px; font-weight: 700; }
       .agendaPaidDate { font-weight: 600; color: #15803d; }
+      .agendaLegacyPago { background: #e0e7ff; color: #3730a3; }
+      .agendaLegacyBox { display: inline-flex; align-items: center; gap: 6px; border-radius: 8px; padding: 5px 10px; background: #e0e7ff; color: #3730a3; font-size: 12px; font-weight: 700; }
       .agendaStateWarn { font-size: 11px; font-weight: 700; border-radius: 6px; padding: 3px 8px; background: #fef3c7; color: #92400e; margin-top: 4px; width: fit-content; }
       .cobroAmount { font-size: 26px; font-weight: 800; color: #0f172a; margin: 6px 0; }
       .cobroWho { font-size: 14px; font-weight: 700; color: #111827; }
@@ -4298,8 +4300,16 @@ def render_calendar_page(
             cls = _acls(r)
             estado_raw = html_lib.escape((r.estado_revision or "PENDIENTE").strip())
             pago_chip = ""
-            if r.pago is True or (r.cobrado or "").strip().upper() == "SI":
+            # L4.7W5-R2: `cobrado`/`fecha_cobro` are canonical. The legacy `pago` boolean
+            # carries no date, so a row with pago=true but cobrado<>'SI' is NOT the same
+            # state as a collected revision — collapsing them told the operator a payment
+            # was recorded when no date exists anywhere.
+            _chip_cobrado = (getattr(r, "cobrado", None) or "").strip().upper() == "SI"
+            _chip_pago_legacy = getattr(r, "pago", None) is True and not _chip_cobrado
+            if _chip_cobrado:
                 pago_chip = '<span class="agendaPayChip agendaPaid">Cobrado</span>'
+            elif _chip_pago_legacy:
+                pago_chip = '<span class="agendaPayChip agendaLegacyPago">Pago previo</span>'
             elif not is_non_occ:
                 pago_chip = '<span class="agendaPayChip agendaUnpaid">Sin cobrar</span>'
 
@@ -4350,6 +4360,20 @@ def render_calendar_page(
                     f'<span class="agendaQuoteAmount">{html_lib.escape(quote_txt)}</span>'
                     f'<span class="agendaPaidBox">&#x2713; Cobrado '
                     f'<span class="agendaPaidDate">{_fc}</span></span>'
+                    f'</div>'
+                )
+            elif getattr(r, "pago", None) is True:
+                # Paid at some point according to the legacy flag, but the real date was
+                # never recorded. Assigning today would invent a payment date, so the
+                # action is withheld and the operator enters the true date in the form.
+                pay_html = (
+                    f'<div class="agendaQuoteRow" data-rev-pay="{r.id}">'
+                    + (f'<span class="agendaQuoteLabel">Presupuesto</span>'
+                       f'<span class="agendaQuoteAmount">{html_lib.escape(quote_txt)}</span>'
+                       if _precio is not None else
+                       f'<span class="agendaQuoteAmount missing">{html_lib.escape(quote_txt)}</span>')
+                    + f'<span class="agendaLegacyBox">&#x26A0; Pago previo — falta registrar fecha</span>'
+                    f'<a class="agendaActionBtn agendaEditBtn" href="{href}">Registrar fecha</a>'
                     f'</div>'
                 )
             elif _precio is None:

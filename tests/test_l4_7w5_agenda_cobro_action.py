@@ -107,12 +107,14 @@ def _client_and_db():
     return client, db, fastapi_app, patcher
 
 
-def _seed(db, *, precio_total=130000, cobrado=None, fecha_cobro=None, estado="CONFIRMADO"):
+def _seed(db, *, precio_total=130000, cobrado=None, fecha_cobro=None, estado="CONFIRMADO",
+          pago=None):
     lead = Lead(estado="CONSULTA_NUEVA", flag="ACEPTADO", nombre="Cliente Sintetico")
     db.add(lead); db.flush()
     rev = Revision(lead_id=lead.id, turno_fecha=TODAY, turno_hora=time(10, 0),
                    precio_base=120000, viaticos=10000, precio_total=precio_total,
                    cobrado=cobrado, fecha_cobro=fecha_cobro, estado_revision=estado,
+                   pago=pago,
                    marca="Renault", modelo="Sandero", anio=2020, tipo_vehiculo="AUTO",
                    zone_group="CABA", zone_detail="La Paternal")
     db.add(rev); db.commit()
@@ -322,6 +324,74 @@ class BackendPayment(unittest.TestCase):
         self.assertNotIn("1100000000", line)
 
 
+class LegacyPagoState(unittest.TestCase):
+    """R2 — `pago=true` with `cobrado<>'SI'` is a DIFFERENT state from collected.
+
+    Three rows in crm_test are in it. The legacy boolean records that money arrived but
+    carries no date anywhere, so stamping today would write a payment date that never
+    happened. It is shown as its own state and routed to the edit form.
+    """
+
+    def setUp(self):
+        self.client, self.db, self.app, self._patcher = _client_and_db()
+        self.lead, self.rev = _seed(self.db, pago=True, cobrado=None, fecha_cobro=None)
+
+    def tearDown(self):
+        self._patcher.stop()
+        for dep in list(self.app.dependency_overrides):
+            if getattr(dep, "__name__", "").endswith("get_db") or \
+                    getattr(dep, "__name__", "") == "_get_db_gen":
+                self.app.dependency_overrides.pop(dep, None)
+        self.db.close()
+
+    def test_r2_01_endpoint_refuses_to_invent_a_date(self):
+        r = _post(self.client, self.rev.id)
+        self.assertEqual(r.status_code, 409, r.text)
+        self.assertIn("Pago previo", r.text)
+
+    def test_r2_02_no_field_is_written(self):
+        _post(self.client, self.rev.id)
+        self.db.expire_all()
+        row = self.db.get(Revision, self.rev.id)
+        self.assertIsNone(row.cobrado)
+        self.assertIsNone(row.fecha_cobro)
+        self.assertTrue(row.pago, "the legacy flag itself must not be touched")
+
+    def test_r2_03_card_shows_the_historical_state_not_cobrado(self):
+        card = _card(_render(pago=True))
+        self.assertIn("Pago previo", card)
+        self.assertNotIn("agendaPaidBox", card)
+        self.assertNotIn('agendaPayChip agendaPaid"', card)
+
+    def test_r2_04_card_offers_no_one_click_action(self):
+        card = _card(_render(pago=True))
+        self.assertNotIn("agendaCobrarBtn", card)
+        self.assertNotIn("openCobroModal", card)
+
+    def test_r2_05_card_guides_to_the_edit_form(self):
+        self.assertIn("Registrar fecha", _card(_render(pago=True)))
+
+    def test_r2_06_quote_is_still_shown_when_available(self):
+        self.assertIn("$ 130.000", _card(_render(pago=True)))
+
+    def test_r2_07_legacy_without_a_quote_is_still_safe(self):
+        card = _card(_render(pago=True, precio_total=None))
+        self.assertIn("Presupuesto no disponible", card)
+        self.assertIn("Pago previo", card)
+        self.assertNotIn("agendaCobrarBtn", card)
+
+    def test_r2_08_canonical_paid_is_unaffected(self):
+        card = _card(_render(cobrado="SI", fecha_cobro=date(2026, 9, 15), pago=True))
+        self.assertIn("agendaPaidBox", card)
+        self.assertIn("15/09/2026", card)
+        self.assertNotIn("Pago previo", card)
+
+    def test_r2_09_pago_false_or_none_still_offers_the_action(self):
+        for pago in (None, False):
+            with self.subTest(pago=pago):
+                self.assertIn("agendaCobrarBtn", _card(_render(pago=pago)))
+
+
 # ── rendered Agenda ───────────────────────────────────────────────────────────
 
 def _render(**kw):
@@ -468,6 +538,34 @@ class RenderedAgenda(unittest.TestCase):
         self.assertIn("Tiene fecha de cobro pero no está cobrado", date_not_paid)
         self.assertIn("agendaCobrarBtn", date_not_paid,
                       "the action stays available; the warning is informational")
+
+    def test_pay_ui_23_two_revisions_cannot_be_confused(self):
+        """Each payment row is keyed by its own revision id, in markup and in the dialog."""
+        rows = []
+        for rid, amount, name in ((901, 130000, "Cliente Uno"), (902, 250000, "Cliente Dos")):
+            rev = NS(id=rid, turno_fecha=TODAY, turno_hora=time(9 if rid == 901 else 12, 0),
+                     precio_total=amount, precio_base=amount - 10000, viaticos=10000,
+                     cobrado=None, fecha_cobro=None, pago=None, estado_revision="CONFIRMADO",
+                     marca="Renault", modelo="Sandero", anio=2020, tipo_vehiculo="AUTO",
+                     zone_group="CABA", zone_detail="La Paternal",
+                     direccion_texto="Av. Test 123", link_maps=None, profesional_id=None,
+                     lead_id=rid, resultado=None, cliente_presente=None, turno_notas=None)
+            rows.append(NS(id=rid, nombre=name, telefono="1100000000", revisions=[rev],
+                           estado="CONSULTA_NUEVA", flag="ACEPTADO", canal=None, email=None))
+        html = render_calendar_page(rows, profesionales=[], week=TODAY.isoformat())
+        cards = re.findall(
+            r'<div class="agendaApptCard.*?agendaApptStatus[^>]*>[^<]*</span></div></div>',
+            html, re.S)[:2]
+        self.assertEqual(len(cards), 2)
+        a, b = cards
+        self.assertIn('data-rev-pay="901"', a)
+        self.assertIn('data-rev-id="901"', a)
+        self.assertIn("$ 130.000", a)
+        self.assertNotIn("902", a)
+        self.assertIn('data-rev-pay="902"', b)
+        self.assertIn('data-rev-id="902"', b)
+        self.assertIn("$ 250.000", b)
+        self.assertNotIn('data-rev-id="901"', b)
 
     def test_pay_ui_22_existing_money_formatter_is_unchanged(self):
         self.assertEqual(_fmt_money(130000), "$130.000")

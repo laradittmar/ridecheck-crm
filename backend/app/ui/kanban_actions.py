@@ -828,6 +828,16 @@ def ui_revision_mark_paid(
         # revision through the existing edit form.
         raise HTTPException(status_code=409, detail="Presupuesto no disponible")
 
+    if getattr(rev, "pago", None) is True and (rev.cobrado or "").strip().upper() != "SI":
+        # L4.7W5-R2: the legacy `pago` boolean says money arrived but carries no date.
+        # Stamping today would record a payment date that is simply false. The UI does not
+        # offer the action for these rows; the rule is enforced here too, because a rule
+        # that lives only in the markup is not a rule.
+        raise HTTPException(
+            status_code=409,
+            detail="Pago previo sin fecha — registrá la fecha real en la revisión",
+        )
+
     today = _buenos_aires_today()
     result = db.execute(
         update(Revision)
