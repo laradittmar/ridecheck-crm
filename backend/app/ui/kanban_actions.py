@@ -1,6 +1,7 @@
 # app/ui/kanban_actions.py
 from __future__ import annotations
 
+import logging
 from datetime import date, time, datetime, timedelta, timezone
 from typing import Any
 from threading import Lock
@@ -8,10 +9,10 @@ import secrets
 import os
 from pathlib import Path
 
-from fastapi import Depends, HTTPException, Form, Body, UploadFile, File
+from fastapi import Depends, HTTPException, Form, Body, UploadFile, File, Request
 from fastapi.responses import RedirectResponse, JSONResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import select
+from sqlalchemy import func, or_, select, update
 
 from ..db import get_db
 from ..models import Agencia, Lead, Revision, Profesional, Vendedor
@@ -25,6 +26,8 @@ from .kanban_view import (
     FLAG_VALUES,
     DEFAULT_OPER_ESTADO,
 )
+
+logger = logging.getLogger(__name__)
 
 PENDING_DELETE_TTL_SECONDS = 7
 _PENDING_DELETES: dict[str, dict[str, Any]] = {}
@@ -781,3 +784,83 @@ def ui_agencia_delete(
     return RedirectResponse(url="/agencias", status_code=303)
 
 
+# ── L4.7W5 — Agenda quick payment ────────────────────────────────────────────
+
+BUENOS_AIRES_TZ = "America/Argentina/Buenos_Aires"
+
+
+def _buenos_aires_today() -> date:
+    """Today's calendar date in Buenos Aires — the operator's business day.
+
+    The server owns this. A browser-supplied date would let a device with a wrong clock,
+    or simply a different timezone, write the wrong business day into the books; and near
+    midnight UTC and Buenos Aires are on different dates, so plain `date.today()` on a
+    UTC host is wrong for roughly three hours every day.
+    """
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo(BUENOS_AIRES_TZ)).date()
+
+
+def ui_revision_mark_paid(
+    request: Request,
+    revision_id: int = Form(...),
+    db: Session = Depends(get_db),
+):
+    """Mark one revision as charged, from the Agenda, in a single confirmed action.
+
+    Writes ONLY the two fields the revision form already owns — `cobrado` and
+    `fecha_cobro` — so there is no second payment state to diverge from. The amount is
+    never recomputed here: `precio_total` is the quote the customer accepted, and asking
+    PricingService again at payment time could bill a different number than the one that
+    was agreed.
+
+    Idempotent by construction. The UPDATE carries its own `cobrado <> 'SI'` predicate, so
+    a double tap, a retried request or a second operator cannot write a second date over
+    the first — the database decides, not the button's disabled attribute.
+    """
+    rev = db.get(Revision, revision_id)
+    if rev is None:
+        raise HTTPException(status_code=404, detail="Revision not found")
+
+    if rev.precio_total is None:
+        # No stored quote means nothing to charge. Inventing one here is how a wrong
+        # amount gets billed, so the action refuses and the operator completes the
+        # revision through the existing edit form.
+        raise HTTPException(status_code=409, detail="Presupuesto no disponible")
+
+    today = _buenos_aires_today()
+    result = db.execute(
+        update(Revision)
+        .where(
+            Revision.id == revision_id,
+            or_(Revision.cobrado.is_(None), func.upper(Revision.cobrado) != "SI"),
+        )
+        .values(cobrado="SI", fecha_cobro=today)
+        .execution_options(synchronize_session=False)
+    )
+    db.commit()
+    db.refresh(rev)
+
+    newly_paid = bool(result.rowcount)
+    operator = (getattr(request.state, "user_email", "") or "").strip() or "unknown"
+    # Identifiers and states only — no customer name, phone or revision payload.
+    logger.info(
+        "AGENDA_MARK_PAID revision_id=%s operator=%s previous=%s result=%s "
+        "fecha_cobro=%s newly_paid=%s",
+        rev.id, operator, "SI" if not newly_paid else (rev.cobrado or "NO"),
+        rev.cobrado, rev.fecha_cobro.isoformat() if rev.fecha_cobro else None, newly_paid,
+    )
+
+    fecha = rev.fecha_cobro
+    return JSONResponse({
+        "ok": True,
+        "revision_id": rev.id,
+        "cobrado": rev.cobrado,
+        "paid": (rev.cobrado or "").strip().upper() == "SI",
+        "already_paid": not newly_paid,
+        "fecha_cobro": fecha.isoformat() if fecha else None,
+        "fecha_cobro_display": fecha.strftime("%d/%m/%Y") if fecha else None,
+        "amount": rev.precio_total,
+        "amount_display": f"$ {rev.precio_total:,}".replace(",", "."),
+        "currency": "ARS",
+    })

@@ -602,6 +602,9 @@ router.add_api_route("/ui/commit_delete", actions.ui_commit_delete, methods=["PO
 # --- Revision actions ---
 router.add_api_route("/ui/revision_create", actions.ui_revision_create, methods=["POST"])
 router.add_api_route("/ui/revision_latest_update", actions.ui_revision_latest_update, methods=["POST"])
+# L4.7W5: a purpose-specific payment action, not the broad revision-update payload.
+# /ui/ is a protected prefix, so the session guard in main.py already applies.
+router.add_api_route("/ui/revision_mark_paid", actions.ui_revision_mark_paid, methods=["POST"])
 router.add_api_route("/ui/revision_latest_delete", actions.ui_revision_latest_delete, methods=["POST"])
 
 # --- Profesionales actions ---

@@ -53,6 +53,28 @@ def _fmt_money(x: int | None) -> str:
         return "-"
     return f"${x:,}".replace(",", ".")
 
+def _fmt_ba_today() -> str:
+    """Today in Buenos Aires, DD/MM/YYYY — what the server will write.
+
+    Shown in the confirmation copy so the operator sees the date before agreeing to it.
+    It is informational only; `ui_revision_mark_paid` recomputes it server-side and the
+    response is what the card is repainted from.
+    """
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("America/Argentina/Buenos_Aires")).strftime("%d/%m/%Y")
+
+
+def _fmt_ars(x: int | None) -> str:
+    """ARS for operator-facing amounts: `$ 130.000`.
+
+    Reuses `_fmt_money` so the thousands separator stays in one place; only the space
+    after the sign differs, and it is not applied retroactively to existing screens.
+    """
+    if x is None:
+        return "Presupuesto no disponible"
+    return _fmt_money(x).replace("$", "$ ", 1)
+
+
 def _safe_url(u: str | None) -> str | None:
     s = (u or "").strip()
     if not s or s.lower() == "string":
@@ -4001,6 +4023,27 @@ def render_calendar_page(
       }
       .agendaPaid { background: #dcfce7; color: #166534; }
       .agendaUnpaid { background: #fef3c7; color: #92400e; }
+      .agendaQuoteRow { display: flex; align-items: center; gap: 8px; margin-top: 5px; flex-wrap: wrap; }
+      .agendaQuoteLabel { font-size: 10px; font-weight: 700; letter-spacing: .04em; color: #64748b; text-transform: uppercase; }
+      .agendaQuoteAmount { font-size: 15px; font-weight: 800; color: #0f172a; white-space: nowrap; }
+      .agendaQuoteAmount.missing { font-size: 12px; font-weight: 700; color: #b45309; white-space: normal; }
+      .agendaCobrarBtn { font-size: 12px; font-weight: 800; padding: 7px 16px; border-radius: 999px; border: 0; cursor: pointer; color: #fff; background: #16a34a; min-height: 36px; display: inline-flex; align-items: center; gap: 5px; }
+      .agendaCobrarBtn:hover { background: #15803d; }
+      .agendaCobrarBtn:focus-visible { outline: 3px solid #86efac; outline-offset: 2px; }
+      .agendaCobrarBtn[disabled] { background: #9ca3af; cursor: not-allowed; }
+      .agendaPaidBox { display: inline-flex; align-items: center; gap: 6px; border-radius: 8px; padding: 5px 10px; background: #dcfce7; color: #166534; font-size: 12px; font-weight: 700; }
+      .agendaPaidDate { font-weight: 600; color: #15803d; }
+      .agendaStateWarn { font-size: 11px; font-weight: 700; border-radius: 6px; padding: 3px 8px; background: #fef3c7; color: #92400e; margin-top: 4px; width: fit-content; }
+      .cobroAmount { font-size: 26px; font-weight: 800; color: #0f172a; margin: 6px 0; }
+      .cobroWho { font-size: 14px; font-weight: 700; color: #111827; }
+      .cobroVeh { font-size: 13px; color: #4b5563; margin-top: 2px; }
+      .cobroNote { font-size: 13px; color: #4b5563; margin-top: 10px; }
+      .cobroErr { display: none; margin-top: 10px; font-size: 13px; font-weight: 700; color: #b91c1c; }
+      .cobroBtnCancel { padding: 9px 16px; border-radius: 8px; border: 1.5px solid #d1d5db; background: #fff; color: #374151; font-weight: 700; font-size: 14px; cursor: pointer; min-height: 40px; }
+      .cobroBtnConfirm { padding: 9px 18px; border-radius: 8px; border: 0; background: #16a34a; color: #fff; font-weight: 800; font-size: 14px; cursor: pointer; min-height: 40px; }
+      .cobroBtnConfirm:hover { background: #15803d; }
+      .cobroBtnConfirm[disabled] { background: #9ca3af; cursor: not-allowed; }
+      @media (max-width: 520px) { .agendaCobrarBtn { width: 100%; justify-content: center; min-height: 42px; } .cobroAmount { font-size: 22px; } .cobroBtnCancel, .cobroBtnConfirm { flex: 1 1 auto; } }
       .agendaEmpty { color: rgba(255,255,255,.35); padding: 20px 4px; font-size: 13px; }
     """
 
@@ -4278,6 +4321,60 @@ def render_calendar_page(
             tend = slot_e.strftime("%H:%M")
             href = _ahref(l, r)
 
+            # ── L4.7W5 — quick payment, straight from the card ────────────────
+            # The amount shown is the stored `precio_total` for THIS revision: the quote
+            # the customer accepted. It is never recomputed at payment time — re-asking
+            # PricingService could bill a number nobody agreed to.
+            # `getattr` rather than attribute access: the Agenda is rendered in tests and
+            # tools with partial revision objects, and a missing optional field must not
+            # take the whole day view down with an AttributeError.
+            _precio = getattr(r, "precio_total", None)
+            _cobrado = getattr(r, "cobrado", None)
+            _fecha_cobro = getattr(r, "fecha_cobro", None)
+            is_paid = (_cobrado or "").strip().upper() == "SI"
+            quote_txt = _fmt_ars(_precio)
+            warn_html = ""
+            if is_paid and _fecha_cobro is None:
+                warn_html = '<div class="agendaStateWarn">&#x26A0; Cobrado sin fecha de cobro</div>'
+            elif (not is_paid) and _fecha_cobro is not None:
+                warn_html = '<div class="agendaStateWarn">&#x26A0; Tiene fecha de cobro pero no está cobrado</div>'
+            # Surfaced, never silently repaired: viewing the Agenda must not mutate data.
+
+            if is_non_occ:
+                pay_html = ""
+            elif is_paid:
+                _fc = _fecha_cobro.strftime("%d/%m/%Y") if _fecha_cobro else "sin fecha"
+                pay_html = (
+                    f'<div class="agendaQuoteRow" data-rev-pay="{r.id}">'
+                    f'<span class="agendaQuoteLabel">Presupuesto</span>'
+                    f'<span class="agendaQuoteAmount">{html_lib.escape(quote_txt)}</span>'
+                    f'<span class="agendaPaidBox">&#x2713; Cobrado '
+                    f'<span class="agendaPaidDate">{_fc}</span></span>'
+                    f'</div>'
+                )
+            elif _precio is None:
+                # No stored quote: the action is unavailable rather than guessing an amount.
+                pay_html = (
+                    f'<div class="agendaQuoteRow" data-rev-pay="{r.id}">'
+                    f'<span class="agendaQuoteAmount missing">{html_lib.escape(quote_txt)}</span>'
+                    f'<a class="agendaActionBtn agendaEditBtn" href="{href}">Completar revisión</a>'
+                    f'</div>'
+                )
+            else:
+                pay_html = (
+                    f'<div class="agendaQuoteRow" data-rev-pay="{r.id}">'
+                    f'<span class="agendaQuoteLabel">Presupuesto</span>'
+                    f'<span class="agendaQuoteAmount">{html_lib.escape(quote_txt)}</span>'
+                    f'<button type="button" class="agendaCobrarBtn" onclick="openCobroModal(this)"'
+                    f' data-rev-id="{r.id}"'
+                    f' data-rev-amount="{html_lib.escape(quote_txt)}"'
+                    f' data-rev-name="{html_lib.escape(cname)}"'
+                    f' data-rev-veh="{html_lib.escape(veh)}"'
+                    f' aria-label="Cobrar {html_lib.escape(quote_txt)} — {html_lib.escape(cname)}">'
+                    f'&#x1F4B5; Cobrar</button>'
+                    f'</div>'
+                )
+
             parts.append(
                 f'<div class="agendaApptCard {cls}-appt">'
                 f'<div class="agendaApptTime">'
@@ -4291,6 +4388,8 @@ def render_calendar_page(
                 f'<div class="agendaApptVehicle">{html_lib.escape(veh)}</div>'
                 + (f'<div class="agendaApptZone">{html_lib.escape(zone_disp)}</div>' if zone_disp else '')
                 + addr_html
+                + pay_html
+                + warn_html
                 + f'<div class="agendaApptActions">'
                 f'<a class="agendaActionBtn agendaEditBtn" href="{href}">&#x270E; Ver revisión</a>'
                 + contact_html
@@ -4565,6 +4664,107 @@ def render_calendar_page(
           document.querySelectorAll(".agendaGpsDropdown").forEach(function(d){{d.style.display="none";}});
       }});
       </script>
+    """)
+
+    # ── L4.7W5 — Confirmar cobro ─────────────────────────────────────────────
+    # The date shown here is informational: the server recomputes today in Buenos Aires
+    # when it writes, and the response is what the card is repainted from.
+    _cobro_today = _fmt_ba_today()
+    html.append(f"""
+    <div class="revModalOverlay" id="cobroModal" role="dialog" aria-modal="true"
+         aria-labelledby="cobroTitle" data-today="{_cobro_today}">
+      <div class="revModal">
+        <div class="revModalHead"><div class="revModalTitle" id="cobroTitle">Confirmar cobro</div></div>
+        <div class="revModalBody">
+          <div class="cobroWho" id="cobroWho"></div>
+          <div class="cobroVeh" id="cobroVeh"></div>
+          <div class="cobroAmount" id="cobroAmount"></div>
+          <div class="cobroNote">Se registrará como cobrada con fecha <b>{_cobro_today}</b>.</div>
+          <div class="cobroErr" id="cobroErr" role="alert"></div>
+        </div>
+        <div class="revModalFooter">
+          <button type="button" class="cobroBtnCancel" id="cobroCancel" onclick="closeCobroModal()">Cancelar</button>
+          <button type="button" class="cobroBtnConfirm" id="cobroConfirm" onclick="confirmCobro()">Confirmar cobro</button>
+        </div>
+      </div>
+    </div>
+    """)
+    html.append("""<script>
+      (function(){
+        var modal=document.getElementById("cobroModal");
+        var trigger=null, revId=null, busy=false;
+
+        function focusables(){
+          return modal.querySelectorAll("button:not([disabled])");
+        }
+        window.openCobroModal=function(btn){
+          trigger=btn; revId=btn.dataset.revId; busy=false;
+          document.getElementById("cobroWho").textContent=btn.dataset.revName||"";
+          document.getElementById("cobroVeh").textContent=btn.dataset.revVeh||"";
+          document.getElementById("cobroAmount").textContent="\u00bfConfirm\u00e1s el cobro de "+(btn.dataset.revAmount||"")+"?";
+          var err=document.getElementById("cobroErr"); err.style.display="none"; err.textContent="";
+          var ok=document.getElementById("cobroConfirm");
+          ok.disabled=false; ok.textContent="Confirmar cobro";
+          modal.classList.add("open");
+          document.body.classList.add("modal-open");
+          document.getElementById("cobroCancel").focus();
+        };
+        window.closeCobroModal=function(){
+          if(busy)return;
+          modal.classList.remove("open");
+          document.body.classList.remove("modal-open");
+          if(trigger)trigger.focus();
+          trigger=null; revId=null;
+        };
+        window.confirmCobro=function(){
+          if(busy||!revId)return;
+          busy=true;
+          var ok=document.getElementById("cobroConfirm");
+          var err=document.getElementById("cobroErr");
+          err.style.display="none";
+          ok.disabled=true; ok.textContent="Registrando cobro\u2026";
+          var body=new URLSearchParams(); body.append("revision_id",revId);
+          fetch("/ui/revision_mark_paid",{method:"POST",credentials:"same-origin",
+                 headers:{"Content-Type":"application/x-www-form-urlencoded"},body:body.toString()})
+            .then(function(res){return res.json().then(function(j){return {status:res.status,body:j};});})
+            .then(function(r){
+              if(r.status!==200||!r.body||!r.body.paid){
+                throw new Error((r.body&&r.body.detail)||"No se pudo registrar el cobro");
+              }
+              paintPaid(r.body);
+              busy=false; closeCobroModal();
+            })
+            .catch(function(e){
+              busy=false;
+              ok.disabled=false; ok.textContent="Confirmar cobro";
+              err.textContent=(e&&e.message)?e.message:"No se pudo registrar el cobro";
+              err.style.display="block";
+            });
+        };
+        function paintPaid(d){
+          // Repaint from the SERVER's canonical values, never from what the client assumed.
+          var row=document.querySelector('[data-rev-pay="'+d.revision_id+'"]');
+          if(!row)return;
+          var amount=d.amount_display||"";
+          var fecha=d.fecha_cobro_display||"sin fecha";
+          row.innerHTML='<span class="agendaQuoteLabel">Presupuesto</span>'+
+            '<span class="agendaQuoteAmount"></span>'+
+            '<span class="agendaPaidBox">\u2713 Cobrado <span class="agendaPaidDate"></span></span>';
+          row.querySelector(".agendaQuoteAmount").textContent=amount;
+          row.querySelector(".agendaPaidDate").textContent=fecha;
+        }
+        modal.addEventListener("click",function(e){ if(e.target===modal)closeCobroModal(); });
+        document.addEventListener("keydown",function(e){
+          if(!modal.classList.contains("open"))return;
+          if(e.key==="Escape"){closeCobroModal();return;}
+          if(e.key!=="Tab")return;
+          var f=focusables(); if(!f.length)return;
+          var first=f[0], last=f[f.length-1];
+          if(e.shiftKey&&document.activeElement===first){e.preventDefault();last.focus();}
+          else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first.focus();}
+        });
+      })();
+    </script>
     """)
     html.append(f"""<script>
       (function(){{
