@@ -10,9 +10,27 @@ reference perfectly declared data, and still be disallowed on that component typ
 This validator encodes what Meta told us, plus one precedent rule. It is deliberately
 NOT a reimplementation of Meta's schema: nothing here is invented. Rules come only from
 
-  * the four authoritative errors returned by Ejecutar on 2026-09-16, and
+  * the errors returned by Ejecutar on 2026-09-16, as corrected by the executions below, and
   * the live PUBLISHED asset, which is the only Flow JSON we hold that Meta has
     demonstrably accepted.
+
+Owner Ejecutar results, 2026-09-16 — these are the authority, and they corrected this file:
+
+  PUBLISHED v7.3  274038ba…1afb15  PASS, zero errors
+  CANDIDATE v7.4  1aa60623…07ac54  FAIL — three disallowed `init-value` properties
+  CANDIDATE r1    dc5f204d…1cd55   PASS, zero errors
+
+The first version of this validator also rejected `on-select-action.name = "data_exchange"`
+on the date Dropdown, because Meta reported it alongside the `init-value` errors. That rule
+was a FALSE POSITIVE and has been removed. The clean run on r1 — which carries that exact
+action, unchanged from the published asset — disproves it. Meta emitted the action error
+only while the invalid `init-value` properties were present; why it does that is not
+recorded here, because we do not know, and guessing would put speculation back into a file
+whose whole purpose is to carry only what Meta actually said.
+
+The cost of that false positive is worth remembering: it was reported as a blocker
+inherited from the live Flow, and a backend-contract milestone was proposed to "resolve"
+an error that did not exist.
 
 `--precedent` compares component properties against that published asset and reports
 anything it has never accepted as UNPROVEN — a warning, not a verdict. Only Meta can
@@ -34,11 +52,9 @@ FORBIDDEN_PROPERTIES = {
     "Dropdown": {"init-value"},
     "TextInput": {"init-value"},
 }
-# 3.   "Invalid value found for property 'name'. Expected 'update_data'."
-#      at screens[0].layout.children[3].children[0]['on-select-action'].name
-REQUIRED_ACTION_NAME = {
-    ("Dropdown", "on-select-action"): "update_data",
-}
+# The Dropdown `on-select-action` rule that stood here is deliberately absent: Meta
+# accepted `data_exchange` on r1 with zero errors. See the module docstring.
+REQUIRED_ACTION_NAME: dict[tuple[str, str], str] = {}
 
 
 def walk(node, path="", out=None):

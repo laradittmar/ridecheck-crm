@@ -1,17 +1,27 @@
-"""L4.7W5 Gate B R1 — the component-schema checks that Meta actually enforces.
+"""L4.7W5 Gate B — Meta Flow component-schema checks, corrected by Meta's own results.
 
 Gate B preparation called the v7.4 prefill candidate contract-PASS. Its evidence was that
-the file parsed and every `${data.*}` reference resolved against its screen's declared
-data. Both were true. Both were irrelevant to what Meta checks: a property can be
-well-formed JSON, reference perfectly declared data, and still be disallowed on that
-component type. Meta's Ejecutar returned four component-schema errors.
+the file parsed and every `${data.*}` reference resolved. Both were true; neither says
+anything about which properties a component type accepts. Meta rejected the candidate.
 
-These tests encode those four errors so the same class of miss cannot recur, and they pin
-the one finding that is NOT ours — `on-select-action.name = "data_exchange"` on the date
-Dropdown is present in the LIVE PUBLISHED asset, so Meta's current validator rejects a
-Flow that is deployed and working today. That is an owner decision, not a silent fix.
+Then this test file made the opposite mistake. Meta had reported an error on the date
+Dropdown's `on-select-action` alongside the `init-value` errors, so a rule was written
+requiring `update_data` — and, because the published asset carries `data_exchange`, the
+suite concluded that the LIVE Flow was invalid and that a backend-contract milestone was
+needed to fix it. The owner then ran Ejecutar on all three assets:
 
-Local PASS is never Meta validation.
+    PUBLISHED v7.3  274038ba…1afb15  PASS, zero errors
+    CANDIDATE v7.4  1aa60623…07ac54  FAIL — three disallowed `init-value` properties
+    CANDIDATE r1    dc5f204d…1cd55   PASS, zero errors
+
+r1 carries that exact `data_exchange` action and passed clean. The rule was a false
+positive; the action was never the defect, and no backend change is required. Meta emits
+the action error only while the invalid `init-value` properties are present. Why is not
+asserted here — we do not know.
+
+The lesson these tests now carry: a local checker may only encode what Meta demonstrably
+did, and a rule that condemns a Flow known to be working in production is far more likely
+to be wrong than the production Flow is.
 """
 from __future__ import annotations
 
@@ -29,6 +39,10 @@ FLOWS = ROOT / "meta" / "flows" / "booking"
 PUBLISHED = FLOWS / "PUBLISHED_28104222025943520_v7.3.json"
 REJECTED = FLOWS / "CANDIDATE_v7.4-prefill.json"
 R1 = FLOWS / "CANDIDATE_v7.4-prefill-r1.json"
+R2 = FLOWS / "CANDIDATE_v7.4-prefill-r2.json"
+
+# Owner-attested Ejecutar results — the authority this suite answers to.
+META_ACCEPTED = (PUBLISHED, R1)
 
 
 def load(p):
@@ -39,100 +53,140 @@ def errors(p, precedent=None):
     return [f for f in check(load(p), load(precedent) if precedent else None) if f[0] == "ERROR"]
 
 
-class MetaErrorsAreReproduced(unittest.TestCase):
-    """All four authoritative errors, at the paths Meta named."""
+class ValidatorMatchesMeta(unittest.TestCase):
+    """The validator must agree with every Ejecutar result we hold."""
+
+    def test_gbr2_01_published_asset_passes(self):
+        self.assertEqual(errors(PUBLISHED), [],
+                         "Meta accepted the published asset with zero errors")
+
+    def test_gbr2_02_r1_passes(self):
+        self.assertEqual(errors(R1), [], "Meta accepted r1 with zero errors")
+
+    def test_gbr2_03_r2_passes(self):
+        self.assertEqual(errors(R2), [])
+
+    def test_gbr2_04_rejected_candidate_fails_for_exactly_three_init_values(self):
+        found = errors(REJECTED)
+        self.assertEqual(len(found), 3, "the real defect was three init-value properties")
+        self.assertEqual(
+            sorted(w for _, w, _ in found),
+            sorted([".screens[0].layout.children[3].children[0].init-value",
+                    ".screens[0].layout.children[3].children[1].init-value",
+                    ".screens[1].layout.children[1].children[0].init-value"]))
+        for _, _, msg in found:
+            self.assertIn("init-value", msg)
+
+    def test_gbr2_05_no_false_rejection_of_the_dropdown_action(self):
+        """The regression that cost a fabricated blocker and a proposed backend milestone."""
+        for asset in META_ACCEPTED + (R2,):
+            with self.subTest(asset=asset.name):
+                for _, where, msg in errors(asset):
+                    self.assertNotIn("on-select-action", where)
+                    self.assertNotIn("update_data", msg)
+
+    def test_gbr2_06_the_action_is_still_data_exchange_everywhere(self):
+        for asset in (PUBLISHED, R1, R2):
+            with self.subTest(asset=asset.name):
+                dd = load(asset)["screens"][0]["layout"]["children"][3]["children"][0]
+                self.assertEqual(dd["on-select-action"]["name"], "data_exchange")
+                self.assertEqual(dd["on-select-action"]["payload"]["trigger"], "date_selected")
+
+
+class PreviewFixture(unittest.TestCase):
+    """R2 exists so the static preview can be walked end to end."""
 
     def setUp(self):
-        self.found = {where: msg for _, where, msg in errors(REJECTED)}
+        self.ap = load(R2)["screens"][0]["data"]
 
-    def test_gbr1_01_init_value_on_the_date_dropdown(self):
-        w = ".screens[0].layout.children[3].children[0].init-value"
-        self.assertIn(w, self.found)
-        self.assertIn("not allowed in 'Dropdown'", self.found[w])
+    def test_gbr2_07_time_selector_is_enabled_in_preview(self):
+        self.assertIs(self.ap["is_time_enabled"]["__example__"], True,
+                      "a disabled Horario dropdown is what blocked traversal in R1")
 
-    def test_gbr1_02_init_value_on_the_time_dropdown(self):
-        w = ".screens[0].layout.children[3].children[1].init-value"
-        self.assertIn(w, self.found)
-        self.assertIn("not allowed in 'Dropdown'", self.found[w])
+    def test_gbr2_08_date_selector_is_enabled_in_preview(self):
+        self.assertIs(self.ap["is_date_enabled"]["__example__"], True)
 
-    def test_gbr1_03_dropdown_on_select_action_name(self):
-        w = ".screens[0].layout.children[3].children[0]['on-select-action'].name"
-        self.assertIn(w, self.found)
-        self.assertIn("Expected 'update_data'", self.found[w])
+    def test_gbr2_09_preview_offers_real_choices(self):
+        self.assertGreater(len(self.ap["date"]["__example__"]), 0)
+        self.assertGreater(len(self.ap["time"]["__example__"]), 0)
+        for item in self.ap["date"]["__example__"] + self.ap["time"]["__example__"]:
+            self.assertIn("id", item)
+            self.assertIn("title", item)
 
-    def test_gbr1_04_init_value_on_the_details_text_input(self):
-        w = ".screens[1].layout.children[1].children[0].init-value"
-        self.assertIn(w, self.found)
-        self.assertIn("not allowed in 'TextInput'", self.found[w])
-
-    def test_gbr1_05_exactly_four_errors_no_more_no_less(self):
-        self.assertEqual(len(self.found), 4, "the validator must mirror Meta's result exactly")
+    def test_gbr2_10_appointment_footer_navigates_client_side(self):
+        """Nothing about traversal to DETAILS depends on a backend round trip."""
+        foot = [c for c in load(R2)["screens"][0]["layout"]["children"][3]["children"]
+                if c.get("type") == "Footer"][0]
+        self.assertEqual(foot["on-click-action"]["name"], "navigate")
+        self.assertEqual(foot["on-click-action"]["next"], {"type": "screen", "name": "DETAILS"})
 
 
-class R1RemovesWhatWeIntroduced(unittest.TestCase):
+class RuntimeSemanticsUnchanged(unittest.TestCase):
+    """R2 may differ from R1 in preview fixtures and nothing else."""
 
-    def test_gbr1_06_no_init_value_anywhere_in_r1(self):
-        self.assertNotIn("init-value", R1.read_text(encoding="utf-8"))
+    @staticmethod
+    def flat(o, p=""):
+        out = {}
+        if isinstance(o, dict):
+            for k, v in o.items():
+                out.update(RuntimeSemanticsUnchanged.flat(v, f"{p}.{k}"))
+        elif isinstance(o, list):
+            for i, v in enumerate(o):
+                out.update(RuntimeSemanticsUnchanged.flat(v, f"{p}[{i}]"))
+        else:
+            out[p] = o
+        return out
 
-    def test_gbr1_07_r1_clears_three_of_the_four_errors(self):
-        remaining = {w for _, w, _ in errors(R1)}
-        for cleared in (".screens[0].layout.children[3].children[0].init-value",
-                        ".screens[0].layout.children[3].children[1].init-value",
-                        ".screens[1].layout.children[1].children[0].init-value"):
-            self.assertNotIn(cleared, remaining)
+    def test_gbr2_11_only_example_fixtures_differ(self):
+        a, b = self.flat(load(R1)), self.flat(load(R2))
+        self.assertEqual(set(a), set(b), "R2 added or removed a key")
+        changed = [k for k in a if a[k] != b[k]]
+        self.assertEqual(changed, [".screens[0].data.is_time_enabled.__example__"])
 
-    def test_gbr1_08_the_rejected_artifact_is_preserved_as_evidence(self):
-        self.assertTrue(REJECTED.exists(), "the rejected candidate must remain for forensics")
-        self.assertNotEqual(REJECTED.read_bytes(), R1.read_bytes())
+    def test_gbr2_12_routing_screens_and_version_unchanged(self):
+        r2, pub = load(R2), load(PUBLISHED)
+        self.assertEqual(r2.get("version"), "7.3")
+        self.assertEqual(r2.get("data_api_version"), pub.get("data_api_version"))
+        self.assertEqual(r2.get("routing_model"), pub.get("routing_model"))
+        self.assertEqual([s["id"] for s in r2["screens"]], [s["id"] for s in pub["screens"]])
+        self.assertEqual([s["id"] for s in r2["screens"] if s.get("terminal")], ["SUMMARY"])
 
+    def test_gbr2_13_no_init_value_anywhere(self):
+        for asset in (R1, R2):
+            with self.subTest(asset=asset.name):
+                self.assertEqual(asset.read_text(encoding="utf-8").count("init-value"), 0)
 
-class TheRemainingErrorIsNotOurs(unittest.TestCase):
-    """The single remaining finding is inherited from the live published Flow."""
+    def test_gbr2_14_submission_contract_unchanged(self):
+        def payloads(d):
+            out = []
+            def w(n):
+                if isinstance(n, dict):
+                    if n.get("name") == "data_exchange" and isinstance(n.get("payload"), dict):
+                        out.append(tuple(sorted(n["payload"])))
+                    for v in n.values(): w(v)
+                elif isinstance(n, list):
+                    for v in n: w(v)
+            w(d); return sorted(out)
+        self.assertEqual(payloads(load(R2)), payloads(load(R1)))
 
-    ACTION = ".screens[0].layout.children[3].children[0]['on-select-action'].name"
-
-    def test_gbr1_09_the_published_live_asset_fails_the_same_check(self):
-        published = {w for _, w, _ in errors(PUBLISHED)}
-        self.assertIn(self.ACTION, published,
-                      "if this ever passes, Meta changed its validator — re-derive the plan")
-
-    def test_gbr1_10_r1_inherits_exactly_that_one_finding(self):
-        self.assertEqual({w for _, w, _ in errors(R1)}, {self.ACTION})
-
-    def test_gbr1_11_r1_does_not_silently_change_the_action(self):
-        """Changing it to update_data would break handle_date_selected — an owner call."""
-        d = load(R1)
-        dd = d["screens"][0]["layout"]["children"][3]["children"][0]
-        self.assertEqual(dd["on-select-action"]["name"], "data_exchange")
-        self.assertEqual(dd["on-select-action"]["payload"]["trigger"], "date_selected")
-
-
-class ContractPreserved(unittest.TestCase):
-
-    def setUp(self):
-        self.r1, self.pub = load(R1), load(PUBLISHED)
-
-    def test_gbr1_12_routing_and_screens_unchanged(self):
-        self.assertEqual([s["id"] for s in self.r1["screens"]],
-                         [s["id"] for s in self.pub["screens"]])
-        self.assertEqual(self.r1.get("routing_model"), self.pub.get("routing_model"))
-        self.assertEqual(self.r1.get("version"), self.pub.get("version"))
-        self.assertEqual(self.r1.get("data_api_version"), self.pub.get("data_api_version"))
-        self.assertEqual([s["id"] for s in self.r1["screens"] if s.get("terminal")], ["SUMMARY"])
-
-    def test_gbr1_13_every_data_reference_resolves(self):
+    def test_gbr2_15_every_data_reference_resolves(self):
         import re
-        for s in self.r1["screens"]:
+        for s in load(R2)["screens"]:
             declared = set((s.get("data") or {}).keys())
             refs = set(re.findall(r"\$\{data\.([A-Za-z0-9_]+)\}", json.dumps(s)))
             self.assertEqual(refs - declared, set(), f"{s['id']} references undeclared data")
 
-    def test_gbr1_14_booking_token_and_summaries_survive(self):
-        ap = self.r1["screens"][0]["data"]
-        for k in ("booking_token", "vehicle_summary", "location_summary", "date", "time"):
-            self.assertIn(k, ap)
+    def test_gbr2_16_backend_authority_preserved(self):
+        r2 = load(R2)
+        ap = r2["screens"][0]["data"]
+        for k in ("booking_token", "vehicle_summary", "location_summary",
+                  "date", "time", "is_date_enabled", "is_time_enabled", "contact_phone"):
+            self.assertIn(k, ap, "availability and identity must still come from the backend")
+        det = r2["screens"][1]["layout"]["children"][1]["children"]
+        self.assertNotIn("phone", [c.get("name") for c in det if c.get("type") == "TextInput"],
+                         "the phone must stay read-only; wa_id is the canonical identity")
 
-    def test_gbr1_15_no_component_type_without_meta_precedent(self):
+    def test_gbr2_17_no_component_type_without_meta_precedent(self):
         def types(d):
             out = set()
             def w(n):
@@ -142,39 +196,29 @@ class ContractPreserved(unittest.TestCase):
                 elif isinstance(n, list):
                     for v in n: w(v)
             w(d); return out
-        self.assertEqual(types(self.r1) - types(self.pub), set())
+        self.assertEqual(types(load(R2)) - types(load(PUBLISHED)), set())
 
-    def test_gbr1_16_no_secret_or_customer_pii(self):
-        txt = R1.read_text(encoding="utf-8")
+    def test_gbr2_18_no_secret_or_customer_pii(self):
+        txt = R2.read_text(encoding="utf-8")
         for marker in ("EA" + "A", "AIz" + "a", "sk" + "-", "-----BEG" + "IN"):
             self.assertNotIn(marker, txt)
         import re
         real = [n for n in re.findall(r"\b549\d{10}\b", txt) if n != "5491100000000"]
-        self.assertEqual(real, [], "a real-looking phone number is embedded")
+        self.assertEqual(real, [])
 
-    def test_gbr1_17_submit_payload_keys_match_the_backend(self):
-        """The backend consumes these at prepare_summary / confirm_booking."""
-        payloads = []
-        def w(n):
-            if isinstance(n, dict):
-                if n.get("name") == "data_exchange" and isinstance(n.get("payload"), dict):
-                    payloads.append(set(n["payload"]))
-                for v in n.values(): w(v)
-            elif isinstance(n, list):
-                for v in n: w(v)
-        w(self.r1)
-        final = max(payloads, key=len)
-        for k in ("booking_token", "date", "time", "name", "email",
-                  "inspection_address", "seller_name", "seller_phone", "listing_url"):
-            self.assertIn(k, final)
+    def test_gbr2_19_evidence_assets_are_preserved(self):
+        for p in (PUBLISHED, REJECTED, R1):
+            self.assertTrue(p.exists(), f"{p.name} must remain as evidence")
+        self.assertNotEqual(R1.read_bytes(), R2.read_bytes())
 
 
 class LocalIsNotMeta(unittest.TestCase):
 
-    def test_gbr1_18_the_validator_says_so_out_loud(self):
+    def test_gbr2_20_the_validator_still_says_so_out_loud(self):
         src = (ROOT / "scripts" / "validate_flow_json.py").read_text(encoding="utf-8")
         self.assertIn("Local PASS is necessary and never sufficient", src)
         self.assertIn("Meta Ejecutar remains the authority", src)
+        self.assertIn("FALSE POSITIVE", src, "the corrected rule must stay documented")
 
 
 if __name__ == "__main__":       # pragma: no cover
