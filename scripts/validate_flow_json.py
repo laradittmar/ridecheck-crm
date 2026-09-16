@@ -20,6 +20,18 @@ Owner Ejecutar results, 2026-09-16 — these are the authority, and they correct
   CANDIDATE v7.4  1aa60623…07ac54  FAIL — three disallowed `init-value` properties
   CANDIDATE r1    dc5f204d…1cd55   PASS, zero errors
 
+There is a second kind of defect, and r1 is the proof that it exists: an asset Meta
+accepts can still be wrong on the handset. r1 published clean and rendered
+`${data.contact_phone_display}` to the tester as those literal characters, because its
+`text` mixed a static sentence with a dynamic reference. Meta's component reference lists
+`text` as a dynamic property on all four text components, and the Flow JSON reference says
+"If you attempt to use the dynamic and static variant of the property together, you will
+get a compilation error" — but no compilation error was emitted, so the rule below is
+justified by the handset, not by that sentence. Every one of the other 39 references in
+r1 is the whole property value, and every one of them resolved. Findings of this kind are
+reported as RENDER, not ERROR, because calling them ERROR would claim Ejecutar rejects
+them, and it does not.
+
 The first version of this validator also rejected `on-select-action.name = "data_exchange"`
 on the date Dropdown, because Meta reported it alongside the `init-value` errors. That rule
 was a FALSE POSITIVE and has been removed. The clean run on r1 — which carries that exact
@@ -42,6 +54,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -52,6 +65,16 @@ FORBIDDEN_PROPERTIES = {
     "Dropdown": {"init-value"},
     "TextInput": {"init-value"},
 }
+# A dynamic reference must BE the property value, never sit inside a sentence.
+# Evidence: handset render of r1 on 2026-09-16 (see the module docstring).
+DYNAMIC_REF = re.compile(r"\$\{[^}]+\}")
+
+
+def mixed_static_and_dynamic(value: str) -> bool:
+    """True when `value` contains a reference but is not exactly one reference."""
+    return bool(DYNAMIC_REF.search(value)) and not DYNAMIC_REF.fullmatch(value)
+
+
 # The Dropdown `on-select-action` rule that stood here is deliberately absent: Meta
 # accepted `data_exchange` on r1 with zero errors. See the module docstring.
 REQUIRED_ACTION_NAME: dict[tuple[str, str], str] = {}
@@ -80,6 +103,11 @@ def check(doc, precedent=None):
             if prop in comp:
                 findings.append(("ERROR", f"{path}.{prop}",
                                  f"Property '{prop}' is not allowed in '{ctype}' component"))
+        for prop, value in sorted(comp.items()):
+            if isinstance(value, str) and mixed_static_and_dynamic(value):
+                findings.append(("RENDER", f"{path}.{prop}",
+                                 f"'{prop}' on '{ctype}' mixes static text with a dynamic "
+                                 f"reference; Meta renders the reference literally"))
         for (t, action), expected in REQUIRED_ACTION_NAME.items():
             if ctype == t and isinstance(comp.get(action), dict):
                 actual = comp[action].get("name")
@@ -119,12 +147,14 @@ def main() -> int:
     findings = check(doc, prec)
 
     errors = [f for f in findings if f[0] == "ERROR"]
+    render = [f for f in findings if f[0] == "RENDER"]
     unproven = [f for f in findings if f[0] == "UNPROVEN"]
     for level, where, msg in findings:
         print(f"{level:9} {where}\n          {msg}")
-    print(f"\n{len(errors)} error(s), {len(unproven)} unproven")
+    print(f"\n{len(errors)} error(s), {len(render)} render, {len(unproven)} unproven")
     print("NOTE: local PASS is not Meta validation. Only Ejecutar can confirm the asset.")
-    return 1 if errors else 0
+    print("NOTE: Meta Ejecutar does not catch RENDER findings — only a handset does.")
+    return 1 if (errors or render) else 0
 
 
 if __name__ == "__main__":
