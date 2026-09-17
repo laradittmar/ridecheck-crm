@@ -1285,36 +1285,104 @@ _URGENCY_PATTERNS: tuple[str, ...] = (
 
 # Dissatisfaction with what automation could actually offer. Only meaningful AFTER an
 # earliest option has been produced — before that it is just urgency.
-_EARLIEST_REJECTED_PATTERNS: tuple[str, ...] = (
-    r"\bes\s+muy\s+tarde\b", r"\bmuy\s+tarde\b", r"\bnecesito\s+antes\b",
+# L4.7W5-F7G-R2: the set below mixes two speech acts, and the difference decides whether a
+# burst with no object can be read as rejecting our offer.
+#
+#   UNSUITABILITY  asserts that what we offered does not work — "no me sirve", "muy tarde"
+#   ALTERNATIVE    asks for something else instead — "¿algo más temprano?", "¿algo antes?"
+#
+# Both are evidence for the pre-existing earliest-option detector, which is why the union is
+# preserved below unchanged. Only the first kind may satisfy the elliptic reading: "no me
+# sirve" with its object omitted can only be about the offer, while "¿no tenés algo más
+# temprano?" is a request whose correct answer is an earlier slot, not a human handoff. The
+# live Wild burst carried both, one message each, and F7G's first cut escalated on either —
+# which quietly absorbed the separate F-03 defect and made the rescue rule too broad.
+_UNSUITABILITY_PATTERNS: tuple[str, ...] = (
+    r"\bes\s+muy\s+tarde\b", r"\bmuy\s+tarde\b",
     r"\bno\s+me\s+sirven?\b", r"\beso\s+no\s+me\s+sirven?\b",
+    r"\bma[nñ]ana\s+ya\s+es\s+tarde\b",
+)
+_ALTERNATIVE_REQUEST_PATTERNS: tuple[str, ...] = (
+    r"\bnecesito\s+antes\b",
     r"\bno\s+hay\s+(algo|nada)\s+antes\b", r"\balgo\s+antes\b",
     r"\bm[aá]s\s+temprano\b", r"\bnecesito\s+resolver(lo)?\s+ya\b",
-    r"\bma[nñ]ana\s+ya\s+es\s+tarde\b", r"\blo\s+necesito\s+hoy\b",
+    r"\blo\s+necesito\s+hoy\b",
+)
+# The union, byte-for-byte the evidence the pre-existing detector has always used.
+_EARLIEST_REJECTED_PATTERNS: tuple[str, ...] = (
+    _UNSUITABILITY_PATTERNS + _ALTERNATIVE_REQUEST_PATTERNS
 )
 
 
-def _rejection_is_about_scheduling(texts: list[str]) -> bool:
+def _rejection_has_no_complement(clauses: list[str]) -> bool:
+    """True when an UNSUITABILITY predicate ends its clause — its object is omitted.
+
+    L4.7W5-F7G, bounded by R2. Ellipsis is detected by position and needs no vocabulary:
+    "no me sirve" with nothing after it has left its object unsaid, while "no me sirve el
+    precio", "no me sirve la garantía" and "no me sirve que me llame ahora" all state theirs.
+
+    Only `_UNSUITABILITY_PATTERNS` qualify. An alternative request — "¿no tenés algo más
+    temprano?" — also ends its clause, but it is not a claim that our offer fails; it asks
+    for a different slot, and answering it with a human handoff would both overshoot and
+    swallow the separate F-03 defect.
+    """
+    for clause in clauses:
+        for pattern in _UNSUITABILITY_PATTERNS:
+            match = re.search(pattern, clause)
+            if match and not clause[match.end():].strip():
+                return True
+    return False
+
+
+def _rejection_is_about_scheduling(texts: list[str], offer_outstanding: bool = False) -> bool:
     """True when what the burst rejects is our calendar and not something else.
 
-    L4.7W5-F7E. "No me sirve" is a rejection predicate carrying no object. Applied to a
-    price, a payment method, a report, a vehicle or a phone call it is not a scheduling
-    rejection, and F7D-R2's audit proved all five escalated. The correction is stated
-    positively — the burst must actually be ABOUT a slot — rather than as a list of the
-    nouns it must not be about, which would need a new entry for every noun a customer can
-    dislike.
+    L4.7W5-F7E established the positive rule: the burst must actually be ABOUT a slot —
+    it names a scheduling object, or the scheduling parser finds a day or a time in it —
+    rather than being screened against a list of nouns it must not be about, which would
+    need a new entry for every noun a customer can dislike.
 
-    Two ways a burst is about the calendar, both already implemented elsewhere: it names a
-    scheduling object from the lexicon, or the scheduling parser finds a day or a time in
-    it. Nothing is enumerated here.
+    L4.7W5-F7G adds the reading F7E was missing, and the live Wild found the hard way. The
+    customer had eight real Friday slots on the table and said
+
+        "Mmm, no me sirve"  /  "No tenés algo más temprano?"
+
+    Neither message names a slot, so F7E judged the rejection off-topic and the thread was
+    never handed to a human; it was asked, instead, whether any of the options it had just
+    rejected would do. But a rejection with NO OBJECT AT ALL, arriving while an offer is
+    outstanding, has exactly one thing it can be about: the offer. The conversation supplies
+    what the sentence omits — the same reasoning `_rejects_every_offered_option` already
+    uses for "ninguna me cierra", and refused there too when nothing is outstanding.
+
+    A named competing object still wins, checked first and checked regardless of context, so
+    every rejection F7E closed stays closed. A phone-call expression counts as such an
+    object through the existing call patterns, so "no me sirve que me llame ahora" is still
+    about a call. No new vocabulary, no model call.
     """
-    from .scheduling_lexicon import names_scheduling_object
+    from .scheduling_lexicon import names_competing_object, names_scheduling_object
 
     normalized = _norm_lower(" ".join(t for t in texts if isinstance(t, str)))
+    if names_competing_object(normalized):
+        return False
     if names_scheduling_object(normalized):
         return True
     day, time_str = _parse_scheduling_text(list(texts), date.today())
-    return bool(day or time_str)
+    if day or time_str:
+        return True
+    if any(p.search(normalized) for p in _PHONE_CALL_PATTERNS):
+        return False
+    if not offer_outstanding:
+        return False
+    # A message boundary is a clause boundary, and a stronger one than a comma: two WhatsApp
+    # messages are two utterances. Joining them first hid that — "Mmm, no me sirve" followed
+    # by "No tenés algo más temprano?" became one clause in which the rejection appeared to
+    # take the request as its complement, so the burst escalated in one arrival order and not
+    # the other. Clauses are therefore derived per message.
+    clauses = [c.strip()
+               for message in texts if isinstance(message, str)
+               for c in _CLAUSE_BOUNDARY.split(_norm_lower(message))
+               if c.strip()]
+    return _rejection_has_no_complement(clauses)
 
 
 def _rejects_every_offered_option(texts: list[str], offer_outstanding: bool) -> bool:
@@ -3530,7 +3598,8 @@ class ConversationEngine:
             # automation has tried.
             if (state.active_requested_date
                     and self._earliest_option_rejected(ai_input_messages)
-                    and _rejection_is_about_scheduling(ai_input_messages)):
+                    and _rejection_is_about_scheduling(
+                        ai_input_messages, self._offer_outstanding(state))):
                 logger.info(
                     "L4.7W5-F2 EARLIEST_REJECTED thread_id=%s offered=%s flow_token=%s "
                     "— human handoff", ctx.thread.id, state.active_requested_date,

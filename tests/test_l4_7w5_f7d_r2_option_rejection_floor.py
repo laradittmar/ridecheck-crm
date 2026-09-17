@@ -40,8 +40,18 @@ from test_l4_7w5_f7a_rescue_flow_guard import _LiveTurn                # noqa: E
 CE_SRC = pathlib.Path(ce.__file__).read_text(encoding="utf-8")
 CORPUS = ROOT / "tests" / "semantic_corpus" / "offered_options_rejected.jsonl"
 CASES = [json.loads(line) for line in CORPUS.read_text(encoding="utf-8").splitlines() if line.strip()]
-# OOR-P04 carries no universal quantifier; the pre-existing floor owns it. See the README.
-GRAMMAR_EXEMPT = {"OOR-P04"}
+# Cases that are positive at ROUTING level but not for THIS grammar, which reads universal
+# quantifiers. OOR-P04 ("Esos horarios no me sirven.") is owned by the pre-existing floor;
+# the `elliptic_rejection` group ("Mmm, no me sirve" — the failed Wild burst) is owned by
+# L4.7W5-F7G, which reads an omitted object plus an outstanding offer. Exempting them here
+# keeps this test measuring what it is named for. See the corpus README's three-level note.
+GRAMMAR_EXEMPT = {"OOR-P04"} | {
+    c["id"] for c in [json.loads(l) for l in
+                      (pathlib.Path(__file__).resolve().parents[1] / "tests" /
+                       "semantic_corpus" / "offered_options_rejected.jsonl")
+                      .read_text(encoding="utf-8").splitlines() if l.strip()]
+    if c.get("group") == "elliptic_rejection"
+}
 
 
 def _code_only(name: str) -> str:

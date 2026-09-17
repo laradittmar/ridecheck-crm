@@ -36,14 +36,25 @@ COMPETING_OBJECTS: frozenset[str] = frozenset({
 # "ningún" arrives accent-stripped as "ningun". This is a morphological shape, not a phrase.
 UNIVERSAL_NEGATIVE = re.compile(r"\bningun(?:o|a|os|as)?\b")
 
+# L4.7W5-F7G: tokenize on word boundaries, not whitespace. Splitting on spaces left
+# punctuation attached, so "no me sirve ninguno de esos horarios." produced the token
+# "horarios." and the scheduling object went unrecognised — a sentence that ends on the
+# noun was invisible to the lexicon. Found while verifying F7G, fixed here because both
+# helpers depend on it and the effect is identical for every caller.
+_WORD = re.compile(r"[a-z0-9]+")
+
+
+def _words(normalized: str) -> list[str]:
+    return _WORD.findall(normalized)
+
 
 def has_universal_negative(normalized: str) -> bool:
     return bool(UNIVERSAL_NEGATIVE.search(normalized))
 
 
 def names_scheduling_object(normalized: str) -> bool:
-    return any(w in SCHEDULING_OBJECTS for w in normalized.split())
+    return any(w in SCHEDULING_OBJECTS for w in _words(normalized))
 
 
 def names_competing_object(normalized: str) -> bool:
-    return any(w in COMPETING_OBJECTS for w in normalized.split())
+    return any(w in COMPETING_OBJECTS for w in _words(normalized))

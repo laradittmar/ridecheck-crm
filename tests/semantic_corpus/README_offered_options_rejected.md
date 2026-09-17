@@ -38,6 +38,21 @@ held-out evaluation set, scored once, through `tests/semantic_corpus/evaluation.
   with `OOR-N06` (a phone call) and `OOR-N08` (the price) they are the five sentences that
   motivated the scope correction, and the F7E suite asserts each end to end.
 
+* `OOR-P10` "Mmm, no me sirve" — the **elliptical rejection** from the live Wild of
+  2026-09-17 that F7E failed to escalate. Positive **only while a scheduling offer is
+  outstanding**: with nothing on the table it carries no object and means nothing
+  schedulable. The F7G suite asserts both directions.
+* `OOR-N17` "No tenés algo más temprano?" — the Wild burst's **second** message, and
+  **NEGATIVE**. It is an alternative request, not a rejection: it asks for an earlier slot,
+  and its correct answer is an earlier appointment — the separate open **F-03** defect, not a
+  human handoff. It carries `belongs_to_burst: OOR-P10` and `burst_position: 2`, so it is
+  evidence of the ordered burst and never an independently positive rejection utterance.
+  F7G-R2 corrected this: the first cut escalated on either message alone, which absorbed
+  F-03 and made the rescue rule too broad.
+* `OOR-N16` "No me sirve la garantía." — added by F7G to prove the discriminator is
+  **ellipsis, not vocabulary**: "garantía" appears in no lexicon, and the case is still
+  negative because the rejection states an object.
+
 ## Which layer a case exercises
 
 The corpus is scored at three levels, and a closeout must not report one as another:
