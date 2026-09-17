@@ -1747,7 +1747,19 @@ class TestEscalationKeywords(unittest.TestCase):
         self.assertTrue(self._check(["solo puedo a las 12"]))
 
     def test_no_me_sirve_escalates(self):
-        self.assertTrue(self._check(["no me sirve ninguno"]))
+        """A total rejection still escalates — through the scoped path, not a bare substring.
+
+        SUPERSEDED AND DISCLOSED (L4.7W5-F7E). This asserted the `_ESCALATION_KEYWORDS`
+        substring "no me sirve", which carried no object and so escalated the price, a
+        payment method, a vehicle and a report — five proven false handoffs. The keyword is
+        gone; the business invariant it was protecting is unchanged and is now owned by the
+        universal-rejection grammar, which reads the object instead of the predicate.
+        """
+        from app.services.conversation_engine import _rejects_every_offered_option
+        self.assertTrue(_rejects_every_offered_option(["no me sirve ninguno"], True),
+                        "a total rejection must still escalate")
+        self.assertFalse(_rejects_every_offered_option(["no me sirve el precio"], True),
+                         "and an unrelated complaint must not")
 
     def test_si_o_si_escalates(self):
         self.assertTrue(self._check(["mañana sí o sí"]))

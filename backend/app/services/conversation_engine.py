@@ -1220,11 +1220,34 @@ _URGENCY_PATTERNS: tuple[str, ...] = (
 # earliest option has been produced — before that it is just urgency.
 _EARLIEST_REJECTED_PATTERNS: tuple[str, ...] = (
     r"\bes\s+muy\s+tarde\b", r"\bmuy\s+tarde\b", r"\bnecesito\s+antes\b",
-    r"\bno\s+me\s+sirve\b", r"\beso\s+no\s+me\s+sirve\b",
+    r"\bno\s+me\s+sirven?\b", r"\beso\s+no\s+me\s+sirven?\b",
     r"\bno\s+hay\s+(algo|nada)\s+antes\b", r"\balgo\s+antes\b",
     r"\bm[aá]s\s+temprano\b", r"\bnecesito\s+resolver(lo)?\s+ya\b",
     r"\bma[nñ]ana\s+ya\s+es\s+tarde\b", r"\blo\s+necesito\s+hoy\b",
 )
+
+
+def _rejection_is_about_scheduling(texts: list[str]) -> bool:
+    """True when what the burst rejects is our calendar and not something else.
+
+    L4.7W5-F7E. "No me sirve" is a rejection predicate carrying no object. Applied to a
+    price, a payment method, a report, a vehicle or a phone call it is not a scheduling
+    rejection, and F7D-R2's audit proved all five escalated. The correction is stated
+    positively — the burst must actually be ABOUT a slot — rather than as a list of the
+    nouns it must not be about, which would need a new entry for every noun a customer can
+    dislike.
+
+    Two ways a burst is about the calendar, both already implemented elsewhere: it names a
+    scheduling object from the lexicon, or the scheduling parser finds a day or a time in
+    it. Nothing is enumerated here.
+    """
+    from .scheduling_lexicon import names_scheduling_object
+
+    normalized = _norm_lower(" ".join(t for t in texts if isinstance(t, str)))
+    if names_scheduling_object(normalized):
+        return True
+    day, time_str = _parse_scheduling_text(list(texts), date.today())
+    return bool(day or time_str)
 
 
 def _rejects_every_offered_option(texts: list[str], offer_outstanding: bool) -> bool:
@@ -1293,7 +1316,10 @@ def _is_human_request(texts: list[str]) -> bool:
 _ESCALATION_KEYWORDS: frozenset[str] = frozenset({
     "solo puedo",
     "necesito a las",
-    "no me sirve",
+    # L4.7W5-F7E: "no me sirve" removed. It is a rejection predicate with no object, so it
+    # fired on price, payment method, a vehicle, a report and a phone call — five proven
+    # false handoffs. The predicate now lives only in _EARLIEST_REJECTED_PATTERNS, where
+    # the router scopes it to scheduling.
     "no puedo por la tarde",
     "no puedo por la mañana",
     "no puedo por la manana",
@@ -3427,7 +3453,8 @@ class ConversationEngine:
             # actually having been offered, so urgency alone never escalates before
             # automation has tried.
             if (state.active_requested_date
-                    and self._earliest_option_rejected(ai_input_messages)):
+                    and self._earliest_option_rejected(ai_input_messages)
+                    and _rejection_is_about_scheduling(ai_input_messages)):
                 logger.info(
                     "L4.7W5-F2 EARLIEST_REJECTED thread_id=%s offered=%s flow_token=%s "
                     "— human handoff", ctx.thread.id, state.active_requested_date,

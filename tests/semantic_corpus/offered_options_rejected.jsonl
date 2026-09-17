@@ -19,3 +19,6 @@
 {"id":"OOR-N10","label":false,"text":"Y... capaz el viernes, no sé todavía.","group":"hesitation","origin":"authored"}
 {"id":"OOR-N11","label":false,"text":"Capaz que ninguno, después te confirmo.","group":"hesitation","origin":"authored","added":"F7D-R2 negative control: hedged modality"}
 {"id":"OOR-N12","label":false,"text":"El viernes no puedo; el sábado a las 14 sí.","group":"partial_rejection","origin":"authored","added":"F7D-R2 negative control: alternative selected same turn"}
+{"id":"OOR-N13","label":false,"text":"No me sirve ese auto.","group":"unrelated_rejection","origin":"authored","added":"F7E: proven false handoff through the unscoped rejection predicate"}
+{"id":"OOR-N14","label":false,"text":"No me sirve esa forma de pago.","group":"unrelated_rejection","origin":"authored","added":"F7E: proven false handoff through the unscoped rejection predicate"}
+{"id":"OOR-N15","label":false,"text":"No me sirve el informe.","group":"unrelated_rejection","origin":"authored","added":"F7E: proven false handoff through the unscoped rejection predicate"}

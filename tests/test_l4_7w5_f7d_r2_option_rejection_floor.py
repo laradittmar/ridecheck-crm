@@ -187,15 +187,23 @@ class TestLivePathNegatives(_Floor):
         self.turn("El viernes no puedo; el sábado a las 14 sí.")
         self.assert_not_rescued()
 
-    def test_r2_12b_the_new_grammar_is_not_the_cause_of_the_pre_existing_escalations(self):
-        """Documents the older detector's false positives without adopting them."""
-        for case_id, text in (("OOR-N06", "No me sirve que me llame ahora."),
-                              ("OOR-N08", "No me sirve el precio.")):
-            with self.subTest(id=case_id):
+    def test_r2_12b_the_grammar_never_claimed_these_and_f7e_closed_them(self):
+        """Updated by L4.7W5-F7E, which removed the unscoped rejection predicate.
+
+        When F7D-R2 shipped, both sentences escalated through the older detector and this
+        test pinned that fact so it could be found. F7E scoped the predicate to scheduling,
+        so the price complaint no longer escalates at all. The negated phone call still does,
+        through `_is_phone_call_request` — a different detector with a different invariant,
+        recorded as an adjacent defect rather than silently absorbed.
+        """
+        for text in ("No me sirve que me llame ahora.", "No me sirve el precio."):
+            with self.subTest(text=text):
                 self.assertFalse(rejects([text], True),
-                                 "the F7D-R2 grammar must reject these")
-                self.assertTrue(ce._should_escalate_scheduling_to_human(
-                    [text], self.state), "pre-existing floor still owns them")
+                                 "the F7D-R2 grammar never claimed these")
+                self.assertFalse(ce._should_escalate_scheduling_to_human([text], self.state),
+                                 "F7E removed the unscoped keyword")
+        self.assertTrue(ce._is_phone_call_request(["No me sirve que me llame ahora."]),
+                        "adjacent defect, still open: a negated call reads as a request")
 
     def test_r2_16_an_already_human_owned_thread_is_untouched(self):
         self.state.needs_human = True; self.db.commit()

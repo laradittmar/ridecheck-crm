@@ -32,3 +32,20 @@ held-out evaluation set, scored once, through `tests/semantic_corpus/evaluation.
   F7D-R2 milestone as a negative control for conditional/hypothetical modality.
 * `OOR-N12` "El viernes no puedo; el sábado a las 14 sí." — required by the F7D-R2
   milestone: partial rejection with an explicit alternative selected in the same turn.
+* `OOR-N13`/`N14`/`N15` "No me sirve ese auto." / "…esa forma de pago." / "…el informe." —
+  added by L4.7W5-F7E. Each was a **proven** false handoff: the rejection predicate
+  `no me sirve` carried no object, so it escalated whatever the customer disliked. Together
+  with `OOR-N06` (a phone call) and `OOR-N08` (the price) they are the five sentences that
+  motivated the scope correction, and the F7E suite asserts each end to end.
+
+## Which layer a case exercises
+
+The corpus is scored at three levels, and a closeout must not report one as another:
+
+1. **pure F7D-R2 grammar** — `_rejects_every_offered_option`
+2. **legacy detectors** — `_earliest_option_rejected`, `_ESCALATION_KEYWORDS`
+3. **complete live router** — `ConversationEngine.handle()`
+
+A case may be negative at level 1 and positive at level 3 (or the reverse). The F7D-R2
+closeout reported level-1 negatives as if they were level-3 negatives; F7E's suite
+separates them explicitly.
