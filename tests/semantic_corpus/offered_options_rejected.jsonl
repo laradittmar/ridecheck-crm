@@ -1,0 +1,21 @@
+{"id":"OOR-P01","label":true,"text":"Ninguno de esos horarios me sirve.","group":"total_rejection","origin":"owner"}
+{"id":"OOR-P02","label":true,"text":"Ninguna de esas opciones me sirve.","group":"total_rejection","origin":"owner"}
+{"id":"OOR-P03","label":true,"text":"No me sirve ninguno de esos horarios.","group":"total_rejection","origin":"authored"}
+{"id":"OOR-P04","label":true,"text":"Esos horarios no me sirven.","group":"total_rejection","origin":"authored"}
+{"id":"OOR-P05","label":true,"text":"No puedo en ninguno de esos turnos.","group":"total_rejection","origin":"authored"}
+{"id":"OOR-P06","label":true,"text":"De las opciones que me mandaste no puedo en ninguna.","group":"total_rejection","origin":"authored"}
+{"id":"OOR-P07","label":true,"text":"No me queda bien ningún horario.","group":"total_rejection","origin":"authored"}
+{"id":"OOR-P08","label":true,"text":"uf ninguno de esos me viene bien laburo todo el dia","group":"total_rejection_noisy","origin":"authored"}
+{"id":"OOR-P09","label":true,"text":"La verdad que a esa hora estoy trabajando, ninguna me cierra.","group":"total_rejection_indirect","origin":"authored"}
+{"id":"OOR-N01","label":false,"text":"Ese horario me sirve.","group":"acceptance","origin":"authored"}
+{"id":"OOR-N02","label":false,"text":"El viernes no, pero el sábado sí.","group":"partial_rejection","origin":"authored"}
+{"id":"OOR-N03","label":false,"text":"¿Qué otros horarios tienen?","group":"more_options_requested","origin":"authored"}
+{"id":"OOR-N04","label":false,"text":"Todavía no sé cuál elegir.","group":"uncertainty","origin":"authored"}
+{"id":"OOR-N05","label":false,"text":"No entendí los horarios.","group":"comprehension","origin":"authored"}
+{"id":"OOR-N06","label":false,"text":"No me sirve que me llame ahora.","group":"unrelated_rejection","origin":"authored"}
+{"id":"OOR-N07","label":false,"text":"Ninguno de esos autos me sirve.","group":"unrelated_rejection","origin":"authored"}
+{"id":"OOR-N08","label":false,"text":"No me sirve el precio.","group":"unrelated_rejection","origin":"authored"}
+{"id":"OOR-N09","label":false,"text":"El viernes 13:30 no puedo pero el sábado 12:30 sí me sirve.","group":"partial_rejection","origin":"authored"}
+{"id":"OOR-N10","label":false,"text":"Y... capaz el viernes, no sé todavía.","group":"hesitation","origin":"authored"}
+{"id":"OOR-N11","label":false,"text":"Capaz que ninguno, después te confirmo.","group":"hesitation","origin":"authored","added":"F7D-R2 negative control: hedged modality"}
+{"id":"OOR-N12","label":false,"text":"El viernes no puedo; el sábado a las 14 sí.","group":"partial_rejection","origin":"authored","added":"F7D-R2 negative control: alternative selected same turn"}

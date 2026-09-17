@@ -1227,6 +1227,47 @@ _EARLIEST_REJECTED_PATTERNS: tuple[str, ...] = (
 )
 
 
+def _rejects_every_offered_option(texts: list[str], offer_outstanding: bool) -> bool:
+    """True when the burst rejects the WHOLE offered slot set. Grammar, not sentences.
+
+    L4.7W5-F7D-R2. The invariant is one sentence long: *a universal negative quantifier
+    scoped to a scheduling object is a rejection of every option we offered.* The verb does
+    not matter — "no me sirve", "no puedo", "no me queda bien", "no me cierra" and whatever
+    a customer says next are all the same act — so none of them appears in the code. What
+    matters is WHICH OBJECT the quantifier ranges over, which is why `ninguno de esos autos`
+    and `ninguno de esos horarios` part company here and nowhere else.
+
+    Two readings, and the second needs the conversation to supply what the sentence omits:
+
+      explicit  "ninguno de esos horarios me sirve"  → quantifier + scheduling object
+      elliptic  "ninguna me cierra"                  → quantifier, no object named at all
+
+    The elliptic reading is admitted ONLY while an option set is actually outstanding, and
+    only when no competing object is named — the customer is answering the offer, so the
+    offer is the object. With nothing outstanding the same words mean nothing schedulable
+    and this returns False. `_EARLIEST_REJECTED_PATTERNS` is untouched and still runs first.
+
+    Hedged and hypothetical bursts are refused through the existing `turn_modality`, so
+    "capaz que ninguno, después te confirmo" is a maybe, not a rejection.
+    """
+    from ..schemas.claims import Modality
+    from .claim_projection import turn_modality
+    from .scheduling_lexicon import (has_universal_negative, names_competing_object,
+                                     names_scheduling_object)
+
+    normalized = _norm_lower(" ".join(t for t in texts if isinstance(t, str)))
+    if not has_universal_negative(normalized):
+        return False
+    if names_competing_object(normalized):
+        return False
+    _temporality, modality = turn_modality(list(texts))
+    if modality is not Modality.FACTUAL:
+        return False
+    if names_scheduling_object(normalized):
+        return True
+    return bool(offer_outstanding)
+
+
 # L4.7W5-F7A: asking for a person. The escalation evidence covered only "hablá con Julián" —
 # a customer who happens to know the owner's name. Asking for "alguien", "una persona" or
 # "un humano" is the ordinary way to say it, and after an offer has been rejected it is the
@@ -3409,6 +3450,18 @@ class ConversationEngine:
                     ctx, state, " ".join(ai_input_messages)
                 )
 
+            # L4.7W5-F7D-R2: every offered option refused. The grammar reports the fact;
+            # this is where it becomes a decision, and only when the context makes the
+            # decision true — an offer must be outstanding, and the same burst must not
+            # have taken one of the slots it supposedly rejected.
+            if (self._offer_outstanding(state)
+                    and not self._turn_took_an_option(ai_input_messages)
+                    and _rejects_every_offered_option(ai_input_messages, True)):
+                logger.info("L4.7W5-F7D OPTIONS_REJECTED thread_id=%s offered=%s "
+                            "— human handoff", ctx.thread.id, state.active_requested_date)
+                return self._handle_scheduling_escalation(
+                    ctx, state, " ".join(ai_input_messages))
+
             # L4.7W5-F7C: the same burst's semantic reading, consulted LAST so the
             # deterministic detectors above remain the floor and cost nothing. A customer
             # asking for a person does not owe us a verb from a list; `handoff.requested`
@@ -5105,6 +5158,36 @@ class ConversationEngine:
             except Exception:
                 pass
             return []
+
+    @staticmethod
+    def _offer_outstanding(state) -> bool:
+        """True when a scheduling option set is actually on the table right now.
+
+        Rejecting options nobody was shown is not a rejection. Three things each mean an
+        outstanding offer: a day under negotiation, slots visibly offered for it, or a live
+        Booking Flow token — the Flow IS the option set.
+        """
+        if getattr(state, "flow_booking_token", None):
+            return True
+        if getattr(state, "active_requested_date", None):
+            return True
+        raw = getattr(state, "last_offered_slots", None)
+        if not raw:
+            return False
+        try:
+            return bool(json.loads(str(raw)))
+        except (ValueError, TypeError):
+            return False
+
+    @staticmethod
+    def _turn_took_an_option(texts: list[str]) -> bool:
+        """True when this same burst named a day or a time — negotiating, not refusing.
+
+        Uses the scheduling parser the router already runs, so "el viernes no, pero el
+        sábado sí" is a selection no matter how the first half sounds. No new vocabulary.
+        """
+        day, time_str = _parse_scheduling_text(texts, date.today())
+        return bool(day or time_str)
 
     def _semantic_handoff_requested(self, state) -> bool:
         """True when THIS burst's semantic reading asks for a person. Never mutates.

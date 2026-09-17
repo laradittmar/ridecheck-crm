@@ -169,11 +169,24 @@ class TestRescueAudibleWithTokenSet(_LiveTurn):
         self.assert_rescued()
 
     def test_rescue_03_offer_rejected_without_inventing_anything(self):
-        """RESCUE-03 — no booking, no invented replacement slot."""
+        """RESCUE-03 — no booking, no re-offer, no invented replacement slot.
+
+        SUPERSEDED AND DISCLOSED (L4.7W5-F7D-R2). This asserted zero `ThreadRevision` rows,
+        and passed only because "ninguno de esos horarios me sirve" escalated nothing — the
+        very gap F7D-R2 closes. Now that it does escalate, the canonical handler creates the
+        provisional manual-coordination record it has always created (that record IS the
+        handoff, see `_handle_scheduling_escalation`), exactly as RESCUE-01 already
+        tolerated. The invariant this test exists to protect is unchanged and now actually
+        exercised: nothing is BOOKED and no replacement slot is invented.
+        """
         self.turn("ninguno de esos horarios me sirve")
         self.db.expire_all()
-        self.assertEqual(len(self.flows), 0)
-        self.assertEqual(self.db.execute(select(ThreadRevision)).scalars().all(), [])
+        self.assertEqual(len(self.flows), 0, "no Flow may be re-sent")
+        revisions = self.db.execute(select(ThreadRevision)).scalars().all()
+        self.assertEqual([r for r in revisions if r.status == "booked"], [],
+                         "a rejection must never book")
+        for rev in revisions:
+            self.assertNotEqual(rev.status, "booked")
 
     def test_rescue_04_explicit_request_for_a_person(self):
         self.turn("necesito hablar con una persona")
