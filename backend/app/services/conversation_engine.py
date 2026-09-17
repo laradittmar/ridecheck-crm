@@ -3409,6 +3409,18 @@ class ConversationEngine:
                     ctx, state, " ".join(ai_input_messages)
                 )
 
+            # L4.7W5-F7C: the same burst's semantic reading, consulted LAST so the
+            # deterministic detectors above remain the floor and cost nothing. A customer
+            # asking for a person does not owe us a verb from a list; `handoff.requested`
+            # is the interpretation of that act, and it was already being produced and
+            # thrown away. No extra model call: this reads the one provider the turn
+            # already dispatched.
+            if self._semantic_handoff_requested(state):
+                logger.info("L4.7W5-F7C SEMANTIC_HANDOFF thread_id=%s — human handoff",
+                            ctx.thread.id)
+                return self._handle_scheduling_escalation(
+                    ctx, state, " ".join(ai_input_messages))
+
         if (
             state.last_stage == STAGE_SCHEDULING
             and not state.needs_human
@@ -5093,6 +5105,47 @@ class ConversationEngine:
             except Exception:
                 pass
             return []
+
+    def _semantic_handoff_requested(self, state) -> bool:
+        """True when THIS burst's semantic reading asks for a person. Never mutates.
+
+        L4.7W5-F7C. `claim_projection` already turns `handoff.requested` into a
+        `NEEDS_HUMAN` claim; until now only the shadow reconciler read it, so an ordinary
+        "¿me puede ayudar una persona?" reached no routing decision because its verb was
+        absent from `_HUMAN_REQUEST_PATTERNS`. This consumes the existing projection — it
+        does not add a second producer, a phrase list, a prompt or a schema field.
+
+        Same-turn by construction: `_semantic_turn_evidence` reads `self._turn_semantic`,
+        which `_handle` resets to None and rebinds to a provider carrying this burst's
+        `burst_id` and `message_ids`. Evidence from an earlier turn cannot be seen here.
+
+        Unresolved evidence is not evidence: an AMBIGUOUS or CONFLICT claim is refused, so
+        uncertainty produces no escalation. A timeout or a failed call returns None from
+        the provider and this returns False, leaving the deterministic floor in charge.
+        """
+        evidence = self._semantic_turn_evidence()
+        if evidence is None:
+            return False
+        try:
+            from ..schemas.claims import ClaimType
+            from ..schemas.turn_evidence import UNRESOLVED_STATUSES
+            from .claim_projection import claims_from_turn_evidence
+            revision_id = getattr(state, "current_revision_id", None)
+            claims = claims_from_turn_evidence(
+                evidence,
+                texts=list(getattr(self, "_turn_semantic_texts", ()) or ()),
+                cycle_id=self._reconciler_cycle_id(state),
+                revision_id=(revision_id if isinstance(revision_id, int) else None))
+            return any(c.claim_type == ClaimType.NEEDS_HUMAN
+                       and c.value is True
+                       and c.status not in UNRESOLVED_STATUSES
+                       for c in claims)
+        except Exception as exc:   # a projection failure is absent evidence, never a guess
+            try:
+                logger.warning("L4.7W5-F7C semantic handoff projection failed: %s", exc)
+            except Exception:
+                pass
+            return False
 
     # ── L4.7C.2 — the single canonical write path for vehicle and location ────
     #
