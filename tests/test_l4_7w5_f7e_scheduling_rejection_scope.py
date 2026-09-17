@@ -53,12 +53,10 @@ WAS_FALSE_POSITIVE = (
     "No me sirve esa forma de pago.",
     "No me sirve el informe.",
 )
-# ADJACENT DEFECT, different root cause, NOT fixed here and NOT hidden. "No me sirve que me
-# llame ahora." still escalates — through `_is_phone_call_request`, which reads "que me
-# llame" as a request for a call and ignores that it is negated. That is a different
-# invariant ("a negated request is not a request") in an M21.1.1-certified detector, and
-# this milestone is explicitly told not to broaden into a general rewrite. F7E proves its
-# own scheduling detectors are silent on it; the follow-up owns the rest.
+# Was an open adjacent defect at F7E: "No me sirve que me llame ahora." escalated through
+# `_is_phone_call_request`, which read "que me llame" as a request and ignored the negation.
+# L4.7W5-F7F closed it by making that detector polarity-aware. Kept here because F7E's own
+# claim — that ITS detectors are silent on this sentence — is still worth asserting.
 NEGATED_CALL_STILL_ESCALATES = "No me sirve que me llame ahora."
 ADJACENT_DEFECT_IDS = {"OOR-N06"}
 # Level-3 positives that the OLDER detectors own, not the F7D-R2 grammar.
@@ -145,18 +143,18 @@ class TestUnrelatedRejectionNoLongerEscalates(_Router):
                                  "the offer must survive an unrelated complaint")
 
     def test_f7e_08a_the_negated_call_is_not_a_scheduling_escalation(self):
-        """F7E's detectors are silent on it; a separate detector still escalates it."""
+        """F7E's detectors are silent on it, and F7F closed the separate detector too."""
         t = NEGATED_CALL_STILL_ESCALATES
         self.assertFalse(about_scheduling([t]), "not a scheduling rejection")
         self.assertFalse(rejects([t], True), "not a total option rejection")
         self.assertNotIn("no me sirve", ce._ESCALATION_KEYWORDS)
-        self.assertTrue(ce._is_phone_call_request([t]),
-                        "documents the adjacent defect: a negated call reads as a request")
+        self.assertFalse(ce._is_phone_call_request([t]),
+                         "closed by L4.7W5-F7F: polarity-aware call detection")
 
     def test_f7e_08_every_corpus_negative_end_to_end(self):
         """Level 3, the complete router — the claim F7D-R2 made too broadly."""
         for case in [c for c in CASES
-                     if not c["label"] and case_id_ok(c["id"])]:
+                     if not c["label"]]:
             with self.subTest(id=case["id"], text=case["text"]):
                 self.setUp(); self.arm()
                 token = self.state.flow_booking_token

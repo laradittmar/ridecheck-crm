@@ -1124,10 +1124,77 @@ def _is_dock_sud_alias(value: str) -> bool:
     return " ".join((value or "").lower().split()) in _DOCK_SUD_ALIASES
 
 
+# L4.7W5-F7F — negation is a closed grammatical class, not a phrase list. These are the
+# particles that carry it in Spanish; nothing here is a sentence or a customer utterance.
+_NEGATORS: frozenset[str] = frozenset({"no", "ni", "nunca", "jamas", "tampoco", "nada"})
+
+# Clause boundaries: terminal punctuation, a comma, or the adversative coordinator. A
+# negation scopes its own clause, which is why "no me sirve que me llame" and "no me sirve
+# ese horario, me llamás?" must be read one clause at a time.
+_CLAUSE_BOUNDARY = re.compile(r"[.;!?¡¿]+|,|\bpero\b")
+
+
+def _clause_is_negated(clause: str) -> bool:
+    """True when a negative particle governs this clause."""
+    return any(token in _NEGATORS for token in clause.split())
+
+
+def _is_short_retraction(clause: str) -> bool:
+    """A brief negative afterthought — "no", "mejor no" — that takes back what precedes it.
+
+    Deliberately length-bounded: a long clause that happens to contain "no" is a new
+    statement, not a retraction. The bound errs toward NOT finding a call request, which is
+    the safe direction — a missed call request costs a customer one more message, an
+    invented one hands a thread to a human who was never asked for.
+    """
+    tokens = clause.split()
+    return 0 < len(tokens) <= 3 and _clause_is_negated(clause)
+
+
+def _opens_a_condition(clause: str) -> bool:
+    """True when the clause is a conditional protasis — it begins with `si`.
+
+    `si o si` is the Argentine intensifier ("definitely"), the opposite of a condition, so
+    it is excluded by shape rather than listed as an exception.
+    """
+    tokens = clause.split()
+    return bool(tokens) and tokens[0] == "si" and tokens[:3] != ["si", "o", "si"]
+
+
 def _is_phone_call_request(messages: list[str]) -> bool:
-    """Return True if any message contains a phone-call request pattern."""
-    combined = " ".join(messages)
-    return any(p.search(combined) for p in _PHONE_CALL_PATTERNS)
+    """True when the customer is asking, affirmatively, to be phoned.
+
+    L4.7W5-F7F. This used to join the burst and search it, so "no me sirve QUE ME LLAME
+    ahora" matched `que me llame` and became a call request — a refusal read as a request.
+    Polarity is now read per clause: a call expression under a negative particle is not a
+    request, a request inside a conditional protasis is an offer rather than a request, and
+    a short negative afterthought later in the same burst retracts an earlier affirmative.
+
+    No model call, no new pattern for any of the sentences involved: the call patterns are
+    untouched and the only addition is grammatical scope.
+    """
+    normalized = _norm_lower(" ".join(m for m in messages if isinstance(m, str)))
+    clauses = [c.strip() for c in _CLAUSE_BOUNDARY.split(normalized) if c.strip()]
+    if not clauses:
+        return False
+
+    affirmative_at = -1
+    for index, clause in enumerate(clauses):
+        if any(p.search(clause) for p in _PHONE_CALL_PATTERNS) and not _clause_is_negated(clause):
+            affirmative_at = index
+    if affirmative_at < 0:
+        return False
+
+    # A retraction after the request wins: "llamame. no, mejor no."
+    if any(_is_short_retraction(c) for c in clauses[affirmative_at + 1:]):
+        return False
+
+    # A request inside a conditional protasis is an offer, not a request: "si hace falta
+    # llamame" leaves the decision with us. Position carries it — a clause OPENING with `si`
+    # is the protasis, while "llamame si podés" and "llamame cuando puedan" are requests
+    # whose timing is merely open. Deliberately NOT `turn_modality`, which treats `cuando`
+    # as conditional and would refuse "llamame cuando puedan" — a certified affirmative.
+    return not _opens_a_condition(clauses[affirmative_at])
 
 
 # ── M21.1.2 Vehicle inspectability detection functions ───────────────────────
@@ -1308,9 +1375,18 @@ _HUMAN_REQUEST_PATTERNS: tuple[str, ...] = (
 
 
 def _is_human_request(texts: list[str]) -> bool:
-    """The customer has asked to speak to a person."""
-    n = _norm_lower(" ".join(texts))
-    return any(re.search(pat, n) for pat in _HUMAN_REQUEST_PATTERNS)
+    r"""The customer has asked, affirmatively, to speak to a person.
+
+    L4.7W5-F7F: the same polarity defect the phone-call detector had. `\bquiero\s+hablar\b`
+    matched inside "NO quiero hablar por teléfono", so a refusal became a request for a
+    human. Read per clause, using the one negation helper, so a request under a negative
+    particle is not a request. The patterns are untouched.
+    """
+    normalized = _norm_lower(" ".join(t for t in texts if isinstance(t, str)))
+    clauses = [c.strip() for c in _CLAUSE_BOUNDARY.split(normalized) if c.strip()]
+    return any(any(re.search(pat, clause) for pat in _HUMAN_REQUEST_PATTERNS)
+               and not _clause_is_negated(clause)
+               for clause in clauses)
 
 
 _ESCALATION_KEYWORDS: frozenset[str] = frozenset({

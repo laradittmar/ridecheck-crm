@@ -202,8 +202,8 @@ class TestLivePathNegatives(_Floor):
                                  "the F7D-R2 grammar never claimed these")
                 self.assertFalse(ce._should_escalate_scheduling_to_human([text], self.state),
                                  "F7E removed the unscoped keyword")
-        self.assertTrue(ce._is_phone_call_request(["No me sirve que me llame ahora."]),
-                        "adjacent defect, still open: a negated call reads as a request")
+        self.assertFalse(ce._is_phone_call_request(["No me sirve que me llame ahora."]),
+                         "closed by L4.7W5-F7F: a negated call is no longer a request")
 
     def test_r2_16_an_already_human_owned_thread_is_untouched(self):
         self.state.needs_human = True; self.db.commit()
