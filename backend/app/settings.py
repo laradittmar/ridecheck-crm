@@ -57,6 +57,11 @@ class Settings:
     semantic_same_turn_enabled: bool = False
     semantic_same_turn_timeout_seconds: float = 6.0
     shadow_evidence_path: str = ""
+    # L4.7W5 Gate 1/2 — hybrid decision trace. OFF by default everywhere. The writer is
+    # observational: it reads state already computed, writes one row of its own, and can
+    # never change routing or customer-visible text. Turning it off stops the write and
+    # leaves every prior trace readable, which is the whole rollback.
+    hybrid_trace_enabled: bool = False
     conversation_engine_direct_webhook_enabled: bool = False
     openai_chat_model: str = "gpt-4o-mini"
     quarantined_test_wa_ids: tuple[str, ...] = ()
@@ -151,6 +156,7 @@ def get_settings() -> Settings:
         semantic_same_turn_timeout_seconds=_float_env(
             "SEMANTIC_SAME_TURN_TIMEOUT_SECONDS", 6.0),
         shadow_evidence_path=_getenv("SHADOW_EVIDENCE_PATH"),
+        hybrid_trace_enabled=(_getenv("HYBRID_TRACE_ENABLED", "false").lower() == "true"),
         conversation_engine_direct_webhook_enabled=_getenv("CONVERSATION_ENGINE_DIRECT_WEBHOOK_ENABLED", "false").lower() in ("1", "true", "yes"),
         openai_chat_model=_getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
         quarantined_test_wa_ids=_parse_quarantined_wa_ids(),

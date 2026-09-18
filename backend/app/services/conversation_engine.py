@@ -2138,6 +2138,11 @@ class ConversationEngine:
         self._burst_message_count: int = 1
         self._burst_earliest_inbound_db_id: int | None = None
         self._faq_reconciliation_burst: str | None = None
+        # L4.7W5 Gate 1/2 — hybrid decision trace collection. Observational only.
+        self._turn_trace_ctx = None
+        self._turn_trace_before = None
+        self._turn_trace_rows: list = []
+        self._turn_trace_reconciliations: list = []
 
     # ── Public entrypoint ─────────────────────────────────────────────────
 
@@ -2171,6 +2176,11 @@ class ConversationEngine:
         self._burst_earliest_inbound_db_id = None
         self._faq_reconciliation_burst = None
         self._turn_burst_texts = []
+        self._turn_trace_ctx = None
+        self._turn_trace_before = None
+        self._turn_trace_rows = []
+        self._turn_trace_reconciliations = []
+        _trace_started_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
         _ce_t0 = _time.perf_counter()
         try:
             out = self._handle(event)
@@ -2240,6 +2250,12 @@ class ConversationEngine:
         out.burst_message_count = getattr(self, "_burst_message_count", 1)
         out.burst_earliest_inbound_db_id = getattr(self, "_burst_earliest_inbound_db_id", None)
         out.contributing_sources = getattr(self, "_contributing_sources", None)
+        # L4.7W5 Gate 1/2 — record how this decision was reached. Runs AFTER the answer is
+        # final and after every response-shaping branch above, so it can observe the real
+        # outcome; it writes in its own transaction and returns None on every failure, so a
+        # trace defect can never cost a customer turn.
+        self._write_hybrid_trace(event, out, _trace_started_at,
+                                 int((_time.perf_counter() - _ce_t0) * 1000))
         return out
 
     # ── Core dispatch ─────────────────────────────────────────────────────
@@ -2258,6 +2274,11 @@ class ConversationEngine:
         # Mark as processing — committed atomically with the final successful action,
         # so a failure mid-flight does not leave the message appearing processed.
         state = self._get_or_create_state(ctx)
+
+        # L4.7W5 Gate 1 — the canonical state as it stood BEFORE this turn touched it.
+        # Taken here because `state` now exists and nothing has yet mutated it; taken later
+        # it would describe the outcome and could no longer explain the decision.
+        self._capture_trace_before(ctx, state)
 
         # WILD-04R: capture previous cursor BEFORE overwrite (burst start discovery)
         previous_cursor = state.last_processed_inbound_wa_message_id
@@ -3350,6 +3371,14 @@ class ConversationEngine:
             len(_burst_msgs) if _burst_msgs else max(1, len(_current_evidence))
         )
         self._burst_earliest_inbound_db_id = _burst_msgs[0].id if _burst_msgs else None
+        # L4.7W5 Gate 1 — the ORDERED burst, not just the message that triggered the call.
+        # The shadow record has only ever carried the triggering WAMID, which is why a
+        # two-message burst could not be reconstructed from evidence afterwards.
+        self._turn_trace_rows = [
+            {"db_id": m.id, "wa_message_id": m.wa_message_id,
+             "timestamp": (m.timestamp.isoformat() if getattr(m, "timestamp", None) else None)}
+            for m in _burst_msgs
+        ]
         _existing_evidence_set = set(_current_evidence)
         _missing_burst = [t for t in _burst_db_texts if t not in _existing_evidence_set]
         if _missing_burst:
@@ -5421,8 +5450,14 @@ class ConversationEngine:
                  or getattr(state, "current_cycle_started_at", None))
         return str(value) if value else None
 
-    def _record_reconciliation(self, ctx, decision, claim_type: str, state=None) -> None:
-        """Append the justification. Log-only in C2: no new table, no migration."""
+    def _record_reconciliation(self, ctx, decision, claim_type: str, state=None,
+                               claims=()) -> None:
+        """Append the justification. Log-only in C2: no new table, no migration.
+
+        `claims` is the reconciler's input set, passed through so the hybrid trace can say
+        WHICH producer contributed to each decision. It is read, never mutated, and its
+        absence degrades the trace only — the JSONL record is unchanged either way.
+        """
         try:
             record = decision.to_record(
                 claim_type=claim_type,
@@ -5439,8 +5474,124 @@ class ConversationEngine:
             # table and no migration (L4.7C.2 Part 16); a decision must survive the log
             # buffer to be auditable at all.
             self._append_reconciliation_record(ctx, record)
+            self._collect_trace_reconciliation(record, claims)
         except Exception:
             pass
+
+    # ── L4.7W5 Gate 1/2: hybrid decision trace ────────────────────────────────
+    # Everything below is observational. It reads values the turn has already computed,
+    # never calls a producer, never waits on one, and writes only its own row. Every method
+    # swallows its own exceptions: a decision that was correctly taken must not be lost
+    # because the record of it could not be written.
+
+    def _hybrid_trace_on(self) -> bool:
+        # `self` may legitimately lack `settings` — the transport-containment suite builds a
+        # bare engine to prove the crash handler. An observer that raises on a half-built
+        # engine would be participating in the turn, which is the one thing it may not do.
+        return getattr(getattr(self, "settings", None),
+                       "hybrid_trace_enabled", False) is True
+
+    def _capture_trace_before(self, ctx, state) -> None:
+        if not self._hybrid_trace_on():
+            return
+        try:
+            from .hybrid_trace import snapshot_state
+            self._turn_trace_ctx = ctx
+            self._turn_trace_before = snapshot_state(state, getattr(ctx, "lead", None))
+        except Exception:
+            self._turn_trace_before = None
+
+    def _collect_trace_reconciliation(self, record, claims=()) -> None:
+        if not self._hybrid_trace_on():
+            return
+        try:
+            from .hybrid_trace import reconciliation_from
+            self._turn_trace_reconciliations.append(reconciliation_from(record, claims))
+        except Exception:
+            pass
+
+    def _trace_outbound_for_turn(self, thread_id) -> dict:
+        """What the gate actually recorded for this turn, by correlation id.
+
+        Read from the ledger rather than reported by the send path, so the trace agrees
+        with the forensic authority instead of offering a second, competing account. Only
+        the WAMID tail is kept — enough to join to the ledger, never a customer identifier.
+        """
+        try:
+            if thread_id is None:
+                return {}
+            row = self.db.execute(
+                select(WhatsAppMessage)
+                .where(WhatsAppMessage.thread_id == thread_id,
+                       WhatsAppMessage.direction == "out",
+                       WhatsAppMessage.correlation_id == getattr(self, "_correlation_id", None))
+                .order_by(WhatsAppMessage.id.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+            if row is None:
+                return {}
+            wamid = row.wa_message_id or ""
+            return {"message_id": row.id, "path_id": row.path_id, "status": row.status,
+                    "wamid_tail": (wamid[-8:] if wamid else None)}
+        except Exception:
+            return {}
+
+    def _write_hybrid_trace(self, event, out, started_at: str, duration_ms: int) -> None:
+        if not self._hybrid_trace_on():
+            return
+        try:
+            from .hybrid_trace import (build_trace, ce_evidence_for, persist,
+                                       semantic_evidence_from, snapshot_state)
+            from .outbound_path_registry import get_deployment_id
+            from ..schemas.hybrid_trace import CanonicalSnapshot
+
+            ctx = self._turn_trace_ctx
+            thread_id = getattr(getattr(ctx, "thread", None), "id", None) or event.thread_id
+            lead = getattr(ctx, "lead", None)
+            before = self._turn_trace_before or CanonicalSnapshot()
+            after = snapshot_state(getattr(ctx, "state", None), lead)
+
+            texts = list(getattr(self, "_turn_burst_texts", []) or [])
+            if not texts and getattr(event, "text", None):
+                texts = [event.text]
+            rows = list(getattr(self, "_turn_trace_rows", []) or [])
+            if not rows:
+                # A turn that early-returned before burst reconstruction, or a thread's very
+                # first message: the triggering WAMID is genuinely all that exists.
+                rows = [{"db_id": None, "wa_message_id": getattr(event, "wa_message_id", None),
+                         "timestamp": None}]
+
+            semantic = semantic_evidence_from(
+                getattr(self, "_turn_semantic", None),
+                "async" if self._shadow_async() else "sync")
+            ce_rules = ce_evidence_for(texts, before, out.action)
+
+            trace = build_trace(
+                turn_id=getattr(self, "_correlation_id", None) or "",
+                thread_id=thread_id,
+                lead_id=getattr(lead, "id", None),
+                deployment_sha=get_deployment_id(),
+                started_at=started_at,
+                completed_at=datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                duration_ms=duration_ms,
+                ordered_message_ids=tuple(r.get("wa_message_id") for r in rows),
+                message_timestamps=tuple(r.get("timestamp") for r in rows),
+                burst_texts=texts,
+                semantic=semantic,
+                ce_rules=ce_rules,
+                reconciliations=tuple(getattr(self, "_turn_trace_reconciliations", []) or ()),
+                before=before, after=after,
+                action=out.action, detail=out.detail,
+                answer_source=out.answer_source,
+                outbound=self._trace_outbound_for_turn(thread_id),
+            )
+            persist(self.db, trace)
+        except Exception as exc:
+            try:
+                logger.warning("HYBRID_TRACE_BUILD_FAILED thread_id=%s category=%s",
+                               getattr(event, "thread_id", None), type(exc).__name__)
+            except Exception:
+                pass
 
     def _append_reconciliation_record(self, ctx, record) -> None:
         """Append one justification. Never raises; a write failure loses no canonical state."""
@@ -5508,7 +5659,7 @@ class ConversationEngine:
                 cycle_id=cycle_id).with_id())
 
         decision = reconcile_vehicle_identity(claims, catalog_lookup=lookup_vehicle)
-        self._record_reconciliation(ctx, decision, ClaimType.VEHICLE_MODEL, state)
+        self._record_reconciliation(ctx, decision, ClaimType.VEHICLE_MODEL, state, claims)
         if not decision.accepted:
             # CLARIFY / HOLD: the legacy value is NOT written. The turn continues on the
             # existing conversational path, which asks rather than assumes.
@@ -5568,7 +5719,7 @@ class ConversationEngine:
             return None
 
         decision = reconcile_inspection_location(claims, zone_validator=_validate)
-        self._record_reconciliation(ctx, decision, claim_type, state)
+        self._record_reconciliation(ctx, decision, claim_type, state, claims)
         if not decision.accepted:
             return False
         target.zone_group = decision.value.zone_group or zone_group
@@ -6234,7 +6385,7 @@ class ConversationEngine:
         try:
             decision = reconcile_vehicle_identity(self._fuzzy_claim(state, result.hit),
                                                   catalog_lookup=lookup_vehicle)
-            self._record_reconciliation(ctx, decision, ClaimType.VEHICLE_MODEL, state)
+            self._record_reconciliation(ctx, decision, ClaimType.VEHICLE_MODEL, state, claims)
             return bool(decision.accepted)
         except Exception as exc:         # a reconciliation failure is not an acceptance
             logger.warning("L4.7W1-F2 fuzzy reconciliation failed thread_id=%s: %s",

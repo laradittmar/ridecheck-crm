@@ -900,6 +900,34 @@ def render_control_page(user_email: str) -> str:
         </div>
       </div>
 
+      <!-- L4.7W5 Gate 2: hybrid decision trace panel -->
+      <div class="panel" id="panel-turns">
+        <div class="panelHeader">
+          <h2>Decisiones híbridas</h2>
+          <div class="filterGroup">
+            <span class="legendNote">Un turno del cliente por fila. Sin fila = turno no capturado.</span>
+          </div>
+        </div>
+        <div class="tableWrap">
+          <table id="turns-table">
+            <thead>
+              <tr>
+                <th>Hora</th>
+                <th>Conversación</th>
+                <th>Mensajes</th>
+                <th>Semántico</th>
+                <th>Clasificación</th>
+                <th>Resultado</th>
+                <th>Traza</th>
+              </tr>
+            </thead>
+            <tbody id="turns-tbody">
+              <tr><td colspan="7" class="emptyState">Cargando…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
       <!-- Critical events panel -->
       <div class="panel criticalPanel" id="panel-critical">
         <div class="panelHeader">
@@ -1438,6 +1466,42 @@ def render_control_page(user_email: str) -> str:
     }}
 
     // -------------------------------------------------------------------------
+    // Hybrid decision traces
+    // -------------------------------------------------------------------------
+    // The burst text is deliberately absent from this table: the trace stores WAMIDs and a
+    // hash, and the message bodies stay in the trazado panel under its existing masking.
+    function fetchTurns() {{
+      apiFetch('/api/ops/turns?limit=25', function(data) {{
+        var rows = (data && data.turns) || [];
+        var tbody = document.getElementById('turns-tbody');
+        if (!tbody) return;
+        if (!rows.length) {{
+          tbody.innerHTML = '<tr><td colspan="7" class="emptyState">'
+            + 'Sin turnos capturados</td></tr>';
+          return;
+        }}
+        tbody.innerHTML = rows.map(function(r) {{
+          var cls = (r.classification === 'CONFLICT') ? 'badgeHigh'
+                  : (r.classification === 'AGREE') ? 'badgeLow' : 'badgeMed';
+          return '<tr>'
+            + '<td>' + fmtDateTime(r.created_at) + '</td>'
+            + '<td>' + (r.thread_id
+                 ? ('<a href="/whatsapp/thread/' + esc(r.thread_id) + '" target="_blank"'
+                    + ' rel="noopener">' + esc(r.thread_id) + '</a>')
+                 : '—') + '</td>'
+            + '<td>' + esc(r.message_count) + '</td>'
+            + '<td>' + esc(r.semantic_status || '—') + '</td>'
+            + '<td><span class="badge ' + cls + '">'
+            + esc(r.classification || '—') + '</span></td>'
+            + '<td>' + esc(r.result_kind || '—') + '</td>'
+            + '<td><a href="/control/turn/' + encodeURIComponent(r.turn_id) + '">'
+            + 'Ver traza</a></td>'
+            + '</tr>';
+        }}).join('');
+      }});
+    }}
+
+    // -------------------------------------------------------------------------
     // Orchestrate refresh
     // -------------------------------------------------------------------------
     function refreshAll() {{
@@ -1446,6 +1510,7 @@ def render_control_page(user_email: str) -> str:
       fetchMessages();
       fetchCritical();
       fetchPaths();
+      fetchTurns();
       document.getElementById('lastUpdated').textContent = nowHMS();
       fetchCustomerOptions();
       fetchPathRegistry();

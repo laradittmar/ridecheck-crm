@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 from ..db import get_db
 from ..models import (
     AiEvent,
+    HybridDecisionTraceRow,
     SecurityEvent,
     WhatsAppContact,
     WhatsAppMessage,
@@ -781,3 +782,66 @@ def _event_description(event_type: str, category: str) -> str:
         "SUCCESSFUL_META_SEND_WHILE_OUTBOUND_OFF": "Successful Meta send while outbound is disabled",
     }
     return descriptions.get(event_type, f"Security event: {event_type}")
+
+
+# ---------------------------------------------------------------------------
+# L4.7W5 Gate 1/2 — hybrid decision trace (read-only, like everything else here)
+# ---------------------------------------------------------------------------
+
+# The message BODIES are deliberately not served here. The trace stores the ordered WAMIDs
+# and the hash of the normalized burst; `/api/ops/messages` already serves the text under
+# the existing preview and masking policy. One source for customer words, not two.
+TRACE_NOT_CAPTURED = "TRACE NOT CAPTURED — predates hybrid-decision-trace/1.0"
+
+
+def _trace_row_summary(row: HybridDecisionTraceRow) -> dict:
+    return {
+        "turn_id": row.turn_id,
+        "thread_id": row.thread_id,
+        "lead_id": row.lead_id,
+        "deployment_sha": row.deployment_sha,
+        "input_hash": row.input_hash,
+        "message_count": row.message_count,
+        "result_kind": row.result_kind,
+        "classification": row.classification,
+        "semantic_status": row.semantic_status,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
+@router.get("/turns")
+def get_turns(
+    thread_id: Optional[int] = Query(None),
+    result_kind: Optional[str] = Query(None),
+    classification: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Recent captured turns, newest first. Absence of a turn means it was not captured."""
+    q = select(HybridDecisionTraceRow).order_by(HybridDecisionTraceRow.id.desc()).limit(limit)
+    if thread_id is not None:
+        q = q.where(HybridDecisionTraceRow.thread_id == thread_id)
+    if result_kind:
+        q = q.where(HybridDecisionTraceRow.result_kind == result_kind)
+    if classification:
+        q = q.where(HybridDecisionTraceRow.classification == classification)
+    rows = list(db.execute(q).scalars().all())
+    return {"count": len(rows), "turns": [_trace_row_summary(r) for r in rows]}
+
+
+@router.get("/turn/{turn_id}")
+def get_turn(turn_id: str, db: Session = Depends(get_db)) -> dict:
+    """The full trace for one turn.
+
+    A turn with no row is reported as not captured rather than as an empty decision: an
+    inspector that renders absence as "nothing happened" is worse than one that renders
+    nothing at all, because it invents evidence.
+    """
+    row = db.execute(
+        select(HybridDecisionTraceRow).where(HybridDecisionTraceRow.turn_id == turn_id)
+    ).scalar_one_or_none()
+    if row is None:
+        return {"turn_id": turn_id, "captured": False, "reason": TRACE_NOT_CAPTURED}
+    out = _trace_row_summary(row)
+    out.update({"captured": True, "trace": row.payload})
+    return out

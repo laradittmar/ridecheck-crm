@@ -578,6 +578,32 @@ class AiEvent(Base):
     unanswered_alert_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class HybridDecisionTraceRow(Base):
+    """L4.7W5 Gate 1 — one hybrid decision per customer turn, `hybrid-decision-trace/1.0`.
+
+    Additive and observational: nothing in the conversation path reads it. The indexed
+    columns are the ones an operator filters on; everything else lives in `payload` so the
+    contract can grow a field without a migration. The customer's message bodies are NOT
+    here — `payload.ordered_message_ids` points at `whatsapp_messages`, which already holds
+    them, and duplicating them would duplicate PII for no evidentiary gain.
+    """
+    __tablename__ = "hybrid_decision_traces"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    turn_id: Mapped[str] = mapped_column(String(64), index=True, unique=True)
+    thread_id: Mapped[Optional[int]] = mapped_column(Integer, index=True, nullable=True)
+    lead_id: Mapped[Optional[int]] = mapped_column(Integer, index=True, nullable=True)
+    deployment_sha: Mapped[Optional[str]] = mapped_column(String(40), index=True, nullable=True)
+    input_hash: Mapped[Optional[str]] = mapped_column(String(64), index=True, nullable=True)
+    message_count: Mapped[int] = mapped_column(Integer, default=0)
+    result_kind: Mapped[Optional[str]] = mapped_column(String(32), index=True, nullable=True)
+    classification: Mapped[Optional[str]] = mapped_column(String(32), index=True, nullable=True)
+    semantic_status: Mapped[Optional[str]] = mapped_column(String(16), index=True, nullable=True)
+    payload: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True)
+
+
 class SecurityEvent(Base):
     """Unauthorized outbound path detection record — M2.
 
