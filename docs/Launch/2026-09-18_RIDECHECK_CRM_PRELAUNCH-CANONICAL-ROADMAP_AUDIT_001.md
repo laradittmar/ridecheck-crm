@@ -41,7 +41,7 @@ The LLM and CE are independent evidence producers. Neither may silently become b
 | Webhook security | App Secret/signature enforcement deployed and proven fail-closed | **PASS** |
 | Human rescue baseline | F7C–F7F deployed; multiple false-positive/negation defects closed | **PASS WITH NEW WILD FINDING** |
 | Failed Wild | “Mmm, no me sirve” did not rescue; system re-asked rejected options | **HIGH DEFECT FOUND** |
-| F7G-R2 safety floor | Correct local commit `ce978a2`; tests pass; not yet deployed | **READY FOR CONTROLLED DEPLOYMENT** |
+| F7G-R2 safety floor | Source `ce978a2` pushed; image `ridecheck-crm-backend:w5f7g-ce978a2` built, pinned (`5177667`) and deployed; certified by `2026-09-18_RIDECHECK_CRM_L4.7W5-F7G-R2-CONTROLLED-DEPLOYMENT_CLOSEOUT_002.md` | **DEPLOYED / GATE 0 COMPLETE** |
 | Hybrid interpretation for offered-slot rejection | Semantic result had no rejection; forensic record cannot prove which complete burst the model saw; no dedicated claim/reconciliation policy exists | **NOT PROVEN** |
 | Alternative-time request | “¿No tenés algo más temprano?” correctly must not be treated as a rejection, but useful alternative response remains open F-03 | **OPEN MEDIUM** |
 | Live hybrid observability | Current Control dashboard shows operational summaries but not Raw/LLM/CE/Reconciler/Canonical evidence | **LAUNCH GATE OPEN** |
@@ -51,9 +51,24 @@ The LLM and CE are independent evidence producers. Neither may silently become b
 
 ## 4. Finite critical path
 
-### Gate 0 — Deploy the proven safety floor
+### Gate 0 — Deploy the proven safety floor — **COMPLETE (2026-09-18)**
 
 **Goal:** Remove the immediate customer loop without pretending the hybrid gap is solved.
+
+**Completed.** Certified by `2026-09-18_RIDECHECK_CRM_L4.7W5-F7G-R2-CONTROLLED-DEPLOYMENT_CLOSEOUT_002.md`.
+
+| item | value |
+|---|---|
+| source commit | `ce978a2` |
+| pin commit | `5177667` |
+| image | `ridecheck-crm-backend:w5f7g-ce978a2` (digest `sha256:67a9054e…81d2`) |
+| backend container | `6c9db45bf53d`, restarts 0, `GIT_SHA=ce978a2` |
+| outbound | **OFF** throughout; 0 attempts, ledger delta 0 |
+| Wild | **none performed** |
+| hybrid semantic/reconciliation gap | **REMAINS OPEN** — this is a deterministic floor, not hybrid capability |
+
+Only the backend was recreated; n8n, Postgres and nginx were untouched. Meta remained PUBLISHED and
+valid, read-only. The seeded Agenda (ids 62–73) and thread 2053's 12 evidence rows are preserved.
 
 Actions:
 
@@ -316,12 +331,17 @@ Public launch begins only after Lara declares **GO**.
 
 ## 7. Immediate next actions
 
-1. Complete `L4.7W5-F7G-R2-CONTROLLED-DEPLOYMENT`.
-2. Build Gate 1 evidence capture and Gate 2 Hybrid Decision Inspector **before the next Wild replay**, so the replay is fully auditable live.
-3. Complete the hybrid rejection capability decision using measured corpus evidence.
-4. Run the owner-controlled Human Rescue Wild replay.
-5. Begin real-client replay.
-6. Only then begin Smart Booking implementation.
+1. ~~Complete `L4.7W5-F7G-R2-CONTROLLED-DEPLOYMENT`.~~ **DONE — Gate 0 complete 2026-09-18.**
+2. **NEXT AUTHORIZED WORK — Gate 1 Hybrid Evidence Contract, audit/design.** Its first identified
+   defect is already proven: the shadow record stores only the burst's triggering WAMID, so it
+   cannot show which messages the model received. That is exactly Gate 1's exit criterion
+   *"the exact model input boundary is provable."*
+3. **Then Gate 2 Hybrid Decision Inspector.**
+   Gates 1 and 2 must both land **before the next Wild replay**, so the replay is fully auditable live.
+4. Complete the hybrid rejection capability decision using measured corpus evidence (Gate 3).
+5. Run the owner-controlled Human Rescue Wild replay (Gate 4).
+6. Begin real-client replay (Gate 5).
+7. Only then begin Smart Booking implementation (Gate 7).
 
 ## 8. Current owner decision
 
