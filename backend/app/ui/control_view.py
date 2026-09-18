@@ -905,7 +905,10 @@ def render_control_page(user_email: str) -> str:
         <div class="panelHeader">
           <h2>Decisiones híbridas</h2>
           <div class="filterGroup">
-            <span class="legendNote">Un turno del cliente por fila. Sin fila = turno no capturado.</span>
+            <span class="legendNote">HYBRID CONVERSATION TRACE — un turno conversacional por
+              fila (ConversationEngine.handle). Sin fila = turno no capturado. Una reserva
+              confirmada dentro del Flow de Meta es una transacción operativa y no aparece
+              aquí como decisión híbrida.</span>
           </div>
         </div>
         <div class="tableWrap">

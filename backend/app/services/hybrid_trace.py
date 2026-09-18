@@ -245,12 +245,22 @@ def classify(semantic: SemanticEvidence, ce_rules: tuple, reconciliations: tuple
 
 
 def badges_for(trace: HybridDecisionTrace, headline: str) -> tuple:
+    """The labels an operator reads first. Headline classification always comes first.
+
+    `RECONCILED` is badged like every other result kind so that "a reconciler decided this"
+    and "a deterministic floor decided this" are told apart at a glance rather than by
+    reading the table below. `SEMANTIC PENDING` is added separately because it is not a
+    classification — the interpreter had simply not answered yet — and leaving it implicit
+    was the difference between "the engine said nothing" and "the engine was not asked".
+    """
     out = [headline.replace("_", " ")]
     if trace.result_kind == ResultKind.DETERMINISTIC_FLOOR:
         out.append("DETERMINISTIC FLOOR")
-    elif trace.result_kind in (ResultKind.HANDOFF, ResultKind.BLOCKED,
+    elif trace.result_kind in (ResultKind.RECONCILED, ResultKind.HANDOFF, ResultKind.BLOCKED,
                                ResultKind.CLARIFICATION, ResultKind.FALLBACK):
         out.append(trace.result_kind.replace("_", " "))
+    if getattr(trace.semantic, "status", None) == "PENDING":
+        out.append("SEMANTIC PENDING")
     return tuple(dict.fromkeys(out))
 
 

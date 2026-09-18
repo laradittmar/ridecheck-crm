@@ -26,12 +26,53 @@ from typing import Any, Optional
 
 TRACE_NOT_CAPTURED = "TRACE NOT CAPTURED — predates hybrid-decision-trace/1.0"
 
+# L4.7W5-HYBRID-TRACE-HARDENING — the scope of this page, stated on the page itself.
+#
+# A hybrid decision is a customer turn in which the semantic engine and the deterministic
+# CE both interpreted the same evidence and a reconciler could have owned the outcome.
+# That happens in `ConversationEngine.handle()` and nowhere else. A booking confirmed
+# inside the Meta Booking Flow is an operational transaction on a different path: no
+# interpretation happens, no claim is produced, nothing is reconciled. Rendering one as a
+# hybrid decision would manufacture evidence, so this page says which it is looking at.
+SCOPE_LABEL = "HYBRID CONVERSATION TRACE"
+SCOPE_NOTE = (
+    "Decisión conversacional (ConversationEngine.handle): el motor semántico y el motor "
+    "determinista interpretaron la misma evidencia del cliente. Una reserva confirmada "
+    "dentro del Flow de Meta es una transacción operativa en otro camino y no aparece "
+    "aquí como decisión híbrida."
+)
+FLOW_TRANSACTION_LABEL = "FLOW TRANSACTION — NOT A HYBRID DECISION"
+FLOW_TRANSACTION_NOTE = (
+    "El envío de este turno salió por BOOKING_FLOW. Lo que el cliente haga dentro del "
+    "Flow es una transacción operativa: no la interpretó ni el LLM ni el CE, y no está "
+    "representada en esta traza."
+)
+
+# Every label this page can show, and what it means. Kept here rather than in prose
+# elsewhere so the vocabulary and the renderer cannot drift apart.
+LABEL_GLOSSARY = (
+    (SCOPE_LABEL, "una decisión conversacional; el único tipo de turno que esta página describe"),
+    ("RECONCILED", "una regla de reconciliación fue la autoridad del resultado"),
+    ("DETERMINISTIC FLOOR", "una regla determinista produjo el resultado; no hubo reconciliación"),
+    ("AGREE", "hubo reconciliación y todas las familias coincidieron"),
+    ("CONFLICT", "hubo reconciliación y la evidencia se contradecía"),
+    ("NO RULE", "hubo evidencia y ninguna autoridad la reconcilió — no es acuerdo"),
+    ("SEMANTIC PENDING", "el intérprete se despachó async y aún no había respondido al decidir"),
+    ("SEMANTIC MISSING", "no hubo interpretación semántica para este turno"),
+    ("SEMANTIC ERROR", "el intérprete falló; la decisión se tomó sin evidencia semántica"),
+    ("CE MISSING", "ninguna regla determinista se evaluó para este turno"),
+    ("TRACE NOT CAPTURED", "no existe traza almacenada para ese turno"),
+    (FLOW_TRANSACTION_LABEL,
+     "acción originada en el Flow de Meta, mostrada como enlace, nunca como decisión híbrida"),
+)
+
 _BADGE_CLASS = {
     "CONFLICT": "bad", "SEMANTIC ERROR": "bad", "BLOCKED": "bad",
-    "AGREE": "good",
-    "NO RULE": "warn", "SEMANTIC MISSING": "warn", "CE MISSING": "warn",
-    "DETERMINISTIC FLOOR": "warn", "HANDOFF": "warn", "CLARIFICATION": "warn",
-    "FALLBACK": "warn",
+    "AGREE": "good", "RECONCILED": "good",
+    "NO RULE": "warn", "SEMANTIC MISSING": "warn", "SEMANTIC PENDING": "warn",
+    "CE MISSING": "warn", "DETERMINISTIC FLOOR": "warn", "HANDOFF": "warn",
+    "CLARIFICATION": "warn", "FALLBACK": "warn",
+    SCOPE_LABEL: "scope", FLOW_TRANSACTION_LABEL: "flow",
 }
 
 _CSS = """
@@ -54,6 +95,8 @@ font-weight:600;background:#eceff3;color:#3c4655}
 .badge.good{background:var(--goodbg);color:var(--good)}
 .badge.warn{background:var(--warnbg);color:var(--warn)}
 .badge.bad{background:var(--badbg);color:var(--bad)}
+.badge.scope{background:#e7edf6;color:#2b4a7a;letter-spacing:.04em}
+.badge.flow{background:#efe9f7;color:#553a7a;letter-spacing:.04em}
 table{width:100%;border-collapse:collapse}
 th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--line);
 vertical-align:top;font-size:13px}
@@ -228,7 +271,22 @@ def _state_card(before: dict, after: dict) -> str:
             'sin revelarlo nunca.</p></div>')
 
 
+def _glossary_card() -> str:
+    rows = "".join(f'<tr><td><span class="badge {_BADGE_CLASS.get(label, "")}">{_e(label)}'
+                   f'</span></td><td>{_e(meaning)}</td></tr>'
+                   for label, meaning in LABEL_GLOSSARY)
+    return ('<details><summary>Qué significa cada etiqueta</summary>'
+            f'<div class="card"><div class="tableWrap"><table><tbody>{rows}'
+            '</tbody></table></div></div></details>')
+
+
 def _outcome_card(trace: dict) -> str:
+    path = trace.get("outbound_path_id")
+    flow_row = ""
+    if path == "BOOKING_FLOW":
+        flow_row = (f'<p class="note"><span class="badge flow">'
+                    f'{_e(FLOW_TRANSACTION_LABEL)}</span> '
+                    f'{html.escape(FLOW_TRANSACTION_NOTE)}</p>')
     return ('<div class="card"><h2>Resultado</h2>' + _kv([
         ("Cómo se produjo", _e(trace.get("result_kind"))),
         ("Acción", _e(trace.get("response_plan_kind"))),
@@ -240,7 +298,7 @@ def _outcome_card(trace: dict) -> str:
         ("Camino de envío", _e(trace.get("outbound_path_id"))),
         ("Estado del envío", _e(trace.get("outbound_status"))),
         ("WAMID (final)", f'<span class="mono">{_e(trace.get("outbound_wamid_tail"))}</span>'),
-    ]) + "</div>")
+    ]) + flow_row + "</div>")
 
 
 def render_turn_not_captured(turn_id: str) -> str:
@@ -250,7 +308,8 @@ def render_turn_not_captured(turn_id: str) -> str:
             '<div class="card"><p>No existe una traza almacenada para este turno.</p>'
             '<p class="note">Esto describe el registro, no la conversación: el turno pudo '
             'haber ocurrido normalmente antes de que la captura existiera, o con la captura '
-            'desactivada. Ausencia de traza no es evidencia de que algo fallara.</p></div>'
+            'desactivada. Ausencia de traza no es evidencia de que algo fallara.</p>'
+            f'<p class="note">{html.escape(SCOPE_NOTE)}</p></div>'
             '<p><a href="/control">← Volver al panel de control</a></p>')
     return _page(f"Turno {turn_id} — sin traza", body)
 
@@ -279,7 +338,8 @@ def render_turn_trace_page(record: Optional[dict], turn_id: str = "") -> str:
     body = (
         f"<h1>Decisión del turno</h1>"
         f'<p class="sub mono">{_e(trace.get("turn_id"))}</p>'
-        + _badges(trace.get("badges"))
+        + _badges((SCOPE_LABEL,) + tuple(trace.get("badges") or ()))
+        + f'<p class="note">{html.escape(SCOPE_NOTE)}</p>' 
         + f'<div class="card"><h2>Identidad</h2>{head}</div>'
         + _messages_card(trace)
         + _semantic_card(trace.get("semantic") or {})
@@ -288,5 +348,6 @@ def render_turn_trace_page(record: Optional[dict], turn_id: str = "") -> str:
         + _state_card(trace.get("canonical_before") or {}, trace.get("canonical_after") or {})
         + _outcome_card(trace)
         + f"<details><summary>Traza completa (JSON)</summary><pre>{dumped}</pre></details>"
+        + _glossary_card()
         + '<p><a href="/control">← Volver al panel de control</a></p>')
     return _page(f"Turno {trace.get('turn_id') or turn_id}", body)

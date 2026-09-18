@@ -7,14 +7,16 @@ Tag: ops
 """
 from __future__ import annotations
 
+import logging
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import Integer, case, func, select, text
 from sqlalchemy.orm import Session
 
+from ..auth import SESSION_COOKIE, verify_session
 from ..db import get_db
 from ..models import (
     AiEvent,
@@ -26,7 +28,29 @@ from ..models import (
     WhatsAppThreadState,
 )
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api/ops", tags=["ops"])
+
+
+def require_crm_session(request: Request) -> str:
+    """The same signed CRM session `/control` requires. Returns the operator's email.
+
+    Applied ONLY to the two hybrid-decision-trace endpoints. The rest of `/api/ops` keeps
+    the access policy it already had: widening it here would change the contract for
+    operational consumers that were never part of this milestone.
+
+    The check runs before any database access, so a caller without a session gets the same
+    401 for a turn that exists, a turn that does not, and a malformed id. Whether a trace
+    exists is itself information, and an unauthenticated caller does not get it.
+    """
+    payload = verify_session(request.cookies.get(SESSION_COOKIE))
+    email = (payload or {}).get("email") or ""
+    if not email:
+        logger.warning("HYBRID_TRACE_UNAUTHENTICATED path=%s method=%s",
+                       request.url.path, request.method)
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return email
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -816,6 +840,7 @@ def get_turns(
     classification: Optional[str] = Query(None),
     limit: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
+    _operator: str = Depends(require_crm_session),
 ) -> dict:
     """Recent captured turns, newest first. Absence of a turn means it was not captured."""
     q = select(HybridDecisionTraceRow).order_by(HybridDecisionTraceRow.id.desc()).limit(limit)
@@ -829,9 +854,13 @@ def get_turns(
     return {"count": len(rows), "turns": [_trace_row_summary(r) for r in rows]}
 
 
-@router.get("/turn/{turn_id}")
-def get_turn(turn_id: str, db: Session = Depends(get_db)) -> dict:
-    """The full trace for one turn.
+def read_turn(turn_id: str, db: Session) -> dict:
+    """The full trace for one turn — the single accessor.
+
+    Both the JSON endpoint and the `/control/turn/{turn_id}` page read through this, so the
+    two can never tell different stories about the same turn. It carries no authorization
+    of its own: the endpoint below adds the session check, and the page is already behind
+    the `/control` boundary.
 
     A turn with no row is reported as not captured rather than as an empty decision: an
     inspector that renders absence as "nothing happened" is worse than one that renders
@@ -845,3 +874,9 @@ def get_turn(turn_id: str, db: Session = Depends(get_db)) -> dict:
     out = _trace_row_summary(row)
     out.update({"captured": True, "trace": row.payload})
     return out
+
+
+@router.get("/turn/{turn_id}")
+def get_turn(turn_id: str, db: Session = Depends(get_db),
+             _operator: str = Depends(require_crm_session)) -> dict:
+    return read_turn(turn_id, db)

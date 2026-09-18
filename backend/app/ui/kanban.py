@@ -634,10 +634,10 @@ def control_turn_trace(turn_id: str, db: Session = Depends(get_db)):
     Reads through the same read-only accessor the API uses, so the page and
     `/api/ops/turn/{turn_id}` can never tell two different stories about the same turn.
     """
-    from ..routes.ops_dashboard import get_turn
+    from ..routes.ops_dashboard import read_turn
     from .hybrid_trace_view import render_turn_trace_page
 
     return HTMLResponse(
-        render_turn_trace_page(get_turn(turn_id, db), turn_id=turn_id),
+        render_turn_trace_page(read_turn(turn_id, db), turn_id=turn_id),
         media_type="text/html; charset=utf-8",
     )

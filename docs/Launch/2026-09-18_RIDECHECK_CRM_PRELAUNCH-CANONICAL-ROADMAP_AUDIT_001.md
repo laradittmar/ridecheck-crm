@@ -85,6 +85,29 @@ Exit:
 
 ### Gate 1 — Hybrid Evidence Contract and live trace capture
 
+**Status 2026-09-18 — IMPLEMENTED LOCALLY, NOT COMPLETE.** `hybrid-decision-trace/1.0` is
+built, tested and hardened on this branch (`5f421f7` + hardening commit). It is **not
+pushed, not built, not deployed**, the migration is **not applied to `crm_test`**, and
+`HYBRID_TRACE_ENABLED` is off everywhere. **No live turn has been traced yet.** Gate 1 is
+complete only after a controlled deployment and one owner-observed real trace are
+certified; until then the exit criteria below are demonstrated in test, not in production.
+
+**Scope — conversational hybrid decisions only.** A hybrid decision is a customer turn in
+which the semantic engine and the deterministic CE both interpret the same evidence and a
+reconciler may own the outcome. That happens in `ConversationEngine.handle()` and nowhere
+else, so that is the only path this gate instruments.
+
+**Meta Flow Data Exchange is explicitly out of scope** (owner decision, 2026-09-18).
+`POST /integrations/whatsapp/flows/booking/data-exchange` is an operational transaction
+path: it does not run the interpreter, produces no claim, and reconciles nothing. Forcing a
+Flow callback into `hybrid-decision-trace/1.0` would fabricate semantic evidence, CE
+evidence and agreement that never existed — the precise failure mode this whole programme
+exists to prevent. A Flow-confirmed booking may be reached through existing booking and
+message evidence and is labelled `FLOW TRANSACTION — NOT A HYBRID DECISION` wherever it is
+shown, but it is never represented as a hybrid decision. **Operational observability for the
+Flow transaction path is a separate, later concern** and is not a prerequisite for proving
+the semantic / CE / reconciler architecture.
+
 **Goal:** Prove exactly what each engine saw and produced for one customer burst.
 
 Required persisted trace, correlated by one `turn_id`/`burst_id`:
@@ -108,6 +131,13 @@ Exit:
 - A complete burst can be reconstructed across all five layers.
 - Missing semantic calls, timeouts and malformed outputs are visible rather than indistinguishable from “no intent.”
 - The exact model input boundary is provable.
+- **Certified on a live deployment with at least one owner-observed real trace.** Local test
+  evidence, however complete, does not satisfy this line.
+
+**Known scope limit carried forward.** Two pre-gates (motorcycle, phone-call) read
+`_current_evidence`, which after WILD-04R burst completion can be wider than the burst the
+two engines share. The trace hashes the shared burst and records the database burst ids;
+the asymmetry is pinned by test rather than papered over, and is not claimed as agreement.
 
 ### Gate 2 — Control dashboard: Hybrid Decision Inspector
 
@@ -134,18 +164,35 @@ The existing dashboard remains the operational overview. Add a conversation/turn
 
 #### C. Operator signals
 
-- obvious badges: `AGREE`, `CONFLICT`, `SEMANTIC MISSING`, `CE MISSING`, `BLOCKED`, `HANDOFF`, `FALLBACK`;
+- obvious badges: `HYBRID CONVERSATION TRACE`, `AGREE`, `CONFLICT`, `NO RULE`,
+  `SEMANTIC PENDING`, `SEMANTIC MISSING`, `SEMANTIC ERROR`, `CE MISSING`, `BLOCKED`,
+  `RECONCILED`, `DETERMINISTIC FLOOR`, `HANDOFF`, `FALLBACK`, `TRACE NOT CAPTURED`, and
+  `FLOW TRANSACTION — NOT A HYBRID DECISION` wherever a Flow-originated action is shown;
+  missing evidence is never labelled agreement and a deterministic floor is never labelled
+  reconciled;
 - filter by deployment, claim, conflict type, model error, human handoff and false progression;
 - expandable raw JSON for expert audit, with a readable summary by default;
 - links from the existing message trace to the exact decision inspector;
 - no secret values and no unmasked phone exposure beyond existing authorized CRM policy.
 
+**Status 2026-09-18 — IMPLEMENTED LOCALLY, NOT COMPLETE.** `/control/turn/{turn_id}` and
+the `Decisiones híbridas` panel exist on this branch and are behind the CRM session. Gate 2
+closes with Gate 1, on the same controlled deployment and owner observation.
+
 Exit:
 
 - Lara can answer: “What did the customer say, what did the LLM infer, what did CE infer, what did reconciliation decide, and why?” from one screen.
 - A failed turn is diagnosable without engineering access.
+- The screen states which kind of turn it is describing, so a Flow transaction can never be
+  read as a hybrid decision.
 
 ### Gate 3 — Hybrid rejection capability and reconciliation authority
+
+**Still open, and still the owner of the missing capability.** Gate 1/2 make the gap
+visible — the failed Wild's turn renders `NO RULE` + `DETERMINISTIC FLOOR` with
+`semantic_input: ABSENT` — but visibility is not capability. There is still no evidence
+claim whose referent is the offered appointment set, and `QUOTE_ACCEPTED` / `QUOTE_NEGATED`
+remain reserved for the quote and must not be reused for it.
 
 **Goal:** Make offered-appointment rejection a supported semantic concept without overloading quote acceptance.
 
@@ -332,7 +379,10 @@ Public launch begins only after Lara declares **GO**.
 ## 7. Immediate next actions
 
 1. ~~Complete `L4.7W5-F7G-R2-CONTROLLED-DEPLOYMENT`.~~ **DONE — Gate 0 complete 2026-09-18.**
-2. **NEXT AUTHORIZED WORK — Gate 1 Hybrid Evidence Contract, audit/design.** Its first identified
+2. **Gate 1 audit/design and implementation are done locally (2026-09-18).** The next
+   authorized step is a controlled deployment checkpoint: push, build, apply the migration
+   to `crm_test`, enable `HYBRID_TRACE_ENABLED`, and certify one owner-observed real trace
+   with outbound still off. Original note retained for the record — its first identified
    defect is already proven: the shadow record stores only the burst's triggering WAMID, so it
    cannot show which messages the model received. That is exactly Gate 1's exit criterion
    *"the exact model input boundary is provable."*
