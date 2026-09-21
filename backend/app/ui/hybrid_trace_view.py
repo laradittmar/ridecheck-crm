@@ -56,6 +56,10 @@ LABEL_GLOSSARY = (
     ("DETERMINISTIC FLOOR", "una regla determinista produjo el resultado; no hubo reconciliación"),
     ("AGREE", "hubo reconciliación y todas las familias coincidieron"),
     ("CONFLICT", "hubo reconciliación y la evidencia se contradecía"),
+    ("PARTIAL RECONCILIATION",
+     "alguna familia se comparó y otra no pudo compararse; NO es contradicción"),
+    ("SEMANTIC NOT ROUTED",
+     "el intérprete sí produjo evidencia en este turno, pero no llegó a ese reconciliador"),
     ("NO RULE", "hubo evidencia y ninguna autoridad la reconcilió — no es acuerdo"),
     ("SEMANTIC PENDING", "el intérprete se despachó async y aún no había respondido al decidir"),
     ("SEMANTIC MISSING", "no hubo interpretación semántica para este turno"),
@@ -69,6 +73,7 @@ LABEL_GLOSSARY = (
 _BADGE_CLASS = {
     "CONFLICT": "bad", "SEMANTIC ERROR": "bad", "BLOCKED": "bad",
     "AGREE": "good", "RECONCILED": "good",
+    "PARTIAL RECONCILIATION": "warn", "SEMANTIC NOT ROUTED": "warn",
     "NO RULE": "warn", "SEMANTIC MISSING": "warn", "SEMANTIC PENDING": "warn",
     "CE MISSING": "warn", "DETERMINISTIC FLOOR": "warn", "HANDOFF": "warn",
     "CLARIFICATION": "warn", "FALLBACK": "warn",
@@ -219,24 +224,63 @@ def _ce_card(rules) -> str:
             f'</thead><tbody>{rows}</tbody></table></div></div>')
 
 
-def _reconciliation_card(items) -> str:
+NOT_ROUTED_SENTENCE = ("Se produjo evidencia semántica en este turno, pero no llegó a "
+                       "este reconciliador.")
+NO_SEMANTIC_SENTENCE = "No se produjo evidencia semántica utilizable en este turno."
+
+
+def _semantic_ran(semantic: dict) -> bool:
+    return (semantic or {}).get("status") == "OK" and bool((semantic or {}).get("produced_claims"))
+
+
+def _row_semantic_cell(row: dict, semantic: dict) -> str:
+    """What the SEMANTIC column should say for one reconciliation row.
+
+    `ABSENT` alone, printed directly under a panel listing `Peugeot 208`, reads as a
+    contradiction even though both statements are true. The column now distinguishes a
+    producer that said nothing from a producer whose claims went elsewhere.
+    """
+    if (row or {}).get("semantic_input") == "PRESENT":
+        return "PRESENT"
+    if _semantic_ran(semantic):
+        return '<span class="badge warn">NOT ROUTED</span>'
+    return "ABSENT"
+
+
+def _reconciliation_card(items, semantic: dict) -> str:
     if not items:
         body = ('<p class="empty">Ninguna reconciliación se registró para este turno.</p>'
                 '<p class="note">Esto no significa que los motores hayan coincidido: '
                 'significa que ninguna autoridad reconcilió esta decisión.</p>')
-    else:
-        rows = "".join(
-            f'<tr><td>{_e(r.get("claim_family"))}</td>'
-            f'<td>{_e(r.get("semantic_input"))}</td>'
-            f'<td>{_e(r.get("ce_input"))}</td>'
-            f'<td>{_e(r.get("classification"))}</td>'
-            f'<td>{_e(r.get("outcome"))}</td>'
-            f'<td class="mono">{_e(r.get("rule_id"))}@{_e(r.get("rule_version"))}</td>'
-            f'<td>{_e(r.get("reason_code"))}</td></tr>' for r in items)
-        body = ('<div class="tableWrap"><table><thead><tr><th>Familia</th>'
-                '<th>Semántico</th><th>Determinista</th><th>Clasificación</th>'
-                '<th>Resultado</th><th>Regla</th><th>Motivo</th></tr></thead>'
-                f'<tbody>{rows}</tbody></table></div>')
+        return f'<div class="card"><h2>Reconciliación</h2>{body}</div>'
+
+    rows = "".join(
+        f'<tr><td>{_e(r.get("claim_family"))}</td>'
+        f'<td>{_row_semantic_cell(r, semantic)}</td>'
+        f'<td>{_e(r.get("ce_input"))}</td>'
+        f'<td>{_e(r.get("classification"))}</td>'
+        f'<td>{_e(r.get("outcome"))}</td>'
+        f'<td class="mono">{_e(r.get("rule_id"))}@{_e(r.get("rule_version"))}</td>'
+        f'<td>{_e(r.get("reason_code"))}</td></tr>' for r in items)
+    body = ('<div class="tableWrap"><table><thead><tr><th>Familia</th>'
+            '<th>Semántico</th><th>Determinista</th><th>Clasificación</th>'
+            '<th>Resultado</th><th>Regla</th><th>Motivo</th></tr></thead>'
+            f'<tbody>{rows}</tbody></table></div>')
+
+    unrouted = [r for r in items if (r or {}).get("semantic_input") != "PRESENT"]
+    compared = [r for r in items if (r or {}).get("classification") in ("AGREE", "CONFLICT")]
+    conflicts = [r for r in items if (r or {}).get("classification") == "CONFLICT"]
+    notes = []
+    if unrouted:
+        notes.append(html.escape(NOT_ROUTED_SENTENCE if _semantic_ran(semantic)
+                                 else NO_SEMANTIC_SENTENCE)
+                     + f" Familias afectadas: {len(unrouted)} de {len(items)}.")
+    if compared and not conflicts:
+        notes.append("Las familias que sí se compararon coincidieron con la evidencia que "
+                     "efectivamente recibieron.")
+    if not conflicts:
+        notes.append("<strong>No hubo contradicción entre los motores en este turno.</strong>")
+    body += "".join(f'<p class="note">{n}</p>' for n in notes)
     return f'<div class="card"><h2>Reconciliación</h2>{body}</div>'
 
 
@@ -314,6 +358,25 @@ def render_turn_not_captured(turn_id: str) -> str:
     return _page(f"Turno {turn_id} — sin traza", body)
 
 
+def _effective_badges(record: dict, trace: dict) -> tuple:
+    """The badge strip, headed by the EFFECTIVE classification.
+
+    A trace stored before this correction carries the old headline in `payload.badges`; that
+    record is evidence and is not rewritten, so the page re-derives the label instead of
+    reprinting it. Everything after the headline — result kind, semantic pending — is taken
+    from the stored strip unchanged.
+    """
+    stored = tuple(trace.get("badges") or ())
+    effective = (record or {}).get("effective_classification")
+    if not effective:
+        return stored
+    conditions = tuple((record or {}).get("supporting_conditions") or ())
+    head = [str(effective).replace("_", " ")]
+    head += [str(c).replace("_", " ") for c in conditions if c != effective]
+    carried = [b for b in stored[1:] if b not in head]
+    return tuple(dict.fromkeys(head + carried))
+
+
 def render_turn_trace_page(record: Optional[dict], turn_id: str = "") -> str:
     """Render one stored decision. `record` is the API payload, or None."""
     if not record or not record.get("captured") or not record.get("trace"):
@@ -338,13 +401,14 @@ def render_turn_trace_page(record: Optional[dict], turn_id: str = "") -> str:
     body = (
         f"<h1>Decisión del turno</h1>"
         f'<p class="sub mono">{_e(trace.get("turn_id"))}</p>'
-        + _badges((SCOPE_LABEL,) + tuple(trace.get("badges") or ()))
+        + _badges((SCOPE_LABEL,) + _effective_badges(record, trace))
         + f'<p class="note">{html.escape(SCOPE_NOTE)}</p>' 
         + f'<div class="card"><h2>Identidad</h2>{head}</div>'
         + _messages_card(trace)
         + _semantic_card(trace.get("semantic") or {})
         + _ce_card(trace.get("ce_evidence") or [])
-        + _reconciliation_card(trace.get("reconciliation") or [])
+        + _reconciliation_card(trace.get("reconciliation") or [],
+                               trace.get("semantic") or {})
         + _state_card(trace.get("canonical_before") or {}, trace.get("canonical_after") or {})
         + _outcome_card(trace)
         + f"<details><summary>Traza completa (JSON)</summary><pre>{dumped}</pre></details>"

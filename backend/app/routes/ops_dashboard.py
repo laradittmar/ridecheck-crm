@@ -819,6 +819,21 @@ TRACE_NOT_CAPTURED = "TRACE NOT CAPTURED — predates hybrid-decision-trace/1.0"
 
 
 def _trace_row_summary(row: HybridDecisionTraceRow) -> dict:
+    """One turn, carrying BOTH classifications, each named for what it is.
+
+    `captured_classification` is the value stored when the trace was written and is never
+    rewritten — it is forensic evidence, including when the writer got the label wrong.
+    `effective_classification` is derived at read time from the same reconciliation rows
+    under the current rules, and is what an operator should be shown. For a trace written
+    after L4.7W5-HYBRID-TRACE-LABEL-TRUTH the two agree.
+
+    `classification` is retained for compatibility with existing consumers and is the
+    **captured** value. It is documented here and in the API docstrings so nothing has to
+    guess which of the two it means.
+    """
+    from ..services.hybrid_trace import effective_from_payload
+
+    effective, conditions = effective_from_payload(row.payload)
     return {
         "turn_id": row.turn_id,
         "thread_id": row.thread_id,
@@ -827,7 +842,11 @@ def _trace_row_summary(row: HybridDecisionTraceRow) -> dict:
         "input_hash": row.input_hash,
         "message_count": row.message_count,
         "result_kind": row.result_kind,
-        "classification": row.classification,
+        "classification": row.classification,          # == captured_classification
+        "captured_classification": row.classification,
+        "effective_classification": effective if effective is not None else row.classification,
+        "reclassified": bool(effective is not None and effective != row.classification),
+        "supporting_conditions": list(conditions),
         "semantic_status": row.semantic_status,
         "created_at": row.created_at.isoformat() if row.created_at else None,
     }
@@ -837,7 +856,8 @@ def _trace_row_summary(row: HybridDecisionTraceRow) -> dict:
 def get_turns(
     thread_id: Optional[int] = Query(None),
     result_kind: Optional[str] = Query(None),
-    classification: Optional[str] = Query(None),
+    classification: Optional[str] = Query(
+        None, description="filters the CAPTURED classification stored on the row"),
     limit: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
     _operator: str = Depends(require_crm_session),

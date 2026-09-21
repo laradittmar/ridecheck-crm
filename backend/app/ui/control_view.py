@@ -1484,8 +1484,12 @@ def render_control_page(user_email: str) -> str:
           return;
         }}
         tbody.innerHTML = rows.map(function(r) {{
-          var cls = (r.classification === 'CONFLICT') ? 'badgeHigh'
-                  : (r.classification === 'AGREE') ? 'badgeLow' : 'badgeMed';
+          // The EFFECTIVE classification, never the captured one: a row stored before
+          // L4.7W5-HYBRID-TRACE-LABEL-TRUTH holds the old aggregation, which called a
+          // turn with nothing to compare a contradiction.
+          var eff = r.effective_classification || r.classification;
+          var cls = (eff === 'CONFLICT') ? 'badgeHigh'
+                  : (eff === 'AGREE') ? 'badgeLow' : 'badgeMed';
           return '<tr>'
             + '<td>' + fmtDateTime(r.created_at) + '</td>'
             + '<td>' + (r.thread_id
@@ -1495,7 +1499,7 @@ def render_control_page(user_email: str) -> str:
             + '<td>' + esc(r.message_count) + '</td>'
             + '<td>' + esc(r.semantic_status || '—') + '</td>'
             + '<td><span class="badge ' + cls + '">'
-            + esc(r.classification || '—') + '</span></td>'
+            + esc(eff || '—') + '</span></td>'
             + '<td>' + esc(r.result_kind || '—') + '</td>'
             + '<td><a href="/control/turn/' + encodeURIComponent(r.turn_id) + '">'
             + 'Ver traza</a></td>'

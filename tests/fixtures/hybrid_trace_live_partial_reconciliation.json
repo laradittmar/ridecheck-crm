@@ -1,0 +1,273 @@
+{
+  "allowed": true,
+  "badges": [
+    "CONFLICT",
+    "FALLBACK"
+  ],
+  "canonical_after": {
+    "active_requested_date": "2026-09-18",
+    "booking_token_fingerprint": "ffffffff",
+    "booking_token_present": true,
+    "candidate_id": 142,
+    "lead_estado": "CONSULTA_NUEVA",
+    "lead_necesita_humano": false,
+    "needs_human": false,
+    "offer_outstanding": true,
+    "offered_slots_count": 8,
+    "revision_id": null,
+    "stage": "SCHEDULING",
+    "zone_detail": "La Paternal",
+    "zone_group": "CABA"
+  },
+  "canonical_before": {
+    "active_requested_date": "2026-09-18",
+    "booking_token_fingerprint": "ffffffff",
+    "booking_token_present": true,
+    "candidate_id": 142,
+    "lead_estado": "CONSULTA_NUEVA",
+    "lead_necesita_humano": false,
+    "needs_human": false,
+    "offer_outstanding": true,
+    "offered_slots_count": 8,
+    "revision_id": null,
+    "stage": "SCHEDULING",
+    "zone_detail": "La Paternal",
+    "zone_group": "CABA"
+  },
+  "ce_evidence": [
+    {
+      "inputs_digest": "3f603932aace",
+      "note": "a day, visible slots or a live Flow token",
+      "rule_id": "scheduling.offer_outstanding",
+      "rule_version": "1.0",
+      "value": true
+    },
+    {
+      "inputs_digest": "23f8846f3c1c",
+      "note": "a day or time named this turn",
+      "rule_id": "scheduling.option_taken_this_turn",
+      "rule_version": "1.0",
+      "value": false
+    },
+    {
+      "inputs_digest": "23f8846f3c1c",
+      "note": "an unsuitability or alternative-request predicate matched",
+      "rule_id": "scheduling.earliest_option_rejected",
+      "rule_version": "1.0",
+      "value": false
+    },
+    {
+      "inputs_digest": "23f8846f3c1c",
+      "note": "the rejection is about the calendar, not another object",
+      "rule_id": "scheduling.rejection_is_about_scheduling",
+      "rule_version": "1.0",
+      "value": false
+    },
+    {
+      "inputs_digest": "23f8846f3c1c",
+      "note": "a universal negative quantifier scoped to a scheduling object",
+      "rule_id": "scheduling.all_offered_options_rejected",
+      "rule_version": "1.0",
+      "value": false
+    },
+    {
+      "inputs_digest": "23f8846f3c1c",
+      "note": "a non-scheduling object was named and wins",
+      "rule_id": "scheduling.competing_object_named",
+      "rule_version": "1.0",
+      "value": false
+    },
+    {
+      "inputs_digest": "23f8846f3c1c",
+      "note": "an affirmative request to speak to a person",
+      "rule_id": "handoff.human_requested",
+      "rule_version": "1.0",
+      "value": false
+    },
+    {
+      "inputs_digest": "23f8846f3c1c",
+      "note": "an affirmative request to be phoned",
+      "rule_id": "handoff.phone_call_requested",
+      "rule_version": "1.0",
+      "value": false
+    },
+    {
+      "inputs_digest": "23f8846f3c1c",
+      "note": "canonical rescue outcome for this turn",
+      "rule_id": "handoff.canonical_rescue",
+      "rule_version": "1.0",
+      "value": false
+    }
+  ],
+  "completed_at": "2026-09-21T15:23:30.934+00:00",
+  "deployment_sha": "2f8acc8",
+  "duration_ms": 9729,
+  "input_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "lead_id": 1,
+  "message_count": 1,
+  "message_timestamps": [
+    "2026-09-21T15:22:58+00:00"
+  ],
+  "ordered_message_ids": [
+    "wamid.SANITISED0001"
+  ],
+  "outbound_message_id": null,
+  "outbound_path_id": null,
+  "outbound_status": null,
+  "outbound_wamid_tail": null,
+  "reason_code": "no_reply_text",
+  "reconciliation": [
+    {
+      "accepted": [],
+      "ce_input": "ABSENT",
+      "claim_family": "vehicle.model",
+      "classification": "SEMANTIC_MISSING",
+      "outcome": "HOLD",
+      "reason_code": "no vehicle evidence",
+      "rejected": [],
+      "rule_id": "reconcile.vehicle_identity",
+      "rule_version": "v1",
+      "semantic_input": "ABSENT"
+    },
+    {
+      "accepted": [
+        "fixture-claim-01"
+      ],
+      "ce_input": "PRESENT",
+      "claim_family": "vehicle.model",
+      "classification": "AGREE",
+      "outcome": "ACCEPT",
+      "reason_code": "anio refinement on an established identity",
+      "rejected": [],
+      "rule_id": "reconcile.vehicle_identity",
+      "rule_version": "v1",
+      "semantic_input": "ABSENT"
+    }
+  ],
+  "response_plan_kind": "replied",
+  "response_plan_source": "CE_AI",
+  "result_kind": "FALLBACK",
+  "semantic": {
+    "dispatch": "async",
+    "error_category": null,
+    "evidence": {
+      "acceptance": null,
+      "ambiguities": [],
+      "conflicts": [],
+      "corrections": [],
+      "faq_intents": [],
+      "freeform_notes": [],
+      "handoff": null,
+      "identity_mentions": [],
+      "interpreter": "semantic:understand:understand/1.18",
+      "location_mentions": [
+        {
+          "alternatives": [],
+          "catalog_candidate": null,
+          "confidence": null,
+          "field": "location",
+          "locality": "Palermo",
+          "normalized_value": null,
+          "provenance": {
+            "interpreter": "semantic:understand:understand/1.18",
+            "model_version": "gpt-4o-mini",
+            "schema_version": "turn-evidence/1.2",
+            "source_kind": "SEMANTIC",
+            "source_message_ids": [
+              "wamid.SANITISED0001"
+            ],
+            "spans": []
+          },
+          "reason": null,
+          "role": "INSPECTION_LOCATION",
+          "status": "CONFIRMED",
+          "value": "Palermo",
+          "zone_hint": null
+        }
+      ],
+      "model_version": "gpt-4o-mini",
+      "scheduling_requests": [],
+      "schema_version": "turn-evidence/1.2",
+      "service_intents": [
+        {
+          "alternatives": [],
+          "catalog_candidate": null,
+          "confidence": null,
+          "field": "service_intent",
+          "kind": "INSPECTION",
+          "normalized_value": null,
+          "provenance": {
+            "interpreter": "semantic:understand:understand/1.18",
+            "model_version": "gpt-4o-mini",
+            "schema_version": "turn-evidence/1.2",
+            "source_kind": "SEMANTIC",
+            "source_message_ids": [
+              "wamid.SANITISED0001"
+            ],
+            "spans": []
+          },
+          "reason": null,
+          "role": null,
+          "status": "CONFIRMED",
+          "value": "PREPURCHASE_INSPECTION"
+        }
+      ],
+      "turn": {
+        "burst_id": "fixture-0001-partial-reconciliation",
+        "corpus_case_id": null,
+        "ordered_message_ids": [
+          "wamid.SANITISED0001"
+        ],
+        "reconstruction": "LIVE_DEBOUNCE",
+        "thread_id": 1
+      },
+      "vehicle_mentions": [
+        {
+          "alternatives": [],
+          "catalog_candidate": "Peugeot 208",
+          "category_suggestion": null,
+          "confidence": null,
+          "field": "vehicle",
+          "is_superseded": false,
+          "make": "Peugeot",
+          "mention_index": 0,
+          "model": "208",
+          "normalized_value": null,
+          "provenance": {
+            "interpreter": "semantic:understand:understand/1.18",
+            "model_version": "gpt-4o-mini",
+            "schema_version": "turn-evidence/1.2",
+            "source_kind": "SEMANTIC",
+            "source_message_ids": [
+              "wamid.SANITISED0001"
+            ],
+            "spans": []
+          },
+          "reason": null,
+          "role": null,
+          "status": "PROPOSED",
+          "value": "Peugeot 208",
+          "year": 2022,
+          "year_status": "CONFIRMED"
+        }
+      ]
+    },
+    "latency_ms": 6048,
+    "model": "gpt-4o-mini",
+    "ok": true,
+    "produced_claims": [
+      "service_intents",
+      "vehicle_mentions",
+      "location_mentions"
+    ],
+    "prompt_version": "understand/1.18",
+    "schema_version": "turn-evidence/1.2",
+    "status": "OK",
+    "total_tokens": 5529
+  },
+  "started_at": "2026-09-21T15:23:21.197+00:00",
+  "thread_id": 1,
+  "trace_version": "hybrid-decision-trace/1.0",
+  "transition": null,
+  "turn_id": "fixture-0001-partial-reconciliation"
+}

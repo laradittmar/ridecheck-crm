@@ -31,15 +31,33 @@ TRACE_VERSION = "hybrid-decision-trace/1.0"
 
 
 class Classification:
-    """How the two evidence producers related on one claim family."""
+    """How the two evidence producers related on one claim family.
+
+    Row-level values describe ONE reconciliation. `PARTIAL_RECONCILIATION` and
+    `SEMANTIC_NOT_ROUTED` are turn-level only: the first is the honest headline when some
+    families were compared and others could not be, the second names why.
+
+    The distinction they exist to protect: a producer that said nothing, and a producer
+    whose claims never reached this reconciler, are both "not compared" — and neither is
+    disagreement. The first deployed trace was labelled CONFLICT for exactly that mistake.
+    """
     AGREE = "AGREE"
     CONFLICT = "CONFLICT"
+    PARTIAL_RECONCILIATION = "PARTIAL_RECONCILIATION"   # turn-level only
     SEMANTIC_MISSING = "SEMANTIC_MISSING"
+    SEMANTIC_NOT_ROUTED = "SEMANTIC_NOT_ROUTED"         # turn-level only
     SEMANTIC_ERROR = "SEMANTIC_ERROR"
     CE_MISSING = "CE_MISSING"
     NO_RULE = "NO_RULE"
 
-    ALL = (AGREE, CONFLICT, SEMANTIC_MISSING, SEMANTIC_ERROR, CE_MISSING, NO_RULE)
+    ALL = (AGREE, CONFLICT, PARTIAL_RECONCILIATION, SEMANTIC_MISSING,
+           SEMANTIC_NOT_ROUTED, SEMANTIC_ERROR, CE_MISSING, NO_RULE)
+
+    #: Row values meaning "this family was compared end to end".
+    COMPARED = (AGREE, CONFLICT)
+    #: Row values meaning "one producer's claim was absent, unavailable or unrouted".
+    INCOMPARABLE = (SEMANTIC_MISSING, SEMANTIC_NOT_ROUTED, SEMANTIC_ERROR,
+                    CE_MISSING, NO_RULE)
 
 
 class ResultKind:
@@ -192,6 +210,9 @@ class HybridDecisionTrace:
     semantic: SemanticEvidence = field(default_factory=SemanticEvidence)
     ce_evidence: tuple = ()
     reconciliation: tuple = ()
+    # Why one or more claim families could not be compared end to end. Empty when every
+    # family that ran was compared. Read alongside the headline, never instead of it.
+    supporting_conditions: tuple = ()
 
     canonical_before: CanonicalSnapshot = field(default_factory=CanonicalSnapshot)
     canonical_after: CanonicalSnapshot = field(default_factory=CanonicalSnapshot)

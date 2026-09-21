@@ -222,16 +222,82 @@ def reconciliation_from(record, claims=()) -> ReconciliationEvidence:
         reason_code=getattr(record, "reason", None))
 
 
+def _semantic_produced_evidence(semantic) -> bool:
+    """True when the interpreter ran and returned usable structured evidence."""
+    status = getattr(semantic, "status", None) if semantic is not None else None
+    claims = getattr(semantic, "produced_claims", ()) if semantic is not None else ()
+    return status == "OK" and bool(claims)
+
+
+def _row_condition(row, semantic) -> Optional[str]:
+    """Why ONE reconciliation could not compare both producers — or None if it could.
+
+    The correction this milestone exists for: a row classified `SEMANTIC_MISSING` on a turn
+    whose interpreter succeeded and produced claims did NOT see a silent interpreter. Its
+    claims went somewhere else. Saying "missing" there is false about the producer, and
+    saying "conflict" about the turn is false about the comparison.
+    """
+    classification = getattr(row, "classification", None)
+    if classification in Classification.COMPARED:
+        return None
+    if classification == Classification.SEMANTIC_MISSING:
+        if _semantic_produced_evidence(semantic):
+            return Classification.SEMANTIC_NOT_ROUTED
+        return Classification.SEMANTIC_MISSING
+    if classification in (Classification.SEMANTIC_ERROR, Classification.CE_MISSING,
+                          Classification.NO_RULE, Classification.SEMANTIC_NOT_ROUTED):
+        return classification
+    return Classification.NO_RULE
+
+
+def supporting_conditions(semantic, reconciliations) -> tuple:
+    """Every reason a family could not be compared, in stable order, without duplicates."""
+    out = []
+    for row in reconciliations or ():
+        condition = _row_condition(row, semantic)
+        if condition is not None and condition not in out:
+            out.append(condition)
+    return tuple(out)
+
+
 def classify(semantic: SemanticEvidence, ce_rules: tuple, reconciliations: tuple) -> str:
     """One headline classification for the turn.
 
-    `NO_RULE` is the honest answer when evidence existed and no authority owned it — the
-    exact condition that made the failed Wild unreadable.
+    Precedence, and the reasoning behind it:
+
+    1. `CONFLICT` **if and only if** some reconciliation row is itself `CONFLICT`. Nothing
+       else may produce this word. The first deployed trace was headlined CONFLICT because
+       the rule used to be "not all agreed"; a row that had nothing to compare was thereby
+       reported as contradiction.
+    2. `AGREE` only when at least one family was compared, every compared family agreed, and
+       no family was left uncompared. Agreement is a claim about evidence that was actually
+       weighed.
+    3. `PARTIAL_RECONCILIATION` when at least one family agreed and at least one could not be
+       compared. `supporting_conditions()` says which.
+    4. When no family was compared at all, the single remaining reason IS the headline —
+       `SEMANTIC_NOT_ROUTED`, `SEMANTIC_MISSING`, `SEMANTIC_ERROR` or `CE_MISSING`.
+    5. With no reconciliation at all, fall back to the producer-level reading, where
+       `NO_RULE` remains the honest answer when evidence existed and no authority owned it —
+       the exact condition that made the failed Wild unreadable.
     """
-    if reconciliations:
-        return Classification.AGREE if all(
-            r.classification == Classification.AGREE for r in reconciliations
-        ) else Classification.CONFLICT
+    rows = tuple(reconciliations or ())
+    if any(getattr(r, "classification", None) == Classification.CONFLICT for r in rows):
+        return Classification.CONFLICT
+
+    if rows:
+        agreed = [r for r in rows if getattr(r, "classification", None) == Classification.AGREE]
+        conditions = supporting_conditions(semantic, rows)
+        if agreed and not conditions:
+            return Classification.AGREE
+        if agreed and conditions:
+            return Classification.PARTIAL_RECONCILIATION
+        # Nothing was compared. The one reason why is the truthful headline; when the rows
+        # disagree about the reason, `PARTIAL_RECONCILIATION` is the honest summary and the
+        # conditions list carries the detail.
+        if len(conditions) == 1:
+            return conditions[0]
+        return Classification.PARTIAL_RECONCILIATION
+
     if semantic.status in ("ERROR", "TIMEOUT", "MALFORMED"):
         return Classification.SEMANTIC_ERROR
     ce_fired = any(bool(r.value) for r in ce_rules)
@@ -254,6 +320,11 @@ def badges_for(trace: HybridDecisionTrace, headline: str) -> tuple:
     was the difference between "the engine said nothing" and "the engine was not asked".
     """
     out = [headline.replace("_", " ")]
+    # The conditions are part of the headline's meaning: PARTIAL RECONCILIATION without
+    # "why" invites the reader to guess, and guessing is how CONFLICT got here.
+    for condition in getattr(trace, "supporting_conditions", ()) or ():
+        if condition != headline:
+            out.append(str(condition).replace("_", " "))
     if trace.result_kind == ResultKind.DETERMINISTIC_FLOOR:
         out.append("DETERMINISTIC FLOOR")
     elif trace.result_kind in (ResultKind.RECONCILED, ResultKind.HANDOFF, ResultKind.BLOCKED,
@@ -306,6 +377,7 @@ def build_trace(*, turn_id, thread_id, lead_id, deployment_sha, started_at, comp
         input_hash=burst_hash(burst_texts),
         semantic=semantic, ce_evidence=tuple(ce_rules),
         reconciliation=tuple(reconciliations),
+        supporting_conditions=supporting_conditions(semantic, reconciliations),
         canonical_before=before, canonical_after=after,
         transition=(f"{before.stage or '-'} -> {after.stage or '-'}"
                     if before.stage != after.stage else None),
@@ -321,6 +393,48 @@ def build_trace(*, turn_id, thread_id, lead_id, deployment_sha, started_at, comp
     return trace
 
 
+class _Row:
+    """A reconciliation row rehydrated from a stored payload, for read-time reclassification."""
+    __slots__ = ("classification",)
+
+    def __init__(self, classification):
+        self.classification = classification
+
+
+class _Sem:
+    __slots__ = ("status", "produced_claims")
+
+    def __init__(self, status, produced_claims):
+        self.status = status
+        self.produced_claims = tuple(produced_claims or ())
+
+
+def effective_from_payload(payload) -> tuple:
+    """Recompute (headline, conditions) from a STORED trace, without touching it.
+
+    A trace written before this correction carries the old headline in its row and in its
+    `badges`. That record is forensic evidence and is never rewritten; instead the reader
+    derives the truthful label from the same reconciliation rows the writer saw. A trace
+    written after the correction recomputes to exactly what it already stored.
+
+    Returns `(None, ())` when the payload cannot be read, so a caller falls back to the
+    captured value rather than inventing one.
+    """
+    if not isinstance(payload, dict):
+        return None, ()
+    try:
+        rows = tuple(_Row(r.get("classification")) for r in payload.get("reconciliation") or ())
+        sem_raw = payload.get("semantic") or {}
+        semantic = _Sem(sem_raw.get("status"), sem_raw.get("produced_claims"))
+        ce_raw = payload.get("ce_evidence") or []
+        ce_rules = tuple(RuleEvidence(rule_id=r.get("rule_id", ""),
+                                      rule_version=r.get("rule_version", ""),
+                                      value=r.get("value")) for r in ce_raw)
+        return classify(semantic, ce_rules, rows), supporting_conditions(semantic, rows)
+    except Exception:
+        return None, ()
+
+
 def persist(db, trace: HybridDecisionTrace) -> bool:
     """Write one trace. Returns False on any failure and never raises.
 
@@ -332,6 +446,10 @@ def persist(db, trace: HybridDecisionTrace) -> bool:
             turn_id=trace.turn_id, thread_id=trace.thread_id, lead_id=trace.lead_id,
             deployment_sha=trace.deployment_sha, input_hash=trace.input_hash,
             message_count=trace.message_count, result_kind=trace.result_kind,
+            # The CAPTURED classification: the corrected headline as computed at write
+            # time. A trace written before L4.7W5-HYBRID-TRACE-LABEL-TRUTH holds the old
+            # aggregation here and is never rewritten — readers derive the effective value
+            # with `effective_from_payload()` instead.
             classification=(trace.badges[0].replace(" ", "_") if trace.badges else None),
             semantic_status=trace.semantic.status, payload=trace.to_payload(),
         )
