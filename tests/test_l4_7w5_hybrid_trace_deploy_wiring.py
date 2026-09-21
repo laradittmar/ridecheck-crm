@@ -28,8 +28,11 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 BETA = ROOT / "docker-compose.beta.yml"
 BASE = ROOT / "docker-compose.yml"
 
-REVIEWED_IMAGE = "ridecheck-crm-backend:w5hybridtrace-2f8acc8"
-PREVIOUS_IMAGE = "ridecheck-crm-backend:w5f7g-ce978a2"
+REVIEWED_IMAGE = "ridecheck-crm-backend:w5labeltruth-0407bab"
+#: Superseded pins. Both images stay on disk as rollback targets; neither may be what
+#: deploys. Keeping the whole chain here means a revert to an older pin also fails.
+SUPERSEDED_IMAGES = ("ridecheck-crm-backend:w5hybridtrace-2f8acc8",
+                     "ridecheck-crm-backend:w5f7g-ce978a2")
 TRACE_KEY = "HYBRID_TRACE_ENABLED"
 TRACE_MAPPING = '"${HYBRID_TRACE_ENABLED:-false}"'
 
@@ -52,16 +55,18 @@ class ReviewedImagePin(unittest.TestCase):
     def test_wire_02_the_tag_names_the_reviewed_commit(self):
         """The tag carries the short SHA it was built from, so a deployed container can be
         traced back to a commit without trusting a mutable label."""
-        self.assertTrue(REVIEWED_IMAGE.endswith("-2f8acc8"), REVIEWED_IMAGE)
+        self.assertTrue(REVIEWED_IMAGE.endswith("-0407bab"), REVIEWED_IMAGE)
 
     def test_wire_03_exactly_one_backend_image_declaration(self):
         lines = declarations(BETA, "image: ridecheck-crm-backend")
         self.assertEqual(len(lines), 1, f"expected one backend image pin, got {lines}")
 
-    def test_wire_04_the_previous_image_is_no_longer_pinned(self):
-        """It remains the rollback target on disk; it must not still be what deploys."""
-        self.assertNotIn(PREVIOUS_IMAGE, [l.split("image:")[-1].strip()
-                                          for l in declarations(BETA, "image:")])
+    def test_wire_04_no_superseded_image_is_still_pinned(self):
+        """They remain rollback targets on disk; none may still be what deploys."""
+        pinned = [l.split("image:")[-1].strip() for l in declarations(BETA, "image:")]
+        for image in SUPERSEDED_IMAGES:
+            with self.subTest(image=image):
+                self.assertNotIn(image, pinned)
 
 
 class TraceMapping(unittest.TestCase):
