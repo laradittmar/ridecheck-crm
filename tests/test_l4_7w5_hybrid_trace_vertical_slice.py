@@ -95,11 +95,14 @@ def _trace(**over) -> HybridDecisionTrace:
 class TraceContract(unittest.TestCase):
 
     def test_trc_01_version_is_pinned(self):
-        """1.1 since L4.7W5-TRACE-ROW-SEMANTICS. 1.0 stays readable, and is named."""
-        from app.schemas.hybrid_trace import READABLE_VERSIONS, TRACE_VERSION_1_0
-        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.1")
+        """1.2 since L4.7W5-TRACE-ROW-SEMANTICS-R2. Older contracts stay readable, named."""
+        from app.schemas.hybrid_trace import (READABLE_VERSIONS, TRACE_VERSION_1_0,
+                                              TRACE_VERSION_1_1)
+        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.2")
+        self.assertEqual(TRACE_VERSION_1_1, "hybrid-decision-trace/1.1")
         self.assertEqual(TRACE_VERSION_1_0, "hybrid-decision-trace/1.0")
         self.assertIn(TRACE_VERSION_1_0, READABLE_VERSIONS)
+        self.assertIn(TRACE_VERSION_1_1, READABLE_VERSIONS)
         self.assertEqual(_trace().trace_version, TRACE_VERSION)
 
     def test_trc_02_normalization_folds_case_and_accents(self):

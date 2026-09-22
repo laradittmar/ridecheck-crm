@@ -1,4 +1,4 @@
-"""L4.7W5 — the Hybrid Decision Trace contract, version `hybrid-decision-trace/1.1`.
+"""L4.7W5 — the Hybrid Decision Trace contract, version `hybrid-decision-trace/1.2`.
 
 One record per customer turn, keyed by the `turn_id` the engine already mints. It exists to
 answer one question from one screen:
@@ -32,6 +32,25 @@ in the row as evidence about polarity; it can no longer decide agreement on its 
 A 1.0 row carries none of those fields. Their absence is not an empty modern row, and a
 reader must never fill it in: `Classification.LEGACY_PROVENANCE_UNAVAILABLE` is the only
 honest label for a 1.0 row in which anything at all participated.
+
+**1.2 — absence of conflict is not agreement either.** 1.1 fixed the direction the audit
+found and left the mirror standing: with two producers present it returned `AGREE` whenever
+no explicit conflict was detected, including when the two had spoken about entirely
+different things. Semantic supplying `vehicle.model` while CE supplied `vehicle.year` is not
+two engines agreeing; it is two engines saying unrelated things.
+
+1.2 requires a **shared canonical proposition** — the same canonical business field —
+carrying evidence from at least two attributed producers, and requires that their canonical
+values be provably compatible before the word `AGREE` is used. Canonical equivalence comes
+from resolvers this system already has (`CANONICAL_PROPOSITIONS` names them); where none can
+establish it, the row is `COMPARISON_UNPROVEN`, never agreement. Two producers with nothing
+in common are `PARALLEL_EVIDENCE`.
+
+1.2 also removes the row ordinal from comparison identity. A logical comparison is now
+identified by what it IS — decision site, proposition, rule, and the sorted content hashes
+of its claims — so inserting an unrelated reconciliation earlier in the turn cannot change
+it. Repeated executions of the same logical comparison are separated by `occurrence_index`,
+which is positional and is deliberately kept out of the identity.
 """
 from __future__ import annotations
 
@@ -41,11 +60,12 @@ import unicodedata
 from dataclasses import dataclass, field, asdict
 from typing import Any, Optional
 
-TRACE_VERSION = "hybrid-decision-trace/1.1"
+TRACE_VERSION = "hybrid-decision-trace/1.2"
+TRACE_VERSION_1_1 = "hybrid-decision-trace/1.1"
 #: The first contract. Its reconciliation rows carry no producer provenance, so a
 #: reader must never treat their absent 1.1 fields as empty 1.1 fields.
 TRACE_VERSION_1_0 = "hybrid-decision-trace/1.0"
-READABLE_VERSIONS = (TRACE_VERSION, TRACE_VERSION_1_0)
+READABLE_VERSIONS = (TRACE_VERSION, TRACE_VERSION_1_1, TRACE_VERSION_1_0)
 
 
 class Classification:
@@ -71,7 +91,16 @@ class Classification:
     AGREE = "AGREE"
     CONFLICT = "CONFLICT"
     # ── proven non-comparisons ──
+    #: Two or more producers participated and shared no canonical proposition. They spoke
+    #: about different things; that is neither agreement nor disagreement.
+    PARALLEL_EVIDENCE = "PARALLEL_EVIDENCE"
+    #: A proposition IS shared, and the captured evidence cannot establish whether the two
+    #: canonical values mean the same thing. Unproven is not compatible.
+    COMPARISON_UNPROVEN = "COMPARISON_UNPROVEN"
     SINGLE_PRODUCER = "SINGLE_PRODUCER"          # exactly one source supplied evidence
+    #: The only participating producer contradicted itself. Self-contradiction is recorded
+    #: as ambiguity of that producer's evidence, never as a conflict between engines.
+    AMBIGUOUS_EVIDENCE = "AMBIGUOUS_EVIDENCE"
     NO_EVIDENCE = "NO_EVIDENCE"                  # no source supplied any; blames nobody
     NOT_ROUTED = "NOT_ROUTED"                    # evidence existed in the turn, not here
     ERROR = "ERROR"                              # a producer or the reconciler failed
@@ -89,7 +118,8 @@ class Classification:
     CE_MISSING = "CE_MISSING"
     NO_RULE = "NO_RULE"
 
-    ROW = (AGREE, CONFLICT, SINGLE_PRODUCER, NO_EVIDENCE, NOT_ROUTED, ERROR,
+    ROW = (AGREE, CONFLICT, PARALLEL_EVIDENCE, COMPARISON_UNPROVEN, SINGLE_PRODUCER,
+           AMBIGUOUS_EVIDENCE, NO_EVIDENCE, NOT_ROUTED, ERROR,
            LEGACY_PROVENANCE_UNAVAILABLE)
     TURN = (AGREE, CONFLICT, PARTIAL_RECONCILIATION, SINGLE_SOURCE_DECISION,
             NO_COMPARISON, TRACE_INCOMPLETE, SEMANTIC_MISSING, SEMANTIC_NOT_ROUTED,
@@ -99,10 +129,14 @@ class Classification:
     #: Row values meaning "two or more distinct sources were actually weighed".
     COMPARED = (AGREE, CONFLICT)
     #: Row values meaning "no comparison happened", for whichever reason.
-    INCOMPARABLE = (SINGLE_PRODUCER, NO_EVIDENCE, NOT_ROUTED, ERROR,
+    INCOMPARABLE = (PARALLEL_EVIDENCE, COMPARISON_UNPROVEN, SINGLE_PRODUCER,
+                    AMBIGUOUS_EVIDENCE, NO_EVIDENCE, NOT_ROUTED, ERROR,
                     LEGACY_PROVENANCE_UNAVAILABLE)
     #: Row values whose true classification cannot be established from the stored record.
-    UNKNOWN = (LEGACY_PROVENANCE_UNAVAILABLE, ERROR)
+    #: `COMPARISON_UNPROVEN` and `AMBIGUOUS_EVIDENCE` belong here because in both the
+    #: captured evidence is insufficient to say what the producers actually did.
+    UNKNOWN = (LEGACY_PROVENANCE_UNAVAILABLE, ERROR, COMPARISON_UNPROVEN,
+               AMBIGUOUS_EVIDENCE)
 
 
 class EvidenceSource:
@@ -143,6 +177,39 @@ def source_of_producer(producer: Optional[str]) -> str:
     """The proven source for a producer literal. Unknown namespaces are UNATTRIBUTED."""
     namespace = str(producer or "").split(":", 1)[0].strip().lower()
     return PRODUCER_NAMESPACE_TO_SOURCE.get(namespace, EvidenceSource.UNATTRIBUTED)
+
+
+#: The canonical business fields two producers can be said to speak about. Two claims
+#: address the same proposition when they carry the same claim type from this list —
+#: never when their raw wording resembles each other, which this system never inspects.
+#:
+#: `resolver` names an EXISTING function that turns a structured claim value into a
+#: canonical identity. Nothing here is a new catalogue, a phrase list or a synonym table:
+#: `vehicle_catalog.lookup_vehicle` is the same resolver `reconcile_vehicle_identity`
+#: already treats as the authority on what a car is called.
+#:
+#: `self_canonical` marks a proposition whose structured value IS already its canonical
+#: form — a year is a year — so two values may be compared directly.
+CANONICAL_PROPOSITIONS = {
+    "vehicle.make":        {"resolver": "vehicle_catalog", "self_canonical": False},
+    "vehicle.model":       {"resolver": "vehicle_catalog", "self_canonical": False},
+    "vehicle.year":        {"resolver": None,              "self_canonical": True},
+    "vehicle.category":    {"resolver": None,              "self_canonical": False},
+    "inspection_location": {"resolver": None,              "self_canonical": False},
+    "customer_origin":     {"resolver": None,              "self_canonical": False},
+    "seller_location":     {"resolver": None,              "self_canonical": False},
+    "service_intent":      {"resolver": None,              "self_canonical": False},
+    "scheduling_preference": {"resolver": None,            "self_canonical": False},
+}
+
+
+class ComparisonVerdict:
+    """What one shared proposition proved. Never inferred from the absence of the others."""
+    COMPATIBLE = "COMPATIBLE"
+    INCOMPATIBLE = "INCOMPATIBLE"
+    UNPROVEN = "UNPROVEN"
+
+    ALL = (COMPATIBLE, INCOMPATIBLE, UNPROVEN)
 
 
 class DecisionSite:
@@ -270,7 +337,29 @@ class SourceContribution:
     value_keys: tuple = ()
     polarities: tuple = ()
     values: tuple = ()                  # displayable entries, `None` where withheld
+    #: Canonical identity per claim, from an existing resolver — `None` when none applies
+    #: or the value did not resolve. Display-safe by construction: a catalog identity is
+    #: the catalog's own name for a thing, never the customer's words.
+    canonical_values: tuple = ()
+    #: `ClaimEvidence.confidence`, advisory only and never read by any rule. Carried so the
+    #: authenticated Inspector can show what the producer itself claimed.
+    confidences: tuple = ()
     withheld: bool = False
+
+
+@dataclass
+class PropositionComparison:
+    """One canonical proposition, and what two or more producers proved about it.
+
+    This is the unit 1.2 added. Before it, a row asked only "did anyone contradict anyone",
+    and two producers who had never spoken about the same field answered no — which was
+    then read as agreement.
+    """
+    claim_type: str
+    sources: tuple = ()                 # the attributed sources that spoke to it
+    canonical_by_source: tuple = ()     # (source, canonical-or-displayable, key) triples
+    verdict: str = "UNPROVEN"           # ComparisonVerdict
+    basis: Optional[str] = None         # which existing resolver, or why it is unproven
 
 
 @dataclass
@@ -292,10 +381,16 @@ class ReconciliationEvidence:
     rejected: tuple = ()
     reason_code: Optional[str] = None
 
-    # ── hybrid-decision-trace/1.1 ────────────────────────────────────────────
+    # ── hybrid-decision-trace/1.1, amended by 1.2 ───────────────────────────
     contract_version: str = TRACE_VERSION
-    #: Stable within the turn; distinguishes two calls that share a claim family.
-    comparison_id: Optional[str] = None
+    #: What this comparison IS: decision site, proposition, rule, and the sorted content
+    #: hashes of the claims weighed. Deliberately carries NO positional component, so
+    #: inserting an unrelated reconciliation earlier in the turn cannot change it, and the
+    #: same logical comparison keeps its identity across deployments.
+    logical_comparison_id: Optional[str] = None
+    #: Which execution of that logical comparison this is, within this turn. Positional,
+    #: and kept OUT of the identity above — that separation is the whole point.
+    occurrence_index: int = 0
     #: An explicit literal from `DecisionSite`, supplied by the call site.
     decision_site_id: Optional[str] = None
     decision_purpose: Optional[str] = None
@@ -304,6 +399,13 @@ class ReconciliationEvidence:
     #: Sources that produced evidence elsewhere in the turn and did not reach this call.
     not_routed_sources: tuple = ()
     source_evidence: tuple = ()          # tuple[SourceContribution]
+    #: One entry per canonical proposition at least two attributed producers spoke to.
+    #: Empty means no proposition was shared — which is `PARALLEL_EVIDENCE`, not agreement.
+    compared_propositions: tuple = ()    # tuple[PropositionComparison]
+    #: Sources whose own claims contradict each other. Recorded separately from any
+    #: cross-producer verdict: a producer disagreeing with itself is not two engines
+    #: disagreeing, and must never be rendered as one.
+    self_contradiction_sources: tuple = ()
     #: Evidence about POLARITY. Never sufficient on its own to classify the row.
     information_state: Optional[str] = None
     error_category: Optional[str] = None

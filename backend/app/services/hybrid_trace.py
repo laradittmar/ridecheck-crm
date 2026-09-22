@@ -21,10 +21,11 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from ..schemas.hybrid_trace import (
-    CanonicalSnapshot, Classification, DECISION_PURPOSE, DecisionSite, EvidenceSource,
-    HybridDecisionTrace, ReconciliationEvidence, ResultKind, RuleEvidence,
+    CANONICAL_PROPOSITIONS, CanonicalSnapshot, Classification, ComparisonVerdict,
+    DECISION_PURPOSE, DecisionSite, EvidenceSource, HybridDecisionTrace,
+    PropositionComparison, ReconciliationEvidence, ResultKind, RuleEvidence,
     SemanticEvidence, SourceContribution, TRACE_VERSION, TRACE_VERSION_1_0,
-    burst_hash, inputs_digest, source_of_producer, token_fingerprint,
+    TRACE_VERSION_1_1, burst_hash, inputs_digest, source_of_producer, token_fingerprint,
 )
 
 logger = logging.getLogger(__name__)
@@ -151,17 +152,41 @@ def ce_evidence_for(texts, snapshot: CanonicalSnapshot, final_action: Optional[s
 # catalog lookup produces `FUZZY_SUGGESTED` claims, and `FUZZY_SUGGESTED` was being counted
 # as semantic participation in a decision the semantic engine never saw.
 
-#: Claim families whose string values the authenticated Inspector is already permitted to
-#: display. Locality is on this list because `CanonicalSnapshot.zone_detail` already renders
-#: it on the same page for the same operator. Vehicle make, model and category are NOT: the
-#: Inspector's current contract does not show them, and widening a privacy surface is not
-#: this milestone's to do. Their values are withheld behind a typed reference instead.
+#: Claim families whose string values the authenticated Inspector may display, under the
+#: owner's visibility decision of 2026-09-22. The Inspector is an operational audit surface
+#: for an authenticated operator: what a customer wants inspected, which car, and which
+#: locality are the facts an operator needs in order to read a decision at all.
+#:
+#: What stays off this list is what identifies a person or opens a door: a phone number, an
+#: email, an exact street address, a booking token, a secret, a raw model response. The
+#: shape scrub below is the second line of that defence — a street address that arrives
+#: inside an `inspection_location` claim is still withheld, because it is long and because
+#: a locality name is not a street with a number.
 DISPLAYABLE_STRING_FAMILIES = frozenset({
+    "vehicle.make", "vehicle.model", "vehicle.category",
     "inspection_location", "customer_origin", "seller_location",
+    "service_intent",
 })
 
-#: Shapes that must never be printed even inside an allowlisted family.
-_UNSAFE_VALUE = re.compile(r"\d{7,}|@|https?://", re.IGNORECASE)
+#: Shapes that must never be printed, whatever family they arrive in.
+#:
+#: Widening the family allowlist made this load-bearing rather than belt-and-braces. A
+#: WAMID or a booking token pasted into a `vehicle.model` claim would previously have been
+#: withheld because the family was not displayable; now the family is, so the shape has to
+#: carry the refusal. Each alternative is a declared identifier or secret shape, not a
+#: guess about language: a phone-length digit run, an email, a URL, a WhatsApp message id,
+#: a booking token, a Meta or OpenAI key, or a PEM block. No vehicle, service or locality
+#: name contains any of them.
+_UNSAFE_VALUE = re.compile(
+    r"\d{7,}"
+    r"|@"
+    r"|https?://"
+    r"|wamid\."
+    r"|bk_tok"
+    r"|-----BEGIN"
+    r"|EAA[A-Za-z0-9]{10,}"
+    r"|sk-[A-Za-z0-9]{10,}",
+    re.IGNORECASE)
 _MAX_DISPLAY_CHARS = 40
 
 
@@ -195,6 +220,60 @@ def display_value(claim_type: Optional[str], value: Any) -> tuple:
     return None, True
 
 
+# ── canonical equivalence, from resolvers this system already has ────────────
+#
+# The rule this whole section serves: the trace NEVER inspects raw customer wording to
+# decide that two producers agree. It compares canonical identities, and where it cannot
+# obtain one it says the comparison is unproven. Deliberately absent: phrase catalogues,
+# synonym lists, fuzzy string matching, and any normalization table invented here.
+
+def _vehicle_canonical(value: Any) -> Optional[str]:
+    """The catalog's own identity for a vehicle value, or None.
+
+    `vehicle_catalog.lookup_vehicle` is the resolver `reconcile_vehicle_identity` already
+    treats as the authority on what a car is called; reading it is how "un doscientos ocho"
+    projected to `Peugeot 208` and a catalogue hit on `208` become the same identity without
+    the trace ever seeing either sentence. Pure, in-memory, no database, no network.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        from .vehicle_catalog import lookup_vehicle
+        match = lookup_vehicle(value)
+    except Exception:                      # a resolver failure is not an equivalence
+        return None
+    if match is None:
+        return None
+    return f"{match.marca} {match.modelo}".strip()
+
+
+_RESOLVERS = {"vehicle_catalog": _vehicle_canonical}
+
+
+def canonical_identity(claim_type: Optional[str], value: Any) -> tuple:
+    """`(identity, basis)` for one structured value, or `(None, why-not)`.
+
+    `identity` is a canonical form two producers can be compared on. `basis` names the
+    existing resolver that supplied it, so the Inspector can show WHY two values were
+    treated as the same thing rather than asking the reader to trust it.
+    """
+    spec = CANONICAL_PROPOSITIONS.get(str(claim_type or ""))
+    if spec is None:
+        return None, "not a canonical proposition"
+    if value is None or value == "" or value == [] or value == {}:
+        return None, "no value"
+    resolver = _RESOLVERS.get(spec.get("resolver") or "")
+    if resolver is not None:
+        identity = resolver(value)
+        if identity is not None:
+            return identity, spec["resolver"]
+        return None, f"{spec['resolver']} did not resolve the value"
+    if spec.get("self_canonical") and isinstance(value, (int, float)) \
+            and not isinstance(value, bool):
+        return str(value), "structured value is already canonical"
+    return None, "no canonical resolver for this proposition"
+
+
 def contributions_from_claims(claims) -> tuple:
     """Group the reconciler's input set by proven source. One entry per source."""
     grouped: dict = {}
@@ -204,11 +283,12 @@ def contributions_from_claims(claims) -> tuple:
         bucket = grouped.setdefault(source, {
             "producer": [], "producer_version": [], "evidence_classes": [],
             "claim_types": [], "claim_ids": [], "value_keys": [], "polarities": [],
-            "values": [], "withheld": False,
+            "values": [], "canonical_values": [], "confidences": [], "withheld": False,
         })
         claim_type = getattr(claim, "claim_type", None)
         value = getattr(claim, "value", None)
         shown, withheld = display_value(claim_type, value)
+        identity, _basis = canonical_identity(claim_type, value)
         polarity = getattr(getattr(claim, "polarity", None), "value", None)
         modality = getattr(getattr(claim, "modality", None), "value", None)
         evidence_class = getattr(getattr(claim, "evidence_class", None), "value", None)
@@ -225,6 +305,8 @@ def contributions_from_claims(claims) -> tuple:
         bucket["polarities"].append("NEGATED" if (polarity == "NEGATED"
                                                   or modality == "NEGATED") else "ASSERTED")
         bucket["values"].append(shown)
+        bucket["canonical_values"].append(identity)
+        bucket["confidences"].append(getattr(claim, "confidence", None))
         bucket["withheld"] = bucket["withheld"] or withheld
 
     out = []
@@ -242,6 +324,8 @@ def contributions_from_claims(claims) -> tuple:
             value_keys=tuple(bucket["value_keys"]),
             polarities=tuple(bucket["polarities"]),
             values=tuple(bucket["values"]),
+            canonical_values=tuple(bucket["canonical_values"]),
+            confidences=tuple(bucket["confidences"]),
             withheld=bucket["withheld"]))
     return tuple(out)
 
@@ -265,54 +349,167 @@ def participating_sources(contributions) -> tuple:
                  if c.source in EvidenceSource.PARTICIPATING and _usable(c))
 
 
-def sources_conflict(contributions) -> bool:
-    """True only for EXPLICIT incompatibility between two distinct participating sources.
+def _claims_of(contribution, claim_type: str) -> tuple:
+    """(value_key, canonical, display, polarity) for one source's claims of one type."""
+    out = []
+    empty = value_key(claim_type, None)
+    for key, kind, polarity, shown, identity in zip(
+            contribution.value_keys, contribution.claim_types, contribution.polarities,
+            (contribution.values or ()) + (None,) * len(contribution.claim_types),
+            (contribution.canonical_values or ()) + (None,) * len(contribution.claim_types)):
+        if kind != claim_type or key == empty:
+            continue
+        out.append((key, identity, shown, polarity))
+    return tuple(out)
 
-    Compared per claim type, never across types: one call site hands the reconciler make,
-    model, year and category together, and "make=Peugeot" does not contradict "year=2020".
-    Two sources are incompatible when one asserts what the other denies, or when both
-    assert values for the same claim type and share none.
+
+def _verdict_for(left_claims, right_claims) -> tuple:
+    """`(verdict, basis)` for one proposition between exactly two sources.
+
+    Compatible requires PROOF, in one of two forms, and nothing else counts:
+
+      * both sides resolve through the same existing resolver to the same canonical
+        identity — how a value the interpreter phrased one way and a value the catalogue
+        phrased another are recognised as one car without reading either sentence; or
+      * the two structured value keys are exactly equal, which needs no resolver at all.
+
+    Incompatible likewise requires proof: one side asserting what the other denies, or two
+    canonical identities that both resolved and differ.
+
+    Everything else is UNPROVEN. Two unequal strings that no resolver could place may be
+    two spellings of one locality, and the trace has no way to tell — so it does not guess
+    in either direction. Under-claiming is the only safe direction here.
+    """
+    def split(claims):
+        return ({c for c in claims if c[3] != "NEGATED"},
+                {c for c in claims if c[3] == "NEGATED"})
+
+    left_yes, left_no = split(left_claims)
+    right_yes, right_no = split(right_claims)
+
+    # assertion against denial of the same value — provable, resolver or not
+    if ({c[0] for c in left_yes} & {c[0] for c in right_no}
+            or {c[0] for c in right_yes} & {c[0] for c in left_no}):
+        return ComparisonVerdict.INCOMPATIBLE, "one source denies what the other asserts"
+    if not left_yes or not right_yes:
+        return ComparisonVerdict.UNPROVEN, "one source asserted nothing about it"
+
+    if {c[0] for c in left_yes} & {c[0] for c in right_yes}:
+        return ComparisonVerdict.COMPATIBLE, "identical structured value"
+
+    left_ids = {c[1] for c in left_yes if c[1]}
+    right_ids = {c[1] for c in right_yes if c[1]}
+    if left_ids and right_ids:
+        if left_ids & right_ids:
+            return ComparisonVerdict.COMPATIBLE, "same canonical identity"
+        return ComparisonVerdict.INCOMPATIBLE, "different canonical identities"
+    return (ComparisonVerdict.UNPROVEN,
+            "no canonical identity could be established for both sides")
+
+
+def compare_propositions(contributions) -> tuple:
+    """Every canonical proposition at least two attributed producers spoke to.
+
+    An empty result is the finding, not a gap: two producers sharing no proposition have
+    not agreed about anything, and 1.1 called that AGREE.
     """
     parts = [c for c in contributions or ()
              if c.source in EvidenceSource.PARTICIPATING and _usable(c)]
-    for index, left in enumerate(parts):
-        for right in parts[index + 1:]:
-            shared = set(left.claim_types) & set(right.claim_types)
-            for claim_type in shared:
-                def split(contribution):
-                    asserted, negated = set(), set()
-                    for key, kind, polarity in zip(contribution.value_keys,
-                                                   contribution.claim_types,
-                                                   contribution.polarities):
-                        if kind != claim_type or key == value_key(kind, None):
-                            continue
-                        (negated if polarity == "NEGATED" else asserted).add(key)
-                    return asserted, negated
-                left_asserted, left_negated = split(left)
-                right_asserted, right_negated = split(right)
-                if (left_asserted & right_negated) or (right_asserted & left_negated):
-                    return True
-                if left_asserted and right_asserted and not (left_asserted & right_asserted):
-                    return True
-    return False
+    if len(parts) < 2:
+        return ()
+    out = []
+    for claim_type in sorted(CANONICAL_PROPOSITIONS):
+        speakers = [c for c in parts if _claims_of(c, claim_type)]
+        if len(speakers) < 2:
+            continue
+        verdicts, bases = set(), []
+        for index, left in enumerate(speakers):
+            for right in speakers[index + 1:]:
+                verdict, basis = _verdict_for(_claims_of(left, claim_type),
+                                              _claims_of(right, claim_type))
+                verdicts.add(verdict)
+                if basis not in bases:
+                    bases.append(basis)
+        # One incompatible pair makes the proposition incompatible; otherwise every pair
+        # must be proven compatible, or the proposition stays unproven.
+        if ComparisonVerdict.INCOMPATIBLE in verdicts:
+            verdict = ComparisonVerdict.INCOMPATIBLE
+        elif verdicts == {ComparisonVerdict.COMPATIBLE}:
+            verdict = ComparisonVerdict.COMPATIBLE
+        else:
+            verdict = ComparisonVerdict.UNPROVEN
+        rendered = []
+        for speaker in speakers:
+            for key, identity, shown, polarity in _claims_of(speaker, claim_type):
+                rendered.append((speaker.source, identity or shown, key, polarity))
+        out.append(PropositionComparison(
+            claim_type=claim_type,
+            sources=tuple(dict.fromkeys(s.source for s in speakers)),
+            canonical_by_source=tuple(rendered),
+            verdict=verdict,
+            basis="; ".join(bases) or None))
+    return tuple(out)
+
+
+def self_contradicting_sources(contributions) -> tuple:
+    """Sources whose OWN claims contradict each other, on any single proposition.
+
+    Recorded apart from every cross-producer verdict. "It is a Ka, it is not a Ka" from one
+    parser is that parser being uncertain; rendering it as a conflict between engines would
+    invent a disagreement that never happened.
+    """
+    out = []
+    for contribution in contributions or ():
+        if contribution.source not in EvidenceSource.PARTICIPATING:
+            continue
+        for claim_type in dict.fromkeys(contribution.claim_types):
+            claims = _claims_of(contribution, claim_type)
+            asserted = {c[0] for c in claims if c[3] != "NEGATED"}
+            negated = {c[0] for c in claims if c[3] == "NEGATED"}
+            if (asserted & negated) or len(asserted) > 1:
+                if contribution.source not in out:
+                    out.append(contribution.source)
+                break
+    return tuple(out)
 
 
 def classify_row(contributions, *, error_category: Optional[str] = None,
                  semantic_available: bool = False) -> str:
-    """What ONE reconciliation row proves. Derived from participation, never from polarity.
+    """What ONE reconciliation row proves. Derived from participation and from PROOF.
 
-    The whole correction is here. `InformationState` describes the polarity of the evidence
-    about a claim type; it cannot say who supplied it, so it can never decide whether two
-    engines agreed. It stays on the row as evidence, next to this label, not behind it.
+    1.1 derived the row from participation, which removed the polarity falsehood and left
+    a second one standing: with two producers present it returned `AGREE` whenever no
+    explicit conflict was found. Absence of conflict is not agreement — two producers who
+    spoke about different fields cannot have agreed, and two who spoke about the same field
+    in values nothing can reconcile have not been shown to.
+
+    `AGREE` now requires a shared canonical proposition, proven compatible. Every weaker
+    outcome has its own name, and none of them is agreement.
     """
     if error_category:
         return Classification.ERROR
     present = participating_sources(contributions)
-    if len(set(present)) >= 2:
-        return (Classification.CONFLICT if sources_conflict(contributions)
-                else Classification.AGREE)
-    if len(set(present)) == 1:
+    distinct = set(present)
+
+    if len(distinct) >= 2:
+        propositions = compare_propositions(contributions)
+        verdicts = {p.verdict for p in propositions}
+        if ComparisonVerdict.INCOMPATIBLE in verdicts:
+            return Classification.CONFLICT
+        if not propositions:
+            return Classification.PARALLEL_EVIDENCE
+        if ComparisonVerdict.COMPATIBLE in verdicts and \
+                ComparisonVerdict.UNPROVEN not in verdicts:
+            return Classification.AGREE
+        return Classification.COMPARISON_UNPROVEN
+
+    if len(distinct) == 1:
+        # A producer that contradicts itself has not produced usable single-source
+        # evidence; it has produced ambiguity, and that is what the row says.
+        if self_contradicting_sources(contributions):
+            return Classification.AMBIGUOUS_EVIDENCE
         return Classification.SINGLE_PRODUCER
+
     # Nothing usable reached this call. Blaming a named producer here is exactly the
     # falsehood 1.0 shipped: `NEITHER` became SEMANTIC_MISSING on rows where CE had said
     # nothing either. NOT_ROUTED is claimed only when the evidence is provably elsewhere.
@@ -375,8 +572,26 @@ def semantic_evidence_from(provider, dispatch: Optional[str]) -> SemanticEvidenc
         evidence=ev, produced_claims=families)
 
 
-def reconciliation_from(record, claims=(), *, decision_site_id=None,
-                        ordinal: int = 0) -> ReconciliationEvidence:
+def logical_comparison_id(*, decision_site_id, claim_family, rule_id, rule_version,
+                          contributions) -> str:
+    """What this comparison IS, independent of where it happened to run.
+
+    Inputs are all semantic: the decision site the caller named, the canonical proposition,
+    the rule and its version, and the SORTED content hashes of every claim weighed. Claim
+    ids are content hashes, so the same claims produce the same id on any deployment, in
+    any iteration order, however the rows are arranged on the page.
+
+    Deliberately absent: the row's position in the turn. 1.1 mixed an ordinal in here, so
+    inserting an unrelated reconciliation earlier in a turn silently renamed every later
+    comparison — an identity that changes when something unrelated moves is not an identity.
+    Repeated executions of one logical comparison are separated by `occurrence_index`.
+    """
+    claim_ids = sorted(cid for c in contributions or () for cid in (c.claim_ids or ()))
+    return inputs_digest("logical-comparison", decision_site_id, claim_family,
+                         rule_id, rule_version, ",".join(claim_ids))
+
+
+def reconciliation_from(record, claims=(), *, decision_site_id=None) -> ReconciliationEvidence:
     """One live reconciliation, told as WHICH source supplied WHAT to WHICH decision.
 
     `claims` is the input set the reconciler was handed; it carries each producer's own
@@ -384,35 +599,39 @@ def reconciliation_from(record, claims=(), *, decision_site_id=None,
     the rule, the outcome and the reason. Neither is read back into the turn.
 
     The row is classified here with `semantic_available=False`, because at this moment the
-    interpreter may not have answered yet. `finalize_rows()` revisits that one question once
-    the turn's semantic evidence is known, and nothing else about the row changes.
+    interpreter may not have answered yet, and with `occurrence_index=0`, because whether
+    this is a repeat is a fact about the turn. `finalize_rows()` settles both.
     """
     contributions = contributions_from_claims(claims)
     present = participating_sources(contributions)
     site = decision_site_id or None
+    claim_family = str(getattr(record, "claim_type", "") or "")
+    rule_id = getattr(record, "rule_id", None)
+    rule_version = getattr(record, "rule_version", None)
     return ReconciliationEvidence(
-        claim_family=str(getattr(record, "claim_type", "") or ""),
+        claim_family=claim_family,
         semantic_input=("PRESENT" if EvidenceSource.SEMANTIC in present else "ABSENT"),
         ce_input=("PRESENT" if (EvidenceSource.DETERMINISTIC in present
                                 or EvidenceSource.CANONICAL_STATE in present) else "ABSENT"),
         classification=classify_row(contributions),
-        rule_id=getattr(record, "rule_id", None),
-        rule_version=getattr(record, "rule_version", None),
+        rule_id=rule_id,
+        rule_version=rule_version,
         outcome=getattr(record, "outcome", None),
         accepted=tuple(getattr(record, "evidence_ids", ()) or ()),
         rejected=(),
         reason_code=getattr(record, "reason", None),
         contract_version=TRACE_VERSION,
-        comparison_id=inputs_digest("comparison", site,
-                                    getattr(record, "claim_type", None), ordinal,
-                                    ",".join(sorted(
-                                        cid for c in contributions
-                                        for cid in c.claim_ids))),
+        logical_comparison_id=logical_comparison_id(
+            decision_site_id=site, claim_family=claim_family, rule_id=rule_id,
+            rule_version=rule_version, contributions=contributions),
+        occurrence_index=0,
         decision_site_id=site,
         decision_purpose=DECISION_PURPOSE.get(site),
         participating_sources=tuple(dict.fromkeys(present)),
         not_routed_sources=(),
         source_evidence=contributions,
+        compared_propositions=compare_propositions(contributions),
+        self_contradiction_sources=self_contradicting_sources(contributions),
         information_state=getattr(record, "information_state", None),
         error_category=None)
 
@@ -425,18 +644,19 @@ def _semantic_produced_evidence(semantic) -> bool:
 
 
 def finalize_rows(reconciliations, semantic) -> tuple:
-    """Settle the one row question that needs the whole turn: did evidence exist elsewhere?
+    """Settle the two questions that need the whole turn, and only those two.
 
-    A row that received nothing is `NO_EVIDENCE` on its own account. It becomes `NOT_ROUTED`
-    only when the interpreter provably produced claims for this turn that did not reach it —
-    "evidence existed and was not routed" is a stronger statement than "nothing arrived",
-    and it may only be made when both halves are proven.
+    **Routing.** A row that received nothing is `NO_EVIDENCE` on its own account. It becomes
+    `NOT_ROUTED` only when the interpreter provably produced claims for this turn that did
+    not reach it — "evidence existed and was not routed" is a stronger statement than
+    "nothing arrived", and it may only be made when both halves are proven. A row that DID
+    have a participant keeps its classification and still names the unrouted source.
 
-    A row that DID have a participant keeps its classification; the unrouted source is still
-    named, because "one producer decided this while the other's evidence went elsewhere" is
-    exactly what an operator needs to see and is not the same as agreement.
+    **Occurrence.** How many times this logical comparison has already run in this turn.
+    Positional by nature, which is exactly why it lives here and not in the identity.
     """
     available = _semantic_produced_evidence(semantic)
+    seen: dict = {}
     out = []
     for row in reconciliations or ():
         contributions = tuple(getattr(row, "source_evidence", ()) or ())
@@ -445,6 +665,9 @@ def finalize_rows(reconciliations, semantic) -> tuple:
             contributions,
             error_category=getattr(row, "error_category", None),
             semantic_available=available)
+        key = getattr(row, "logical_comparison_id", None)
+        row.occurrence_index = seen.get(key, 0)
+        seen[key] = row.occurrence_index + 1
         out.append(row)
     return tuple(out)
 
@@ -506,8 +729,11 @@ def classify(semantic: SemanticEvidence, ce_rules: tuple, reconciliations: tuple
         unknown = [k for k in kinds
                    if k in Classification.UNKNOWN or k not in Classification.ROW]
         single = [k for k in kinds if k == Classification.SINGLE_PRODUCER]
+        # `PARALLEL_EVIDENCE` is a PROVEN non-comparison — both producers spoke, about
+        # different things — so it belongs with the uncompared rows, not the unknown ones.
         uncompared = [k for k in kinds
-                      if k in (Classification.NO_EVIDENCE, Classification.NOT_ROUTED)]
+                      if k in (Classification.NO_EVIDENCE, Classification.NOT_ROUTED,
+                               Classification.PARALLEL_EVIDENCE)]
         if agreed and not (unknown or single or uncompared):
             return Classification.AGREE
         if agreed:
@@ -545,10 +771,17 @@ def family_counts(reconciliations) -> dict:
         "agreed": count(Classification.AGREE),
         "conflicting": count(Classification.CONFLICT),
         "single_producer": count(Classification.SINGLE_PRODUCER),
+        "parallel_evidence": count(Classification.PARALLEL_EVIDENCE),
+        "comparison_unproven": count(Classification.COMPARISON_UNPROVEN),
+        "ambiguous_evidence": count(Classification.AMBIGUOUS_EVIDENCE),
         "no_evidence": count(Classification.NO_EVIDENCE),
         "not_routed": count(Classification.NOT_ROUTED),
         "errored": count(Classification.ERROR),
         "legacy_unknown": count(Classification.LEGACY_PROVENANCE_UNAVAILABLE),
+        #: Distinct logical comparisons, which is NOT the row count when one of them ran
+        #: more than once in a turn.
+        "distinct_comparisons": len({getattr(r, "logical_comparison_id", None)
+                                     for r in rows}),
     }
 
 
@@ -659,11 +892,12 @@ class _StoredRow:
     exactly as the writer did — from participation, not from a label it found lying there.
     """
     __slots__ = ("classification", "source_evidence", "error_category",
-                 "not_routed_sources", "claim_family")
+                 "not_routed_sources", "claim_family", "logical_comparison_id")
 
     def __init__(self, raw: dict):
         raw = raw if isinstance(raw, dict) else {}
         self.claim_family = raw.get("claim_family")
+        self.logical_comparison_id = raw.get("logical_comparison_id")
         self.error_category = raw.get("error_category")
         self.not_routed_sources = tuple(raw.get("not_routed_sources") or ())
         self.classification = raw.get("classification")
@@ -678,6 +912,8 @@ class _StoredRow:
                 value_keys=tuple(c.get("value_keys") or ()),
                 polarities=tuple(c.get("polarities") or ()),
                 values=tuple(c.get("values") or ()),
+                canonical_values=tuple(c.get("canonical_values") or ()),
+                confidences=tuple(c.get("confidences") or ()),
                 withheld=bool(c.get("withheld")))
             for c in (raw.get("source_evidence") or []) if isinstance(c, dict))
 
@@ -787,7 +1023,11 @@ def row_summaries_from_payload(payload) -> tuple:
             "claim_family": raw.get("claim_family"),
             "decision_site_id": raw.get("decision_site_id"),
             "decision_purpose": raw.get("decision_purpose"),
-            "comparison_id": raw.get("comparison_id"),
+            "logical_comparison_id": raw.get("logical_comparison_id"),
+            "occurrence_index": raw.get("occurrence_index"),
+            "compared_propositions": (None if legacy
+                                      else list(raw.get("compared_propositions") or [])),
+            "self_contradiction_sources": list(raw.get("self_contradiction_sources") or []),
             "captured_classification": raw.get("classification"),
             "effective_classification": row.classification,
             "reclassified": bool(raw.get("classification") != row.classification),

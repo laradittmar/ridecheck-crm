@@ -717,12 +717,16 @@ class ScopeLabels(unittest.TestCase):
         from app.schemas.hybrid_trace import SourceContribution
         from app.services.hybrid_trace import value_key
 
+        from app.services.hybrid_trace import canonical_identity
+
         def contribution(source):
             return SourceContribution(
                 source=source, producer=f"{source.lower()}:test",
                 claim_types=("vehicle.model",), claim_ids=(f"{source}-0",),
                 value_keys=(value_key("vehicle.model", "peugeot 208"),),
-                polarities=("ASSERTED",), values=(None,), withheld=True)
+                polarities=("ASSERTED",), values=(None,),
+                canonical_values=(canonical_identity("vehicle.model", "peugeot 208")[0],),
+                confidences=(None,), withheld=True)
 
         contributions = (contribution("SEMANTIC"), contribution("DETERMINISTIC"))
         agree = self.Rec(claim_family="VEHICLE_MODEL", semantic_input="PRESENT",

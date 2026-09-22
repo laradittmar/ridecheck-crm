@@ -32,6 +32,17 @@ ROW-24..25   API and renderer tell the same story
 ROW-26       privacy
 ROW-27..29   nothing outside this milestone moved
 ROW-30..33   the unbound name, and the decision sites now carried
+
+**Amended by L4.7W5-TRACE-ROW-SEMANTICS-R2 (`hybrid-decision-trace/1.2`).** Two of the
+expectations below pinned behaviour R2 corrected, and both changed in the safe direction:
+
+* a row whose only participant contradicts itself now reads `AMBIGUOUS_EVIDENCE` rather
+  than `SINGLE_PRODUCER` — one producer disagreeing with itself is ambiguity of that
+  producer's evidence, and `SINGLE_PRODUCER` implied usable single-source evidence;
+* `ordinal` is gone from comparison identity, so the helpers no longer pass one; identity
+  now comes from `logical_comparison_id`, and repeats are numbered separately.
+
+R2's own matrix lives in `test_l4_7w5_trace_row_semantics_r2.py`.
 """
 from __future__ import annotations
 
@@ -105,11 +116,10 @@ class Record:
         self.evidence_ids = tuple(evidence_ids)
 
 
-def built(claims=(), *, record=None, site=DecisionSite.VEHICLE_IDENTITY_APPLY, ordinal=0,
+def built(claims=(), *, record=None, site=DecisionSite.VEHICLE_IDENTITY_APPLY,
           semantic=None):
     """One row, captured and then settled exactly as the engine settles it."""
-    row = svc.reconciliation_from(record or Record(), claims,
-                                  decision_site_id=site, ordinal=ordinal)
+    row = svc.reconciliation_from(record or Record(), claims, decision_site_id=site)
     return svc.finalize_rows((row,), semantic or SemanticEvidence(status="ABSENT"))[0]
 
 
@@ -233,12 +243,18 @@ class PolarityIsNotAgreement(unittest.TestCase):
         self.assertNotIn("SEMANTIC", row.classification)
 
     def test_row_11b_both_with_one_producer_is_not_a_conflict(self):
-        """One producer asserting two values contradicts itself, not another engine."""
+        """One producer asserting two values contradicts itself, not another engine.
+
+        R2 refined the label from `SINGLE_PRODUCER` to `AMBIGUOUS_EVIDENCE`: the producer
+        did speak, but what it produced cannot be used as one source's position. The
+        invariant this test exists for is unchanged — it is never `CONFLICT`.
+        """
         row = built((claim("ce:catalog", ClaimType.VEHICLE_MODEL, "208"),
                      claim("ce:catalog", ClaimType.VEHICLE_MODEL, "Ka")),
                     record=Record(information_state="BOTH"))
         self.assertEqual(row.information_state, "BOTH")
-        self.assertEqual(row.classification, Classification.SINGLE_PRODUCER)
+        self.assertEqual(row.classification, Classification.AMBIGUOUS_EVIDENCE)
+        self.assertEqual(row.self_contradiction_sources, (DET,))
         self.assertNotEqual(row.classification, Classification.CONFLICT)
 
     def test_row_12_one_producer_plus_accept_is_still_not_agreement(self):
@@ -269,19 +285,19 @@ class IdentityAndCounting(unittest.TestCase):
     def two_vehicle_model_rows(self):
         apply_row = svc.reconciliation_from(
             Record(), (claim("ce:catalog", ClaimType.VEHICLE_MODEL, "208"),),
-            decision_site_id=DecisionSite.VEHICLE_IDENTITY_APPLY, ordinal=0)
+            decision_site_id=DecisionSite.VEHICLE_IDENTITY_APPLY)
         fuzzy_row = svc.reconciliation_from(
             Record(outcome="HOLD"),
             (claim("ce:fuzzy_lookup_vehicle", ClaimType.VEHICLE_MODEL, "208",
                    evidence_class=EvidenceClass.FUZZY_SUGGESTED),),
-            decision_site_id=DecisionSite.VEHICLE_FUZZY_ADMISSIBILITY, ordinal=1)
+            decision_site_id=DecisionSite.VEHICLE_FUZZY_ADMISSIBILITY)
         return svc.finalize_rows((apply_row, fuzzy_row), SEM_ABSENT)
 
     def test_row_14_two_same_family_rows_stay_individually_identifiable(self):
         first, second = self.two_vehicle_model_rows()
         self.assertEqual(first.claim_family, second.claim_family)
         self.assertNotEqual(first.decision_site_id, second.decision_site_id)
-        self.assertNotEqual(first.comparison_id, second.comparison_id)
+        self.assertNotEqual(first.logical_comparison_id, second.logical_comparison_id)
         self.assertEqual(first.decision_purpose,
                          DECISION_PURPOSE[DecisionSite.VEHICLE_IDENTITY_APPLY])
         self.assertEqual(second.decision_purpose,
@@ -366,27 +382,26 @@ class TurnAggregation(unittest.TestCase):
 
     def agree_row(self, ordinal=0):
         return svc.reconciliation_from(
-            Record(), (claim("semantic:understand", ClaimType.VEHICLE_MODEL, "208",
+            Record(), (claim("semantic:understand", ClaimType.VEHICLE_MODEL, "Peugeot 208",
                              evidence_class=EvidenceClass.SEMANTIC_INFERRED),
-                       claim("ce:catalog", ClaimType.VEHICLE_MODEL, "208")),
-            decision_site_id=DecisionSite.VEHICLE_IDENTITY_APPLY, ordinal=ordinal)
+                       claim("ce:catalog", ClaimType.VEHICLE_MODEL, "Peugeot 208")),
+            decision_site_id=DecisionSite.VEHICLE_IDENTITY_APPLY)
 
     def conflict_row(self, ordinal=0):
         return svc.reconciliation_from(
-            Record(), (claim("semantic:understand", ClaimType.VEHICLE_MODEL, "208",
+            Record(), (claim("semantic:understand", ClaimType.VEHICLE_MODEL, "Peugeot 208",
                              evidence_class=EvidenceClass.SEMANTIC_INFERRED),
-                       claim("ce:catalog", ClaimType.VEHICLE_MODEL, "Ka")),
-            decision_site_id=DecisionSite.VEHICLE_IDENTITY_APPLY, ordinal=ordinal)
+                       claim("ce:catalog", ClaimType.VEHICLE_MODEL, "Ford Ka")),
+            decision_site_id=DecisionSite.VEHICLE_IDENTITY_APPLY)
 
     def single_row(self, ordinal=0):
         return svc.reconciliation_from(
             Record(), (claim("ce:zone", ClaimType.INSPECTION_LOCATION, "Palermo"),),
-            decision_site_id=DecisionSite.LOCATION_INSPECTION_APPLY, ordinal=ordinal)
+            decision_site_id=DecisionSite.LOCATION_INSPECTION_APPLY)
 
     def empty_row(self, ordinal=0):
         return svc.reconciliation_from(Record(), (),
-                                       decision_site_id=DecisionSite.VEHICLE_IDENTITY_APPLY,
-                                       ordinal=ordinal)
+                                       decision_site_id=DecisionSite.VEHICLE_IDENTITY_APPLY)
 
     def test_row_20_a_real_modern_conflict_still_reads_conflict(self):
         self.assertEqual(self.head((self.agree_row(0), self.conflict_row(1))),
@@ -557,8 +572,11 @@ class PrivacyOfTheNewFields(unittest.TestCase):
         # plausible phone number or a WAMID to prove that neither can be printed. A WAMID
         # base64-encodes the sender's number, so writing a realistic one to assert its
         # absence would put the thing in the repository to say it is not there.
+        #
+        # R2 note: these now arrive inside families the owner AUTHORIZED for display, which
+        # is the point. The family allowlist can no longer carry the refusal on its own;
+        # the shape must, and that is what this asserts.
         cases = [
-            (ClaimType.VEHICLE_MODEL, "Peugeot 208"),
             (ClaimType.INSPECTION_LOCATION, "0000000"),           # a seven-digit run
             (ClaimType.INSPECTION_LOCATION, "cliente@example.com"),
             (ClaimType.INSPECTION_LOCATION, "https://example.com/aviso"),
@@ -566,6 +584,8 @@ class PrivacyOfTheNewFields(unittest.TestCase):
                                             "Ciudad de Buenos Aires"),
             (ClaimType.VEHICLE_MODEL, "wamid.SANITISED-SHAPE-ONLY"),
             (ClaimType.VEHICLE_MODEL, "bk_tok_DO_NOT_LEAK_0001"),
+            (ClaimType.VEHICLE_MODEL, "sk-ABCDEFGHIJKLMNOP"),
+            (ClaimType.SERVICE_INTENT, "-----BEGIN PRIVATE KEY-----"),
         ]
         for claim_type, value in cases:
             with self.subTest(value=value[:18]):
@@ -581,13 +601,20 @@ class PrivacyOfTheNewFields(unittest.TestCase):
         self.assertEqual(row.source_evidence[0].values, ("Palermo",))
         self.assertFalse(row.source_evidence[0].withheld)
 
-    def test_row_26c_vehicle_identity_stays_outside_the_inspector_allowlist(self):
-        """The Inspector does not render make or model today; this milestone does not
-        widen that. The year is an integer and carries nothing identifying."""
-        model = self.row_with("208", ClaimType.VEHICLE_MODEL)
-        self.assertEqual(model.source_evidence[0].values, (None,))
-        year = self.row_with(2020, ClaimType.VEHICLE_YEAR)
-        self.assertEqual(year.source_evidence[0].values, ("2020",))
+    def test_row_26c_vehicle_identity_is_now_authorized_for_display(self):
+        """Owner decision of 2026-09-22: the Inspector is an authenticated audit surface,
+        and an operator cannot read a vehicle decision without seeing the vehicle."""
+        for claim_type, value, shown in (
+                (ClaimType.VEHICLE_MAKE, "Peugeot", "Peugeot"),
+                (ClaimType.VEHICLE_MODEL, "Peugeot 208", "Peugeot 208"),
+                (ClaimType.VEHICLE_YEAR, 2020, "2020"),
+                (ClaimType.VEHICLE_CATEGORY, "AUTO", "AUTO"),
+                (ClaimType.SERVICE_INTENT, "revision_pre_compra", "revision_pre_compra"),
+                (ClaimType.INSPECTION_LOCATION, "Palermo", "Palermo")):
+            with self.subTest(claim_type=claim_type):
+                row = self.row_with(value, claim_type)
+                self.assertEqual(row.source_evidence[0].values, (shown,))
+                self.assertFalse(row.source_evidence[0].withheld)
 
     def test_row_26d_two_values_stay_distinguishable_while_withheld(self):
         a = self.row_with("Peugeot 208").source_evidence[0].value_keys[0]
@@ -766,8 +793,8 @@ class FuzzyAdmissibilityRepair(unittest.TestCase):
             self.assertFalse(instance._fuzzy_identity_accepted(ctx, state, result),
                              "a raising observer is caught, and acceptance is never assumed")
 
-    def test_row_33b_the_contract_version_is_1_1(self):
-        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.1")
+    def test_row_33b_the_contract_version_is_current(self):
+        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.2")
 
 
 if __name__ == "__main__":       # pragma: no cover

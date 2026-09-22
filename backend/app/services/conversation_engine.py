@@ -5518,11 +5518,12 @@ class ConversationEngine:
 
     def _collect_trace_reconciliation(self, record, claims=(), *,
                                       decision_site_id: str = None) -> None:
-        """Capture one reconciliation row. The ordinal is its position within this turn.
+        """Capture one reconciliation row, in the order the turn produced it.
 
-        Two calls from the same decision site on the same claim family would otherwise
-        produce the same `comparison_id`; the ordinal is what keeps repeated calls
-        individually identifiable without reaching for anything outside the turn.
+        Nothing positional is passed. A comparison's identity is derived from what it IS —
+        the decision site, the proposition, the rule, and the content hashes of the claims
+        weighed — so inserting another reconciliation ahead of this one cannot rename it.
+        Repeat executions are numbered by `finalize_rows`, which can see the whole turn.
         """
         if not self._hybrid_trace_on():
             return
@@ -5530,8 +5531,7 @@ class ConversationEngine:
             from .hybrid_trace import reconciliation_from
             self._turn_trace_reconciliations.append(
                 reconciliation_from(record, claims,
-                                    decision_site_id=decision_site_id,
-                                    ordinal=len(self._turn_trace_reconciliations)))
+                                    decision_site_id=decision_site_id))
         except Exception:
             pass
 

@@ -85,7 +85,12 @@ CAN = "CANONICAL_STATE"
 
 
 def contribution(source, *claims, producer=None):
-    """One source's contribution to one reconciliation, shaped as the engine shapes it."""
+    """One source's contribution to one reconciliation, shaped as the engine shapes it.
+
+    `canonical_values` is populated through the same resolver the real builder uses. Under
+    `hybrid-decision-trace/1.2` a comparison needs a canonical identity on both sides to be
+    provable, so a helper that omitted it would manufacture UNPROVEN rows and test nothing.
+    """
     return SourceContribution(
         source=source,
         producer=producer or f"{source.lower()}:test",
@@ -94,6 +99,8 @@ def contribution(source, *claims, producer=None):
         value_keys=tuple(svc.value_key(t, v) for t, v in claims),
         polarities=tuple("ASSERTED" for _ in claims),
         values=tuple(None for _ in claims),
+        canonical_values=tuple(svc.canonical_identity(t, v)[0] for t, v in claims),
+        confidences=tuple(None for _ in claims),
         withheld=True)
 
 

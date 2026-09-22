@@ -27,11 +27,42 @@ click away and already governed by the existing masking policy.
 """
 from __future__ import annotations
 
+import hashlib
 import html
 import json
+import re
 from typing import Any, Optional
 
 TRACE_NOT_CAPTURED = "TRACE NOT CAPTURED — predates hybrid-decision-trace/1.0"
+
+# ── WAMID masking (owner decision, 2026-09-22) ───────────────────────────────
+#
+# A WhatsApp message id base64-encodes the sender's MSISDN. Printing one in full on an
+# operational page hands out a customer's phone number to anyone who can read the page and
+# knows how to decode it — which is not a threat model, it is a base64 decoder.
+#
+# The rendered form is a SHA-256 prefix: stable, so the same message always reads the same
+# and an operator can still tell two messages apart and follow their order; irreversible,
+# so nothing about the number can be recovered from it. The stored payload is untouched,
+# and the authenticated JSON API still returns the real id, because that id is the join key
+# into `whatsapp_messages` and the outbound ledger. Masking is a rendering policy; breaking
+# a durable forensic join would be a different and worse defect.
+_WAMID_RE = re.compile(r"wamid\.[A-Za-z0-9+/=_-]{4,}")
+WAMID_MASK_NOTE = (
+    "Los WAMID se muestran como huella irreversible: identifican y ordenan el mensaje sin "
+    "revelar el teléfono del cliente, que va codificado dentro del WAMID real.")
+
+
+def mask_wamid(value: Any) -> Any:
+    """`wamid.…` → a stable, irreversible fingerprint. Anything else is returned unchanged."""
+    if not isinstance(value, str) or not value.startswith("wamid."):
+        return value
+    return "wamid⋯" + hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+
+def mask_wamids_in_text(text: str) -> str:
+    """Mask every WAMID inside an already-serialized blob, such as the raw JSON panel."""
+    return _WAMID_RE.sub(lambda m: mask_wamid(m.group(0)), text)
 
 # L4.7W5-HYBRID-TRACE-HARDENING — the scope of this page, stated on the page itself.
 #
@@ -75,6 +106,15 @@ LABEL_GLOSSARY = (
     ("SINGLE PRODUCER",
      "exactamente una fuente aportó evidencia utilizable; no hubo comparación, aunque el "
      "reconciliador haya aceptado el valor"),
+    ("PARALLEL EVIDENCE",
+     "participaron dos o más fuentes pero ninguna habló del mismo campo canónico: "
+     "dijeron cosas distintas, lo cual no es acuerdo ni desacuerdo"),
+    ("COMPARISON UNPROVEN",
+     "sí hay un campo canónico compartido y la evidencia capturada no alcanza para probar "
+     "que los valores significan lo mismo. No probado no es compatible"),
+    ("AMBIGUOUS EVIDENCE",
+     "la única fuente participante se contradice a sí misma; eso es ambigüedad de esa "
+     "fuente, nunca un conflicto entre motores"),
     ("NO EVIDENCE",
      "ninguna fuente aportó evidencia utilizable a esa llamada; no culpa a ningún motor"),
     ("NOT ROUTED",
@@ -111,6 +151,8 @@ _BADGE_CLASS = {
     "NO RESPONSE PRODUCED": "warn",
     "NO RULE": "warn", "SEMANTIC MISSING": "warn", "SEMANTIC PENDING": "warn",
     "SINGLE PRODUCER": "warn", "NO EVIDENCE": "warn", "NOT ROUTED": "warn",
+    "PARALLEL EVIDENCE": "warn", "COMPARISON UNPROVEN": "warn",
+    "AMBIGUOUS EVIDENCE": "warn",
     "ERROR": "bad", "LEGACY PROVENANCE UNAVAILABLE": "warn",
     "SINGLE SOURCE DECISION": "warn", "NO COMPARISON": "warn",
     "TRACE INCOMPLETE": "warn",
@@ -177,11 +219,23 @@ def _e(value: Any) -> str:
 
 
 def _page(title: str, body: str) -> str:
-    return (f"<!DOCTYPE html>\n<html lang=\"es\">\n<head>\n"
+    """Assemble the page, then sweep every WAMID out of the finished HTML.
+
+    The sweep is the backstop, and it is why the guarantee is structural rather than a
+    promise. Masking each panel by hand nearly worked: the reconciliation table and the raw
+    trace panel were masked, and the semantic-evidence panel was not, because a WAMID also
+    travels inside `provenance.source_message_ids` on every claim the interpreter produced.
+    A rule that depends on remembering every panel is a rule that fails at the next panel.
+
+    Masking is idempotent — the masked form uses `⋯`, which the pattern cannot match — so
+    running it over already-masked output changes nothing.
+    """
+    page = (f"<!DOCTYPE html>\n<html lang=\"es\">\n<head>\n"
             f"<meta charset=\"utf-8\">\n"
             f"<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n"
             f"<title>{html.escape(title)}</title>\n<style>{_CSS}</style>\n</head>\n"
             f"<body><div class=\"wrap\">{body}</div></body>\n</html>")
+    return mask_wamids_in_text(page)
 
 
 def _badges(badges) -> str:
@@ -206,7 +260,7 @@ def _messages_card(trace: dict) -> str:
         rows = '<tr><td colspan="3" class="empty">Sin mensajes registrados</td></tr>'
     else:
         rows = "".join(
-            f"<tr><td>{i + 1}</td><td class=\"mono\">{_e(wamid)}</td>"
+            f"<tr><td>{i + 1}</td><td class=\"mono\">{_e(mask_wamid(wamid))}</td>"
             f"<td>{_e(stamps[i] if i < len(stamps) else None)}</td></tr>"
             for i, wamid in enumerate(ids))
     return (
@@ -218,7 +272,8 @@ def _messages_card(trace: dict) -> str:
             ("Hash de entrada", f'<span class="mono">{_e(trace.get("input_hash"))}</span>'),
         ])
         + '<p class="note">El texto no se reproduce aquí. El hash identifica la ráfaga '
-          'normalizada; las palabras del cliente están en la conversación.</p></div>')
+          'normalizada; las palabras del cliente están en la conversación.</p>'
+        + f'<p class="note">{html.escape(WAMID_MASK_NOTE)}</p></div>')
 
 
 def _semantic_card(sem: dict) -> str:
@@ -297,6 +352,15 @@ NO_PARTICIPATION_SENTENCE = (
 SINGLE_PRODUCER_SENTENCE = (
     "Una sola fuente aportó evidencia. Que el reconciliador haya aceptado el valor no "
     "convierte la decisión en un acuerdo entre motores: no hubo con qué compararla.")
+PARALLEL_EVIDENCE_SENTENCE = (
+    "Participaron dos o más fuentes y ninguna habló del mismo campo canónico. Que no haya "
+    "contradicción NO significa que hayan coincidido: hablaron de cosas distintas.")
+COMPARISON_UNPROVEN_SENTENCE = (
+    "Hay un campo canónico compartido y la evidencia capturada no permite probar que los "
+    "valores signifiquen lo mismo. Se informa como no probado, nunca como acuerdo.")
+AMBIGUOUS_EVIDENCE_SENTENCE = (
+    "La única fuente participante se contradice a sí misma. Se registra como ambigüedad de "
+    "esa fuente y se conserva la polaridad; no es un conflicto entre motores.")
 LEGACY_ROW_SENTENCE = (
     "Traza «hybrid-decision-trace/1.0»: esas filas registran que algo participó, pero no "
     "quién. No se puede probar acuerdo ni contradicción a nivel de fila. La etiqueta "
@@ -351,20 +415,76 @@ def _evidence_cell(row: dict) -> str:
         keys = contribution.get("value_keys") or []
         values = contribution.get("values") or []
         polarities = contribution.get("polarities") or []
+        canonicals = contribution.get("canonical_values") or []
         for index, claim_type in enumerate(types):
             shown = values[index] if index < len(values) else None
             key = keys[index] if index < len(keys) else None
             polarity = polarities[index] if index < len(polarities) else None
+            canonical = canonicals[index] if index < len(canonicals) else None
             rendered = (_e(shown) if shown is not None
                         else f'<span class="empty">«retenido»</span> '
                              f'<span class="mono">#{_e(key)}</span>')
             negated = ' <span class="badge bad">NEGADO</span>' if polarity == "NEGATED" else ""
+            # The canonical identity is the resolver's own name for the thing, which is what
+            # makes two differently-phrased values comparable at all. Shown so an operator
+            # can see WHY they were treated as one, rather than being asked to trust it.
+            canonical_html = (f' <span class="sub2">→ canónico: {_e(canonical)}</span>'
+                              if canonical and canonical != shown else "")
             items.append(f'<li><span class="mono">{_e(claim_type)}</span> = '
-                         f'{rendered}{negated}</li>')
+                         f'{rendered}{negated}{canonical_html}</li>')
         producer = contribution.get("producer")
+        confidences = [c for c in (contribution.get("confidences") or []) if c is not None]
+        confidence_html = ""
+        if confidences:
+            confidence_html = ('<div class="sub2">confianza declarada: '
+                               + ", ".join(_e(c) for c in confidences)
+                               + ' (advisoria; ninguna regla la lee)</div>')
+        classes = contribution.get("evidence_classes") or []
+        classes_html = (f'<div class="sub2 mono">{_e(", ".join(str(c) for c in classes))}</div>'
+                        if classes else "")
         blocks.append(f'<div class="srcblock"><strong>{_e(label)}</strong>'
                       f'<div class="sub2 mono">{_e(producer)}</div>'
-                      f'<ul class="vals">{"".join(items)}</ul></div>')
+                      f'{classes_html}'
+                      f'<ul class="vals">{"".join(items)}</ul>{confidence_html}</div>')
+    return "".join(blocks)
+
+
+_VERDICT_LABEL = {
+    "COMPATIBLE": ("compatible", "good"),
+    "INCOMPATIBLE": ("incompatible", "bad"),
+    "UNPROVEN": ("no probado", "warn"),
+}
+
+
+def _propositions_cell(row: dict) -> str:
+    """What was actually compared, field by field, and on what basis.
+
+    An empty cell beside two participating sources is the point: it says the producers
+    never spoke about the same thing, which is why the row cannot read AGREE.
+    """
+    if row.get("legacy"):
+        return '<span class="empty">no registrado en 1.0</span>'
+    propositions = row.get("compared_propositions") or []
+    if not propositions:
+        return ('<span class="empty">ningún campo canónico compartido</span>')
+    blocks = []
+    for proposition in propositions:
+        label, cls = _VERDICT_LABEL.get(str(proposition.get("verdict")),
+                                        (str(proposition.get("verdict")), ""))
+        items = []
+        for entry in proposition.get("canonical_by_source") or []:
+            source, shown, key, polarity = (list(entry) + [None, None, None, None])[:4]
+            source_label = SOURCE_LABELS.get(str(source), (str(source), ""))[0]
+            rendered = (_e(shown) if shown is not None
+                        else f'<span class="empty">«retenido»</span> '
+                             f'<span class="mono">#{_e(key)}</span>')
+            negated = ' <span class="badge bad">NEGADO</span>' if polarity == "NEGATED" else ""
+            items.append(f'<li>{_e(source_label)}: {rendered}{negated}</li>')
+        blocks.append(
+            f'<div class="srcblock"><span class="mono">{_e(proposition.get("claim_type"))}'
+            f'</span> <span class="badge {cls}">{_e(label)}</span>'
+            f'<ul class="vals">{"".join(items)}</ul>'
+            f'<div class="sub2">{_e(proposition.get("basis"))}</div></div>')
     return "".join(blocks)
 
 
@@ -373,11 +493,16 @@ def _counts_line(counts: dict) -> str:
     parts = [
         f'familias distintas: <strong>{_e(counts.get("distinct_families"))}</strong>',
         f'filas de comparación: <strong>{_e(counts.get("comparison_rows"))}</strong>',
+        f'comparaciones lógicas distintas: {_e(counts.get("distinct_comparisons"))}',
         f'comparadas: {_e(counts.get("compared"))}',
         f'una sola fuente: {_e(counts.get("single_producer"))}',
+        f'evidencia paralela: {_e(counts.get("parallel_evidence"))}',
+        f'no probadas: {_e(counts.get("comparison_unproven"))}',
         f'sin evidencia: {_e(counts.get("no_evidence"))}',
         f'no ruteadas: {_e(counts.get("not_routed"))}',
     ]
+    if counts.get("ambiguous_evidence"):
+        parts.append(f'ambiguas: {_e(counts.get("ambiguous_evidence"))}')
     if counts.get("errored"):
         parts.append(f'con error: {_e(counts.get("errored"))}')
     if counts.get("legacy_unknown"):
@@ -425,22 +550,35 @@ def _reconciliation_card(rows, counts: dict, *, semantic: dict) -> str:
         site = row.get("decision_site_id")
         site_html = (f'<div class="sub2 mono">{_e(site)}</div>' if site else
                      '<div class="sub2 empty">sitio no registrado (1.0)</div>')
+        identity = row.get("logical_comparison_id")
+        if identity:
+            occurrence = row.get("occurrence_index") or 0
+            repeat = f' · ejecución {occurrence + 1}' if occurrence else ""
+            site_html += (f'<div class="sub2 mono">#{_e(identity)}{_e(repeat)}</div>')
+        contradiction = row.get("self_contradiction_sources") or []
+        contradiction_html = ""
+        if contradiction:
+            names = ", ".join(_e(SOURCE_LABELS.get(str(s), (str(s), ""))[0])
+                              for s in contradiction)
+            contradiction_html = (f'<div class="sub2">se contradice a sí misma: {names}</div>')
         cells.append(
             f'<tr><td>{_e(purpose)}{site_html}</td>'
             f'<td class="mono">{_e(row.get("claim_family"))}</td>'
             f'<td>{_sources_cell(row)}</td>'
             f'<td>{_evidence_cell(row)}</td>'
+            f'<td>{_propositions_cell(row)}</td>'
             f'<td><span class="badge {badge_cls}">'
             f'{_e(effective.replace("_", " "))}</span>{captured_html}'
-            f'<div class="sub2">polaridad: {_e(row.get("information_state"))}</div></td>'
+            f'<div class="sub2">polaridad: {_e(row.get("information_state"))}</div>'
+            f'{contradiction_html}</td>'
             f'<td>{_e(row.get("outcome"))}</td>'
             f'<td class="mono">{_e(row.get("rule_id"))}@{_e(row.get("rule_version"))}</td>'
             f'<td>{_e(row.get("reason_code"))}</td></tr>')
 
     body = ('<div class="tableWrap"><table><thead><tr>'
             '<th>Decisión</th><th>Familia</th><th>Fuentes que participaron</th>'
-            '<th>Evidencia comparada</th><th>Clasificación</th><th>Resultado</th>'
-            '<th>Regla</th><th>Motivo</th></tr></thead>'
+            '<th>Evidencia aportada</th><th>Qué se comparó</th><th>Clasificación</th>'
+            '<th>Resultado</th><th>Regla</th><th>Motivo</th></tr></thead>'
             f'<tbody>{"".join(cells)}</tbody></table></div>')
     body += f'<p class="note">{_counts_line(counts or {})}</p>'
 
@@ -450,6 +588,12 @@ def _reconciliation_card(rows, counts: dict, *, semantic: dict) -> str:
         notes.append(html.escape(LEGACY_ROW_SENTENCE))
     if "SINGLE_PRODUCER" in kinds:
         notes.append(html.escape(SINGLE_PRODUCER_SENTENCE))
+    if "PARALLEL_EVIDENCE" in kinds:
+        notes.append(html.escape(PARALLEL_EVIDENCE_SENTENCE))
+    if "COMPARISON_UNPROVEN" in kinds:
+        notes.append(html.escape(COMPARISON_UNPROVEN_SENTENCE))
+    if "AMBIGUOUS_EVIDENCE" in kinds:
+        notes.append(html.escape(AMBIGUOUS_EVIDENCE_SENTENCE))
     if "NOT_ROUTED" in kinds or any(r.get("not_routed_sources") for r in rows):
         notes.append(html.escape(NOT_ROUTED_SENTENCE))
     if "NO_EVIDENCE" in kinds:
@@ -605,7 +749,11 @@ def render_turn_trace_page(record: Optional[dict], turn_id: str = "") -> str:
         ("Duración", f'{_e(trace.get("duration_ms"))} ms'
                      if trace.get("duration_ms") is not None else "—"),
     ])
-    dumped = html.escape(json.dumps(trace, ensure_ascii=False, indent=2, sort_keys=True))
+    # The stored payload is evidence and is never altered; what is RENDERED from it is
+    # masked, exactly as the table above is. A panel that reprints the raw ids would undo
+    # the masking three lines further down the page.
+    dumped = html.escape(mask_wamids_in_text(
+        json.dumps(trace, ensure_ascii=False, indent=2, sort_keys=True)))
     body = (
         f"<h1>Decisión del turno</h1>"
         f'<p class="sub mono">{_e(trace.get("turn_id"))}</p>'
