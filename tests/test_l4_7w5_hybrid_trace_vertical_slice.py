@@ -95,7 +95,11 @@ def _trace(**over) -> HybridDecisionTrace:
 class TraceContract(unittest.TestCase):
 
     def test_trc_01_version_is_pinned(self):
-        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.0")
+        """1.1 since L4.7W5-TRACE-ROW-SEMANTICS. 1.0 stays readable, and is named."""
+        from app.schemas.hybrid_trace import READABLE_VERSIONS, TRACE_VERSION_1_0
+        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.1")
+        self.assertEqual(TRACE_VERSION_1_0, "hybrid-decision-trace/1.0")
+        self.assertIn(TRACE_VERSION_1_0, READABLE_VERSIONS)
         self.assertEqual(_trace().trace_version, TRACE_VERSION)
 
     def test_trc_02_normalization_folds_case_and_accents(self):
@@ -215,13 +219,22 @@ class ProducerAdapters(unittest.TestCase):
     def test_cls_08_an_absent_provider_is_absent_not_an_error(self):
         self.assertEqual(svc.semantic_evidence_from(None, "async").status, "ABSENT")
 
-    def test_cls_09_information_state_maps_to_classification(self):
+    def test_cls_09_information_state_no_longer_decides_the_row(self):
+        """`BOTH` with no claims is not a conflict — nobody was there to disagree.
+
+        This assertion used to read CONFLICT. `InformationState` describes the polarity of
+        the evidence about a claim type; with an empty claim set there is no evidence and
+        no producer, and calling that a contradiction between engines was the defect
+        L4.7W5-TRACE-ROW-SEMANTICS exists to remove. The state is still recorded on the row.
+        """
         class Rec:
             claim_type, information_state = "VEHICLE_MODEL", "BOTH"
             rule_id, rule_version, outcome, reason = "r", "1.0", "NEEDS_HUMAN", "why"
             evidence_ids = ()
         out = svc.reconciliation_from(Rec(), ())
-        self.assertEqual(out.classification, Classification.CONFLICT)
+        self.assertEqual(out.classification, Classification.NO_EVIDENCE)
+        self.assertEqual(out.information_state, "BOTH")
+        self.assertEqual(out.participating_sources, ())
         self.assertEqual(out.semantic_input, "ABSENT")
         self.assertEqual(out.ce_input, "ABSENT")
 

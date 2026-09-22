@@ -15,8 +15,24 @@ Two things are separated here and must stay separated:
 * **reconciliation coverage** — did that evidence reach the reconciler that needed it?
 
 A turn where the interpreter succeeded but its claims were routed elsewhere is
-`SEMANTIC NOT ROUTED`, not `SEMANTIC MISSING`, and the turn is
-`PARTIAL RECONCILIATION`, not `CONFLICT`.
+`SEMANTIC NOT ROUTED`, not `SEMANTIC MISSING`, and the turn is not `CONFLICT`.
+
+**Amended by L4.7W5-TRACE-ROW-SEMANTICS (hybrid-decision-trace/1.1).** This suite was
+written against a row vocabulary derived from `InformationState`, which describes evidence
+POLARITY and cannot say who supplied it. Under 1.1 a row is classified from recorded
+producer participation, so the expectations below moved:
+
+* a row with one contributing source is `SINGLE_PRODUCER`, never `AGREE`;
+* a row with none is `NO_EVIDENCE` — or `NOT_ROUTED` when the interpreter provably
+  produced claims elsewhere in the turn — and never `SEMANTIC_MISSING`, which blamed a
+  named producer for an absence that was nobody's in particular;
+* the preserved 1.0 trace can no longer reach `PARTIAL_RECONCILIATION`: that headline
+  requires a proven agreement, and its surviving `AGREE` row was one producer. It reads
+  `TRACE_INCOMPLETE`, which is weaker, and true.
+
+Every assertion that changed changed because it pinned a false statement about producers.
+No assertion about CONFLICT weakened: CONFLICT still requires a row that proves it, and now
+also requires two distinct sources to have supplied incompatible evidence.
 
 LIVE-01..12  the preserved production trace, sanitized, as the permanent regression
 MTX-01..12   the classification matrix
@@ -56,21 +72,90 @@ import app.models as models
 from app.models import HybridDecisionTraceRow
 from app.schemas.hybrid_trace import (CanonicalSnapshot, Classification,
                                       ReconciliationEvidence, ResultKind, RuleEvidence,
-                                      SemanticEvidence)
+                                      SemanticEvidence, SourceContribution)
 from app.services import hybrid_trace as svc
 
 FIXTURE = ROOT / "tests" / "fixtures" / "hybrid_trace_live_partial_reconciliation.json"
 LIVE = json.loads(FIXTURE.read_text(encoding="utf-8"))
 
 
-def rows(*classifications, semantic_present=()):
-    """Reconciliation rows by classification; `semantic_present` marks routed indices."""
-    return tuple(
-        ReconciliationEvidence(
-            claim_family=f"family.{i}",
-            semantic_input="PRESENT" if i in semantic_present else "ABSENT",
-            ce_input="PRESENT", classification=c)
-        for i, c in enumerate(classifications))
+SEM = "SEMANTIC"
+DET = "DETERMINISTIC"
+CAN = "CANONICAL_STATE"
+
+
+def contribution(source, *claims, producer=None):
+    """One source's contribution to one reconciliation, shaped as the engine shapes it."""
+    return SourceContribution(
+        source=source,
+        producer=producer or f"{source.lower()}:test",
+        claim_types=tuple(t for t, _ in claims),
+        claim_ids=tuple(f"{source.lower()}-{i}" for i, _ in enumerate(claims)),
+        value_keys=tuple(svc.value_key(t, v) for t, v in claims),
+        polarities=tuple("ASSERTED" for _ in claims),
+        values=tuple(None for _ in claims),
+        withheld=True)
+
+
+def row(family="vehicle.model", contributions=(), *, error=None, state=None,
+        site="vehicle.identity.apply"):
+    """A 1.1 reconciliation row, classified the way the engine classifies it."""
+    present = svc.participating_sources(contributions)
+    return ReconciliationEvidence(
+        claim_family=family,
+        semantic_input=("PRESENT" if SEM in present else "ABSENT"),
+        ce_input=("PRESENT" if (DET in present or CAN in present) else "ABSENT"),
+        classification=svc.classify_row(contributions, error_category=error),
+        decision_site_id=site,
+        participating_sources=tuple(dict.fromkeys(present)),
+        source_evidence=tuple(contributions),
+        information_state=state,
+        error_category=error)
+
+
+#: The evidence shape that produces each row outcome. Named for the outcome so the matrix
+#: below stays readable, but every one of them is built from real contributions — the
+#: classification is computed, never asserted into place.
+def _agree(i):
+    return (contribution(SEM, ("vehicle.model", "peugeot 208")),
+            contribution(DET, ("vehicle.model", "peugeot 208")))
+
+
+def _conflict(i):
+    return (contribution(SEM, ("vehicle.model", "peugeot 208")),
+            contribution(DET, ("vehicle.model", "ford ka")))
+
+
+SHAPES = {
+    Classification.AGREE: _agree,
+    Classification.CONFLICT: _conflict,
+    Classification.SINGLE_PRODUCER: lambda i: (
+        contribution(DET, ("vehicle.model", "peugeot 208")),),
+    Classification.NO_EVIDENCE: lambda i: (),
+    Classification.NOT_ROUTED: lambda i: (),
+    Classification.ERROR: lambda i: (),
+}
+
+
+def rows(*classifications):
+    """Rows built from real contributions, one per requested outcome."""
+    out = []
+    for i, wanted in enumerate(classifications):
+        contributions = SHAPES[wanted](i)
+        out.append(row(family=f"family.{i}", contributions=contributions,
+                       error=("ProducerError" if wanted == Classification.ERROR else None)))
+    return tuple(out)
+
+
+def _dc_to_dict(obj):
+    """A dataclass row as the payload stores it."""
+    import dataclasses
+    return dataclasses.asdict(obj)
+
+
+def final(reconciliations, semantic):
+    """Rows as the writer stores them: settled against the turn's semantic evidence."""
+    return svc.finalize_rows(reconciliations, semantic)
 
 
 def sem(status="OK", claims=("vehicle_mentions",)):
@@ -112,16 +197,31 @@ class PreservedLiveTrace(unittest.TestCase):
             [r for r in LIVE["reconciliation"] if r["classification"] == "CONFLICT"], [])
 
     def test_live_03_the_old_algorithm_returned_conflict(self):
-        stored = rows(*[r["classification"] for r in LIVE["reconciliation"]])
-        self.assertEqual(old_algorithm(stored), Classification.CONFLICT)
+        """`AGREE if all(...) else CONFLICT`, over the labels the fixture actually holds."""
+        stored = [r["classification"] for r in LIVE["reconciliation"]]
+        self.assertEqual(
+            Classification.AGREE if all(c == Classification.AGREE for c in stored)
+            else Classification.CONFLICT,
+            Classification.CONFLICT)
         self.assertEqual(LIVE["badges"][0], "CONFLICT",
                          "the fixture must keep the wrong headline it was written with")
 
-    def test_live_04_the_corrected_algorithm_returns_partial_reconciliation(self):
-        self.assertEqual(self.headline, Classification.PARTIAL_RECONCILIATION)
+    def test_live_04_the_corrected_algorithm_returns_trace_incomplete(self):
+        """Weaker than the 1.0-era reading, and the only one the record can carry.
 
-    def test_live_05_the_supporting_condition_is_semantic_not_routed(self):
-        self.assertEqual(self.conditions, (Classification.SEMANTIC_NOT_ROUTED,))
+        `PARTIAL_RECONCILIATION` asserts that something WAS compared. This trace's one
+        surviving `AGREE` row had a single contributing producer, and a 1.0 row cannot
+        prove otherwise, so nothing here was compared and the honest headline says the
+        trace is incomplete rather than partially reconciled.
+        """
+        self.assertEqual(self.headline, Classification.TRACE_INCOMPLETE)
+        self.assertNotEqual(self.headline, Classification.AGREE)
+        self.assertNotEqual(self.headline, Classification.CONFLICT)
+
+    def test_live_05_the_conditions_name_both_reasons(self):
+        self.assertEqual(self.conditions,
+                         (Classification.NOT_ROUTED,
+                          Classification.LEGACY_PROVENANCE_UNAVAILABLE))
 
     def test_live_06_it_is_not_called_semantic_missing(self):
         """The interpreter ran and produced three claim families. Nothing was missing."""
@@ -133,10 +233,15 @@ class PreservedLiveTrace(unittest.TestCase):
         self.assertIn("vehicle_mentions", LIVE["semantic"]["produced_claims"])
 
     def test_live_08_the_reconciler_is_shown_as_not_having_received_claims(self):
-        from app.ui.hybrid_trace_view import _row_semantic_cell
-        cell = _row_semantic_cell(LIVE["reconciliation"][0], LIVE["semantic"])
-        self.assertIn("NOT ROUTED", cell)
-        self.assertNotIn("ABSENT", cell)
+        first, second = svc.row_summaries_from_payload(LIVE)
+        self.assertEqual(first["effective_classification"], Classification.NOT_ROUTED)
+        self.assertEqual(first["captured_classification"], "SEMANTIC_MISSING")
+        self.assertTrue(first["legacy"])
+        self.assertEqual(second["effective_classification"],
+                         Classification.LEGACY_PROVENANCE_UNAVAILABLE)
+        self.assertEqual(second["captured_classification"], "AGREE",
+                         "the withdrawn label stays visible as the record of the claim")
+        self.assertTrue(second["reclassified"])
 
     def test_live_09_captured_and_effective_stay_distinguishable(self):
         db = _db()
@@ -152,7 +257,7 @@ class PreservedLiveTrace(unittest.TestCase):
         summary = _trace_row_summary(db.query(HybridDecisionTraceRow).one())
         self.assertEqual(summary["captured_classification"], "CONFLICT")
         self.assertEqual(summary["effective_classification"],
-                         Classification.PARTIAL_RECONCILIATION)
+                         Classification.TRACE_INCOMPLETE)
         self.assertTrue(summary["reclassified"])
         self.assertEqual(summary["classification"], summary["captured_classification"],
                          "the compatibility field must be the CAPTURED value, unambiguously")
@@ -193,11 +298,11 @@ class PreservedLiveTrace(unittest.TestCase):
             started_at="s", completed_at="c", duration_ms=1,
             ordered_message_ids=("w",), message_timestamps=("t",), burst_texts=["x"],
             semantic=sem(), ce_rules=(),
-            reconciliations=rows(Classification.SEMANTIC_MISSING, Classification.AGREE,
-                                 semantic_present=(1,)),
+            reconciliations=rows(Classification.SINGLE_PRODUCER, Classification.AGREE),
             before=svc.snapshot_state(None, None), after=svc.snapshot_state(None, None),
             action="replied", detail=None, answer_source="CE_AI", outbound={})
         self.assertEqual(trace.badges[0], "PARTIAL RECONCILIATION")
+        self.assertIn("SINGLE PRODUCER", trace.badges)
         self.assertIn("SEMANTIC NOT ROUTED", trace.badges)
         db = _db()
         self.assertTrue(svc.persist(db, trace))
@@ -216,16 +321,15 @@ def _db() -> Session:
 class ClassificationMatrix(unittest.TestCase):
 
     def head(self, reconciliations, semantic, ce_rules=()):
-        return svc.classify(semantic, ce_rules, reconciliations)
+        return svc.classify(semantic, ce_rules, final(reconciliations, semantic))
 
-    def test_mtx_01_single_agree_with_semantic_participating(self):
-        self.assertEqual(self.head(rows(Classification.AGREE, semantic_present=(0,)), sem()),
+    def test_mtx_01_single_agree_with_two_sources(self):
+        self.assertEqual(self.head(rows(Classification.AGREE), sem()),
                          Classification.AGREE)
 
-    def test_mtx_02_two_agrees_with_semantic_participating(self):
+    def test_mtx_02_two_agrees(self):
         self.assertEqual(
-            self.head(rows(Classification.AGREE, Classification.AGREE,
-                           semantic_present=(0, 1)), sem()),
+            self.head(rows(Classification.AGREE, Classification.AGREE), sem()),
             Classification.AGREE)
 
     def test_mtx_03_single_conflict(self):
@@ -234,48 +338,44 @@ class ClassificationMatrix(unittest.TestCase):
 
     def test_mtx_04_agree_plus_conflict_is_conflict(self):
         self.assertEqual(
-            self.head(rows(Classification.AGREE, Classification.CONFLICT,
-                           semantic_present=(0, 1)), sem()),
+            self.head(rows(Classification.AGREE, Classification.CONFLICT), sem()),
             Classification.CONFLICT)
 
-    def test_mtx_05_semantic_missing_alone_with_no_semantic_evidence(self):
-        self.assertEqual(self.head(rows(Classification.SEMANTIC_MISSING), ABSENT_SEM),
-                         Classification.SEMANTIC_MISSING)
+    def test_mtx_05_one_producer_alone_is_a_single_source_decision(self):
+        """Was `SEMANTIC_MISSING`. One producer decided; nothing was missing about it."""
+        self.assertEqual(self.head(rows(Classification.SINGLE_PRODUCER), ABSENT_SEM),
+                         Classification.SINGLE_SOURCE_DECISION)
 
-    def test_mtx_06_agree_plus_missing_with_semantic_absent(self):
-        headline = self.head(rows(Classification.AGREE, Classification.SEMANTIC_MISSING,
-                                  semantic_present=(0,)), ABSENT_SEM)
-        self.assertEqual(headline, Classification.PARTIAL_RECONCILIATION)
+    def test_mtx_06_agree_plus_single_with_semantic_absent(self):
+        reconciliations = rows(Classification.AGREE, Classification.SINGLE_PRODUCER)
+        self.assertEqual(self.head(reconciliations, ABSENT_SEM),
+                         Classification.PARTIAL_RECONCILIATION)
         self.assertEqual(
-            svc.supporting_conditions(ABSENT_SEM,
-                                      rows(Classification.AGREE,
-                                           Classification.SEMANTIC_MISSING,
-                                           semantic_present=(0,))),
-            (Classification.SEMANTIC_MISSING,))
+            svc.supporting_conditions(ABSENT_SEM, final(reconciliations, ABSENT_SEM)),
+            (Classification.SINGLE_PRODUCER,))
 
-    def test_mtx_07_agree_plus_missing_with_semantic_ok_is_not_routed(self):
-        """The preserved live turn's shape."""
-        reconciliations = rows(Classification.AGREE, Classification.SEMANTIC_MISSING,
-                               semantic_present=(0,))
+    def test_mtx_07_agree_plus_single_with_semantic_ok_names_the_unrouted_source(self):
+        """The preserved live turn's shape, told truthfully."""
+        reconciliations = rows(Classification.AGREE, Classification.SINGLE_PRODUCER)
         self.assertEqual(self.head(reconciliations, sem()),
                          Classification.PARTIAL_RECONCILIATION)
-        self.assertEqual(svc.supporting_conditions(sem(), reconciliations),
-                         (Classification.SEMANTIC_NOT_ROUTED,))
+        self.assertEqual(svc.supporting_conditions(sem(), final(reconciliations, sem())),
+                         (Classification.SINGLE_PRODUCER,
+                          Classification.SEMANTIC_NOT_ROUTED))
 
-    def test_mtx_08_semantic_error_row(self):
-        self.assertEqual(self.head(rows(Classification.SEMANTIC_ERROR), ERROR_SEM),
-                         Classification.SEMANTIC_ERROR)
+    def test_mtx_08_an_errored_row_alone_cannot_be_summarised_more_strongly(self):
+        self.assertEqual(self.head(rows(Classification.ERROR), ERROR_SEM),
+                         Classification.TRACE_INCOMPLETE)
 
-    def test_mtx_09_agree_plus_semantic_error_is_never_conflict(self):
-        headline = self.head(rows(Classification.AGREE, Classification.SEMANTIC_ERROR,
-                                  semantic_present=(0,)), ERROR_SEM)
+    def test_mtx_09_agree_plus_error_is_never_conflict(self):
+        headline = self.head(rows(Classification.AGREE, Classification.ERROR), ERROR_SEM)
         self.assertEqual(headline, Classification.PARTIAL_RECONCILIATION)
         self.assertNotEqual(headline, Classification.CONFLICT)
 
-    def test_mtx_10_ce_missing_row(self):
-        self.assertEqual(self.head(rows(Classification.CE_MISSING), sem()),
-                         Classification.CE_MISSING)
-        self.assertNotEqual(self.head(rows(Classification.CE_MISSING), sem()),
+    def test_mtx_10_a_row_that_received_nothing_is_no_comparison(self):
+        self.assertEqual(self.head(rows(Classification.NO_EVIDENCE), ABSENT_SEM),
+                         Classification.NO_COMPARISON)
+        self.assertNotEqual(self.head(rows(Classification.NO_EVIDENCE), sem()),
                             Classification.CONFLICT)
 
     def test_mtx_11_no_reconciliation_rows_is_no_rule(self):
@@ -304,14 +404,15 @@ class ClassificationMatrix(unittest.TestCase):
 class ConflictIffAConflictRow(unittest.TestCase):
 
     ROW_VALUES = (Classification.AGREE, Classification.CONFLICT,
-                  Classification.SEMANTIC_MISSING, Classification.SEMANTIC_ERROR,
-                  Classification.CE_MISSING, Classification.NO_RULE)
+                  Classification.SINGLE_PRODUCER, Classification.NO_EVIDENCE,
+                  Classification.ERROR)
 
     def test_iff_01_every_single_row_combination(self):
         for value in self.ROW_VALUES:
             for semantic in (sem(), ABSENT_SEM, ERROR_SEM):
                 with self.subTest(row=value, semantic=semantic.status):
-                    headline = svc.classify(semantic, (), rows(value))
+                    headline = svc.classify(semantic, (),
+                                            final(rows(value), semantic))
                     self.assertEqual(headline == Classification.CONFLICT,
                                      value == Classification.CONFLICT)
 
@@ -319,7 +420,7 @@ class ConflictIffAConflictRow(unittest.TestCase):
         for a in self.ROW_VALUES:
             for b in self.ROW_VALUES:
                 with self.subTest(pair=(a, b)):
-                    headline = svc.classify(sem(), (), rows(a, b, semantic_present=(0, 1)))
+                    headline = svc.classify(sem(), (), final(rows(a, b), sem()))
                     expected = Classification.CONFLICT in (a, b)
                     self.assertEqual(headline == Classification.CONFLICT, expected)
 
@@ -344,8 +445,7 @@ class HistoryIsNotRewritten(unittest.TestCase):
             started_at="s", completed_at="c", duration_ms=1,
             ordered_message_ids=("w",), message_timestamps=("t",), burst_texts=["x"],
             semantic=sem(), ce_rules=(),
-            reconciliations=rows(Classification.AGREE, Classification.SEMANTIC_MISSING,
-                                 semantic_present=(0,)),
+            reconciliations=rows(Classification.AGREE, Classification.SINGLE_PRODUCER),
             before=svc.snapshot_state(None, None), after=svc.snapshot_state(None, None),
             action="replied", detail=None, answer_source="CE_AI", outbound={})
         headline, conditions = svc.effective_from_payload(trace.to_payload())
@@ -373,8 +473,10 @@ class HistoryIsNotRewritten(unittest.TestCase):
         out = read_turn("h2", db)
         self.assertEqual(out["captured_classification"], "CONFLICT")
         self.assertEqual(out["effective_classification"],
-                         Classification.PARTIAL_RECONCILIATION)
-        self.assertEqual(out["supporting_conditions"], [Classification.SEMANTIC_NOT_ROUTED])
+                         Classification.TRACE_INCOMPLETE)
+        self.assertEqual(out["supporting_conditions"],
+                         [Classification.NOT_ROUTED,
+                          Classification.LEGACY_PROVENANCE_UNAVAILABLE])
 
     def test_hist_05_no_backfill_helper_exists(self):
         source = (ROOT / "backend" / "app" / "services"
@@ -392,10 +494,13 @@ class WordingAndRendering(unittest.TestCase):
         from app.ui.hybrid_trace_view import render_turn_trace_page
         payload = payload or LIVE
         headline, conditions = svc.effective_from_payload(payload)
-        return render_turn_trace_page({"captured": True, "trace": payload,
-                                       "captured_classification": payload["badges"][0],
-                                       "effective_classification": headline,
-                                       "supporting_conditions": list(conditions)})
+        return render_turn_trace_page({
+            "captured": True, "trace": payload,
+            "captured_classification": payload["badges"][0],
+            "effective_classification": headline,
+            "supporting_conditions": list(conditions),
+            "reconciliation_rows": list(svc.row_summaries_from_payload(payload)),
+            "reconciliation_counts": svc.counts_from_payload(payload)})
 
     def test_word_01_not_routed_sentence_is_shown(self):
         from app.ui.hybrid_trace_view import NOT_ROUTED_SENTENCE
@@ -406,7 +511,8 @@ class WordingAndRendering(unittest.TestCase):
         self.assertNotIn(NO_SEMANTIC_SENTENCE, self.page())
 
     def test_word_03_the_page_states_there_was_no_contradiction(self):
-        self.assertIn("No hubo contradicción entre los motores en este turno", self.page())
+        self.assertIn("Ninguna fila prueba una contradicción entre fuentes distintas "
+                      "en este turno", self.page())
 
     def test_word_04_a_genuinely_absent_producer_says_so(self):
         payload = json.loads(json.dumps(LIVE))
@@ -418,15 +524,21 @@ class WordingAndRendering(unittest.TestCase):
         self.assertIn(NO_SEMANTIC_SENTENCE, page)
         self.assertNotIn(NOT_ROUTED_SENTENCE, page)
 
-    def test_word_05_the_compared_family_is_described_honestly(self):
-        self.assertIn("coincidieron con la evidencia que", self.page())
+    def test_word_05_no_row_is_described_as_agreement(self):
+        """Nothing on this turn was compared, so nothing on the page may say it was."""
+        page = self.page()
+        self.assertNotIn("compararon dos o más fuentes distintas", page)
+        self.assertIn("no se puede probar acuerdo ni contradicción a nivel de fila".lower(),
+                      page.lower())
 
-    def test_ui_01_the_headline_is_partial_reconciliation(self):
+    def test_ui_01_the_headline_is_trace_incomplete(self):
         badges = self.page().split('class="badges"')[1].split("</div>")[0]
-        self.assertIn("PARTIAL RECONCILIATION", badges)
-        self.assertIn("SEMANTIC NOT ROUTED", badges)
+        self.assertIn("TRACE INCOMPLETE", badges)
+        self.assertIn("NOT ROUTED", badges)
+        self.assertIn("LEGACY PROVENANCE UNAVAILABLE", badges)
         self.assertIn("HYBRID CONVERSATION TRACE", badges)
         self.assertIn("FALLBACK", badges)
+        self.assertNotIn("AGREE", badges)
 
     def test_ui_02_the_headline_is_not_conflict(self):
         badges = self.page().split('class="badges"')[1].split("</div>")[0]
@@ -444,18 +556,27 @@ class WordingAndRendering(unittest.TestCase):
         self.assertIn("r.effective_classification", control)
         self.assertIn("esc(eff ", control)
 
-    def test_ui_05_both_new_labels_are_in_the_glossary(self):
+    def test_ui_05_every_label_the_page_can_show_is_in_the_glossary(self):
         from app.ui.hybrid_trace_view import LABEL_GLOSSARY
         documented = {label for label, _ in LABEL_GLOSSARY}
-        self.assertIn("PARTIAL RECONCILIATION", documented)
-        self.assertIn("SEMANTIC NOT ROUTED", documented)
+        for label in ("PARTIAL RECONCILIATION", "SEMANTIC NOT ROUTED", "SINGLE PRODUCER",
+                      "NO EVIDENCE", "NOT ROUTED", "ERROR",
+                      "LEGACY PROVENANCE UNAVAILABLE", "SINGLE SOURCE DECISION",
+                      "NO COMPARISON", "TRACE INCOMPLETE"):
+            with self.subTest(label=label):
+                self.assertIn(label, documented)
 
     def test_ui_06_a_real_conflict_still_reads_conflict(self):
+        """A 1.1 row with two incompatible sources. A relabelled 1.0 row would not do:
+        under the corrected contract a stored label is no longer what makes a conflict."""
         payload = json.loads(json.dumps(LIVE))
-        payload["reconciliation"][0]["classification"] = "CONFLICT"
+        payload["trace_version"] = "hybrid-decision-trace/1.1"
+        payload["reconciliation"][0] = json.loads(json.dumps(
+            _dc_to_dict(row("vehicle.model", _conflict(0)))))
         badges = self.page(payload).split('class="badges"')[1].split("</div>")[0]
         self.assertIn("CONFLICT", badges)
         self.assertNotIn("PARTIAL RECONCILIATION", badges)
+        self.assertNotIn("TRACE INCOMPLETE", badges)
 
 
 class PrivacyUnchanged(unittest.TestCase):

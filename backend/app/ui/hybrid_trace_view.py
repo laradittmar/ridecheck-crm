@@ -11,8 +11,15 @@ not an empty decision. A semantic engine that had not answered yet reads PENDING
 "no claims". An inspector that quietly turns missing evidence into negative evidence is
 worse than no inspector, because it is believed.
 
-**It never re-derives.** Every value on this page is read from the stored payload. Nothing
-is recomputed here, so the page cannot disagree with the decision it is describing.
+**It never re-derives.** Every value on this page is read from the stored payload, and the
+one reading that IS derived — a reconciliation row's effective classification — is derived
+by `services.hybrid_trace`, the same function the JSON API calls. There is one
+implementation, so the page and the API cannot tell different stories about a turn.
+
+If a caller hands this page a record without that derived table, the page derives it rather
+than rendering an empty reconciliation card: printing "ninguna reconciliación se registró"
+for a turn that recorded two of them is precisely the class of falsehood this page exists
+to stop.
 
 Customer message bodies are not rendered: the trace carries ordered WAMIDs and the hash of
 the normalized burst, and the words themselves stay in the WhatsApp thread, which is one
@@ -35,11 +42,16 @@ TRACE_NOT_CAPTURED = "TRACE NOT CAPTURED — predates hybrid-decision-trace/1.0"
 # interpretation happens, no claim is produced, nothing is reconciled. Rendering one as a
 # hybrid decision would manufacture evidence, so this page says which it is looking at.
 SCOPE_LABEL = "HYBRID CONVERSATION TRACE"
+# The old wording said both engines "interpretaron la misma evidencia". Both engines may
+# receive the same customer burst; that is a fact about the input, not about any particular
+# decision. Whether a producer contributed to a given reconciliation is recorded per row and
+# is frequently NO — which is the single most important thing this page has to convey.
 SCOPE_NOTE = (
-    "Decisión conversacional (ConversationEngine.handle): el motor semántico y el motor "
-    "determinista interpretaron la misma evidencia del cliente. Una reserva confirmada "
-    "dentro del Flow de Meta es una transacción operativa en otro camino y no aparece "
-    "aquí como decisión híbrida."
+    "Decisión conversacional (ConversationEngine.handle). Ambos motores pueden haber "
+    "recibido la misma ráfaga del cliente; eso NO significa que ambos hayan aportado "
+    "evidencia a cada reconciliación. Qué fuente participó en cada decisión se indica "
+    "fila por fila más abajo. Una reserva confirmada dentro del Flow de Meta es una "
+    "transacción operativa en otro camino y no aparece aquí como decisión híbrida."
 )
 FLOW_TRANSACTION_LABEL = "FLOW TRANSACTION — NOT A HYBRID DECISION"
 FLOW_TRANSACTION_NOTE = (
@@ -54,8 +66,28 @@ LABEL_GLOSSARY = (
     (SCOPE_LABEL, "una decisión conversacional; el único tipo de turno que esta página describe"),
     ("RECONCILED", "una regla de reconciliación fue la autoridad del resultado"),
     ("DETERMINISTIC FLOOR", "una regla determinista produjo el resultado; no hubo reconciliación"),
-    ("AGREE", "hubo reconciliación y todas las familias coincidieron"),
-    ("CONFLICT", "hubo reconciliación y la evidencia se contradecía"),
+    ("AGREE",
+     "dos o más fuentes DISTINTAS aportaron evidencia a la misma decisión y esa "
+     "evidencia era compatible. Una sola fuente nunca produce AGREE"),
+    ("CONFLICT",
+     "dos o más fuentes distintas aportaron evidencia incompatible sobre el mismo tipo "
+     "de dato. Es lo único que se llama contradicción"),
+    ("SINGLE PRODUCER",
+     "exactamente una fuente aportó evidencia utilizable; no hubo comparación, aunque el "
+     "reconciliador haya aceptado el valor"),
+    ("NO EVIDENCE",
+     "ninguna fuente aportó evidencia utilizable a esa llamada; no culpa a ningún motor"),
+    ("NOT ROUTED",
+     "el intérprete sí produjo evidencia en este turno y no llegó a esa reconciliación"),
+    ("ERROR", "un productor o el reconciliador falló y la comparación no pudo hacerse"),
+    ("LEGACY PROVENANCE UNAVAILABLE",
+     "traza 1.0: la fila registra que algo participó, pero no quién. No se puede probar "
+     "ni acuerdo ni desacuerdo; la etiqueta original se conserva aparte"),
+    ("SINGLE SOURCE DECISION",
+     "ninguna comparación multi-fuente ocurrió; una sola fuente condujo las decisiones"),
+    ("NO COMPARISON", "hay filas y ninguna recibió evidencia utilizable"),
+    ("TRACE INCOMPLETE",
+     "el registro no alcanza para afirmar algo más fuerte con verdad"),
     ("PARTIAL RECONCILIATION",
      "alguna familia se comparó y otra no pudo compararse; NO es contradicción"),
     ("SEMANTIC NOT ROUTED",
@@ -78,6 +110,10 @@ _BADGE_CLASS = {
     "PARTIAL RECONCILIATION": "warn", "SEMANTIC NOT ROUTED": "warn",
     "NO RESPONSE PRODUCED": "warn",
     "NO RULE": "warn", "SEMANTIC MISSING": "warn", "SEMANTIC PENDING": "warn",
+    "SINGLE PRODUCER": "warn", "NO EVIDENCE": "warn", "NOT ROUTED": "warn",
+    "ERROR": "bad", "LEGACY PROVENANCE UNAVAILABLE": "warn",
+    "SINGLE SOURCE DECISION": "warn", "NO COMPARISON": "warn",
+    "TRACE INCOMPLETE": "warn",
     "CE MISSING": "warn", "DETERMINISTIC FLOOR": "warn", "HANDOFF": "warn",
     "CLARIFICATION": "warn", "FALLBACK": "warn",
     SCOPE_LABEL: "scope", FLOW_TRANSACTION_LABEL: "flow",
@@ -117,6 +153,11 @@ tr:last-child td{border-bottom:0}
 .empty{color:var(--muted);font-style:italic}
 .changed{background:#fff8e1}
 .tableWrap{overflow-x:auto}
+.sub2{color:var(--muted);font-size:11px;margin-top:3px;word-break:break-word}
+.srcblock{margin-bottom:8px}
+.srcblock:last-child{margin-bottom:0}
+ul.vals{margin:3px 0 0;padding-left:16px}
+ul.vals li{font-size:12px}
 details{margin-top:12px}
 summary{cursor:pointer;color:var(--muted);font-size:13px}
 pre{background:#0f1720;color:#dfe7ef;padding:12px;border-radius:6px;overflow-x:auto;
@@ -235,62 +276,193 @@ NO_RESPONSE_HISTORICAL_NOTE = (
     "Ese registro se conserva sin modificar; la lectura correcta del turno es que no hubo "
     "respuesta.")
 
+#: What each source name means on a reconciliation row. Only sources the executable audit
+#: proved can appear; `SERVICE_COMPUTED` exists as an evidence class but no code builds a
+#: claim with it, so there is no "system-derived" label here to be misapplied.
+SOURCE_LABELS = {
+    "SEMANTIC": ("Semántico", "el intérprete (producer `semantic:*`)"),
+    "DETERMINISTIC": ("Determinista", "un parser o el catálogo del CE (producer `ce:*`)"),
+    "CANONICAL_STATE": ("Estado canónico",
+                        "evidencia derivada del estado ya establecido (producer `canonical:*`)"),
+    "UNATTRIBUTED": ("Sin atribuir",
+                     "la afirmación no declara productor; nunca cuenta como participante"),
+}
+
 NOT_ROUTED_SENTENCE = ("Se produjo evidencia semántica en este turno, pero no llegó a "
                        "este reconciliador.")
 NO_SEMANTIC_SENTENCE = "No se produjo evidencia semántica utilizable en este turno."
+NO_PARTICIPATION_SENTENCE = (
+    "Ninguna fuente aportó evidencia utilizable a esta reconciliación. Eso no es un fallo "
+    "del motor semántico: no aportó nadie.")
+SINGLE_PRODUCER_SENTENCE = (
+    "Una sola fuente aportó evidencia. Que el reconciliador haya aceptado el valor no "
+    "convierte la decisión en un acuerdo entre motores: no hubo con qué compararla.")
+LEGACY_ROW_SENTENCE = (
+    "Traza «hybrid-decision-trace/1.0»: esas filas registran que algo participó, pero no "
+    "quién. No se puede probar acuerdo ni contradicción a nivel de fila. La etiqueta "
+    "original queda a la vista, sin modificar, en la columna «Registrado».")
+VALUES_WITHHELD_SENTENCE = (
+    "Los valores que no figuran en la lista de exhibición del inspector se retienen y se "
+    "muestran como referencia tipada (#huella). Dos referencias distintas son dos valores "
+    "distintos; la misma referencia es el mismo valor.")
 
 
 def _semantic_ran(semantic: dict) -> bool:
     return (semantic or {}).get("status") == "OK" and bool((semantic or {}).get("produced_claims"))
 
 
-def _row_semantic_cell(row: dict, semantic: dict) -> str:
-    """What the SEMANTIC column should say for one reconciliation row.
+def _source_chip(source: str) -> str:
+    label, _ = SOURCE_LABELS.get(str(source), (str(source), ""))
+    return f'<span class="badge">{_e(label)}</span>'
 
-    `ABSENT` alone, printed directly under a panel listing `Peugeot 208`, reads as a
-    contradiction even though both statements are true. The column now distinguishes a
-    producer that said nothing from a producer whose claims went elsewhere.
+
+def _sources_cell(row: dict) -> str:
+    """Who actually participated — and who produced evidence that went elsewhere."""
+    if row.get("legacy"):
+        return ('<span class="badge warn">1.0 — sin procedencia</span>'
+                f'<div class="sub2">semantic_input={_e(row.get("legacy_semantic_input"))} · '
+                f'ce_input={_e(row.get("legacy_ce_input"))}</div>')
+    present = row.get("participating_sources") or []
+    unrouted = row.get("not_routed_sources") or []
+    if present:
+        body = "".join(_source_chip(s) for s in present)
+    else:
+        body = '<span class="empty">ninguna</span>'
+    if unrouted:
+        body += ('<div class="sub2">no ruteada: '
+                 + ", ".join(_e(SOURCE_LABELS.get(str(s), (str(s), ""))[0]) for s in unrouted)
+                 + "</div>")
+    return body
+
+
+def _evidence_cell(row: dict) -> str:
+    """What each source supplied, under the Inspector's display allowlist."""
+    if row.get("legacy"):
+        return '<span class="empty">no registrado en 1.0</span>'
+    contributions = row.get("source_evidence") or []
+    if not contributions:
+        return '<span class="empty">ninguna</span>'
+    blocks = []
+    for contribution in contributions:
+        label = SOURCE_LABELS.get(str(contribution.get("source")),
+                                  (str(contribution.get("source")), ""))[0]
+        items = []
+        types = contribution.get("claim_types") or []
+        keys = contribution.get("value_keys") or []
+        values = contribution.get("values") or []
+        polarities = contribution.get("polarities") or []
+        for index, claim_type in enumerate(types):
+            shown = values[index] if index < len(values) else None
+            key = keys[index] if index < len(keys) else None
+            polarity = polarities[index] if index < len(polarities) else None
+            rendered = (_e(shown) if shown is not None
+                        else f'<span class="empty">«retenido»</span> '
+                             f'<span class="mono">#{_e(key)}</span>')
+            negated = ' <span class="badge bad">NEGADO</span>' if polarity == "NEGATED" else ""
+            items.append(f'<li><span class="mono">{_e(claim_type)}</span> = '
+                         f'{rendered}{negated}</li>')
+        producer = contribution.get("producer")
+        blocks.append(f'<div class="srcblock"><strong>{_e(label)}</strong>'
+                      f'<div class="sub2 mono">{_e(producer)}</div>'
+                      f'<ul class="vals">{"".join(items)}</ul></div>')
+    return "".join(blocks)
+
+
+def _counts_line(counts: dict) -> str:
+    """Row counts are row counts; family counts deduplicate. Never one printed as the other."""
+    parts = [
+        f'familias distintas: <strong>{_e(counts.get("distinct_families"))}</strong>',
+        f'filas de comparación: <strong>{_e(counts.get("comparison_rows"))}</strong>',
+        f'comparadas: {_e(counts.get("compared"))}',
+        f'una sola fuente: {_e(counts.get("single_producer"))}',
+        f'sin evidencia: {_e(counts.get("no_evidence"))}',
+        f'no ruteadas: {_e(counts.get("not_routed"))}',
+    ]
+    if counts.get("errored"):
+        parts.append(f'con error: {_e(counts.get("errored"))}')
+    if counts.get("legacy_unknown"):
+        parts.append(f'procedencia 1.0 desconocida: {_e(counts.get("legacy_unknown"))}')
+    return " · ".join(parts)
+
+
+def _rows_and_counts(record: dict, trace: dict) -> tuple:
+    """The reconciliation table, from the record when present and derived when not."""
+    rows = (record or {}).get("reconciliation_rows")
+    counts = (record or {}).get("reconciliation_counts")
+    if rows is None or counts is None:
+        from ..services.hybrid_trace import (counts_from_payload,
+                                             row_summaries_from_payload)
+        rows = list(row_summaries_from_payload(trace))
+        counts = counts_from_payload(trace)
+    return list(rows), dict(counts or {})
+
+
+def _reconciliation_card(rows, counts: dict, *, semantic: dict) -> str:
+    """One row per reconciliation CALL, never one per family.
+
+    Every column answers a different question, and they are not collapsed into one label:
+    which decision, which family, which sources participated, what they supplied, what the
+    comparison proves, what the reconciler decided, under which rule, and why.
     """
-    if (row or {}).get("semantic_input") == "PRESENT":
-        return "PRESENT"
-    if _semantic_ran(semantic):
-        return '<span class="badge warn">NOT ROUTED</span>'
-    return "ABSENT"
-
-
-def _reconciliation_card(items, semantic: dict) -> str:
-    if not items:
+    if not rows:
         body = ('<p class="empty">Ninguna reconciliación se registró para este turno.</p>'
                 '<p class="note">Esto no significa que los motores hayan coincidido: '
                 'significa que ninguna autoridad reconcilió esta decisión.</p>')
         return f'<div class="card"><h2>Reconciliación</h2>{body}</div>'
 
-    rows = "".join(
-        f'<tr><td>{_e(r.get("claim_family"))}</td>'
-        f'<td>{_row_semantic_cell(r, semantic)}</td>'
-        f'<td>{_e(r.get("ce_input"))}</td>'
-        f'<td>{_e(r.get("classification"))}</td>'
-        f'<td>{_e(r.get("outcome"))}</td>'
-        f'<td class="mono">{_e(r.get("rule_id"))}@{_e(r.get("rule_version"))}</td>'
-        f'<td>{_e(r.get("reason_code"))}</td></tr>' for r in items)
-    body = ('<div class="tableWrap"><table><thead><tr><th>Familia</th>'
-            '<th>Semántico</th><th>Determinista</th><th>Clasificación</th>'
-            '<th>Resultado</th><th>Regla</th><th>Motivo</th></tr></thead>'
-            f'<tbody>{rows}</tbody></table></div>')
+    cells = []
+    for row in rows:
+        effective = str(row.get("effective_classification") or "")
+        badge_cls = _BADGE_CLASS.get(effective.replace("_", " "), "")
+        captured = row.get("captured_classification")
+        captured_html = ""
+        if row.get("reclassified"):
+            captured_html = (f'<div class="sub2">registrado: '
+                             f'<span class="mono">{_e(captured)}</span></div>')
+        purpose = (row.get("decision_purpose")
+                   or row.get("decision_site_id")
+                   or "—")
+        site = row.get("decision_site_id")
+        site_html = (f'<div class="sub2 mono">{_e(site)}</div>' if site else
+                     '<div class="sub2 empty">sitio no registrado (1.0)</div>')
+        cells.append(
+            f'<tr><td>{_e(purpose)}{site_html}</td>'
+            f'<td class="mono">{_e(row.get("claim_family"))}</td>'
+            f'<td>{_sources_cell(row)}</td>'
+            f'<td>{_evidence_cell(row)}</td>'
+            f'<td><span class="badge {badge_cls}">'
+            f'{_e(effective.replace("_", " "))}</span>{captured_html}'
+            f'<div class="sub2">polaridad: {_e(row.get("information_state"))}</div></td>'
+            f'<td>{_e(row.get("outcome"))}</td>'
+            f'<td class="mono">{_e(row.get("rule_id"))}@{_e(row.get("rule_version"))}</td>'
+            f'<td>{_e(row.get("reason_code"))}</td></tr>')
 
-    unrouted = [r for r in items if (r or {}).get("semantic_input") != "PRESENT"]
-    compared = [r for r in items if (r or {}).get("classification") in ("AGREE", "CONFLICT")]
-    conflicts = [r for r in items if (r or {}).get("classification") == "CONFLICT"]
+    body = ('<div class="tableWrap"><table><thead><tr>'
+            '<th>Decisión</th><th>Familia</th><th>Fuentes que participaron</th>'
+            '<th>Evidencia comparada</th><th>Clasificación</th><th>Resultado</th>'
+            '<th>Regla</th><th>Motivo</th></tr></thead>'
+            f'<tbody>{"".join(cells)}</tbody></table></div>')
+    body += f'<p class="note">{_counts_line(counts or {})}</p>'
+
+    kinds = [str(r.get("effective_classification") or "") for r in rows]
     notes = []
-    if unrouted:
-        notes.append(html.escape(NOT_ROUTED_SENTENCE if _semantic_ran(semantic)
-                                 else NO_SEMANTIC_SENTENCE)
-                     + f" Familias afectadas: {len(unrouted)} de {len(items)}.")
-    if compared and not conflicts:
-        notes.append("Las familias que sí se compararon coincidieron con la evidencia que "
-                     "efectivamente recibieron.")
-    if not conflicts:
-        notes.append("<strong>No hubo contradicción entre los motores en este turno.</strong>")
+    if any(r.get("legacy") for r in rows):
+        notes.append(html.escape(LEGACY_ROW_SENTENCE))
+    if "SINGLE_PRODUCER" in kinds:
+        notes.append(html.escape(SINGLE_PRODUCER_SENTENCE))
+    if "NOT_ROUTED" in kinds or any(r.get("not_routed_sources") for r in rows):
+        notes.append(html.escape(NOT_ROUTED_SENTENCE))
+    if "NO_EVIDENCE" in kinds:
+        notes.append(html.escape(NO_PARTICIPATION_SENTENCE if _semantic_ran(semantic)
+                                 else NO_SEMANTIC_SENTENCE))
+    if any(r.get("source_evidence") for r in rows):
+        notes.append(html.escape(VALUES_WITHHELD_SENTENCE))
+    if "AGREE" in kinds and "CONFLICT" not in kinds:
+        notes.append("Las filas marcadas AGREE compararon dos o más fuentes distintas y "
+                     "la evidencia resultó compatible.")
+    if "CONFLICT" not in kinds:
+        notes.append("<strong>Ninguna fila prueba una contradicción entre fuentes "
+                     "distintas en este turno.</strong>")
     body += "".join(f'<p class="note">{n}</p>' for n in notes)
     return f'<div class="card"><h2>Reconciliación</h2>{body}</div>'
 
@@ -443,8 +615,8 @@ def render_turn_trace_page(record: Optional[dict], turn_id: str = "") -> str:
         + _messages_card(trace)
         + _semantic_card(trace.get("semantic") or {})
         + _ce_card(trace.get("ce_evidence") or [])
-        + _reconciliation_card(trace.get("reconciliation") or [],
-                               trace.get("semantic") or {})
+        + _reconciliation_card(*_rows_and_counts(record, trace),
+                               semantic=trace.get("semantic") or {})
         + _state_card(trace.get("canonical_before") or {}, trace.get("canonical_after") or {})
         + _outcome_card(trace)
         + f"<details><summary>Traza completa (JSON)</summary><pre>{dumped}</pre></details>"

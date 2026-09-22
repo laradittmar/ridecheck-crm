@@ -596,6 +596,12 @@ def render_control_page(user_email: str) -> str:
       padding: 28px 12px;
       font-size: var(--font-sm);
     }}
+    /* The withdrawn label on a reclassified trace row. Small, present, never hidden. */
+    .subtle {{
+      color: var(--muted);
+      font-size: 11px;
+      margin-top: 3px;
+    }}
 
     /* ---- Row health colours ---- */
     .rowCritical td:first-child {{ border-left: 3px solid var(--clr-critical); }}
@@ -1486,10 +1492,18 @@ def render_control_page(user_email: str) -> str:
         tbody.innerHTML = rows.map(function(r) {{
           // The EFFECTIVE classification, never the captured one: a row stored before
           // L4.7W5-HYBRID-TRACE-LABEL-TRUTH holds the old aggregation, which called a
-          // turn with nothing to compare a contradiction.
+          // turn with nothing to compare a contradiction. Under
+          // hybrid-decision-trace/1.1 the effective value is recomputed from recorded
+          // producer participation, so this cell and the Inspector cannot disagree.
           var eff = r.effective_classification || r.classification;
           var cls = (eff === 'CONFLICT') ? 'badgeHigh'
                   : (eff === 'AGREE') ? 'badgeLow' : 'badgeMed';
+          // A reclassified row says so, and says what it was. Hiding the withdrawn label
+          // would make the correction unauditable from the list an operator actually reads.
+          var note = r.reclassified
+            ? '<div class="subtle">registrado: ' + esc(r.captured_classification || '—')
+              + (r.contract_version ? ' · ' + esc(r.contract_version) : '') + '</div>'
+            : '';
           return '<tr>'
             + '<td>' + fmtDateTime(r.created_at) + '</td>'
             + '<td>' + (r.thread_id
@@ -1499,7 +1513,7 @@ def render_control_page(user_email: str) -> str:
             + '<td>' + esc(r.message_count) + '</td>'
             + '<td>' + esc(r.semantic_status || '—') + '</td>'
             + '<td><span class="badge ' + cls + '">'
-            + esc(eff || '—') + '</span></td>'
+            + esc(eff || '—') + '</span>' + note + '</td>'
             + '<td>' + esc(r.result_kind || '—') + '</td>'
             + '<td><a href="/control/turn/' + encodeURIComponent(r.turn_id) + '">'
             + 'Ver traza</a></td>'

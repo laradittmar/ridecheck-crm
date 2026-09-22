@@ -834,7 +834,12 @@ def _trace_row_summary(row: HybridDecisionTraceRow) -> dict:
     from ..services.hybrid_trace import effective_from_payload
 
     effective, conditions = effective_from_payload(row.payload)
+    payload = row.payload if isinstance(row.payload, dict) else {}
     return {
+        # Which contract wrote this row. A 1.0 trace carries no per-row provenance, so an
+        # operator reading `effective_classification` needs to know it was derived under
+        # the legacy rule rather than recomputed from recorded participation.
+        "contract_version": payload.get("trace_version"),
         "turn_id": row.turn_id,
         "thread_id": row.thread_id,
         "lead_id": row.lead_id,
@@ -891,8 +896,20 @@ def read_turn(turn_id: str, db: Session) -> dict:
     ).scalar_one_or_none()
     if row is None:
         return {"turn_id": turn_id, "captured": False, "reason": TRACE_NOT_CAPTURED}
+    from ..services.hybrid_trace import counts_from_payload, row_summaries_from_payload
+
     out = _trace_row_summary(row)
-    out.update({"captured": True, "trace": row.payload})
+    out.update({
+        "captured": True,
+        "trace": row.payload,
+        # The reconciliation table, with captured and effective carried SEPARATELY on every
+        # row. Derived here rather than in the renderer so the JSON consumer and the page
+        # cannot tell different stories about the same reconciliation.
+        "reconciliation_rows": list(row_summaries_from_payload(row.payload)),
+        # Row counts are row counts and family counts deduplicate. "2 of 2 families" was
+        # neither, and it was printed beside a claim of agreement.
+        "reconciliation_counts": counts_from_payload(row.payload),
+    })
     return out
 
 

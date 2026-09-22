@@ -708,9 +708,28 @@ class ScopeLabels(unittest.TestCase):
         self.assertNotIn(">AGREE<", badges)
 
     def test_scp_05_a_reconciled_decision_says_so(self):
+        """The row now carries the participation that makes it an agreement.
+
+        Setting `classification=AGREE` by hand no longer produces an AGREE badge, and that
+        is the correction: under `hybrid-decision-trace/1.1` a row is classified from the
+        sources recorded on it, so a label with no participation behind it cannot survive.
+        """
+        from app.schemas.hybrid_trace import SourceContribution
+        from app.services.hybrid_trace import value_key
+
+        def contribution(source):
+            return SourceContribution(
+                source=source, producer=f"{source.lower()}:test",
+                claim_types=("vehicle.model",), claim_ids=(f"{source}-0",),
+                value_keys=(value_key("vehicle.model", "peugeot 208"),),
+                polarities=("ASSERTED",), values=(None,), withheld=True)
+
+        contributions = (contribution("SEMANTIC"), contribution("DETERMINISTIC"))
         agree = self.Rec(claim_family="VEHICLE_MODEL", semantic_input="PRESENT",
                          ce_input="PRESENT", classification=self.Cls.AGREE,
-                         rule_id="vehicle.identity", rule_version="1.0", outcome="ACCEPT")
+                         rule_id="vehicle.identity", rule_version="1.0", outcome="ACCEPT",
+                         source_evidence=contributions,
+                         participating_sources=("SEMANTIC", "DETERMINISTIC"))
         page = self._page(semantic=self.Sem(ok=True, status="OK",
                                             produced_claims=("vehicle_mentions",)),
                           ce_rules=(), reconciliations=(agree,), action="replied",

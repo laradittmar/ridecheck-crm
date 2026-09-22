@@ -55,6 +55,7 @@ from ..schemas.conversation import (
     ConversationHandleIn,
     ConversationHandleOut,
 )
+from ..schemas.hybrid_trace import DecisionSite
 from ..schemas.schedule import ScheduleCheckIn
 from ..services.pricing import PricingNotFoundError, PricingQuote, PricingService
 from ..services.schedule import NEXT_AVAILABLE_HORIZON_DAYS, ScheduleService
@@ -5458,12 +5459,18 @@ class ConversationEngine:
         return str(value) if value else None
 
     def _record_reconciliation(self, ctx, decision, claim_type: str, state=None,
-                               claims=()) -> None:
+                               claims=(), *, decision_site_id: str = None) -> None:
         """Append the justification. Log-only in C2: no new table, no migration.
 
         `claims` is the reconciler's input set, passed through so the hybrid trace can say
         WHICH producer contributed to each decision. It is read, never mutated, and its
         absence degrades the trace only — the JSONL record is unchanged either way.
+
+        `decision_site_id` is a stable literal from `DecisionSite`, supplied by the caller
+        because only the caller knows which question it is asking. Two call sites reconcile
+        `vehicle.model` for entirely different purposes, and the Inspector could not tell
+        them apart; deriving the site from a function name or a stack frame would tie an
+        operator's reading of a stored trace to a refactor, so it is passed, not inferred.
         """
         try:
             record = decision.to_record(
@@ -5481,7 +5488,8 @@ class ConversationEngine:
             # table and no migration (L4.7C.2 Part 16); a decision must survive the log
             # buffer to be auditable at all.
             self._append_reconciliation_record(ctx, record)
-            self._collect_trace_reconciliation(record, claims)
+            self._collect_trace_reconciliation(record, claims,
+                                               decision_site_id=decision_site_id)
         except Exception:
             pass
 
@@ -5508,12 +5516,22 @@ class ConversationEngine:
         except Exception:
             self._turn_trace_before = None
 
-    def _collect_trace_reconciliation(self, record, claims=()) -> None:
+    def _collect_trace_reconciliation(self, record, claims=(), *,
+                                      decision_site_id: str = None) -> None:
+        """Capture one reconciliation row. The ordinal is its position within this turn.
+
+        Two calls from the same decision site on the same claim family would otherwise
+        produce the same `comparison_id`; the ordinal is what keeps repeated calls
+        individually identifiable without reaching for anything outside the turn.
+        """
         if not self._hybrid_trace_on():
             return
         try:
             from .hybrid_trace import reconciliation_from
-            self._turn_trace_reconciliations.append(reconciliation_from(record, claims))
+            self._turn_trace_reconciliations.append(
+                reconciliation_from(record, claims,
+                                    decision_site_id=decision_site_id,
+                                    ordinal=len(self._turn_trace_reconciliations)))
         except Exception:
             pass
 
@@ -5666,7 +5684,9 @@ class ConversationEngine:
                 cycle_id=cycle_id).with_id())
 
         decision = reconcile_vehicle_identity(claims, catalog_lookup=lookup_vehicle)
-        self._record_reconciliation(ctx, decision, ClaimType.VEHICLE_MODEL, state, claims)
+        self._record_reconciliation(
+            ctx, decision, ClaimType.VEHICLE_MODEL, state, claims,
+            decision_site_id=DecisionSite.VEHICLE_IDENTITY_APPLY)
         if not decision.accepted:
             # CLARIFY / HOLD: the legacy value is NOT written. The turn continues on the
             # existing conversational path, which asks rather than assumes.
@@ -5726,7 +5746,9 @@ class ConversationEngine:
             return None
 
         decision = reconcile_inspection_location(claims, zone_validator=_validate)
-        self._record_reconciliation(ctx, decision, claim_type, state, claims)
+        self._record_reconciliation(
+            ctx, decision, claim_type, state, claims,
+            decision_site_id=DecisionSite.LOCATION_INSPECTION_APPLY)
         if not decision.accepted:
             return False
         target.zone_group = decision.value.zone_group or zone_group
@@ -6390,9 +6412,16 @@ class ConversationEngine:
         from .vehicle_catalog import lookup_vehicle
         from ..schemas.claims import ClaimType
         try:
-            decision = reconcile_vehicle_identity(self._fuzzy_claim(state, result.hit),
-                                                  catalog_lookup=lookup_vehicle)
-            self._record_reconciliation(ctx, decision, ClaimType.VEHICLE_MODEL, state, claims)
+            # `claims` is bound before the call because the trace argument added in
+            # L4.7W5 Gate 1 named a variable that did not exist in this scope. Python
+            # raised NameError at the observation point, the `except` below swallowed it,
+            # and every fuzzy identity was rejected regardless of what the reconciler
+            # decided. An observer changed a customer-facing outcome — see the closeout.
+            claims = self._fuzzy_claim(state, result.hit)
+            decision = reconcile_vehicle_identity(claims, catalog_lookup=lookup_vehicle)
+            self._record_reconciliation(
+                ctx, decision, ClaimType.VEHICLE_MODEL, state, claims,
+                decision_site_id=DecisionSite.VEHICLE_FUZZY_ADMISSIBILITY)
             return bool(decision.accepted)
         except Exception as exc:         # a reconciliation failure is not an acceptance
             logger.warning("L4.7W1-F2 fuzzy reconciliation failed thread_id=%s: %s",
