@@ -17,6 +17,13 @@ _CHECK_INTERVAL_SECONDS = 60    # poll every 60 seconds
 # ── Per-turn SLA alert (WILD-04R Phase 2) ────────────────────────────────────
 # Queries ai_events where:
 #   reply_required=true, alert_eligible=true, reply_produced is not true
+#
+# What `reply_produced` means in THIS contract (L4.7W5): it is an operational flag meaning
+# "the customer-facing reply completed well enough that this turn needs no rescue" — NOT
+# "an internal draft once existed". That is why `blocked_dispatch` records false: a reply
+# that never reached the customer leaves the customer waiting, whatever was drafted. The
+# Hybrid Inspector is where the three cases are told apart — never produced, produced but
+# blocked, produced and sent — and this milestone does not change blocked-send alerting.
 #   unanswered_alert_sent_at IS NULL (no alert sent yet)
 #   event older than _ALERT_THRESHOLD_SECONDS
 # Updates performance_status=ALERT and unanswered_alert_sent_at to prevent repeat alerts.
@@ -40,6 +47,35 @@ _FIND_UNANSWERED_EVENTS_SQL = text("""
         AND ae.created_at < NOW() - INTERVAL ':threshold seconds'
         AND wc.wa_id NOT IN (SELECT phone FROM excluded_phones)
         AND (wts.needs_human IS NULL OR wts.needs_human = false)
+        -- L4.7W5-R2 successor suppression. A conversation that was answered is not
+        -- unanswered, even if an earlier turn in it produced nothing.
+        --
+        -- Correlation is by thread_id, never by phone number and never by message text:
+        -- a successful reply to a different customer must not silence this one.
+        --
+        -- "Successful" is the transport contract's own vocabulary. `OutboundSafetyGate` is
+        -- the sole writer of direction='out' rows; it inserts `pending` BEFORE calling Meta
+        -- and only `mark_sent()` promotes a row to `sent` while stamping the WAMID Meta
+        -- returned. Status webhooks then advance sent -> delivered -> read by precedence,
+        -- or to failed. So `status IN ('sent','delivered','read')` with a WAMID present is
+        -- durable proof that Meta accepted the message; `blocked`, `failed` and `pending`
+        -- are each proof that it did not, and none of them suppresses.
+        --
+        -- `timestamp` is stamped once, when the send is ATTEMPTED, and is never moved by
+        -- mark_sent or by a status webhook. `> ae.created_at` therefore means "attempted
+        -- after the turn that produced nothing", which is the ordering we want: a reply
+        -- already in flight before the failure does not excuse it.
+        --
+        -- Automated, human-CRM and Flow sends all pass through the same gate, so all three
+        -- are represented here identically. No path is missing.
+        AND NOT EXISTS (
+            SELECT 1 FROM whatsapp_messages ob
+            WHERE ob.thread_id = ae.thread_id
+              AND ob.direction = 'out'
+              AND ob.status IN ('sent', 'delivered', 'read')
+              AND ob.wa_message_id IS NOT NULL
+              AND ob.timestamp > ae.created_at
+        )
 """)
 
 _MARK_EVENT_ALERTED_SQL = text("""
