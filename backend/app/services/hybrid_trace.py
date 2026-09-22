@@ -41,6 +41,10 @@ RULE_HUMAN_REQUEST = "handoff.human_requested"
 RULE_PHONE_CALL_REQUEST = "handoff.phone_call_requested"
 RULE_RESCUE_DECISION = "handoff.canonical_rescue"
 
+#: The engine outcome meaning "a reply was required and none was produced".
+#: Imported rather than repeated so the trace and the engine cannot drift apart.
+ACTION_NO_REPLY_PRODUCED = "no_reply_produced"
+
 ACTIONS_HANDOFF = frozenset({"skipped_human", "human_handoff_blocked"})
 ACTIONS_BLOCKED = frozenset({"blocked_dispatch", "service_gate_blocked",
                              "inspectability_gate_blocked", "location_contradiction_blocked",
@@ -353,6 +357,12 @@ def result_kind_for(action: Optional[str], snapshot_before: CanonicalSnapshot,
         return ResultKind.DETERMINISTIC_FLOOR
     if action == "skipped_human" or became_human:
         return ResultKind.HANDOFF
+    # L4.7W5-NO-REPLY-ALERT-INTEGRITY. A turn that produced nothing is NO_ACTION, not a
+    # fallback that answered. Checked before the answer-source reading because the AI
+    # fallback did run — it simply returned nothing usable, and "CE_AI ran" is not the same
+    # claim as "CE_AI answered".
+    if action == ACTION_NO_REPLY_PRODUCED:
+        return ResultKind.NO_ACTION
     if answer_source == "CE_AI":
         return ResultKind.FALLBACK
     if answer_source == "DETERMINISTIC_RULE":

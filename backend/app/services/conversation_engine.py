@@ -50,6 +50,7 @@ from ..models import (
 )
 from ..repositories.pricing_repository import PricingRepository
 from ..schemas.conversation import (
+    ACTION_NO_REPLY_PRODUCED,
     HANDLED_ACTIONS,
     ConversationHandleIn,
     ConversationHandleOut,
@@ -4555,8 +4556,14 @@ class ConversationEngine:
         # Scrub AI-hallucinated booking confirmations in SCHEDULING/QUOTED stages.
         reply = _scrub_scheduling_confirmation(reply, stage)
         if not reply:
+            # L4.7W5-NO-REPLY-ALERT-INTEGRITY. Nothing usable came back and nothing is
+            # handed to the outbound path, so this is NOT a reply. Returning `replied`
+            # here set `reply_produced=true` and removed the turn from the unanswered
+            # rescue: the customer got silence and the alert for silence was suppressed.
+            # `detail` is unchanged — it is the diagnostic evidence of *why* nothing was
+            # produced, and it must not be what decides whether a reply existed.
             self.db.commit()
-            return _out("replied", detail="no_reply_text")
+            return _out(ACTION_NO_REPLY_PRODUCED, detail="no_reply_text")
 
         # All paths: _send_text_to_wa commits everything atomically after the send.
         # For PRESUPUESTO_ENVIADO (rule B), this means the flag is only committed

@@ -60,6 +60,8 @@ LABEL_GLOSSARY = (
      "alguna familia se comparó y otra no pudo compararse; NO es contradicción"),
     ("SEMANTIC NOT ROUTED",
      "el intérprete sí produjo evidencia en este turno, pero no llegó a ese reconciliador"),
+    ("NO RESPONSE PRODUCED",
+     "no se produjo respuesta utilizable y no se intentó ningún envío; no es «replied»"),
     ("NO RULE", "hubo evidencia y ninguna autoridad la reconcilió — no es acuerdo"),
     ("SEMANTIC PENDING", "el intérprete se despachó async y aún no había respondido al decidir"),
     ("SEMANTIC MISSING", "no hubo interpretación semántica para este turno"),
@@ -74,6 +76,7 @@ _BADGE_CLASS = {
     "CONFLICT": "bad", "SEMANTIC ERROR": "bad", "BLOCKED": "bad",
     "AGREE": "good", "RECONCILED": "good",
     "PARTIAL RECONCILIATION": "warn", "SEMANTIC NOT ROUTED": "warn",
+    "NO RESPONSE PRODUCED": "warn",
     "NO RULE": "warn", "SEMANTIC MISSING": "warn", "SEMANTIC PENDING": "warn",
     "CE MISSING": "warn", "DETERMINISTIC FLOOR": "warn", "HANDOFF": "warn",
     "CLARIFICATION": "warn", "FALLBACK": "warn",
@@ -224,6 +227,14 @@ def _ce_card(rules) -> str:
             f'</thead><tbody>{rows}</tbody></table></div></div>')
 
 
+NO_RESPONSE_PRODUCED_SENTENCE = (
+    "No se produjo ninguna respuesta utilizable en este turno: no se intentó ningún envío "
+    "y el cliente no recibió nada. Esto NO es una respuesta enviada.")
+NO_RESPONSE_HISTORICAL_NOTE = (
+    "La traza almacenada registra la acción como «replied» con motivo «no_reply_text». "
+    "Ese registro se conserva sin modificar; la lectura correcta del turno es que no hubo "
+    "respuesta.")
+
 NOT_ROUTED_SENTENCE = ("Se produjo evidencia semántica en este turno, pero no llegó a "
                        "este reconciliador.")
 NO_SEMANTIC_SENTENCE = "No se produjo evidencia semántica utilizable en este turno."
@@ -324,6 +335,24 @@ def _glossary_card() -> str:
             '</tbody></table></div></div></details>')
 
 
+def _no_response_produced(trace: dict) -> tuple:
+    """(is_no_response, is_historical_representation).
+
+    Two shapes describe the same outcome. A trace written after
+    L4.7W5-NO-REPLY-ALERT-INTEGRITY names it directly. One written before it carries
+    `replied` + `no_reply_text` and no outbound — the stored record is evidence and is never
+    rewritten, so the reading is derived here instead.
+    """
+    action = trace.get("response_plan_kind")
+    reason = trace.get("reason_code")
+    no_outbound = not trace.get("outbound_message_id") and not trace.get("outbound_path_id")
+    if action == "no_reply_produced":
+        return True, False
+    if action == "replied" and reason == "no_reply_text" and no_outbound:
+        return True, True
+    return False, False
+
+
 def _outcome_card(trace: dict) -> str:
     path = trace.get("outbound_path_id")
     flow_row = ""
@@ -331,7 +360,7 @@ def _outcome_card(trace: dict) -> str:
         flow_row = (f'<p class="note"><span class="badge flow">'
                     f'{_e(FLOW_TRANSACTION_LABEL)}</span> '
                     f'{html.escape(FLOW_TRANSACTION_NOTE)}</p>')
-    return ('<div class="card"><h2>Resultado</h2>' + _kv([
+    body = '<div class="card"><h2>Resultado</h2>' + _kv([
         ("Cómo se produjo", _e(trace.get("result_kind"))),
         ("Acción", _e(trace.get("response_plan_kind"))),
         ("Fuente de la respuesta", _e(trace.get("response_plan_source"))),
@@ -342,7 +371,14 @@ def _outcome_card(trace: dict) -> str:
         ("Camino de envío", _e(trace.get("outbound_path_id"))),
         ("Estado del envío", _e(trace.get("outbound_status"))),
         ("WAMID (final)", f'<span class="mono">{_e(trace.get("outbound_wamid_tail"))}</span>'),
-    ]) + flow_row + "</div>")
+    ])
+    no_response, historical = _no_response_produced(trace)
+    if no_response:
+        body += (f'<p class="note"><span class="badge warn">NO RESPONSE PRODUCED</span> '
+                 f'{html.escape(NO_RESPONSE_PRODUCED_SENTENCE)}</p>')
+        if historical:
+            body += f'<p class="note">{html.escape(NO_RESPONSE_HISTORICAL_NOTE)}</p>'
+    return body + flow_row + "</div>"
 
 
 def render_turn_not_captured(turn_id: str) -> str:

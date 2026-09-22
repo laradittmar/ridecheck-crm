@@ -2,6 +2,21 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+#: L4.7W5-NO-REPLY-ALERT-INTEGRITY — a required reply that was never produced.
+#:
+#: The fallback ran, returned no usable text, and nothing was handed to the outbound path.
+#: Before this constant existed the branch returned `replied`, which put the turn into
+#: `_REPLY_PRODUCED_ACTIONS`, wrote `reply_produced=true`, and thereby excluded it from the
+#: unanswered-message rescue — the customer received silence and the alert built to catch
+#: exactly that silence was switched off by the action name.
+#:
+#: No existing action could carry this meaning truthfully: `error` asserts a crash and sets
+#: `ok=False`; every `skipped_*` value sets `reply_required=false`; every `*_blocked` value
+#: asserts that a usable reply existed and was withheld. `ai_events.action` is an
+#: unconstrained `String(50)`, so this is a new value in a free-form field, not a schema or
+#: enum change.
+ACTION_NO_REPLY_PRODUCED = "no_reply_produced"
+
 # Actions that mean the engine fully owned the turn (n8n should stop)
 HANDLED_ACTIONS = frozenset({
     "replied", "flow_button_sent", "booking_created",
@@ -27,6 +42,12 @@ HANDLED_ACTIONS = frozenset({
     "blocked_dispatch",
     # L4.7W2-F1: a locality proposal suppressed by the kill switch is still a CE decision.
     "location_proposal_blocked",
+    # L4.7W5: producing nothing is a CE outcome, not a CE abdication. It MUST be handled,
+    # for the same reason `blocked_dispatch` is: the false branch of n8n's
+    # `IF - Engine Handled?` runs a legacy booking chain that bypasses the booking
+    # authority. A truthful action that fell outside this set would fix an alert and open
+    # a far worse hole.
+    ACTION_NO_REPLY_PRODUCED,
 })
 # NOT included, deliberately: "no_lead". M21.2.8 certified it as genuine non-ownership
 # (the thread has no lead, so CE could not act), the text-path false branch is empty, and
