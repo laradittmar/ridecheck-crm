@@ -28,10 +28,11 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 BETA = ROOT / "docker-compose.beta.yml"
 BASE = ROOT / "docker-compose.yml"
 
-REVIEWED_IMAGE = "ridecheck-crm-backend:w5labeltruth-0407bab"
-#: Superseded pins. Both images stay on disk as rollback targets; neither may be what
-#: deploys. Keeping the whole chain here means a revert to an older pin also fails.
-SUPERSEDED_IMAGES = ("ridecheck-crm-backend:w5hybridtrace-2f8acc8",
+REVIEWED_IMAGE = "ridecheck-crm-backend:w5noreply-a7a6413"
+#: Superseded pins. Every one stays on disk as a rollback target; none may be what deploys.
+#: Keeping the whole chain here means a revert to any older pin also fails the test.
+SUPERSEDED_IMAGES = ("ridecheck-crm-backend:w5labeltruth-0407bab",
+                     "ridecheck-crm-backend:w5hybridtrace-2f8acc8",
                      "ridecheck-crm-backend:w5f7g-ce978a2")
 TRACE_KEY = "HYBRID_TRACE_ENABLED"
 TRACE_MAPPING = '"${HYBRID_TRACE_ENABLED:-false}"'
@@ -55,7 +56,7 @@ class ReviewedImagePin(unittest.TestCase):
     def test_wire_02_the_tag_names_the_reviewed_commit(self):
         """The tag carries the short SHA it was built from, so a deployed container can be
         traced back to a commit without trusting a mutable label."""
-        self.assertTrue(REVIEWED_IMAGE.endswith("-0407bab"), REVIEWED_IMAGE)
+        self.assertTrue(REVIEWED_IMAGE.endswith("-a7a6413"), REVIEWED_IMAGE)
 
     def test_wire_03_exactly_one_backend_image_declaration(self):
         lines = declarations(BETA, "image: ridecheck-crm-backend")
