@@ -97,12 +97,13 @@ class TraceContract(unittest.TestCase):
     def test_trc_01_version_is_pinned(self):
         """1.2 since L4.7W5-TRACE-ROW-SEMANTICS-R2. Older contracts stay readable, named."""
         from app.schemas.hybrid_trace import (READABLE_VERSIONS, TRACE_VERSION_1_0,
-                                              TRACE_VERSION_1_1)
-        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.2")
+                                              TRACE_VERSION_1_1, TRACE_VERSION_1_2)
+        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.3")
+        self.assertEqual(TRACE_VERSION_1_2, "hybrid-decision-trace/1.2")
         self.assertEqual(TRACE_VERSION_1_1, "hybrid-decision-trace/1.1")
         self.assertEqual(TRACE_VERSION_1_0, "hybrid-decision-trace/1.0")
-        self.assertIn(TRACE_VERSION_1_0, READABLE_VERSIONS)
-        self.assertIn(TRACE_VERSION_1_1, READABLE_VERSIONS)
+        for older in (TRACE_VERSION_1_0, TRACE_VERSION_1_1, TRACE_VERSION_1_2):
+            self.assertIn(older, READABLE_VERSIONS)
         self.assertEqual(_trace().trace_version, TRACE_VERSION)
 
     def test_trc_02_normalization_folds_case_and_accents(self):

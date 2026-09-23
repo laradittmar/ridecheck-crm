@@ -56,6 +56,19 @@ from ..schemas.conversation import (
     ConversationHandleOut,
 )
 from ..schemas.hybrid_trace import DecisionSite
+
+# G3-1 trace prose for the semantic handoff site. Hoisted out of
+# `_semantic_handoff_requested` on purpose: F7C-23 forbids multi-word string literals
+# inside that function, because that is where a phrase lexicon would first appear. These
+# are trace labels — they are never compared against customer text — and keeping them out
+# here means the guard can stay exactly as strict as it was.
+_G3_HANDOFF_REASON_YES = "affirmative current request for a person"
+_G3_HANDOFF_REASON_NO = "no resolved affirmative handoff claim in this burst"
+_G3_HANDOFF_OUTCOME_YES = "scheduling escalation to a person"
+_G3_HANDOFF_OUTCOME_NO = "no escalation from semantic evidence"
+_G3_HANDOFF_RULE_ID = "handoff.semantic_request"
+_G3_HANDOFF_ACTION = "human_escalation"
+_G3_RULE_VERSION = "v1"
 from ..schemas.schedule import ScheduleCheckIn
 from ..services.pricing import PricingNotFoundError, PricingQuote, PricingService
 from ..services.schedule import NEXT_AVAILABLE_HORIZON_DAYS, ScheduleService
@@ -5301,6 +5314,35 @@ class ConversationEngine:
             getattr(ctx.thread, "id", None), fragment.text, fragment.role, match.status,
             (match.best.zone_detail if match.best else None),
             (match.best.score if match.best else 0.0), match.rule_id, match.rule_version)
+        # ── G3-1: observational. The fragment IS the evidence this decision consumed. ──
+        # It is expressed as a claim carrying the fragment's OWN producer literal, so the
+        # source is read from provenance rather than assumed. The zone catalogue validated
+        # the fragment but produced no competing claim of its own, so this row is
+        # SINGLE_PRODUCER: SEMANTIC — and `canonical_effect` is NONE, because P2 permits a
+        # proposal and a question and nothing else. This milestone changes no behaviour.
+        from ..schemas.claims import (ClaimEvidence, ClaimType, EvidenceClass,
+                                      Explicitness)
+        from ..schemas.hybrid_trace import CanonicalEffect
+        try:
+            _claims = [ClaimEvidence(
+                claim_type=ClaimType.INSPECTION_LOCATION, value=fragment.text,
+                evidence_class=EvidenceClass.SEMANTIC_INFERRED,
+                producer=getattr(fragment, "producer", None) or "semantic:understand",
+                explicitness=Explicitness.IMPLIED,
+                cycle_id=self._reconciler_cycle_id(state)).with_id()]
+        except Exception:
+            _claims = []
+        _proposes = bool(match.needs_confirmation and match.best is not None)
+        self._trace_decision(
+            decision_site_id=DecisionSite.LOCALITY_SEMANTIC_RECOVERY,
+            claim_type=ClaimType.INSPECTION_LOCATION, claims=_claims,
+            outcome=match.status, reason=match.reason,
+            rule_id=match.rule_id, rule_version=match.rule_version,
+            authority_result=match.status,
+            canonical_effect=CanonicalEffect.NONE,
+            permitted_action=("ask_locality_confirmation" if _proposes else None),
+            business_outcome=("locality proposed for customer confirmation" if _proposes
+                              else f"no proposal ({match.status})"))
         return match
 
     def _location_proposal_key(self, state, zone_group, zone_detail) -> str:
@@ -5428,10 +5470,30 @@ class ConversationEngine:
                 texts=list(getattr(self, "_turn_semantic_texts", ()) or ()),
                 cycle_id=self._reconciler_cycle_id(state),
                 revision_id=(revision_id if isinstance(revision_id, int) else None))
-            return any(c.claim_type == ClaimType.NEEDS_HUMAN
-                       and c.value is True
-                       and c.status not in UNRESOLVED_STATUSES
-                       for c in claims)
+            handoff_claims = [c for c in claims if c.claim_type == ClaimType.NEEDS_HUMAN]
+            requested = any(c.value is True and c.status not in UNRESOLVED_STATUSES
+                            for c in handoff_claims)
+            # ── G3-1: observational. Only the NEEDS_HUMAN claims the decision read. ──
+            # CE contributed nothing here and none is invented: with the interpreter as the
+            # only producer this row is SINGLE_PRODUCER: SEMANTIC, which is the truth and
+            # is exactly what P1 permits. A refused claim (negated, ambiguous, unresolved)
+            # is still recorded — the reader must be able to see that the system looked and
+            # declined, which is different from never having looked.
+            from ..schemas.hybrid_trace import CanonicalEffect
+            self._trace_decision(
+                decision_site_id=DecisionSite.HANDOFF_SEMANTIC_REQUEST,
+                claim_type=ClaimType.NEEDS_HUMAN, claims=handoff_claims,
+                outcome=("ACCEPT" if requested else "HOLD"),
+                reason=(_G3_HANDOFF_REASON_YES if requested else _G3_HANDOFF_REASON_NO),
+                rule_id=_G3_HANDOFF_RULE_ID, rule_version=_G3_RULE_VERSION,
+                evidence_ids=tuple(c.claim_id for c in handoff_claims if c.claim_id),
+                authority_result=("ACCEPT" if requested else "HOLD"),
+                canonical_effect=(CanonicalEffect.WROTE if requested
+                                  else CanonicalEffect.NONE),
+                permitted_action=(_G3_HANDOFF_ACTION if requested else None),
+                business_outcome=(_G3_HANDOFF_OUTCOME_YES if requested
+                                  else _G3_HANDOFF_OUTCOME_NO))
+            return requested
         except Exception as exc:   # a projection failure is absent evidence, never a guess
             try:
                 logger.warning("L4.7W5-F7C semantic handoff projection failed: %s", exc)
@@ -5532,6 +5594,62 @@ class ConversationEngine:
             self._turn_trace_reconciliations.append(
                 reconciliation_from(record, claims,
                                     decision_site_id=decision_site_id))
+        except Exception:
+            pass
+
+    class _TraceDecisionRecord:
+        """A decision expressed in the shape `reconciliation_from` already reads.
+
+        G3-1 traces four sites whose authorities return four different result types — a
+        `SchedulingDecision`, an `AuthorizationDecision`, a bool, a `LocalityMatch`. Rather
+        than teach the observer four shapes, each site states what it decided in the words
+        of its own authority and this carries them. It holds no logic and no defaults that
+        could invent a value: a field the site does not supply stays None.
+        """
+        __slots__ = ("claim_type", "information_state", "outcome", "reason",
+                     "rule_id", "rule_version", "evidence_ids")
+
+        def __init__(self, *, claim_type, outcome=None, reason=None, rule_id=None,
+                     rule_version=None, information_state=None, evidence_ids=()):
+            self.claim_type = claim_type
+            self.information_state = information_state
+            self.outcome = outcome
+            self.reason = reason
+            self.rule_id = rule_id
+            self.rule_version = rule_version
+            self.evidence_ids = tuple(evidence_ids or ())
+
+    def _trace_decision(self, *, decision_site_id, claim_type, claims=(),
+                        outcome=None, reason=None, rule_id=None, rule_version=None,
+                        information_state=None, evidence_ids=(),
+                        authority_result=None, authority_verdict=None,
+                        canonical_effect=None, permitted_action=None,
+                        business_outcome=None) -> None:
+        """Record one already-made decision. Observational, fail-open, never re-derives.
+
+        G3-1. Four production decisions were already hybrid and already invisible. This
+        records what each one actually consumed and actually decided — it does not re-parse
+        the burst, does not call the provider, does not build a claim the decision did not
+        see, and does not touch the decision itself. Every failure is swallowed, so a trace
+        defect cannot cost a customer turn.
+        """
+        if not self._hybrid_trace_on():
+            return
+        try:
+            from .hybrid_trace import reconciliation_from
+            record = self._TraceDecisionRecord(
+                claim_type=claim_type, outcome=outcome, reason=reason,
+                rule_id=rule_id, rule_version=rule_version,
+                information_state=information_state, evidence_ids=evidence_ids)
+            self._turn_trace_reconciliations.append(
+                reconciliation_from(
+                    record, tuple(claims or ()),
+                    decision_site_id=decision_site_id,
+                    authority_result=authority_result,
+                    authority_verdict=authority_verdict,
+                    canonical_effect=canonical_effect,
+                    permitted_action=permitted_action,
+                    business_outcome=business_outcome))
         except Exception:
             pass
 
@@ -5838,6 +5956,25 @@ class ConversationEngine:
 
         decision = authorize_quote_acceptance(claims, self._commercial_state(ctx, state))
         self._record_authorization(ctx, decision, state)
+        # ── G3-1: observational. The authorizer decided; this records what it saw. ──
+        # No authority verdict is passed: `authorize_quote_acceptance` folds the claims
+        # into a stance, it does not compare the producers against each other. Inventing a
+        # verdict here would be the trace deciding, and P4's HOLD-and-clarify conflict
+        # policy is explicitly NOT implemented in this milestone.
+        from ..schemas.claims import ClaimType
+        from ..schemas.hybrid_trace import CanonicalEffect
+        self._trace_decision(
+            decision_site_id=DecisionSite.QUOTE_ACCEPTANCE_AUTHORIZATION,
+            claim_type=ClaimType.QUOTE_ACCEPTED, claims=claims,
+            outcome=decision.result, reason=decision.reason,
+            rule_id=decision.rule_id, rule_version=decision.rule_version,
+            information_state=decision.stance_state,
+            evidence_ids=decision.evidence_ids,
+            authority_result=decision.result,
+            canonical_effect=CanonicalEffect.NONE,
+            permitted_action=("advance_commercial_state" if decision.allows else None),
+            business_outcome=("acceptance authorized" if decision.allows
+                              else f"acceptance not authorized ({decision.result})"))
         return decision
 
     def _turn_has_scheduling_evidence(self, texts, evidence) -> bool:
@@ -5990,6 +6127,30 @@ class ConversationEngine:
             pass
         requests = [SchedulingRequest(day_iso=b.resolved_date, time_str=b.time)
                     for b in decision.branches if b.resolved_date]
+        # ── G3-1: record the decision that was just made. Observational only. ──
+        # `decision.source` is the reconciler's own word. `deterministic_conflict` means
+        # `semantic_covers_deterministic` PROVED the two readings incompatible on resolved
+        # dates and times — a resolver's finding, not the trace guessing — so it is passed
+        # as the authority verdict. Any other source compared nothing incompatible.
+        from ..schemas.claims import ClaimType
+        from ..schemas.hybrid_trace import CanonicalEffect, ComparisonVerdict
+        _verdict = None
+        if decision.source == "deterministic_conflict":
+            _verdict = ComparisonVerdict.INCOMPATIBLE
+        elif decision.source in ("semantic", "deterministic") and len(claims) > 1:
+            _verdict = ComparisonVerdict.COMPATIBLE
+        self._trace_decision(
+            decision_site_id=DecisionSite.SCHEDULING_REQUEST_RECONCILIATION,
+            claim_type=ClaimType.SCHEDULING_PREFERENCE, claims=claims,
+            outcome=decision.source, reason=decision.reason,
+            rule_id=decision.rule_id, rule_version=decision.rule_version,
+            information_state=decision.information_state,
+            evidence_ids=decision.evidence_ids,
+            authority_result=decision.source, authority_verdict=_verdict,
+            canonical_effect=CanonicalEffect.NONE,
+            permitted_action=("check_availability" if requests else None),
+            business_outcome=(f"{len(requests)} scheduling request(s) resolved"
+                              if requests else "no resolvable scheduling request"))
         # L4.7W3-F1: record that this turn asked about availability, so the FAQ layer can
         # tell "what do you have tomorrow?" from "what are your opening hours?".
         if requests:

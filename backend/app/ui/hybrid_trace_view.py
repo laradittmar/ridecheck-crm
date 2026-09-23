@@ -120,6 +120,10 @@ LABEL_GLOSSARY = (
     ("NOT ROUTED",
      "el intérprete sí produjo evidencia en este turno y no llegó a esa reconciliación"),
     ("ERROR", "un productor o el reconciliador falló y la comparación no pudo hacerse"),
+    ("Autoridad y acción",
+     "qué decidió el reconciliador o autorizador, si escribió estado canónico y qué "
+     "acción quedó permitida. Que la evidencia sea válida NO significa que haya "
+     "autoridad para mutar: son columnas distintas a propósito"),
     ("LEGACY PROVENANCE UNAVAILABLE",
      "traza 1.0: la fila registra que algo participó, pero no quién. No se puede probar "
      "ni acuerdo ni desacuerdo; la etiqueta original se conserva aparte"),
@@ -488,6 +492,46 @@ def _propositions_cell(row: dict) -> str:
     return "".join(blocks)
 
 
+_EFFECT_LABEL = {
+    "NONE": ("no escribió estado", ""),
+    "WROTE": ("escribió estado canónico", "warn"),
+    "BLOCKED": ("escritura bloqueada", "bad"),
+}
+
+
+def _authority_cell(row: dict) -> str:
+    """What the real authority decided, what it changed, and what it permitted.
+
+    Five things kept apart on purpose (G3-1). Evidence classification lives in its own
+    column; this one answers the questions a reader actually has next: did the authority
+    allow it, did anything get written, and what was the customer then told. A row that
+    reads ACCEPT and wrote nothing is a normal, correct outcome for a proposal — and
+    before this column existed there was no way to see that.
+    """
+    result = row.get("authority_result")
+    if result is None and row.get("outcome") is None:
+        return '<span class="empty">—</span>'
+    parts = [f'<div><strong>{_e(result or row.get("outcome"))}</strong></div>']
+    verdict = row.get("authority_verdict")
+    if verdict:
+        label, cls = _VERDICT_LABEL.get(str(verdict), (str(verdict), ""))
+        parts.append(f'<div class="sub2">la autoridad comparó: '
+                     f'<span class="badge {cls}">{_e(label)}</span></div>')
+    effect = row.get("canonical_effect")
+    if effect:
+        label, cls = _EFFECT_LABEL.get(str(effect), (str(effect), ""))
+        badge = f'<span class="badge {cls}">{_e(label)}</span>' if cls else _e(label)
+        parts.append(f'<div class="sub2">estado canónico: {badge}</div>')
+    action = row.get("permitted_action")
+    parts.append('<div class="sub2">acción permitida: '
+                 + (f'<span class="mono">{_e(action)}</span>' if action
+                    else '<span class="empty">ninguna</span>') + '</div>')
+    outcome = row.get("business_outcome")
+    if outcome:
+        parts.append(f'<div class="sub2">resultado: {_e(outcome)}</div>')
+    return "".join(parts)
+
+
 def _counts_line(counts: dict) -> str:
     """Row counts are row counts; family counts deduplicate. Never one printed as the other."""
     parts = [
@@ -571,14 +615,14 @@ def _reconciliation_card(rows, counts: dict, *, semantic: dict) -> str:
             f'{_e(effective.replace("_", " "))}</span>{captured_html}'
             f'<div class="sub2">polaridad: {_e(row.get("information_state"))}</div>'
             f'{contradiction_html}</td>'
-            f'<td>{_e(row.get("outcome"))}</td>'
+            f'<td>{_authority_cell(row)}</td>'
             f'<td class="mono">{_e(row.get("rule_id"))}@{_e(row.get("rule_version"))}</td>'
             f'<td>{_e(row.get("reason_code"))}</td></tr>')
 
     body = ('<div class="tableWrap"><table><thead><tr>'
             '<th>Decisión</th><th>Familia</th><th>Fuentes que participaron</th>'
             '<th>Evidencia aportada</th><th>Qué se comparó</th><th>Clasificación</th>'
-            '<th>Resultado</th><th>Regla</th><th>Motivo</th></tr></thead>'
+            '<th>Autoridad y acción</th><th>Regla</th><th>Motivo</th></tr></thead>'
             f'<tbody>{"".join(cells)}</tbody></table></div>')
     body += f'<p class="note">{_counts_line(counts or {})}</p>'
 

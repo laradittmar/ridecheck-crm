@@ -326,6 +326,13 @@ class ComparisonIdentityIsLogical(unittest.TestCase):
                          svc.logical_comparison_id(**kwargs))
 
     def test_r2_19_the_engine_passes_nothing_positional(self):
+        """No caller may hand the row builder a positional ordinal.
+
+        G3-1 added a second builder call (`_trace_decision`), so counting call sites no
+        longer expresses the invariant. What must hold is that EVERY call names its
+        arguments and none of them is positional: position is what 1.2 removed from
+        comparison identity, and a keyword list is the thing that keeps it out.
+        """
         import ast
         source = (ROOT / "backend" / "app" / "services"
                   / "conversation_engine.py").read_text(encoding="utf-8-sig")
@@ -333,8 +340,14 @@ class ComparisonIdentityIsLogical(unittest.TestCase):
         calls = [n for n in ast.walk(tree)
                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
                  and n.func.id == "reconciliation_from"]
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(sorted(k.arg for k in calls[0].keywords), ["decision_site_id"])
+        self.assertGreaterEqual(len(calls), 1)
+        positional = {"ordinal", "index", "position", "row_index"}
+        for call in calls:
+            names = {k.arg for k in call.keywords}
+            self.assertIn("decision_site_id", names)
+            self.assertEqual(names & positional, set())
+            # record + claims are the only positional arguments any caller may pass
+            self.assertLessEqual(len(call.args), 2)
 
     def test_r2_20_counts_separate_rows_from_logical_comparisons(self):
         rows = svc.finalize_rows((self.apply_row(), self.apply_row(), self.unrelated_row()),
@@ -795,7 +808,7 @@ class RemainingMatrix(unittest.TestCase):
         known = {v for k, v in vars(ClaimType).items() if not k.startswith("_")}
         self.assertTrue(set(CANONICAL_PROPOSITIONS) <= known,
                         "a proposition nothing can produce is a vocabulary nobody earned")
-        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.2")
+        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.3")
 
 
 if __name__ == "__main__":       # pragma: no cover

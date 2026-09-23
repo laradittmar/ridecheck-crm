@@ -60,12 +60,14 @@ import unicodedata
 from dataclasses import dataclass, field, asdict
 from typing import Any, Optional
 
-TRACE_VERSION = "hybrid-decision-trace/1.2"
+TRACE_VERSION = "hybrid-decision-trace/1.3"
+TRACE_VERSION_1_2 = "hybrid-decision-trace/1.2"
 TRACE_VERSION_1_1 = "hybrid-decision-trace/1.1"
 #: The first contract. Its reconciliation rows carry no producer provenance, so a
 #: reader must never treat their absent 1.1 fields as empty 1.1 fields.
 TRACE_VERSION_1_0 = "hybrid-decision-trace/1.0"
-READABLE_VERSIONS = (TRACE_VERSION, TRACE_VERSION_1_1, TRACE_VERSION_1_0)
+READABLE_VERSIONS = (TRACE_VERSION, TRACE_VERSION_1_2, TRACE_VERSION_1_1,
+                     TRACE_VERSION_1_0)
 
 
 class Classification:
@@ -200,6 +202,13 @@ CANONICAL_PROPOSITIONS = {
     "seller_location":     {"resolver": None,              "self_canonical": False},
     "service_intent":      {"resolver": None,              "self_canonical": False},
     "scheduling_preference": {"resolver": None,            "self_canonical": False},
+    # G3-1. Both are boolean propositions, so their structured value IS their canonical
+    # form and two producers can be compared directly. Without them the acceptance and
+    # handoff sites had no shared proposition at all and two producers speaking about the
+    # same thing read as PARALLEL_EVIDENCE — an understatement that would have hidden a
+    # real quote-acceptance disagreement from the operator.
+    "quote_accepted":      {"resolver": None,              "self_canonical": True},
+    "needs_human":         {"resolver": None,              "self_canonical": True},
 }
 
 
@@ -210,6 +219,20 @@ class ComparisonVerdict:
     UNPROVEN = "UNPROVEN"
 
     ALL = (COMPATIBLE, INCOMPATIBLE, UNPROVEN)
+
+
+class CanonicalEffect:
+    """What a decision did to canonical state. Separate from whether it was allowed.
+
+    G3-1 exists because those two were indistinguishable: a row could say `ACCEPT` and a
+    reader could not tell whether anything had been written. `NONE` is the common and
+    correct answer for a proposal.
+    """
+    NONE = "NONE"
+    WROTE = "WROTE"
+    BLOCKED = "BLOCKED"
+
+    ALL = (NONE, WROTE, BLOCKED)
 
 
 class DecisionSite:
@@ -227,9 +250,16 @@ class DecisionSite:
     VEHICLE_IDENTITY_APPLY = "vehicle.identity.apply"
     LOCATION_INSPECTION_APPLY = "location.inspection.apply"
     VEHICLE_FUZZY_ADMISSIBILITY = "vehicle.fuzzy.admissibility"
+    # ── G3-1: the four decisions that were already hybrid and already invisible ──
+    SCHEDULING_REQUEST_RECONCILIATION = "scheduling.request.reconciliation"
+    QUOTE_ACCEPTANCE_AUTHORIZATION = "quote.acceptance.authorization"
+    HANDOFF_SEMANTIC_REQUEST = "handoff.semantic.request"
+    LOCALITY_SEMANTIC_RECOVERY = "locality.semantic.recovery"
 
     ALL = (VEHICLE_IDENTITY_APPLY, LOCATION_INSPECTION_APPLY,
-           VEHICLE_FUZZY_ADMISSIBILITY)
+           VEHICLE_FUZZY_ADMISSIBILITY,
+           SCHEDULING_REQUEST_RECONCILIATION, QUOTE_ACCEPTANCE_AUTHORIZATION,
+           HANDOFF_SEMANTIC_REQUEST, LOCALITY_SEMANTIC_RECOVERY)
 
 
 #: What each decision site is actually deciding, in the operator's language.
@@ -240,6 +270,14 @@ DECISION_PURPOSE = {
         "escribir la localidad de inspección",
     DecisionSite.VEHICLE_FUZZY_ADMISSIBILITY:
         "admitir o rechazar una coincidencia difusa del catálogo como identidad",
+    DecisionSite.SCHEDULING_REQUEST_RECONCILIATION:
+        "decidir qué día y hora pidió el cliente",
+    DecisionSite.QUOTE_ACCEPTANCE_AUTHORIZATION:
+        "autorizar (o no) que el presupuesto quede aceptado",
+    DecisionSite.HANDOFF_SEMANTIC_REQUEST:
+        "decidir si el cliente pidió hablar con una persona",
+    DecisionSite.LOCALITY_SEMANTIC_RECOVERY:
+        "proponer una localidad para confirmar con el cliente",
 }
 
 
@@ -409,6 +447,31 @@ class ReconciliationEvidence:
     #: Evidence about POLARITY. Never sufficient on its own to classify the row.
     information_state: Optional[str] = None
     error_category: Optional[str] = None
+
+    # ── hybrid-decision-trace/1.3 (G3-1) ─────────────────────────────────────
+    # Five things a reader must be able to tell apart. Before G3-1 a row carried the
+    # first and the sixth and nothing between them, so "the reconciler accepted it" and
+    # "canonical state changed" and "the customer was answered" were one undifferentiated
+    # fact. They are not one fact, and conflating them is how an evidence classification
+    # gets mistaken for permission.
+    #
+    #: What the real authority returned, in ITS OWN vocabulary — `ACCEPT`/`HOLD` from a
+    #: field reconciler, `ALLOW`/`DENY`/`CLARIFY`/`HOLD` from the acceptance authorizer,
+    #: `semantic`/`deterministic`/`deterministic_conflict` from the scheduling reconciler.
+    #: Never translated, because translation is where meaning is lost.
+    authority_result: Optional[str] = None
+    #: The authority's OWN cross-producer finding, when it made one. A `ComparisonVerdict`.
+    #: This is not the trace guessing: `semantic_covers_deterministic` is an existing
+    #: resolver for the scheduling proposition, and its answer is evidence of the same kind
+    #: as a catalogue lookup. Absent when the authority compared nothing.
+    authority_verdict: Optional[str] = None
+    #: What this decision did to canonical state — a `CanonicalEffect`.
+    canonical_effect: Optional[str] = None
+    #: The action this decision permitted, named for the business, or `None` for a decision
+    #: that permitted nothing.
+    permitted_action: Optional[str] = None
+    #: The customer-facing outcome that actually followed, when the site knows it.
+    business_outcome: Optional[str] = None
 
 
 @dataclass

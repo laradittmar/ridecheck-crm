@@ -21,11 +21,12 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from ..schemas.hybrid_trace import (
-    CANONICAL_PROPOSITIONS, CanonicalSnapshot, Classification, ComparisonVerdict,
-    DECISION_PURPOSE, DecisionSite, EvidenceSource, HybridDecisionTrace,
-    PropositionComparison, ReconciliationEvidence, ResultKind, RuleEvidence,
-    SemanticEvidence, SourceContribution, TRACE_VERSION, TRACE_VERSION_1_0,
-    TRACE_VERSION_1_1, burst_hash, inputs_digest, source_of_producer, token_fingerprint,
+    CANONICAL_PROPOSITIONS, CanonicalEffect, CanonicalSnapshot, Classification,
+    ComparisonVerdict, DECISION_PURPOSE, DecisionSite, EvidenceSource,
+    HybridDecisionTrace, PropositionComparison, ReconciliationEvidence, ResultKind,
+    RuleEvidence, SemanticEvidence, SourceContribution, TRACE_VERSION,
+    TRACE_VERSION_1_0, TRACE_VERSION_1_1, TRACE_VERSION_1_2,
+    burst_hash, inputs_digest, source_of_producer, token_fingerprint,
 )
 
 logger = logging.getLogger(__name__)
@@ -268,9 +269,15 @@ def canonical_identity(claim_type: Optional[str], value: Any) -> tuple:
         if identity is not None:
             return identity, spec["resolver"]
         return None, f"{spec['resolver']} did not resolve the value"
-    if spec.get("self_canonical") and isinstance(value, (int, float)) \
-            and not isinstance(value, bool):
-        return str(value), "structured value is already canonical"
+    if spec.get("self_canonical"):
+        # A boolean proposition is its own canonical form: `True` and `False` are not two
+        # spellings of one thing, they are contradictory answers to one question. Excluding
+        # bools here was correct while every self-canonical proposition was numeric; with
+        # `quote_accepted` and `needs_human` it would leave a real contradiction unproven.
+        if isinstance(value, bool):
+            return ("true" if value else "false"), "boolean proposition"
+        if isinstance(value, (int, float)):
+            return str(value), "structured value is already canonical"
     return None, "no canonical resolver for this proposition"
 
 
@@ -474,7 +481,8 @@ def self_contradicting_sources(contributions) -> tuple:
 
 
 def classify_row(contributions, *, error_category: Optional[str] = None,
-                 semantic_available: bool = False) -> str:
+                 semantic_available: bool = False,
+                 authority_verdict: Optional[str] = None) -> str:
     """What ONE reconciliation row proves. Derived from participation and from PROOF.
 
     1.1 derived the row from participation, which removed the polarity falsehood and left
@@ -485,6 +493,18 @@ def classify_row(contributions, *, error_category: Optional[str] = None,
 
     `AGREE` now requires a shared canonical proposition, proven compatible. Every weaker
     outcome has its own name, and none of them is agreement.
+
+    **1.3 — an authority's own finding counts as proof.** `authority_verdict` is supplied
+    ONLY by a site whose real reconciler compared the producers itself. The scheduling
+    reconciler's `semantic_covers_deterministic` is a resolver for the scheduling
+    proposition in exactly the sense the governing AGREE/CONFLICT definitions intend, and
+    refusing to hear it would make the trace report `COMPARISON_UNPROVEN` for a
+    disagreement the system actually proved — understating a real conflict.
+
+    It is bounded by two rules that keep it from becoming inference. It is honoured only
+    when **two or more distinct producers actually participated**, so it can never
+    manufacture a cross-producer finding out of one producer or none; and a site that
+    compared nothing passes `None` and changes nothing.
     """
     if error_category:
         return Classification.ERROR
@@ -492,6 +512,10 @@ def classify_row(contributions, *, error_category: Optional[str] = None,
     distinct = set(present)
 
     if len(distinct) >= 2:
+        if authority_verdict == ComparisonVerdict.INCOMPATIBLE:
+            return Classification.CONFLICT
+        if authority_verdict == ComparisonVerdict.COMPATIBLE:
+            return Classification.AGREE
         propositions = compare_propositions(contributions)
         verdicts = {p.verdict for p in propositions}
         if ComparisonVerdict.INCOMPATIBLE in verdicts:
@@ -591,7 +615,10 @@ def logical_comparison_id(*, decision_site_id, claim_family, rule_id, rule_versi
                          rule_id, rule_version, ",".join(claim_ids))
 
 
-def reconciliation_from(record, claims=(), *, decision_site_id=None) -> ReconciliationEvidence:
+def reconciliation_from(record, claims=(), *, decision_site_id=None,
+                        authority_result=None, authority_verdict=None,
+                        canonical_effect=None, permitted_action=None,
+                        business_outcome=None) -> ReconciliationEvidence:
     """One live reconciliation, told as WHICH source supplied WHAT to WHICH decision.
 
     `claims` is the input set the reconciler was handed; it carries each producer's own
@@ -613,7 +640,8 @@ def reconciliation_from(record, claims=(), *, decision_site_id=None) -> Reconcil
         semantic_input=("PRESENT" if EvidenceSource.SEMANTIC in present else "ABSENT"),
         ce_input=("PRESENT" if (EvidenceSource.DETERMINISTIC in present
                                 or EvidenceSource.CANONICAL_STATE in present) else "ABSENT"),
-        classification=classify_row(contributions),
+        classification=classify_row(contributions,
+                                    authority_verdict=authority_verdict),
         rule_id=rule_id,
         rule_version=rule_version,
         outcome=getattr(record, "outcome", None),
@@ -633,7 +661,12 @@ def reconciliation_from(record, claims=(), *, decision_site_id=None) -> Reconcil
         compared_propositions=compare_propositions(contributions),
         self_contradiction_sources=self_contradicting_sources(contributions),
         information_state=getattr(record, "information_state", None),
-        error_category=None)
+        error_category=None,
+        authority_result=authority_result,
+        authority_verdict=authority_verdict,
+        canonical_effect=canonical_effect,
+        permitted_action=permitted_action,
+        business_outcome=business_outcome)
 
 
 def _semantic_produced_evidence(semantic) -> bool:
@@ -664,7 +697,8 @@ def finalize_rows(reconciliations, semantic) -> tuple:
         row.classification = classify_row(
             contributions,
             error_category=getattr(row, "error_category", None),
-            semantic_available=available)
+            semantic_available=available,
+            authority_verdict=getattr(row, "authority_verdict", None))
         key = getattr(row, "logical_comparison_id", None)
         row.occurrence_index = seen.get(key, 0)
         seen[key] = row.occurrence_index + 1
@@ -892,12 +926,14 @@ class _StoredRow:
     exactly as the writer did — from participation, not from a label it found lying there.
     """
     __slots__ = ("classification", "source_evidence", "error_category",
-                 "not_routed_sources", "claim_family", "logical_comparison_id")
+                 "not_routed_sources", "claim_family", "logical_comparison_id",
+                 "authority_verdict")
 
     def __init__(self, raw: dict):
         raw = raw if isinstance(raw, dict) else {}
         self.claim_family = raw.get("claim_family")
         self.logical_comparison_id = raw.get("logical_comparison_id")
+        self.authority_verdict = raw.get("authority_verdict")
         self.error_category = raw.get("error_category")
         self.not_routed_sources = tuple(raw.get("not_routed_sources") or ())
         self.classification = raw.get("classification")
@@ -975,7 +1011,8 @@ def rows_from_payload(payload) -> tuple:
             row.not_routed_sources = not_routed_for(row.source_evidence, available)
             row.classification = classify_row(row.source_evidence,
                                               error_category=row.error_category,
-                                              semantic_available=available)
+                                              semantic_available=available,
+                                              authority_verdict=row.authority_verdict)
         out.append(row)
     return tuple(out)
 
@@ -1036,6 +1073,11 @@ def row_summaries_from_payload(payload) -> tuple:
             "not_routed_sources": list(row.not_routed_sources),
             "source_evidence": (None if legacy else list(raw.get("source_evidence") or [])),
             "information_state": raw.get("information_state"),
+            "authority_result": raw.get("authority_result"),
+            "authority_verdict": raw.get("authority_verdict"),
+            "canonical_effect": raw.get("canonical_effect"),
+            "permitted_action": raw.get("permitted_action"),
+            "business_outcome": raw.get("business_outcome"),
             "outcome": raw.get("outcome"),
             "rule_id": raw.get("rule_id"),
             "rule_version": raw.get("rule_version"),

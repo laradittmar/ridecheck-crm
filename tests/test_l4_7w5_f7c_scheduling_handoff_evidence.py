@@ -273,11 +273,32 @@ class TestGovernance(unittest.TestCase):
         self.assertIn("UNRESOLVED_STATUSES", src)
 
     def test_f7c_20_no_second_needs_human_producer(self):
-        """Only claim_projection may mint a NEEDS_HUMAN claim."""
-        hits = [n for n in ast.walk(ast.parse(CE_SRC))
-                if isinstance(n, ast.Attribute) and n.attr == "NEEDS_HUMAN"]
-        self.assertEqual(len(hits), 1,
-                         "conversation_engine references NEEDS_HUMAN once, to read it")
+        """Only claim_projection may mint a NEEDS_HUMAN claim.
+
+        This asserted a reference COUNT of one, which was a proxy for the invariant while
+        the engine had exactly one reason to name the claim type. G3-1 gave it a second
+        legitimate reason — labelling the traced decision — so the count no longer
+        expresses the rule.
+
+        The invariant is tested directly instead, and more strictly than a count ever
+        could: the engine may READ the claim type as often as it likes, and may never
+        CONSTRUCT a `ClaimEvidence` carrying it. A count of one would have permitted a
+        single minting call; this permits none.
+        """
+        tree = ast.parse(CE_SRC)
+        minted = []
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id == "ClaimEvidence"):
+                continue
+            for kw in node.keywords:
+                if kw.arg != "claim_type":
+                    continue
+                if isinstance(kw.value, ast.Attribute) and kw.value.attr == "NEEDS_HUMAN":
+                    minted.append(node.lineno)
+        self.assertEqual(minted, [],
+                         "conversation_engine must never construct a NEEDS_HUMAN claim; "
+                         "claim_projection is the only producer")
 
     def test_f7c_21_projection_remains_the_only_mapping(self):
         ev = evidence_with_handoff()
