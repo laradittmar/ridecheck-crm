@@ -8,6 +8,12 @@ MILESTONE: PRELAUNCH-CANONICAL-ROADMAP
 **Last gate sync:** 2026-09-22 — `PRELAUNCH-ROADMAP-GATE1-GATE2-SYNC`. Gates 1 and 2 closed
 on owner `INSPECTOR PASS`; Gate 3 reframed and left open as the next architectural
 milestone. Documentation only: no code, no deployment, no Wild.  
+**Truth correction:** 2026-09-23 — `L4.7W5-GATE3-ROADMAP-TRUTH-CORRECTION`. The
+2026-09-22 sync asserted that semantic evidence reaches no production reconciler. The
+executable-source audit
+`2026-09-23_RIDECHECK_CRM_L4.7W5-GATE3-SEMANTIC-ROUTING-AUDIT_AUDIT_001.md` proved that
+false. Gate 3 is redefined from *initial routing* to *completion, governance and
+visibility* of a hybrid architecture that partially exists. Documentation only.  
 **Purpose:** Replace the outdated launch roadmap with one finite, deadline-driven source of truth.
 
 ## 1. Executive truth
@@ -48,7 +54,8 @@ The LLM and CE are independent evidence producers. Neither may silently become b
 | Hybrid interpretation for offered-slot rejection | Semantic result had no rejection; forensic record cannot prove which complete burst the model saw; no dedicated claim/reconciliation policy exists | **NOT PROVEN** |
 | Alternative-time request | “¿No tenés algo más temprano?” correctly must not be treated as a rejection, but useful alternative response remains open F-03 | **OPEN MEDIUM** |
 | Live hybrid observability | Hybrid Decision Inspector deployed as `ridecheck-crm-backend:w5tracerows-355c0ae` (`GIT_SHA 355c0ae`, config `b2e6d43`); owner returned `INSPECTOR PASS` 2026-09-22 | **DEPLOYED / GATES 1+2 COMPLETE** |
-| Semantic evidence routing | Every production reconciliation still builds its claims from CE evidence alone; no semantic claim reaches a reconciler | **GATE 3 — OPEN, NEXT** |
+| Semantic evidence routing | Semantic evidence ALREADY reaches five production consumers same-turn (scheduling, quote acceptance, human handoff, locality recovery, FAQ topics); it is ungoverned by one authority policy and four materially hybrid sites emit no reconciliation row | **GATE 3 — OPEN, NEXT** |
+| Hybrid Inspector coverage | Truthful for the rows it receives; the three traced sites are CE-only, so no materially hybrid decision is currently visible | **INCOMPLETE COVERAGE — GATE 3** |
 | Raw WAMID on the forensic API | Rendered CRM surfaces mask WAMIDs; anonymous API access denied; the authenticated JSON API still returns the raw WAMID as a join key | **PRELAUNCH PRIVACY DECISION — NON-BLOCKING** |
 | Real-client replay | Not yet executed against the completed hybrid architecture | **PENDING** |
 | Smart Booking | Premises supplied; audit/design, implementation and certification remain | **PENDING / SCOPE CONTAINED** |
@@ -127,9 +134,21 @@ turn, contract `hybrid-decision-trace/1.2`, carrying:
 | `HYBRID_TRACE_ENABLED` | `true` |
 | `OUTBOUND_ENABLED` | `false` |
 
-**What this gate does NOT claim.** Semantic evidence has **no production reconciliation
-authority**. Capture proves what each producer did; it does not route semantic claims to a
-reconciler and does not grant them the power to change canonical state. That is Gate 3.
+**Bounded completion — what Gate 1 DID prove.** Durable trace infrastructure; burst
+identity; evidence capture; the `hybrid-decision-trace/1.2` contract; and the deployment
+and persistence foundation beneath them.
+
+**What Gate 1 did NOT prove**, corrected 2026-09-23 against executable source:
+
+- **complete coverage of every production hybrid decision site.** Three reconciliation
+  sites are instrumented; four materially hybrid sites are not (Gate 3 findings below);
+- **universal semantic-to-reconciler governance.** Semantic evidence already reaches
+  several production consumers, under no single authority policy;
+- **complete claim-family authority policy.** No family-by-family policy exists yet.
+
+Semantic evidence has **no direct canonical-mutation authority** and must not acquire any:
+it may inform a reconciler or an authorizer, and those — not the producer — decide. That
+separation is intact today and is Gate 3's to formalise.
 
 **Scope — conversational hybrid decisions only.** A hybrid decision is a customer turn in
 which the semantic engine and the deterministic CE both interpret the same evidence and a
@@ -242,6 +261,22 @@ The existing dashboard remains the operational overview. Add a conversation/turn
   `action=replied` for a turn that produced no reply; the scope sentence claiming both
   engines interpreted the same evidence; and the unmasked inbound WAMID.
 
+**Bounded completion — what Gate 2 DID prove.** Truthful rendering of the rows the
+Inspector receives; corrected row semantics; the captured-versus-effective distinction; an
+owner-approved dashboard and detail page; privacy masking on rendered surfaces.
+
+**What Gate 2 did NOT prove**, corrected 2026-09-23 against executable source:
+
+- **that every production hybrid decision emits a reconciliation row.** Four do not;
+- **that the dashboard currently represents all semantic influence.** Semantic evidence
+  influences scheduling, acceptance, handoff, locality and FAQ selection, none of which
+  appears as a reconciliation row;
+- **that existing hybrid decision paths share one authority policy.** They do not.
+
+The Inspector is **truthful for what it receives and incomplete in coverage**. It must not
+be described as showing every production hybrid decision. Closing that gap is Gate 3, and
+it does not reopen Gate 2: nothing the Inspector displays is wrong.
+
 Exit:
 
 - Lara can answer: “What did the customer say, what did the LLM infer, what did CE infer, what did reconciliation decide, and why?” from one screen.
@@ -251,16 +286,76 @@ Exit:
 
 ### Gate 3 — Semantic Evidence Routing and Reconciliation Authority — **OPEN / NEXT ARCHITECTURAL MILESTONE**
 
-**Still open, and now the only thing between the architecture and its own premise.** Gates
-1 and 2 made the gap visible and inspectable; visibility is not capability. Every
-production reconciliation still builds its claims from CE evidence alone, so no semantic
-claim has ever reached a reconciler. There is still no evidence claim whose referent is the
-offered appointment set, and `QUOTE_ACCEPTED` / `QUOTE_NEGATED` remain reserved for the
-quote and must not be reused for it.
+**Still open — and it is not what this roadmap said it was until 2026-09-23.**
 
-**Objective:** Route real semantic `TurnEvidence` into the production reconciler alongside
-deterministic CE evidence, then let explicit reconciliation policy determine canonical
-state and permitted actions.
+The 2026-09-22 sync asserted that every production reconciliation builds its claims from CE
+evidence alone and that no semantic claim had ever reached a reconciler. The
+executable-source audit of 2026-09-23 proved that false. The correction is recorded here
+because planning Gate 3 against the wrong premise would have produced the wrong milestone.
+
+#### Current production truth
+
+1. **One semantic interpretation is dispatched per burst**, near the beginning of the
+   `ConversationEngine` turn (`conversation_engine.py:3417`), before every consumer below.
+   At most one model call per burst; that invariant is enforced in code and must survive
+   Gate 3.
+2. **With the flags production actually runs** — `SHADOW_UNDERSTAND_ENABLED=true`,
+   `SHADOW_UNDERSTAND_ASYNC=true`, `SEMANTIC_SAME_TURN_ENABLED=true`,
+   `SEMANTIC_SAME_TURN_TIMEOUT_SECONDS=6.0` — semantic evidence **is available to same-turn
+   production consumers**. All five flags default to `false`/off in `settings.py`; they are
+   `true` by environment.
+3. **Execution is concurrent, but consumption is a join.** The interpretation starts
+   alongside CE work; a consumer that needs it waits through a bounded 6-second join before
+   making the affected decision. A timeout is absent evidence, never a guess.
+4. **Semantic evidence already participates in five production paths:**
+   - **scheduling requests** — CE claims and semantic claims both enter
+     `reconcile_scheduling`;
+   - **quote acceptance** — CE and semantic evidence both enter
+     `authorize_quote_acceptance`;
+   - **human handoff** — semantic evidence can **independently** trigger scheduling
+     escalation;
+   - **locality recovery** — semantic evidence can produce a locality proposal and a
+     customer-facing confirmation question;
+   - **FAQ topics** — consumed in a lower-risk response path.
+5. **Scheduling reconciliation can already compare deterministic and semantic claims**, and
+   does so on resolved dates and times rather than wording. It uses its own current
+   vocabulary (`source = semantic | deterministic | deterministic_conflict`) and is not
+   represented through the Inspector's complete row semantics.
+6. **The three currently traced reconciliation sites are CE-only:** vehicle-identity
+   application; inspection-zone application; fuzzy vehicle-identity admissibility.
+7. **The four materially hybrid decision sites emit no reconciliation row:** scheduling
+   reconciliation; quote-acceptance authorization; semantic human-handoff request; semantic
+   locality recovery.
+8. **Therefore the Hybrid Decision Inspector is truthful for the rows it receives, and its
+   production coverage is incomplete.**
+9. **The deployed Inspector must not be described as showing every production hybrid
+   decision.** It shows the CE-only decisions correctly and does not yet see the hybrid ones.
+10. **Gate 3 is therefore not "route semantic evidence for the first time."**
+
+Carried forward unchanged: there is still no evidence claim whose referent is the offered
+appointment set, and `QUOTE_ACCEPTED` / `QUOTE_NEGATED` remain reserved for the quote and
+must not be reused for it.
+
+**Objective:** Gate 3 must **complete, govern and expose** the partially existing hybrid
+architecture by bringing every production semantic/CE decision under explicit reconciliation
+policy, consistent authority rules and complete Hybrid Decision Inspector coverage.
+
+That objective includes, without exception:
+
+- preserve the current **one-interpretation-per-burst** invariant;
+- preserve **same-turn burst isolation** — a per-request engine, no cross-turn reuse;
+- preserve **deterministic business validation** for availability, price, booking, zone and
+  catalogue resolution;
+- **trace every materially hybrid decision**;
+- distinguish **semantic success, absence, timeout, provider error and validation failure**
+  at the decision layer, not only in the log;
+- **project semantic ambiguities and conflicts** instead of discarding them;
+- establish **explicit claim-family authority policies**;
+- prevent semantic interpretation from **directly authorizing protected business actions**;
+- place canonical mutations behind **identified authoritative writers**;
+- expose **evidence, reconciliation, authority and action** decisions in the Inspector;
+- prevent a **late semantic result from changing a finalized turn**;
+- keep **phrase cataloguing out of the architecture**.
 
 #### Architectural principles this gate must preserve
 
@@ -342,10 +437,12 @@ Actions:
 
 Exit:
 
-- Real semantic `TurnEvidence` reaches the production reconciler alongside CE evidence, and
-  the Inspector shows it doing so on a live turn.
-- Live `AGREE`, `CONFLICT` and `PARALLEL_EVIDENCE` between the two producers become
-  reachable in production and are observed, not merely proven by fixture.
+- **Every** materially hybrid production decision emits a reconciliation row, and the
+  Inspector shows a real two-producer comparison on a live turn.
+- Live `AGREE`, `CONFLICT` and `PARALLEL_EVIDENCE` between the two producers are
+  **observed in the Inspector**, not merely reachable in code and not merely proven by
+  fixture.
+- Every routed site shares one explicit authority policy, per claim family.
 - New wording variants are handled by semantic equivalence plus bounded deterministic safeguards—not by adding each sentence to production logic.
 - Corpus evaluation meets agreed precision/recall thresholds, especially false-handoff rate.
 - Reconciler decisions — every `HOLD`, acceptance, conflict, ambiguity, fallback and human
@@ -355,17 +452,88 @@ Exit:
 
 #### Honest limitation until Gate 3 is implemented
 
-This is what the deployed Inspector will and will not show today, stated so that a reader
-does not mistake a truthful trace for a completed architecture:
+What the deployed Inspector will and will not show today, so that a reader does not mistake
+a truthful trace for a complete architecture:
 
-- **live production reconciliation claims are still built from CE evidence**;
-- **live rows may show `SINGLE_PRODUCER`, `NOT_ROUTED` or `NO_EVIDENCE`** — and will, by
-  design, because only one producer ever participates;
-- **genuine live `AGREE`, `CONFLICT` and `PARALLEL_EVIDENCE` between the semantic and
-  deterministic producers are not yet reachable**;
-- **fixture proof of those classifications is not equivalent to production routing proof.**
-  The `1.2` matrix demonstrates the classifier is correct; it does not demonstrate that the
-  architecture is wired.
+- **the three rows it receives are CE-only**, so they correctly read `SINGLE_PRODUCER`,
+  `NOT_ROUTED` or `NO_EVIDENCE`;
+- **the four hybrid decisions produce no row at all**, so live `AGREE`, `CONFLICT` and
+  `PARALLEL_EVIDENCE` are not observable — not because semantic evidence is unrouted, but
+  because the routed sites are uninstrumented;
+- **fixture proof is not production-coverage proof.** The `1.2` matrix demonstrates the
+  classifier is correct; it does not demonstrate that every hybrid decision is captured.
+
+#### Open findings — executable-source audit, 2026-09-23
+
+**BLOCKER**
+
+- The four materially hybrid production decision paths are not traced in the Hybrid
+  Decision Inspector.
+
+**HIGH**
+
+- Thread-level locality fields have multiple direct writers and are not governed by one
+  reconciliation authority.
+- Semantic-only evidence can currently trigger a human handoff or a locality-confirmation
+  response without an Inspector reconciliation row or an owner-ratified family policy.
+- Semantic ambiguities and conflicts are produced by the interpreter but discarded before
+  claim projection.
+
+**MEDIUM**
+
+- Scheduling producer identity is inferred from evidence class instead of producer
+  namespace.
+- Scheduling reconciliation hard-codes `TRUE_ONLY` and loses real polarity.
+- Timeout, provider error, validation error and genuine semantic silence all collapse to
+  `None` at the decision layer.
+- Five post-2026-09-01 Wild sessions are absent from the durable semantic corpus.
+
+**LOW**
+
+- `ConversationEngine` contains many transaction commits, complicating a single
+  authoritative turn-finalization boundary.
+
+#### Pending owner decisions — NOT decided here
+
+These are business-policy questions. They are recorded, not answered:
+
+1. Whether semantic-only evidence may trigger human handoff.
+2. Whether semantic-only locality evidence may send a confirmation question.
+3. Whether thread-level locality must use the reconciled single-writer path.
+4. Whether quote-acceptance disagreement must HOLD and clarify, or retain the deterministic
+   reading.
+5. Whether all five later Wild sessions must enter the durable certification corpus.
+
+#### Engineering recommendations — pending owner ratification
+
+Recorded separately from adopted policy. **None of these is in force.**
+
+- A semantic-only **explicit human request** may escalate, with a trace row and a named
+  policy.
+- Semantic-only **locality** may propose and ask for confirmation, but must not write
+  canonical location or unlock quote/availability.
+- **Thread-level locality** should use one reconciled writer.
+- **Quote-acceptance disagreement** should HOLD and clarify.
+- **All preserved Wild failures** should become versioned corpus evidence.
+
+#### Bounded implementation sequence
+
+- **G3-0** — roadmap truth correction (this entry).
+- **G3-1** — instrument the four existing hybrid decision sites **without changing their
+  decisions**.
+- **G3-2** — preserve the semantic outcome reason: `OK`, `ABSENT`, `TIMEOUT`, `ERROR`,
+  `VALIDATION_ERROR`.
+- **G3-3** — project semantic ambiguities and conflicts, without granting them mutation
+  authority.
+- **G3-4** — establish reconciled single-writer authority for thread-level locality.
+- **G3-5** — derive producer identity from the producer namespace and preserve real
+  polarity.
+- **G3-6** — implement owner-ratified family authority policies.
+- **G3-7** — complete the durable Wild corpus, replay, certify, deploy and conduct an
+  owner-present Wild, through separate controlled milestones.
+
+**G3-1 is the next proposed implementation slice**, after this roadmap correction is
+reviewed and pushed.
 
 ### Gate 4 — Owner-controlled Human Rescue Wild completion
 
@@ -497,8 +665,10 @@ Public launch begins only after Lara declares **GO**.
 - ~~Deploy and replay F7G-R2.~~ **DONE — Gate 0 complete 2026-09-18.**
 - ~~Complete hybrid evidence capture and dashboard inspector.~~ **DONE — Gates 1 and 2
   complete 2026-09-22 on owner `INSPECTOR PASS`.**
-- **Route semantic evidence into the reconciler and define reconciliation authority
-  (Gate 3).** ← next architectural milestone.
+- **Complete, govern and expose the partially existing hybrid architecture (Gate 3).**
+  ← next architectural milestone. Corrected 2026-09-23: semantic evidence already reaches
+  five production consumers; what is missing is one authority policy and complete Inspector
+  coverage, not initial routing.
 - Complete Human Rescue Wild — only after Gate 3.
 - Run real-client replay before Smart Booking.
 - Implement and certify the agreed Smart Booking MVP.
@@ -549,10 +719,11 @@ open for the owner:
    normalized burst, satisfying *"the exact model input boundary is provable."*
 3. ~~Gate 2 Hybrid Decision Inspector.~~ **DONE — Gate 2 complete 2026-09-22 on owner
    `INSPECTOR PASS`.**
-4. **NEXT — Gate 3: Semantic Evidence Routing and Reconciliation Authority.** Route real
-   semantic `TurnEvidence` into the production reconciler alongside deterministic CE
-   evidence, then let explicit reconciliation policy determine canonical state and
-   permitted actions. Not started.
+4. **NEXT — Gate 3: Semantic Evidence Routing and Reconciliation Authority.** Complete,
+   govern and expose the hybrid architecture that partially exists: bring every production
+   semantic/CE decision under explicit reconciliation policy, consistent authority rules and
+   complete Inspector coverage. The next implementation slice is **G3-1**, instrumenting the
+   four existing hybrid decision sites without changing their decisions. Not started.
 5. Run the owner-controlled Human Rescue Wild replay (Gate 4) — **only after Gate 3 is
    implemented, reviewed, deployed and visible in the Inspector.**
 6. Begin real-client replay (Gate 5) — **before any Smart Booking expansion.**
