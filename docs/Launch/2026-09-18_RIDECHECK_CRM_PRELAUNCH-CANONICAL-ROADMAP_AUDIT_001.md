@@ -493,28 +493,133 @@ a truthful trace for a complete architecture:
 - `ConversationEngine` contains many transaction commits, complicating a single
   authoritative turn-finalization boundary.
 
-#### Pending owner decisions — NOT decided here
+#### Owner-ratified Gate 3 authority policies — adopted 2026-09-23
 
-These are business-policy questions. They are recorded, not answered:
+The five questions raised by the 2026-09-23 audit were put to the owner and **ratified**.
+They are binding constraints on G3-1 through G3-7.
 
-1. Whether semantic-only evidence may trigger human handoff.
-2. Whether semantic-only locality evidence may send a confirmation question.
-3. Whether thread-level locality must use the reconciled single-writer path.
-4. Whether quote-acceptance disagreement must HOLD and clarify, or retain the deterministic
-   reading.
-5. Whether all five later Wild sessions must enter the durable certification corpus.
+**None of them is implemented.** Nothing in this subsection describes current behaviour;
+each is a requirement the corresponding slice must satisfy and prove.
 
-#### Engineering recommendations — pending owner ratification
+**The six layers these policies keep apart.** Every policy below is written against this
+separation, and no policy may be read as collapsing any two of them:
 
-Recorded separately from adopted policy. **None of these is in force.**
+- **semantic interpretation** — what the customer meant;
+- **structured evidence** — that meaning expressed as typed claims;
+- **reconciliation** — what two or more producers, taken together, prove;
+- **canonical-state authority** — what may be written, and by which writer;
+- **business validation** — availability, price, zone and catalogue, from the sources of
+  truth;
+- **permitted action** — what the system is then allowed to do.
 
-- A semantic-only **explicit human request** may escalate, with a trace row and a named
-  policy.
-- Semantic-only **locality** may propose and ask for confirmation, but must not write
-  canonical location or unlock quote/availability.
-- **Thread-level locality** should use one reconciled writer.
-- **Quote-acceptance disagreement** should HOLD and clarify.
-- **All preserved Wild failures** should become versioned corpus evidence.
+**Two statements that govern every policy below.**
+
+- **Semantic evidence does not require matching CE evidence to be valid.** Evidence the
+  deterministic engine could not produce is still evidence. Discarding it because CE stayed
+  silent would delete exactly the capability the interpreter exists to supply.
+- **CE silence is not disagreement, and it is not a veto.** An absent deterministic reading
+  neither contradicts a semantic one nor blocks it.
+
+**None of these policies establishes phrase matching as the architecture.** They are
+policies about meaning, evidence and authority. No policy below authorises a phrase list, a
+keyword set, a regex or a sentence-specific branch, and P5 forbids turning corpus evidence
+into one.
+
+**P1 — Semantic-only human-handoff requests: ALLOWED.**
+
+The semantic engine must be allowed to recognise an affirmative request for a person **even
+when CE cannot understand the customer's wording**.
+
+**"Explicit" means explicit in semantic meaning — not exact spelling, keywords or
+phrasing.**
+
+Requirements:
+
+- the proposition must be **affirmative**;
+- **negation must be respected**;
+- "no me llame", "no quiero hablar con alguien" and equivalent negative meanings **must not
+  trigger a handoff**;
+- **ambiguity must not be converted into a positive request**;
+- **CE silence is not a veto**;
+- the decision requires an **explicit reconciliation policy**;
+- the decision and the resulting state and action must be **fully traced**.
+
+**P2 — Semantic-only locality evidence: MAY ASK A CONFIRMATION QUESTION.**
+
+It may propose a candidate interpretation, of the form "¿Te referís a Palermo?".
+
+Semantic-only locality evidence **must not**, by itself:
+
+- write canonical locality or zone;
+- determine **viáticos**;
+- calculate or authorize a price;
+- authorize a quote;
+- promise availability;
+- select a scheduling slot;
+- dispatch a booking Flow;
+- create a revision or a booking.
+
+The **proposal**, the **confirmation question** and the **eventual confirmed resolution**
+must all be traced.
+
+**P3 — Thread-level locality: ONE RECONCILED AUTHORITATIVE WRITER.**
+
+The implementation must place `state.home_zone_group`, `state.home_zone_detail` and
+equivalent thread-level locality mutations behind **one identified reconciliation and
+mutation path**.
+
+**Direct competing writers must be removed or routed through that authority.**
+
+Implementation constraint carried from the owner's instruction: existing behaviour is
+preserved until separately reviewed, with regression protection for location retention,
+pricing and scheduling.
+
+**P4 — Quote-acceptance disagreement: HOLD AND CLARIFY.**
+
+When semantic and CE evidence address the **same** quote-acceptance proposition and are
+**provably incompatible**:
+
+- do **not** treat the quote as accepted;
+- do **not** silently prefer CE;
+- do **not** silently prefer semantic evidence;
+- do **not** advance to scheduling;
+- do **not** send the booking Flow;
+- **HOLD and ask a concise clarification question**.
+
+Neither producer wins by default. Silent victory for either side is what hides a real
+disagreement from the operator, and it is precisely what this policy forbids.
+
+**Scope limit, stated deliberately.** P4 applies to **genuine cross-producer conflict**. It
+does **not** decide the separate policy for **semantic-only** quote acceptance; that family
+case remains to be evaluated during Gate 3 authority-policy design (G3-6).
+
+**P5 — Durable Wild corpus: ALL FIVE POST-2026-09-01 SESSIONS.**
+
+All five preserved Wild sessions after 2026-09-01 must be added to the durable semantic
+evaluation corpus **with provenance**. They are evaluation and certification evidence.
+
+They **must not** become:
+
+- phrase rules;
+- regexes;
+- keywords;
+- deterministic exception lists;
+- production matching shortcuts.
+
+A corpus case proves whether the architecture understands. It is never a branch inside the
+architecture.
+
+#### Still unresolved after the 2026-09-23 ratification
+
+Recorded so nothing here is mistaken for already answered:
+
+- the **semantic-only quote-acceptance** family policy, outside a true semantic-versus-CE
+  conflict — to be evaluated during Gate 3 authority-policy design (G3-6);
+- **confidence thresholds** of any kind;
+- the **exact customer-facing wording** of any clarification or confirmation question;
+- **implementation details** of every slice;
+- any change to the semantic **timeout**;
+- **deployment timing** for any Gate 3 slice.
 
 #### Bounded implementation sequence
 
