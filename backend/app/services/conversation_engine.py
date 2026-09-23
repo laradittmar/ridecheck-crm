@@ -5622,7 +5622,7 @@ class ConversationEngine:
     def _trace_decision(self, *, decision_site_id, claim_type, claims=(),
                         outcome=None, reason=None, rule_id=None, rule_version=None,
                         information_state=None, evidence_ids=(),
-                        authority_result=None, authority_verdict=None,
+                        authority_result=None, domain_verdict=None,
                         canonical_effect=None, permitted_action=None,
                         business_outcome=None) -> None:
         """Record one already-made decision. Observational, fail-open, never re-derives.
@@ -5630,8 +5630,14 @@ class ConversationEngine:
         G3-1. Four production decisions were already hybrid and already invisible. This
         records what each one actually consumed and actually decided — it does not re-parse
         the burst, does not call the provider, does not build a claim the decision did not
-        see, and does not touch the decision itself. Every failure is swallowed, so a trace
-        defect cannot cost a customer turn.
+        see, and does not touch the decision itself.
+
+        G3-1-R2. The failure stays fail-open — a trace defect must never cost a customer
+        turn — but it is no longer silent. A systematically failing observer used to leave
+        no trace of its own failure, which is the one bug an observability layer cannot
+        afford. The diagnostic carries the operation, the contract version, the exception
+        class, the thread id and the deployment SHA, and nothing else: no message text, no
+        claim values, no identifiers beyond the thread the operator already sees.
         """
         if not self._hybrid_trace_on():
             return
@@ -5646,12 +5652,23 @@ class ConversationEngine:
                     record, tuple(claims or ()),
                     decision_site_id=decision_site_id,
                     authority_result=authority_result,
-                    authority_verdict=authority_verdict,
+                    domain_verdict=domain_verdict,
                     canonical_effect=canonical_effect,
                     permitted_action=permitted_action,
                     business_outcome=business_outcome))
-        except Exception:
-            pass
+        except Exception as exc:
+            try:
+                from ..schemas.hybrid_trace import TRACE_VERSION
+                from .outbound_path_registry import get_deployment_id
+                _ctx = getattr(self, "_turn_trace_ctx", None)
+                logger.warning(
+                    "HYBRID_TRACE_COLLECT_FAILED operation=_trace_decision site=%s "
+                    "contract=%s error=%s thread_id=%s deployment=%s",
+                    decision_site_id, TRACE_VERSION, type(exc).__name__,
+                    getattr(getattr(_ctx, "thread", None), "id", None),
+                    get_deployment_id())
+            except Exception:
+                pass
 
     def _trace_outbound_for_turn(self, thread_id) -> dict:
         """What the gate actually recorded for this turn, by correlation id.
@@ -6134,11 +6151,26 @@ class ConversationEngine:
         # as the authority verdict. Any other source compared nothing incompatible.
         from ..schemas.claims import ClaimType
         from ..schemas.hybrid_trace import CanonicalEffect, ComparisonVerdict
+        from .hybrid_trace import contributions_from_claims, has_cross_producer_comparison
+        # G3-1-R2. `len(claims) > 1` counted claims, so five readings from one parser looked
+        # like a comparison, and `source == "deterministic"` — which means no semantic claim
+        # existed and NOTHING was compared — reported COMPATIBLE. The gate now requires what
+        # a cross-producer statement actually requires: two distinct producers that both
+        # addressed the same canonical proposition.
+        #
+        # `deterministic_conflict` and `semantic` are the only two outcomes `reconcile_
+        # scheduling` reaches by running `semantic_covers_deterministic`; every other
+        # source means it never compared anything, and supplies no verdict.
         _verdict = None
-        if decision.source == "deterministic_conflict":
-            _verdict = ComparisonVerdict.INCOMPATIBLE
-        elif decision.source in ("semantic", "deterministic") and len(claims) > 1:
-            _verdict = ComparisonVerdict.COMPATIBLE
+        try:
+            _compared = has_cross_producer_comparison(contributions_from_claims(claims))
+        except Exception:
+            _compared = False
+        if _compared:
+            if decision.source == "deterministic_conflict":
+                _verdict = ComparisonVerdict.INCOMPATIBLE
+            elif decision.source == "semantic":
+                _verdict = ComparisonVerdict.COMPATIBLE
         self._trace_decision(
             decision_site_id=DecisionSite.SCHEDULING_REQUEST_RECONCILIATION,
             claim_type=ClaimType.SCHEDULING_PREFERENCE, claims=claims,
@@ -6146,7 +6178,7 @@ class ConversationEngine:
             rule_id=decision.rule_id, rule_version=decision.rule_version,
             information_state=decision.information_state,
             evidence_ids=decision.evidence_ids,
-            authority_result=decision.source, authority_verdict=_verdict,
+            authority_result=decision.source, domain_verdict=_verdict,
             canonical_effect=CanonicalEffect.NONE,
             permitted_action=("check_availability" if requests else None),
             business_outcome=(f"{len(requests)} scheduling request(s) resolved"

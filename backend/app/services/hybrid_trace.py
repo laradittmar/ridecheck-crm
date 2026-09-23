@@ -22,7 +22,8 @@ from typing import Any, Optional
 
 from ..schemas.hybrid_trace import (
     CANONICAL_PROPOSITIONS, CanonicalEffect, CanonicalSnapshot, Classification,
-    ComparisonVerdict, DECISION_PURPOSE, DecisionSite, EvidenceSource,
+    ComparisonVerdict, DECISION_PURPOSE, DecisionSite, DomainVerdictAdmission,
+    EvidenceSource,
     HybridDecisionTrace, PropositionComparison, ReconciliationEvidence, ResultKind,
     RuleEvidence, SemanticEvidence, SourceContribution, TRACE_VERSION,
     TRACE_VERSION_1_0, TRACE_VERSION_1_1, TRACE_VERSION_1_2,
@@ -480,9 +481,48 @@ def self_contradicting_sources(contributions) -> tuple:
     return tuple(out)
 
 
+def has_cross_producer_comparison(contributions) -> bool:
+    """True when two or more DISTINCT producers addressed at least one shared proposition.
+
+    The single precondition for any cross-producer statement. Counting claims is not a
+    substitute: five claims from one parser are one producer, and two producers who never
+    named the same field have not compared anything. Both mistakes were live before
+    G3-1-R2 — one in the classifier, one in the scheduling verdict gate.
+    """
+    if len(set(participating_sources(contributions))) < 2:
+        return False
+    return bool(compare_propositions(contributions))
+
+
+def admit_domain_verdict(contributions, propositions, domain_verdict) -> str:
+    """Whether a domain comparator's finding may affect the classification, and why not.
+
+    A domain comparator knows something the generic one does not — for scheduling, that a
+    richer reading which covers every deterministic branch on the same resolved dates is
+    an enrichment rather than a disagreement. That knowledge is admissible, under exactly
+    the preconditions every other comparison obeys, and never over the top of a generic
+    comparison that already proved the answer.
+
+    Returns a `DomainVerdictAdmission`. Rejections are returned rather than swallowed so
+    the row can show that two comparators disagreed.
+    """
+    if domain_verdict not in (ComparisonVerdict.COMPATIBLE, ComparisonVerdict.INCOMPATIBLE):
+        return DomainVerdictAdmission.NOT_SUPPLIED
+    if len(set(participating_sources(contributions))) < 2:
+        return DomainVerdictAdmission.REJECTED_SINGLE_PRODUCER
+    if not propositions:
+        return DomainVerdictAdmission.REJECTED_NO_SHARED_PROPOSITION
+    verdicts = {p.verdict for p in propositions}
+    if ComparisonVerdict.INCOMPATIBLE in verdicts:
+        return DomainVerdictAdmission.REJECTED_EVIDENCE_ALREADY_PROVEN
+    if ComparisonVerdict.COMPATIBLE in verdicts and ComparisonVerdict.UNPROVEN not in verdicts:
+        return DomainVerdictAdmission.REJECTED_EVIDENCE_ALREADY_PROVEN
+    return DomainVerdictAdmission.ADMITTED
+
+
 def classify_row(contributions, *, error_category: Optional[str] = None,
                  semantic_available: bool = False,
-                 authority_verdict: Optional[str] = None) -> str:
+                 domain_verdict: Optional[str] = None) -> str:
     """What ONE reconciliation row proves. Derived from participation and from PROOF.
 
     1.1 derived the row from participation, which removed the polarity falsehood and left
@@ -491,53 +531,55 @@ def classify_row(contributions, *, error_category: Optional[str] = None,
     spoke about different fields cannot have agreed, and two who spoke about the same field
     in values nothing can reconcile have not been shown to.
 
-    `AGREE` now requires a shared canonical proposition, proven compatible. Every weaker
+    `AGREE` requires a shared canonical proposition, proven compatible. Every weaker
     outcome has its own name, and none of them is agreement.
 
-    **1.3 — an authority's own finding counts as proof.** `authority_verdict` is supplied
-    ONLY by a site whose real reconciler compared the producers itself. The scheduling
-    reconciler's `semantic_covers_deterministic` is a resolver for the scheduling
-    proposition in exactly the sense the governing AGREE/CONFLICT definitions intend, and
-    refusing to hear it would make the trace report `COMPARISON_UNPROVEN` for a
-    disagreement the system actually proved — understating a real conflict.
+    **1.3-R2 — a domain comparator is heard last, never first.** G3-1 let a supplied
+    verdict short-circuit ahead of `compare_propositions`, which meant it could promote
+    parallel evidence to `AGREE` and could override a proven incompatibility. The
+    pre-condition ladder below is now evaluated in full FIRST, and the domain verdict is
+    consulted only in the one place where it can add knowledge: a shared proposition whose
+    generic comparison came back `UNPROVEN`. `admit_domain_verdict` records every
+    rejection so a disagreement between the two comparators stays visible.
 
-    It is bounded by two rules that keep it from becoming inference. It is honoured only
-    when **two or more distinct producers actually participated**, so it can never
-    manufacture a cross-producer finding out of one producer or none; and a site that
-    compared nothing passes `None` and changes nothing.
+    An action-authority result — `ALLOW`, `HOLD`, `ACCEPT` — is never an input here and
+    cannot be: this function receives contributions and a comparison verdict, nothing else.
     """
     if error_category:
         return Classification.ERROR
     present = participating_sources(contributions)
     distinct = set(present)
 
-    if len(distinct) >= 2:
-        if authority_verdict == ComparisonVerdict.INCOMPATIBLE:
-            return Classification.CONFLICT
-        if authority_verdict == ComparisonVerdict.COMPATIBLE:
-            return Classification.AGREE
-        propositions = compare_propositions(contributions)
-        verdicts = {p.verdict for p in propositions}
-        if ComparisonVerdict.INCOMPATIBLE in verdicts:
-            return Classification.CONFLICT
-        if not propositions:
-            return Classification.PARALLEL_EVIDENCE
-        if ComparisonVerdict.COMPATIBLE in verdicts and \
-                ComparisonVerdict.UNPROVEN not in verdicts:
-            return Classification.AGREE
-        return Classification.COMPARISON_UNPROVEN
+    # 1. no usable evidence at all
+    if not distinct:
+        return Classification.NOT_ROUTED if semantic_available else Classification.NO_EVIDENCE
 
+    # 2. exactly one producer — no verdict can invent the second one
     if len(distinct) == 1:
-        # A producer that contradicts itself has not produced usable single-source
-        # evidence; it has produced ambiguity, and that is what the row says.
         if self_contradicting_sources(contributions):
             return Classification.AMBIGUOUS_EVIDENCE
         return Classification.SINGLE_PRODUCER
 
-    # Nothing usable reached this call. Blaming a named producer here is exactly the
-    # falsehood 1.0 shipped: `NEITHER` became SEMANTIC_MISSING on rows where CE had said
-    # nothing either. NOT_ROUTED is claimed only when the evidence is provably elsewhere.
-    return Classification.NOT_ROUTED if semantic_available else Classification.NO_EVIDENCE
+    # 3. two or more producers: what, if anything, did they both address?
+    propositions = compare_propositions(contributions)
+    if not propositions:
+        return Classification.PARALLEL_EVIDENCE
+
+    verdicts = {p.verdict for p in propositions}
+
+    # 4. the generic comparison decides whenever it can prove an answer
+    if ComparisonVerdict.INCOMPATIBLE in verdicts:
+        return Classification.CONFLICT
+    if ComparisonVerdict.COMPATIBLE in verdicts and ComparisonVerdict.UNPROVEN not in verdicts:
+        return Classification.AGREE
+
+    # 5. only an unprovable shared proposition may be resolved by domain knowledge
+    if admit_domain_verdict(contributions, propositions,
+                            domain_verdict) == DomainVerdictAdmission.ADMITTED:
+        if domain_verdict == ComparisonVerdict.INCOMPATIBLE:
+            return Classification.CONFLICT
+        return Classification.AGREE
+    return Classification.COMPARISON_UNPROVEN
 
 
 def not_routed_for(contributions, semantic_available: bool) -> tuple:
@@ -616,7 +658,7 @@ def logical_comparison_id(*, decision_site_id, claim_family, rule_id, rule_versi
 
 
 def reconciliation_from(record, claims=(), *, decision_site_id=None,
-                        authority_result=None, authority_verdict=None,
+                        authority_result=None, domain_verdict=None,
                         canonical_effect=None, permitted_action=None,
                         business_outcome=None) -> ReconciliationEvidence:
     """One live reconciliation, told as WHICH source supplied WHAT to WHICH decision.
@@ -640,8 +682,7 @@ def reconciliation_from(record, claims=(), *, decision_site_id=None,
         semantic_input=("PRESENT" if EvidenceSource.SEMANTIC in present else "ABSENT"),
         ce_input=("PRESENT" if (EvidenceSource.DETERMINISTIC in present
                                 or EvidenceSource.CANONICAL_STATE in present) else "ABSENT"),
-        classification=classify_row(contributions,
-                                    authority_verdict=authority_verdict),
+        classification=classify_row(contributions, domain_verdict=domain_verdict),
         rule_id=rule_id,
         rule_version=rule_version,
         outcome=getattr(record, "outcome", None),
@@ -663,7 +704,9 @@ def reconciliation_from(record, claims=(), *, decision_site_id=None,
         information_state=getattr(record, "information_state", None),
         error_category=None,
         authority_result=authority_result,
-        authority_verdict=authority_verdict,
+        domain_verdict=domain_verdict,
+        domain_verdict_admission=admit_domain_verdict(
+            contributions, compare_propositions(contributions), domain_verdict),
         canonical_effect=canonical_effect,
         permitted_action=permitted_action,
         business_outcome=business_outcome)
@@ -698,7 +741,10 @@ def finalize_rows(reconciliations, semantic) -> tuple:
             contributions,
             error_category=getattr(row, "error_category", None),
             semantic_available=available,
-            authority_verdict=getattr(row, "authority_verdict", None))
+            domain_verdict=getattr(row, "domain_verdict", None))
+        row.domain_verdict_admission = admit_domain_verdict(
+            contributions, compare_propositions(contributions),
+            getattr(row, "domain_verdict", None))
         key = getattr(row, "logical_comparison_id", None)
         row.occurrence_index = seen.get(key, 0)
         seen[key] = row.occurrence_index + 1
@@ -927,13 +973,13 @@ class _StoredRow:
     """
     __slots__ = ("classification", "source_evidence", "error_category",
                  "not_routed_sources", "claim_family", "logical_comparison_id",
-                 "authority_verdict")
+                 "domain_verdict")
 
     def __init__(self, raw: dict):
         raw = raw if isinstance(raw, dict) else {}
         self.claim_family = raw.get("claim_family")
         self.logical_comparison_id = raw.get("logical_comparison_id")
-        self.authority_verdict = raw.get("authority_verdict")
+        self.domain_verdict = raw.get("domain_verdict")
         self.error_category = raw.get("error_category")
         self.not_routed_sources = tuple(raw.get("not_routed_sources") or ())
         self.classification = raw.get("classification")
@@ -1012,7 +1058,7 @@ def rows_from_payload(payload) -> tuple:
             row.classification = classify_row(row.source_evidence,
                                               error_category=row.error_category,
                                               semantic_available=available,
-                                              authority_verdict=row.authority_verdict)
+                                              domain_verdict=row.domain_verdict)
         out.append(row)
     return tuple(out)
 
@@ -1074,7 +1120,8 @@ def row_summaries_from_payload(payload) -> tuple:
             "source_evidence": (None if legacy else list(raw.get("source_evidence") or [])),
             "information_state": raw.get("information_state"),
             "authority_result": raw.get("authority_result"),
-            "authority_verdict": raw.get("authority_verdict"),
+            "domain_verdict": raw.get("domain_verdict"),
+            "domain_verdict_admission": raw.get("domain_verdict_admission"),
             "canonical_effect": raw.get("canonical_effect"),
             "permitted_action": raw.get("permitted_action"),
             "business_outcome": raw.get("business_outcome"),

@@ -124,6 +124,10 @@ LABEL_GLOSSARY = (
      "qué decidió el reconciliador o autorizador, si escribió estado canónico y qué "
      "acción quedó permitida. Que la evidencia sea válida NO significa que haya "
      "autoridad para mutar: son columnas distintas a propósito"),
+    ("NO APLICADO",
+     "un comparador de dominio dio un veredicto que NO se aplicó, porque faltaba una "
+     "segunda fuente, faltaba un campo compartido, o la evidencia genérica ya lo había "
+     "probado. Se muestra en vez de ocultarse"),
     ("LEGACY PROVENANCE UNAVAILABLE",
      "traza 1.0: la fila registra que algo participó, pero no quién. No se puede probar "
      "ni acuerdo ni desacuerdo; la etiqueta original se conserva aparte"),
@@ -492,6 +496,17 @@ def _propositions_cell(row: dict) -> str:
     return "".join(blocks)
 
 
+#: Why a domain comparator's finding was not allowed to decide the row. Shown in full:
+#: the point of the Inspector is that a disagreement between comparators is visible.
+_ADMISSION_NOTE = {
+    "REJECTED_SINGLE_PRODUCER":
+        "una sola fuente participó; un comparador no puede inventar la segunda",
+    "REJECTED_NO_SHARED_PROPOSITION":
+        "las fuentes no hablaron del mismo campo canónico",
+    "REJECTED_EVIDENCE_ALREADY_PROVEN":
+        "la comparación genérica ya había probado el resultado; la evidencia manda",
+}
+
 _EFFECT_LABEL = {
     "NONE": ("no escribió estado", ""),
     "WROTE": ("escribió estado canónico", "warn"),
@@ -512,11 +527,17 @@ def _authority_cell(row: dict) -> str:
     if result is None and row.get("outcome") is None:
         return '<span class="empty">—</span>'
     parts = [f'<div><strong>{_e(result or row.get("outcome"))}</strong></div>']
-    verdict = row.get("authority_verdict")
+    verdict = row.get("domain_verdict")
     if verdict:
         label, cls = _VERDICT_LABEL.get(str(verdict), (str(verdict), ""))
-        parts.append(f'<div class="sub2">la autoridad comparó: '
+        admission = str(row.get("domain_verdict_admission") or "NOT_SUPPLIED")
+        parts.append(f'<div class="sub2">comparador de dominio: '
                      f'<span class="badge {cls}">{_e(label)}</span></div>')
+        # A rejected domain verdict is shown, never hidden: two comparators disagreeing is
+        # a fact the operator should see, not something the trace quietly resolves.
+        if admission.startswith("REJECTED"):
+            parts.append('<div class="sub2"><span class="badge warn">NO APLICADO</span> '
+                         + _e(_ADMISSION_NOTE.get(admission, admission)) + '</div>')
     effect = row.get("canonical_effect")
     if effect:
         label, cls = _EFFECT_LABEL.get(str(effect), (str(effect), ""))

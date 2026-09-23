@@ -221,6 +221,34 @@ class ComparisonVerdict:
     ALL = (COMPATIBLE, INCOMPATIBLE, UNPROVEN)
 
 
+class DomainVerdictAdmission:
+    """Whether a domain comparator's finding was allowed to affect the classification.
+
+    G3-1-R2. A domain comparator — `semantic_covers_deterministic` is the only one today —
+    compares two producers on one proposition using knowledge the generic comparator does
+    not have. Its finding is admissible evidence, but only inside the same preconditions
+    every other comparison must satisfy, and never over the top of a generic comparison
+    that already proved the opposite.
+
+    A rejection is recorded rather than dropped. The whole point of the Inspector is that
+    a disagreement between two comparators is a fact an operator should see, not something
+    the trace quietly resolves.
+    """
+    NOT_SUPPLIED = "NOT_SUPPLIED"
+    ADMITTED = "ADMITTED"
+    #: fewer than two distinct producers — a comparator cannot invent the second one
+    REJECTED_SINGLE_PRODUCER = "REJECTED_SINGLE_PRODUCER"
+    #: the producers addressed no proposition in common
+    REJECTED_NO_SHARED_PROPOSITION = "REJECTED_NO_SHARED_PROPOSITION"
+    #: the generic comparison already proved compatibility or incompatibility
+    REJECTED_EVIDENCE_ALREADY_PROVEN = "REJECTED_EVIDENCE_ALREADY_PROVEN"
+
+    ALL = (NOT_SUPPLIED, ADMITTED, REJECTED_SINGLE_PRODUCER,
+           REJECTED_NO_SHARED_PROPOSITION, REJECTED_EVIDENCE_ALREADY_PROVEN)
+    REJECTIONS = (REJECTED_SINGLE_PRODUCER, REJECTED_NO_SHARED_PROPOSITION,
+                  REJECTED_EVIDENCE_ALREADY_PROVEN)
+
+
 class CanonicalEffect:
     """What a decision did to canonical state. Separate from whether it was allowed.
 
@@ -460,11 +488,17 @@ class ReconciliationEvidence:
     #: `semantic`/`deterministic`/`deterministic_conflict` from the scheduling reconciler.
     #: Never translated, because translation is where meaning is lost.
     authority_result: Optional[str] = None
-    #: The authority's OWN cross-producer finding, when it made one. A `ComparisonVerdict`.
-    #: This is not the trace guessing: `semantic_covers_deterministic` is an existing
-    #: resolver for the scheduling proposition, and its answer is evidence of the same kind
-    #: as a catalogue lookup. Absent when the authority compared nothing.
-    authority_verdict: Optional[str] = None
+    #: A DOMAIN COMPARATOR's own cross-producer finding, when one was made — a
+    #: `ComparisonVerdict`. Renamed from `authority_verdict` in G3-1-R2 because that name
+    #: invited exactly the confusion the audit found: this is an EVIDENCE comparison made
+    #: with domain knowledge (`semantic_covers_deterministic` compares resolved dates and
+    #: times), not an action-authority result. `authority_result` above is the action one,
+    #: and it never touches the classification.
+    domain_verdict: Optional[str] = None
+    #: Whether that finding was admitted, and if not, why — a `DomainVerdictAdmission`.
+    #: A rejection is recorded so a disagreement between the generic and domain comparators
+    #: is visible rather than silently resolved.
+    domain_verdict_admission: str = "NOT_SUPPLIED"
     #: What this decision did to canonical state — a `CanonicalEffect`.
     canonical_effect: Optional[str] = None
     #: The action this decision permitted, named for the business, or `None` for a decision

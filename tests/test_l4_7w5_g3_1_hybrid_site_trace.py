@@ -151,7 +151,7 @@ class SchedulingSite(unittest.TestCase):
         row = row_for(e, self.SITE)[0]
         self.assertEqual(row.classification, Classification.AGREE)
         self.assertEqual(sorted(row.participating_sources), sorted([SEM, DET]))
-        self.assertEqual(row.authority_verdict, ComparisonVerdict.COMPATIBLE)
+        self.assertEqual(row.domain_verdict, ComparisonVerdict.COMPATIBLE)
         self.assertEqual(row.authority_result, "semantic")
 
     def test_site_02_incompatible_two_producers_is_conflict(self):
@@ -159,7 +159,7 @@ class SchedulingSite(unittest.TestCase):
                                sem_claims=[self.sem(self.BR_B)])
         row = row_for(e, self.SITE)[0]
         self.assertEqual(row.classification, Classification.CONFLICT)
-        self.assertEqual(row.authority_verdict, ComparisonVerdict.INCOMPATIBLE)
+        self.assertEqual(row.domain_verdict, ComparisonVerdict.INCOMPATIBLE)
         self.assertEqual(row.authority_result, "deterministic_conflict")
 
     def test_site_03_ce_only_is_single_producer(self):
@@ -167,7 +167,7 @@ class SchedulingSite(unittest.TestCase):
         row = row_for(e, self.SITE)[0]
         self.assertEqual(row.classification, Classification.SINGLE_PRODUCER)
         self.assertEqual(row.participating_sources, (DET,))
-        self.assertIsNone(row.authority_verdict, "one producer compared nothing")
+        self.assertIsNone(row.domain_verdict, "one producer compared nothing")
 
     def test_site_04_semantic_only_is_single_producer_semantic(self):
         e, out = self.run_site(ce_claims=[], sem_claims=[self.sem(self.BR_A)])
@@ -660,3 +660,281 @@ def _as_dict(row):
 
 if __name__ == "__main__":       # pragma: no cover
     unittest.main()
+
+
+# ── G3-1-R2: the verdict guard, cases A..N from the corrective milestone ─────
+
+class DomainVerdictGuard(unittest.TestCase):
+    """A domain comparator is heard last, never first.
+
+    G3-1 let a supplied verdict short-circuit ahead of `compare_propositions`. The
+    independent pre-push audit proved three consequences: parallel evidence could be
+    promoted to AGREE, parallel evidence could be promoted to CONFLICT, and a verdict could
+    override an incompatibility the generic comparator had already proven. None was
+    reachable from the single site that supplies a verdict today, which is exactly why it
+    had to be fixed before a second site exists.
+
+    The rule these cases pin: preconditions first, generic comparison second, domain
+    knowledge only where the generic comparison could not reach an answer.
+    """
+
+    @staticmethod
+    def claim(producer, claim_type, value, klass=EvidenceClass.DETERMINISTIC_EXTRACTED,
+              polarity=None):
+        from app.schemas.claims import ClaimEvidence, Explicitness, Polarity
+        return ClaimEvidence(claim_type=claim_type, value=value, evidence_class=klass,
+                             producer=producer,
+                             polarity=polarity or Polarity.ASSERTED,
+                             explicitness=Explicitness.STATED).with_id()
+
+    def sem(self, t, v, **k):
+        return self.claim("semantic:understand", t, v,
+                          klass=EvidenceClass.SEMANTIC_INFERRED, **k)
+
+    def det(self, t, v, **k):
+        return self.claim("ce:catalog", t, v, **k)
+
+    def classify(self, claims, verdict=None):
+        return svc.classify_row(svc.contributions_from_claims(claims),
+                                domain_verdict=verdict)
+
+    def admission(self, claims, verdict):
+        contribs = svc.contributions_from_claims(claims)
+        return svc.admit_domain_verdict(contribs, svc.compare_propositions(contribs),
+                                        verdict)
+
+    MODEL = ClaimType.VEHICLE_MODEL
+    YEAR = ClaimType.VEHICLE_YEAR
+    LOC = ClaimType.INSPECTION_LOCATION
+
+    # A
+    def test_r2_a_one_producer_plus_compatible_is_not_agree(self):
+        claims = [self.sem(self.MODEL, "Peugeot 208")]
+        self.assertEqual(self.classify(claims, ComparisonVerdict.COMPATIBLE),
+                         Classification.SINGLE_PRODUCER)
+        self.assertEqual(self.admission(claims, ComparisonVerdict.COMPATIBLE),
+                         "REJECTED_SINGLE_PRODUCER")
+
+    # B
+    def test_r2_b_zero_producers_plus_incompatible_is_no_evidence(self):
+        self.assertEqual(self.classify([], ComparisonVerdict.INCOMPATIBLE),
+                         Classification.NO_EVIDENCE)
+
+    # C
+    def test_r2_c_zero_producers_plus_compatible_is_no_evidence(self):
+        self.assertEqual(self.classify([], ComparisonVerdict.COMPATIBLE),
+                         Classification.NO_EVIDENCE)
+
+    # D
+    def test_r2_d_parallel_plus_compatible_stays_parallel(self):
+        claims = [self.sem(self.MODEL, "Peugeot 208"), self.det(self.YEAR, 2020)]
+        self.assertEqual(self.classify(claims, ComparisonVerdict.COMPATIBLE),
+                         Classification.PARALLEL_EVIDENCE)
+        self.assertEqual(self.admission(claims, ComparisonVerdict.COMPATIBLE),
+                         "REJECTED_NO_SHARED_PROPOSITION")
+
+    # E
+    def test_r2_e_parallel_plus_incompatible_stays_parallel(self):
+        claims = [self.sem(self.MODEL, "Peugeot 208"), self.det(self.YEAR, 2020)]
+        self.assertEqual(self.classify(claims, ComparisonVerdict.INCOMPATIBLE),
+                         Classification.PARALLEL_EVIDENCE)
+
+    # F
+    def test_r2_f_verdict_cannot_override_proven_incompatibility(self):
+        claims = [self.sem(self.MODEL, "Peugeot 208"), self.det(self.MODEL, "Ford Ka")]
+        self.assertEqual(self.classify(claims), Classification.CONFLICT)
+        self.assertEqual(self.classify(claims, ComparisonVerdict.COMPATIBLE),
+                         Classification.CONFLICT)
+        self.assertEqual(self.admission(claims, ComparisonVerdict.COMPATIBLE),
+                         "REJECTED_EVIDENCE_ALREADY_PROVEN")
+
+    def test_r2_f2_verdict_cannot_override_proven_compatibility(self):
+        claims = [self.sem(self.MODEL, "208"), self.det(self.MODEL, "Peugeot 208")]
+        self.assertEqual(self.classify(claims), Classification.AGREE)
+        self.assertEqual(self.classify(claims, ComparisonVerdict.INCOMPATIBLE),
+                         Classification.AGREE)
+
+    # G
+    def test_r2_g_many_claims_one_producer_is_single_producer(self):
+        claims = [self.det(self.MODEL, "Peugeot 208"), self.det(self.YEAR, 2020),
+                  self.det(ClaimType.VEHICLE_MAKE, "Peugeot")]
+        for verdict in (None, ComparisonVerdict.COMPATIBLE, ComparisonVerdict.INCOMPATIBLE):
+            with self.subTest(verdict=verdict):
+                self.assertEqual(self.classify(claims, verdict),
+                                 Classification.SINGLE_PRODUCER)
+
+    # H / I
+    def test_r2_h_two_producers_compatible_is_agree(self):
+        self.assertEqual(
+            self.classify([self.sem(self.MODEL, "208"), self.det(self.MODEL, "Peugeot 208")]),
+            Classification.AGREE)
+
+    def test_r2_i_two_producers_incompatible_is_conflict(self):
+        self.assertEqual(
+            self.classify([self.sem(self.MODEL, "Peugeot 208"),
+                           self.det(self.MODEL, "Toyota Corolla")]),
+            Classification.CONFLICT)
+
+    def test_r2_i2_unprovable_is_where_domain_knowledge_may_help(self):
+        """The one place a domain verdict is admissible — and the only one."""
+        claims = [self.sem(self.LOC, "Villa Crespo"), self.det(self.LOC, "V. Crespo")]
+        self.assertEqual(self.classify(claims), Classification.COMPARISON_UNPROVEN)
+        self.assertEqual(self.admission(claims, ComparisonVerdict.COMPATIBLE), "ADMITTED")
+        self.assertEqual(self.classify(claims, ComparisonVerdict.COMPATIBLE),
+                         Classification.AGREE)
+        self.assertEqual(self.classify(claims, ComparisonVerdict.INCOMPATIBLE),
+                         Classification.CONFLICT)
+
+    # J
+    def test_r2_j_boolean_canonicalization_remains_exact(self):
+        ci = svc.canonical_identity
+        t, f = ci(ClaimType.QUOTE_ACCEPTED, True)[0], ci(ClaimType.QUOTE_ACCEPTED, False)[0]
+        self.assertNotEqual(t, f)
+        self.assertNotEqual(t, ci(ClaimType.QUOTE_ACCEPTED, 1)[0])
+        self.assertNotEqual(f, ci(ClaimType.QUOTE_ACCEPTED, 0)[0])
+        self.assertIsNone(ci(ClaimType.QUOTE_ACCEPTED, "true")[0])
+        self.assertIsNone(ci(ClaimType.QUOTE_ACCEPTED, "false")[0])
+        self.assertEqual(
+            self.classify([self.sem(ClaimType.QUOTE_ACCEPTED, "true"),
+                           self.claim("canonical:deterministic_acceptance",
+                                      ClaimType.QUOTE_ACCEPTED, True)]),
+            Classification.COMPARISON_UNPROVEN)
+        self.assertEqual(ci(ClaimType.VEHICLE_YEAR, 2020)[0], "2020")
+
+    # L
+    def test_r2_l_locality_projection_is_trace_only(self):
+        loc = LocalitySite()
+        e, out = loc.run_site(loc.match())
+        row = row_for(e, loc.SITE)[0]
+        self.assertEqual(row.participating_sources, (SEM,),
+                         "the projection preserves the real semantic producer")
+        self.assertNotIn(DET, row.participating_sources, "no CE producer is created")
+        self.assertEqual(len(row.participating_sources), 1,
+                         "the projection is never counted as an additional producer")
+        self.assertEqual(row.canonical_effect, CanonicalEffect.NONE)
+        # SITE-29 already pins that `_recover_locality` returns the resolver's own match
+        # object; the projection is never substituted for it.
+
+    def test_r2_l2_the_projection_never_reaches_business_logic(self):
+        """It is built inside the tracer's own scope and returned to nobody."""
+        import ast
+        src = (ROOT / "backend" / "app" / "services"
+               / "conversation_engine.py").read_text(encoding="utf-8-sig")
+        fn = next(n for n in ast.walk(ast.parse(src))
+                  if isinstance(n, ast.FunctionDef) and n.name == "_recover_locality")
+        seg = ast.get_source_segment(src, fn)
+        self.assertIn("_claims = [ClaimEvidence(", seg)
+        self.assertNotIn("return _claims", seg)
+        self.assertNotIn("self._claims", seg)
+        self.assertTrue(seg.rstrip().endswith("return match"),
+                        "the method still returns the resolver's match and nothing else")
+
+    # M
+    def test_r2_m_instrumentation_adds_no_provider_call(self):
+        import ast
+        src = (ROOT / "backend" / "app" / "services"
+               / "conversation_engine.py").read_text(encoding="utf-8-sig")
+        tree = ast.parse(src)
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == "_trace_decision")
+        seg = ast.get_source_segment(src, fn)
+        # Code only. The docstring says "does not call the provider", which is the claim
+        # being tested, not a violation of it.
+        code = "\n".join(l for l in seg.splitlines()
+                         if not l.strip().startswith(("#", '"""', "G3-", "records ", "turn",
+                                                      "no trace", "afford", "class,", "claim")))
+        code = code.split('"""')[0] + code.split('"""')[-1] if code.count('"""') >= 2 else code
+        for forbidden in ("_semantic_turn_evidence", "provider.", "interpret(",
+                          "SemanticTurnInterpreter", "_run_shadow_understand"):
+            self.assertNotIn(forbidden, code)
+        # the four sites gained no new call to the evidence accessor either
+        calls = sum(1 for n in ast.walk(tree)
+                    if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                    and n.func.attr == "_semantic_turn_evidence")
+        self.assertEqual(calls, 5, "the same five pre-existing consumers, no more")
+
+
+class ObserverFailureDiagnostics(unittest.TestCase):
+    """Case K — fail-open, but no longer silent, and never chatty with customer data."""
+
+    def test_r2_k_forced_failure_logs_safely_and_changes_nothing(self):
+        import logging
+        h = HandoffSite()
+        with self.assertLogs("app.services.conversation_engine", level="WARNING") as caught:
+            with mock.patch("app.services.hybrid_trace.reconciliation_from",
+                            side_effect=RuntimeError("observer exploded")):
+                e_fail, out_fail = h.run_site([h.claim(True)], trace=True)
+        e_off, out_off = h.run_site([h.claim(True)], trace=False)
+        e_ok, out_ok = h.run_site([h.claim(True)], trace=True)
+
+        self.assertEqual(out_fail, out_off,
+                         "a failed observer gives the same result as no observer")
+        self.assertEqual(out_fail, out_ok,
+                         "and the same result as a working observer")
+        self.assertEqual(len(e_fail._turn_trace_reconciliations), 0)
+
+        blob = "\n".join(caught.output)
+        self.assertIn("HYBRID_TRACE_COLLECT_FAILED", blob)
+        self.assertIn("operation=_trace_decision", blob)
+        self.assertIn("handoff.semantic.request", blob)
+        self.assertIn("RuntimeError", blob)
+        self.assertIn("hybrid-decision-trace/", blob)
+
+    def test_r2_k2_the_diagnostic_carries_no_customer_data(self):
+        h = HandoffSite()
+        with self.assertLogs("app.services.conversation_engine", level="WARNING") as caught:
+            with mock.patch("app.services.hybrid_trace.reconciliation_from",
+                            side_effect=RuntimeError("boom")):
+                h.run_site([h.claim(True)], trace=True)
+        blob = "\n".join(caught.output)
+        self.assertEqual(re.findall(r"\b549\d{8,12}\b", blob), [])
+        for marker in ("wamid.", "bk_tok", "@", "-----BEGIN", "sk-", "prompt"):
+            self.assertNotIn(marker, blob)
+
+    def test_r2_k3_the_diagnostic_fields_are_an_allowlist(self):
+        """Read from source: only these five values may reach the log line."""
+        import ast
+        src = (ROOT / "backend" / "app" / "services"
+               / "conversation_engine.py").read_text(encoding="utf-8-sig")
+        fn = next(n for n in ast.walk(ast.parse(src))
+                  if isinstance(n, ast.FunctionDef) and n.name == "_trace_decision")
+        seg = ast.get_source_segment(src, fn)
+        line = seg[seg.index("HYBRID_TRACE_COLLECT_FAILED"):seg.index("except Exception:\n                pass")]
+        for allowed in ("decision_site_id", "TRACE_VERSION", "type(exc).__name__",
+                        "thread", "get_deployment_id()"):
+            self.assertIn(allowed, line)
+        for forbidden in ("claims", "reason", "business_outcome", "value", "text",
+                          "evidence_ids", "outcome"):
+            self.assertNotIn(forbidden, line)
+
+
+class TracingOffParity(unittest.TestCase):
+    """Case N — with tracing off the business path is the pre-G3-1 path."""
+
+    def test_r2_n_all_four_sites_identical_with_tracing_off(self):
+        s, a, h, l = SchedulingSite(), AcceptanceSite(), HandoffSite(), LocalitySite()
+        cases = []
+        for det, sem in ((True, True), (True, False), (False, True), (False, False)):
+            d = [s.det(s.BR_A)] if det else []
+            m = [s.sem(s.BR_B)] if sem else []
+            _, on = s.run_site(ce_claims=d, sem_claims=m, trace=True)
+            _, off = s.run_site(ce_claims=d, sem_claims=m, trace=False)
+            cases.append((f"sched {det}/{sem}", [(r.day_iso, r.time_str) for r in on],
+                                                 [(r.day_iso, r.time_str) for r in off]))
+        for claims, label in (([h.claim(True)], "handoff+"), ([h.claim(False)], "handoff-"),
+                              ([], "handoff0")):
+            _, on = h.run_site(claims, trace=True); _, off = h.run_site(claims, trace=False)
+            cases.append((label, on, off))
+        for allows, result in ((True, "ALLOW"), (False, "HOLD"), (False, "DENY")):
+            _, on = a.run_site([a.det()], allows=allows, result=result, trace=True)
+            _, off = a.run_site([a.det()], allows=allows, result=result, trace=False)
+            cases.append((result, (on.result, on.allows), (off.result, off.allows)))
+        for st in ("APPROXIMATE", "EXACT", "AMBIGUOUS", "NONE"):
+            best = "Berazategui" if st not in ("NONE",) else None
+            _, on = l.run_site(l.match(st, best), trace=True)
+            _, off = l.run_site(l.match(st, best), trace=False)
+            cases.append((f"loc {st}", (on.status, on.reason), (off.status, off.reason)))
+        for label, on, off in cases:
+            with self.subTest(case=label):
+                self.assertEqual(on, off)
+        self.assertEqual(len(cases), 14)
