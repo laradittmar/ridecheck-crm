@@ -270,22 +270,50 @@ state and permitted actions.
 2. **The deterministic engine supplies independently derived evidence and enforces
    deterministic business floors.** It is a second producer and a safety floor, not a
    second opinion to be averaged with the first.
-3. **Agreement is based on shared canonical business propositions and compatible canonical
-   values** — not identical wording, and not identical extraction methods. Two producers
-   reaching `Peugeot 208` by different routes agree; two producers speaking about different
-   fields have not agreed about anything.
-4. **Semantic-only evidence is valid evidence and must remain visible as
+3. **`AGREE` requires distinct producers contributing to the same canonical business
+   proposition, with compatible canonical values or equivalent polarity.** Agreement never
+   depends on identical wording or identical extraction methods: two producers reaching
+   `Peugeot 208` by different routes — one from colloquial speech, one from the catalogue —
+   agree, because the canonical identity is the same. Compatibility must be established
+   from canonical normalization or an existing resolver; where it cannot be established,
+   the comparison is `COMPARISON_UNPROVEN`, never agreement.
+4. **`CONFLICT` requires at least two distinct evidence producers contributing to the same
+   canonical business proposition, with values or polarity that are provably incompatible
+   after applicable canonical normalization or resolution.** Nothing weaker is a conflict:
+
+   - missing semantic evidence is **not** conflict;
+   - unrouted evidence is **not** conflict;
+   - CE silence is **not** conflict;
+   - a single producer is **not** cross-producer conflict;
+   - claims about different propositions are **not** conflict;
+   - an internally contradictory single producer is `AMBIGUOUS_EVIDENCE`, not cross-producer
+     `CONFLICT`;
+   - uncertainty, or an inability to prove equivalence, is `COMPARISON_UNPROVEN`, not
+     `CONFLICT`.
+
+   The first trace this system ever captured was headlined `CONFLICT` because a row with
+   nothing to compare was read as contradiction. This principle exists so that cannot
+   recur by policy, not only by code.
+5. **`PARALLEL_EVIDENCE` means distinct producers contributed evidence about
+   non-overlapping canonical propositions or claim families.** They spoke about different
+   things, so:
+
+   - parallel evidence is neither `AGREE` nor `CONFLICT`;
+   - absence of contradiction does **not** convert parallel evidence into agreement;
+   - each contribution remains available for its own reconciliation and authority policy;
+   - no producer is considered to have confirmed a proposition it did not address.
+6. **Semantic-only evidence is valid evidence and must remain visible as
    `SINGLE_PRODUCER`.** It must not be discarded merely because the CE could not understand
    the same language — that is precisely the language the interpreter exists for.
-5. **Semantic evidence does not automatically gain mutation authority.** Routing it to a
+7. **Semantic evidence does not automatically gain mutation authority.** Routing it to a
    reconciler is not the same as letting it write canonical state.
-6. **CE silence is not disagreement.**
-7. **Absence of conflict is not agreement.**
-8. **The reconciler — not either producer — decides** how evidence affects canonical state
-   and which actions are permitted.
-9. **No phrase catalogue or accumulating list of sentence variants is an acceptable
-   architectural solution.** Real expressions belong in a versioned evaluation corpus.
-10. **Every `HOLD`, acceptance, conflict, ambiguity, fallback and human escalation must be
+8. **CE silence is not disagreement.**
+9. **Absence of conflict is not agreement.**
+10. **The reconciler — not either producer — decides** how evidence affects canonical state
+    and which actions are permitted.
+11. **No phrase catalogue or accumulating list of sentence variants is an acceptable
+    architectural solution.** Real expressions belong in a versioned evaluation corpus.
+12. **Every `HOLD`, acceptance, conflict, ambiguity, fallback and human escalation must be
     inspectable in the Hybrid Decision Inspector.** A decision that cannot be read is a
     decision that cannot be certified.
 
