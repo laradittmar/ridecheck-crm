@@ -896,8 +896,155 @@ _FAQ_TOPIC_PROBES: dict[str, str] = {
 #
 # Priority is absolute: canonical truth > generated prose. A contradiction is never merely
 # supplemented, because leaving both would ship a self-contradicting message.
+# ── L4.7W5-FAQ-HOURS-TRUTH — operating hours are a FACT, not a phrasing ──────
+#
+# The live failure: generated prose said "sábados de 9 a 13 hs" while the canonical table
+# says 9 to 15, and the guard let it stand. The old satisfaction test asked a STRUCTURAL
+# question — does the reply name weekdays and the token "hs"? — and a sentence with the
+# wrong numbers answers that question exactly as well as one with the right numbers.
+# Structural presence is not factual agreement.
+#
+# What follows reads the VALUES the prose asserts and compares each one against
+# `business_hours_for_weekday`, the same authority the customer-facing answer is generated
+# from. Add a day to that table, change a closing time, and this check follows it with no
+# edit here.
+#
+# It is deliberately NOT a catalogue: there is no list of wrong hours, no customer phrasing,
+# no sentence exception and no typo variant. It recognises numbers standing next to weekday
+# names — the shape of an hours assertion — and everything it decides is decided by
+# comparison with canonical values.
+#
+# It runs ONLY over text this system generated. Customer input never reaches it.
+
+_HOUR_TOKEN = r"(\d{1,2}(?:[.:]\d{2})?)"
+_HOUR_UNIT = r"(?:\s*(?:hs?\b|horas?\b))?"
+_HOURS_CLOSED_MARKER = re.compile(
+    r"\bno\s+(?:trabajamos|abrimos|atendemos)\b|\bcerrad[oa]s?\b|\bcerramos\b")
+_HOURS_OPEN_MARKER = re.compile(r"\b(?:trabajamos|abrimos|atendemos)\b")
+_HOURS_RE_CACHE: dict = {}
+
+
+def _es_day_tokens() -> dict[str, int]:
+    """Accent-free weekday word -> weekday index, derived from the schedule's own labels."""
+    cached = _HOURS_RE_CACHE.get("days")
+    if cached is None:
+        from .schedule import canonical_weekday_hours
+        cached = {}
+        for wd, label, _start, _end, _closed in canonical_weekday_hours():
+            base = _strip_accents(label).lower()
+            cached[base] = wd
+            # "sabados" -> also "sabado"; "lunes"/"martes"/"viernes" are untouched.
+            if base.endswith("s") and not base.endswith("es"):
+                cached[base[:-1]] = wd
+        _HOURS_RE_CACHE["days"] = cached
+    return cached
+
+
+def _hours_patterns() -> tuple:
+    cached = _HOURS_RE_CACHE.get("patterns")
+    if cached is None:
+        alt = "|".join(sorted((re.escape(t) for t in _es_day_tokens()),
+                              key=len, reverse=True))
+        cached = (
+            re.compile(rf"\b({alt})\s+a\s+({alt})\s+de\s+{_HOUR_TOKEN}\s+a\s+"
+                       rf"{_HOUR_TOKEN}{_HOUR_UNIT}"),
+            re.compile(rf"\b({alt})\s+de\s+{_HOUR_TOKEN}\s+a\s+{_HOUR_TOKEN}{_HOUR_UNIT}"),
+            re.compile(rf"\b({alt})\b"),
+        )
+        _HOURS_RE_CACHE["patterns"] = cached
+    return cached
+
+
+def _parse_stated_hour(token: str) -> tuple[int, int]:
+    """'9' -> (9, 0); '9.30' -> (9, 30); '14:00' -> (14, 0)."""
+    raw = token.replace(":", ".")
+    if "." in raw:
+        hour, minute = raw.split(".", 1)
+        return int(hour), int(minute)
+    return int(raw), 0
+
+
+def _stated_hours_claims(normalized: str) -> tuple[dict, set, set]:
+    """What the text ASSERTS about operating hours, with no judgement about truth.
+
+    Returns (day -> (start, end) stated with concrete hours, days stated closed,
+    days stated open without hours). A day range carries its hours to every day it spans.
+    """
+    days = _es_day_tokens()
+    range_re, single_re, day_re = _hours_patterns()
+    with_hours: dict[int, tuple[tuple[int, int], tuple[int, int]]] = {}
+
+    text = normalized
+    consumed: list[tuple[int, int]] = []
+    for match in range_re.finditer(text):
+        first, last = days[match.group(1)], days[match.group(2)]
+        start = _parse_stated_hour(match.group(3))
+        end = _parse_stated_hour(match.group(4))
+        step = 1 if last >= first else -1
+        for wd in range(first, last + step, step):
+            with_hours.setdefault(wd, (start, end))
+        consumed.append(match.span())
+    for begin, finish in reversed(consumed):     # a range must not be re-read as a single day
+        text = text[:begin] + " " * (finish - begin) + text[finish:]
+    for match in single_re.finditer(text):
+        with_hours.setdefault(days[match.group(1)],
+                              (_parse_stated_hour(match.group(2)),
+                               _parse_stated_hour(match.group(3))))
+
+    stated_closed: set[int] = set()
+    stated_open: set[int] = set()
+    for clause in re.split(r"[.;,!?]| y | pero | aunque ", normalized):
+        named = {days[m.group(1)] for m in day_re.finditer(clause)} - set(with_hours)
+        if not named:
+            continue
+        if _HOURS_CLOSED_MARKER.search(clause):
+            stated_closed |= named
+        elif _HOURS_OPEN_MARKER.search(clause):
+            stated_open |= named
+    return with_hours, stated_closed, stated_open
+
+
+def _hours_truth_violations(normalized_reply: str) -> list[str]:
+    """Every operating-hours assertion in the text that canonical truth contradicts."""
+    from .schedule import business_hours_for_weekday
+    with_hours, stated_closed, stated_open = _stated_hours_claims(normalized_reply)
+    violations: list[str] = []
+    for wd, (start, end) in sorted(with_hours.items()):
+        canon_start, canon_end, closed = business_hours_for_weekday(wd)
+        if closed:
+            violations.append(f"{wd}:hours_on_closed_day")
+        elif (start, end) != ((canon_start.hour, canon_start.minute),
+                              (canon_end.hour, canon_end.minute)):
+            violations.append(f"{wd}:wrong_hours")
+    for wd in sorted(stated_closed):
+        if not business_hours_for_weekday(wd)[2]:
+            violations.append(f"{wd}:closed_on_open_day")
+    for wd in sorted(stated_open):
+        if business_hours_for_weekday(wd)[2]:
+            violations.append(f"{wd}:open_on_closed_day")
+    return violations
+
+
+def _hours_prose_contradicts(normalized_reply: str) -> bool:
+    """True when the prose states any operating-hours value canonical truth denies."""
+    return bool(_hours_truth_violations(normalized_reply))
+
+
+def _hours_prose_satisfies(normalized_reply: str) -> bool:
+    """True only when the prose states the canonical hours for EVERY operating day.
+
+    Partial truth is not satisfaction: an answer that omits Saturday leaves the customer
+    without a fact they asked for, so the canonical answer is still supplied.
+    """
+    from .schedule import business_hours_for_weekday
+    if _hours_truth_violations(normalized_reply):
+        return False
+    with_hours, _closed, _open = _stated_hours_claims(normalized_reply)
+    return all(wd in with_hours
+               for wd in range(7) if not business_hours_for_weekday(wd)[2])
+
+
 _FAQ_TOPIC_SATISFIED: dict[str, tuple[str, ...]] = {
-    "business_hours": (r"\blunes\b.*\bviernes\b", r"\bs[aá]bados?\b.*\bhs\b"),
     "report": (r"\binforme\b",),
     # Correct presence statements are about the CUSTOMER not needing to attend.
     "presence": (
@@ -989,7 +1136,11 @@ def _payment_contradicts_policy(normalized_reply: str) -> bool:
     return False
 
 
-_FAQ_TOPIC_CONTRADICT_FN = {"payment": _payment_contradicts_policy}
+_FAQ_TOPIC_CONTRADICT_FN = {"payment": _payment_contradicts_policy,
+                            "business_hours": _hours_prose_contradicts}
+#: Topics whose "already stated correctly" test needs VALUES, not a pattern.
+#: A predicate here takes precedence over `_FAQ_TOPIC_SATISFIED`.
+_FAQ_TOPIC_SATISFIED_FN = {"business_hours": _hours_prose_satisfies}
 
 # F3 duplicate-answer probes — key phrases checked in normalized primary reply.
 # If found, the corresponding FAQ was already answered; no supplement appended.
@@ -2759,9 +2910,15 @@ class ConversationEngine:
     def _satisfies_canonical(topic: str, normalized_reply: str) -> bool:
         """True when the composed prose already states this fact correctly.
 
-        Falls back to the historical single-probe behaviour for topics with no explicit
-        predicate, so existing de-duplication is preserved rather than silently dropped.
+        A topic whose truth is a VALUE — operating hours — supplies a predicate that
+        compares against canonical data; a pattern cannot tell 9 to 15 from 9 to 13.
+        Everything else keeps its pattern set, and falls back to the historical
+        single-probe behaviour when it has none, so existing de-duplication is preserved
+        rather than silently dropped.
         """
+        predicate = _FAQ_TOPIC_SATISFIED_FN.get(topic)
+        if predicate is not None:
+            return predicate(normalized_reply)
         patterns = _FAQ_TOPIC_SATISFIED.get(topic)
         if patterns:
             return any(re.search(pat, normalized_reply) for pat in patterns)

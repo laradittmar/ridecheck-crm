@@ -95,6 +95,17 @@ def business_hours_for_weekday(weekday: int, is_holiday: bool = False) -> tuple[
     return _WEEKDAY_HOURS[int(weekday) % 7]
 
 
+def canonical_weekday_hours() -> tuple[tuple[int, str, time, time, bool], ...]:
+    """Every weekday's canonical hours with its Spanish label: (index, label, start, end, closed).
+
+    Reads the same authority `business_hours_for_weekday` reads, so a truth check over
+    generated prose and the answer the customer receives can never drift apart. Holidays are
+    a per-date exception (`_HOLIDAY_HOURS`) and deliberately have no place in a weekly table.
+    """
+    return tuple((wd, _WEEKDAY_LABELS_ES[wd]) + business_hours_for_weekday(wd)
+                 for wd in range(7))
+
+
 def _format_hour_es(value: time) -> str:
     """'9', '9.30', '13' — Argentine conversational hour rendering."""
     if value.minute == 0:
