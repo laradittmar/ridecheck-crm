@@ -280,9 +280,11 @@ class TestFutureIntent(unittest.TestCase):
     def test_quality_14_schema_version_bumped_and_backward_compatible(self):
         # L4.7C.1 bumped the minor version additively (ReconciliationRecord gained the
         # fields a decision needs to be replayable). 1.0/1.1 records still load.
-        self.assertEqual(SCHEMA_VERSION, "turn-evidence/1.2")
-        self.assertEqual(PROMPT_VERSION, "understand/1.18",
-                         "L4.7B.3/B.4 moved the prompt; turn-evidence/1.1 is unchanged")
+        # G3-3 bumped both, additively: SchedulingIntentEvidence and the prompt rule that
+        # emits it. The guard keeps its job — an UNAPPROVED move still fails here.
+        self.assertEqual(SCHEMA_VERSION, "turn-evidence/1.3")
+        self.assertEqual(PROMPT_VERSION, "understand/1.19",
+                         "L4.7W5-GATE3-G3-3 moved the prompt and the schema together")
         old = TurnEvidence.from_json(json.dumps({"schema_version": "turn-evidence/1.0"}))
         self.assertEqual(old.schema_version, "turn-evidence/1.0",
                          "a 1.0 record still loads under the major-version guard")

@@ -49,6 +49,8 @@ from ..schemas.turn_evidence import (
     LocationEvidence,
     LocationRole,
     Provenance,
+    SchedulingIntentEvidence,
+    SchedulingIntentKind,
     SchedulingPriority,
     SchedulingRequestEvidence,
     ServiceIntentEvidence,
@@ -61,7 +63,7 @@ from ..schemas.turn_evidence import (
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "understand/1.18"
+PROMPT_VERSION = "understand/1.19"
 INTERPRETER_ID = "semantic:understand"
 
 # Controlled vocabularies. These are the *schema* the interpreter must speak — not phrase
@@ -76,6 +78,9 @@ FAQ_TOPICS = ("service_scope", "report", "presence", "payment", "business_hours"
               "duration", "coverage")
 DAY_EXPRESSIONS = ("TODAY", "TOMORROW", "DAY_AFTER_TOMORROW", "MONDAY", "TUESDAY",
                    "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY", "EXPLICIT_DATE")
+# G3-3: the scheduling OPERATION, which is not a day. One member today; see
+# SchedulingIntentKind for why the vocabulary grows by decision rather than by phrase.
+SCHEDULING_INTENT_VALUES = ("AVAILABILITY_ENQUIRY",)
 
 ACCEPTANCE_VALUES = ("ACCEPT", "REJECT", "HESITATE", "FUTURE_INTENT", "QUESTION_ONLY",
                      "UNKNOWN")
@@ -203,7 +208,40 @@ S5. Una FRANJA del día (por la mañana, a la tarde, temprano, al mediodía) NO 
     time=null y flexible_time=true. Sólo un horario concreto va en time, en formato HH:MM.
 S6. Un número suelto junto a un día es la HORA de esa opción ("jueves 11" = jueves 11:00).
 S7. Preguntar CUÁNDO podemos, qué horarios tenemos o qué disponibilidad hay NO es proponer
-    un día: no inventes scheduling_requests para una pregunta de disponibilidad.
+    un día: NUNCA inventes un scheduling_requests para una pregunta de disponibilidad, ni
+    un día, ni una fecha, ni una hora que el cliente no dijo.
+    Pero ESA PREGUNTA ES EVIDENCIA: va en scheduling_intents con
+    kind=AVAILABILITY_ENQUIRY. La prohibición es sobre INVENTAR un turno, no sobre
+    entender que el cliente está preguntando por turnos.
+S7b. Si el mismo mensaje pregunta por disponibilidad Y ADEMÁS propone un día o una hora
+    concretos, van LOS DOS: el intent en scheduling_intents y el día/hora en
+    scheduling_requests. Preguntar y proponer no se excluyen.
+
+═══ 3b. PEDIDO DE DISPONIBILIDAD (scheduling_intents) ═══
+D1. kind=AVAILABILITY_ENQUIRY cuando el cliente PREGUNTA QUÉ TURNOS HAY para la revisión:
+    qué disponibilidad tenés, qué te queda libre, cuándo podrían venir, qué turnos hay.
+    Es una PREGUNTA POR LA AGENDA, no una propuesta de día.
+D2. NO lleva día, ni fecha, ni hora. El schema no tiene esos campos a propósito: qué
+    turnos existen realmente lo decide después la capa determinística, nunca vos.
+D3. DISTINCIÓN CENTRAL — dos preguntas parecidas que NO significan lo mismo:
+      * en qué HORARIO ABRE el negocio (de tal hora a tal hora, qué días abren, si
+        trabajan sábados)                 → faq_topics: business_hours
+      * qué TURNOS LIBRES hay para MI revisión (qué disponibilidad hay, qué le queda,
+        cuándo pueden venir)              → scheduling_intents AVAILABILITY_ENQUIRY
+    La primera pregunta por el horario comercial. La segunda pregunta por la agenda.
+    Si el cliente ya está coordinando la revisión y pregunta "qué horarios tenés", está
+    preguntando por la AGENDA, no por el horario comercial.
+D4. Si de verdad no podés decidir entre las dos lecturas: status=AMBIGUOUS y anotalo en
+    ambiguities. No elijas por el cliente y no emitas las dos como CONFIRMED.
+D5. Estas NO son pedidos de disponibilidad:
+      * elegir o proponer un día/hora concretos      → scheduling_requests
+      * rechazar los turnos ofrecidos                → acceptance REJECT
+      * preguntar CUÁNTO DURA la revisión            → faq_topics duration
+      * pedir hablar con una persona                 → handoff
+      * mencionar una hora sin pedir turno ("te escribo a las 3")  → nada de esto
+D6. El ruido no borra la intención: con typos, audio mal transcripto o texto cortado,
+    si igual se entiende que pregunta por turnos, emitilo con status PROPOSED. Lo que no
+    se hace nunca es completar un día o una hora que no dijo.
 
 ═══ 4. UBICACIONES: EL ROL NO DEPENDE DEL ORDEN ═══
 L1. Una localidad dicha SOBRE EL AUTO ("está en X", "el auto está en X", "es un <modelo>
@@ -300,6 +338,7 @@ Vocabulario permitido:
 - faq_topics: {" | ".join(FAQ_TOPICS)}
 - scheduling_requests[].day_expression: {" | ".join(DAY_EXPRESSIONS)}
 - scheduling_requests[].priority: PRIMARY | FALLBACK | ADDITIONAL
+- scheduling_intents[].kind: {" | ".join(SCHEDULING_INTENT_VALUES)}
 - acceptance.signal: {" | ".join(ACCEPTANCE_VALUES)}
 - corrections[].relation: CORRECT_EXISTING | REPLACE_CANDIDATE | SWITCH_TO_PRIOR_CANDIDATE
   | ADD_SECOND_CANDIDATE | UNKNOWN_RELATION
@@ -338,6 +377,7 @@ Respondé SOLO con este JSON (las listas van vacías si no hay evidencia; los ob
   "faq_topics": [],
   "acceptance": null,
   "scheduling_requests": [],
+  "scheduling_intents": [],
   "corrections": [],
   "identity": [],
   "handoff": null,
@@ -354,6 +394,7 @@ Forma de cada ítem cuando SÍ hay evidencia:
 - acceptance: {{"signal", "status", "reason"}}
 - scheduling_requests[]: {{"priority", "day_expression", "time", "flexible_time", "rank",
                           "status"}}
+- scheduling_intents[]: {{"kind", "status", "reason"}}   ← sin día, sin fecha, sin hora
 - corrections[]: {{"relation", "from_value", "to_value", "status", "reason"}}
 - faq_topics[]: strings del vocabulario de arriba, uno por cada pregunta del mensaje
 - identity[]: {{"kind", "value", "status"}}
@@ -369,6 +410,8 @@ ANTES DE RESPONDER, repasá slot por slot:
   ADEMÁS del valor nuevo y del viejo marcado is_superseded.
 - ¿Hay más de una pregunta? → falta un tema de FAQ por cada una.
 - ¿Usó una expresión relativa de día? → tiene que quedar relativa, no un día de la semana.
+- ¿Preguntó qué turnos o qué disponibilidad hay? → falta scheduling_intents
+  AVAILABILITY_ENQUIRY (y NO lleva día ni hora).
 - ¿Alguna ubicación que emitiste podría ser una expresión de tiempo? → quitala.
 
 No devuelvas ítems cuyos campos estén todos en null. Sin texto fuera del JSON."""
@@ -893,6 +936,25 @@ class SemanticTurnInterpreter:
                 rank=int(raw.get("rank") or index + 1),
                 status=_status(raw.get("status")), provenance=prov))
 
+        # G3-3: the scheduling OPERATION. Anything outside the controlled vocabulary is
+        # dropped rather than coerced — an unknown kind is absence, never a literal. There
+        # is no day/date/time to parse here because the type has no such field.
+        intents_sched: list[SchedulingIntentEvidence] = []
+        for raw in payload.get("scheduling_intents") or []:
+            if not isinstance(raw, dict):
+                continue
+            raw_kind = _clean(raw.get("kind"))
+            if not isinstance(raw_kind, str):
+                continue
+            try:
+                kind = SchedulingIntentKind(raw_kind.upper())
+            except ValueError:
+                continue
+            intents_sched.append(SchedulingIntentEvidence(
+                value=kind.value, kind=kind, status=_status(raw.get("status")),
+                confidence=_confidence(raw.get("confidence")),
+                reason=_clean(raw.get("reason")), provenance=prov))
+
         corrections: list[CorrectionEvidence] = []
         for raw in payload.get("corrections") or []:
             if not isinstance(raw, dict):
@@ -960,6 +1022,7 @@ class SemanticTurnInterpreter:
             faq_intents=faqs,
             acceptance=acceptance,
             scheduling_requests=tuple(schedule),
+            scheduling_intents=tuple(intents_sched),
             corrections=tuple(corrections),
             identity_mentions=tuple(identities),
             handoff=handoff,

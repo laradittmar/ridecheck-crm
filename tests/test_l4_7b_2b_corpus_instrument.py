@@ -56,7 +56,7 @@ MIX = [c for cid, c in CORPUS.items() if cid.startswith("SYN-MIX")]
 # prove the ruler was repaired without touching the interpreter; L4.7B.3 then changed the
 # interpreter on purpose, so the pin moved with it — deliberately, and only in a milestone
 # whose stated job is to change the interpreter.
-INTERPRETER_SHA256 = "bddb37468d9a44f8c10a3fd4d9f3acb4a18cce19113728f996bc9775ab943e32"
+INTERPRETER_SHA256 = "7fc31f5571d26d93c07104bdf89e52bd77be77efc4b0d6eef7bfff2a621aacc5"
 INTERPRETER_PATH = ROOT / "backend" / "app" / "services" / "semantic_interpreter.py"
 
 
@@ -224,12 +224,13 @@ class TestImmutability(unittest.TestCase):
     def test_fixture_10_interpreter_source_unchanged(self):
         digest = hashlib.sha256(INTERPRETER_PATH.read_bytes()).hexdigest()
         self.assertEqual(digest, INTERPRETER_SHA256,
-                         "L4.7B.2B repairs the ruler, never the interpreter")
+                         "B.2B repaired the ruler, never the interpreter; the digest is "
+                         "re-pinned only by a milestone that is allowed to move it")
 
     def test_fixture_11_prompt_version_unchanged(self):
         from app.services.semantic_interpreter import PROMPT_VERSION
-        self.assertEqual(PROMPT_VERSION, "understand/1.18",
-                         "prompt version moved again in L4.7B.4; the MODEL did not")
+        self.assertEqual(PROMPT_VERSION, "understand/1.19",
+                         "moved by L4.7W5-GATE3-G3-3; the MODEL did not")
         source = INTERPRETER_PATH.read_text(encoding="utf-8")
         self.assertIn('or "gpt-4o-mini"', source, "the model is unchanged")
 

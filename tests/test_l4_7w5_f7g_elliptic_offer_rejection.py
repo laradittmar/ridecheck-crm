@@ -367,7 +367,7 @@ class TestGovernance(unittest.TestCase):
             self.assertIn(marker, CE_SRC)
         self.assertNotIn("no me sirve", ce._ESCALATION_KEYWORDS)
         interp = (ROOT / "backend/app/services/semantic_interpreter.py").read_text(encoding="utf-8")
-        self.assertIn('PROMPT_VERSION = "understand/1.18"', interp)
+        self.assertIn('PROMPT_VERSION = "understand/1.19"', interp)   # G3-3
 
     def test_f7g_28_the_wild_burst_is_permanent_and_correctly_labelled(self):
         by_text = {c["text"]: c for c in CASES}

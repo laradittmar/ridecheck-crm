@@ -251,7 +251,7 @@ class TestNoRegression(unittest.TestCase):
             self.assertIsInstance(items, list, case["id"])
 
     def test_prompt_version_and_model(self):
-        self.assertEqual(PROMPT_VERSION, "understand/1.18")
+        self.assertEqual(PROMPT_VERSION, "understand/1.19")   # moved by G3-3
         source = (ROOT / "backend" / "app" / "services" / "semantic_interpreter.py").read_text()
         self.assertIn('or "gpt-4o-mini"', source, "companion evidence, not a new model")
 

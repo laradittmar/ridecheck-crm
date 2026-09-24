@@ -277,7 +277,7 @@ class TestGovernance(unittest.TestCase):
 
     def test_f7f_24_no_semantic_schema_claim_or_prompt_change(self):
         interp = (ROOT / "backend/app/services/semantic_interpreter.py").read_text(encoding="utf-8")
-        self.assertIn('PROMPT_VERSION = "understand/1.18"', interp)
+        self.assertIn('PROMPT_VERSION = "understand/1.19"', interp)   # G3-3
         self.assertNotIn("offered_options", interp)
         self.assertNotIn("OFFERED_OPTIONS_REJECTED",
                          (ROOT / "backend/app/schemas/claims.py").read_text(encoding="utf-8"))

@@ -30,7 +30,7 @@ from typing import Any, Iterator, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
-SCHEMA_VERSION = "turn-evidence/1.2"
+SCHEMA_VERSION = "turn-evidence/1.3"
 # 1.1 (L4.7B.2): additive only — AcceptanceSignal.FUTURE_INTENT and the
 # `is_semantically_empty()` helper. No existing field changed meaning, so 1.0 records
 # validate unchanged under the major-version guard.
@@ -38,6 +38,12 @@ SCHEMA_VERSION = "turn-evidence/1.2"
 # be replayable (claim_type, evidence_ids, candidate_values, rule id/version,
 # information_state, outcome, cycle/revision scope, depends_on, supersedes, risk_tier).
 # Every 1.0/1.1 field kept its meaning; older records still validate.
+# 1.3 (L4.7W5-GATE3-G3-3): additive only — SchedulingIntentEvidence and the
+# `scheduling_intents` collection. It carries the OPERATION the customer is asking about,
+# which `SchedulingRequestEvidence` cannot hold: that type models a PROPOSED APPOINTMENT and
+# defines a row with no day and no time as empty, so "which slots do you have?" had nowhere
+# to go and was lost (G3-2 DEF-01). No existing field changed meaning and no existing type
+# gained a field, so 1.0/1.1/1.2 records still validate unchanged.
 
 
 # ── enumerations ──────────────────────────────────────────────────────────────
@@ -98,6 +104,19 @@ class SchedulingPriority(str, Enum):
     PRIMARY = "PRIMARY"
     FALLBACK = "FALLBACK"
     ADDITIONAL = "ADDITIONAL"
+
+
+class SchedulingIntentKind(str, Enum):
+    """The scheduling OPERATION a burst asks for, as distinct from a slot it proposes.
+
+    One member today, deliberately. G3-2 catalogued five enquiry meanings the schema cannot
+    express — availability, a further option, soon-ness, an open "when could this happen",
+    and rescheduling. Only the first is implemented here, because only the first is proved
+    by live evidence; the rest are named in the G3-3 closeout as future work rather than
+    guessed at now. Adding a member is a schema change and a version bump, which is the
+    point: the vocabulary grows by decision, never by a phrase slipping through.
+    """
+    AVAILABILITY_ENQUIRY = "AVAILABILITY_ENQUIRY"
 
 
 class IdentityKind(str, Enum):
@@ -281,6 +300,23 @@ class SchedulingRequestEvidence(EvidenceItem):
     rank: int = 1
 
 
+class SchedulingIntentEvidence(EvidenceItem):
+    """The customer is ASKING ABOUT scheduling, without proposing one.
+
+    Deliberately has no day, date or time field of ANY kind. That is the safety property,
+    and it is structural rather than guarded: there is nowhere for a fabricated appointment
+    to be written, so no consumer can read one out, and no amount of model creativity can
+    turn an enquiry into a booking. `extra="forbid"` on the base model refuses an invented
+    field rather than carrying it.
+
+    What it asserts is the operation. Whether any appointment actually exists is a fact the
+    deterministic scheduling layer owns, and this layer may never state it.
+    """
+    field: str = "scheduling_intent"
+    _MEANINGFUL_FIELDS = ("kind",)
+    kind: Optional[SchedulingIntentKind] = None
+
+
 class CorrectionEvidence(EvidenceItem):
     field: str = "correction"
     _MEANINGFUL_FIELDS = ("from_value", "to_value", "target_ref")
@@ -344,6 +380,7 @@ class TurnEvidence(_Frozen):
     faq_intents: tuple[FaqIntentEvidence, ...] = ()
     acceptance: Optional[AcceptanceEvidence] = None
     scheduling_requests: tuple[SchedulingRequestEvidence, ...] = ()
+    scheduling_intents: tuple[SchedulingIntentEvidence, ...] = ()
     corrections: tuple[CorrectionEvidence, ...] = ()
     identity_mentions: tuple[IdentityEvidence, ...] = ()
     handoff: Optional[HandoffEvidence] = None
@@ -355,7 +392,7 @@ class TurnEvidence(_Frozen):
 
     _COLLECTIONS = (
         "service_intents", "vehicle_mentions", "location_mentions", "faq_intents",
-        "scheduling_requests", "corrections", "identity_mentions",
+        "scheduling_requests", "scheduling_intents", "corrections", "identity_mentions",
     )
 
     def iter_items(self) -> Iterator[tuple[str, EvidenceItem]]:
@@ -402,6 +439,7 @@ class TurnEvidence(_Frozen):
             "location_mentions": keep(self.location_mentions),
             "faq_intents": keep(self.faq_intents),
             "scheduling_requests": keep(self.scheduling_requests),
+            "scheduling_intents": keep(self.scheduling_intents),
             "corrections": keep(self.corrections),
             "identity_mentions": keep(self.identity_mentions),
             "acceptance": acceptance,
@@ -486,10 +524,12 @@ class ReconciliationLog(_Frozen):
 __all__ = [
     "SCHEMA_VERSION", "EvidenceStatus", "UNRESOLVED_STATUSES", "SourceKind", "LocationRole",
     "ServiceIntentKind", "AcceptanceSignal", "CorrectionRelation", "SchedulingPriority",
+    "SchedulingIntentKind",
     "IdentityKind", "ReconciliationStatus", "BurstReconstruction",
     "SourceSpan", "Provenance", "TurnRef", "Alternative", "EvidenceItem",
     "ServiceIntentEvidence", "VehicleEvidence", "LocationEvidence", "FaqIntentEvidence",
-    "AcceptanceEvidence", "SchedulingRequestEvidence", "CorrectionEvidence",
+    "AcceptanceEvidence", "SchedulingRequestEvidence", "SchedulingIntentEvidence",
+    "CorrectionEvidence",
     "IdentityEvidence", "HandoffEvidence", "AmbiguityNote", "ConflictNote",
     "TurnEvidence", "ReconciliationRecord", "ReconciliationLog",
 ]
