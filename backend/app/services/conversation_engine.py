@@ -1044,6 +1044,173 @@ def _hours_prose_satisfies(normalized_reply: str) -> bool:
                for wd in range(7) if not business_hours_for_weekday(wd)[2])
 
 
+# ── L4.7W5-FAQ-HOURS-TRUTH-R2 — fail CLOSED on unverifiable hours prose ─────
+#
+# R1 removed only what it RECOGNISED and appended the canonical answer regardless, so a
+# phrasing its grammar did not cover survived NEXT TO the correct schedule — two conflicting
+# schedules in one message, which is worse than either half. The independent review proved
+# five such shapes.
+#
+# The repair is not more grammar. It is a different decision: while hours correction is
+# armed, a response unit that carries BOTH a weekday token AND a clock-like number must
+# PROVE itself before it may survive. Two proofs are accepted, and nothing else:
+#
+#   A  its hours claims parse COMPLETELY — every clock token in the unit is accounted for
+#      by a parsed claim — and every claim agrees with canonical_weekday_hours();
+#   B  it is appointment evidence: every clock token is a slot this thread actually has in
+#      canonical state (`last_visible_slots` / `last_offered_slots`), and the unit asserts
+#      no hours that canonical truth denies.
+#
+# Anything else is removed, whatever it says and however it is worded. Unrecognised is
+# treated as unproven, never as innocent. The safety boundary is the weekday-plus-hour
+# predicate plus canonical verification — there is no list of phrasings, and adding one
+# would be the defect, not the fix.
+#
+# A unit that mixes a real offered slot with hours canonical truth denies cannot be split
+# safely, so it is removed and the offer is REGENERATED deterministically from state, in
+# the wording this engine already uses for an offer.
+
+_HOUR_LIKE = re.compile(r"\b(\d{1,2})(?:[.:](\d{2}))?\b")
+
+
+def _clock_tokens(normalized_unit: str) -> list[tuple[int, int, int]]:
+    """(position, hour, minute) for every token in the unit that could be a clock time.
+
+    Deliberately narrow: one or two digits, optionally `.mm` or `:mm`. A model year, a
+    price or "250 puntos" is not a clock token and never makes a unit suspicious.
+    """
+    found: list[tuple[int, int, int]] = []
+    for match in _HOUR_LIKE.finditer(normalized_unit):
+        hour = int(match.group(1))
+        minute = int(match.group(2) or 0)
+        if hour <= 24 and minute < 60:
+            found.append((match.start(), hour, minute))
+    return found
+
+
+def _hours_claim_spans(normalized: str) -> list[tuple[int, int]]:
+    """Character spans the hours patterns actually consumed — what the parser can vouch for."""
+    range_re, single_re, _day_re = _hours_patterns()
+    spans: list[tuple[int, int]] = []
+    text = normalized
+    for match in range_re.finditer(text):
+        spans.append(match.span())
+    for begin, finish in reversed(spans):
+        text = text[:begin] + " " * (finish - begin) + text[finish:]
+    for match in single_re.finditer(text):
+        spans.append(match.span())
+    return spans
+
+
+def _hours_unit_is_fully_verified(normalized_unit: str) -> bool:
+    """Proof A: every clock token belongs to a parsed claim, and every claim is canonical."""
+    claims, _closed, _open = _stated_hours_claims(normalized_unit)
+    if not claims or _hours_truth_violations(normalized_unit):
+        return False
+    spans = _hours_claim_spans(normalized_unit)
+    return all(any(begin <= position < finish for begin, finish in spans)
+               for position, _hour, _minute in _clock_tokens(normalized_unit))
+
+
+def _protected_slot_minutes(state) -> frozenset[int]:
+    """Minutes-past-midnight of the slots this thread really has, from canonical state.
+
+    The canonical slot representation is `last_visible_slots` (what was shown) and
+    `last_offered_slots` (what was computed) — both JSON lists of "HH:MM" written by the
+    scheduling path. A time is protected because the state holds it, never because a
+    sentence looks like an offer.
+    """
+    minutes: set[int] = set()
+    for raw in (getattr(state, "last_visible_slots", None),
+                getattr(state, "last_offered_slots", None)):
+        if not raw:
+            continue
+        try:
+            values = json.loads(str(raw))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+        for value in values or ():
+            try:
+                hour, minute = str(value).split(":")[:2]
+                minutes.add(int(hour) * 60 + int(minute))
+            except (ValueError, TypeError):
+                continue
+    return frozenset(minutes)
+
+
+#: How a response unit earned its place, so the caller can tell an hours restatement
+#: (redundant once the canonical answer is appended) from an appointment offer (never).
+_UNIT_NOT_HOURS = "NOT_HOURS"
+_UNIT_VERIFIED_HOURS = "VERIFIED_HOURS"      # proof A
+_UNIT_PROTECTED_SLOT = "PROTECTED_SLOT"      # proof B
+_UNIT_UNPROVEN = "UNPROVEN"
+
+
+def _hours_unit_survives(unit: str, protected: frozenset[int]) -> tuple[str, tuple[int, ...]]:
+    """(disposition, protected slot minutes this unit carried) under armed hours correction."""
+    normalized = _norm_lower(unit)
+    _range_re, _single_re, day_re = _hours_patterns()
+    tokens = _clock_tokens(normalized)
+    carried = tuple(sorted({h * 60 + m for _p, h, m in tokens if (h * 60 + m) in protected}))
+    # A falsehood is removed whether or not it carries a clock. "Los domingos también
+    # trabajamos" names no hour and still claims we open on a day we are closed — the
+    # owner policy is that a response may never claim or imply Sunday is open.
+    if _hours_truth_violations(normalized):
+        return _UNIT_UNPROVEN, carried                    # false: removed, offer regenerated
+    if not tokens or not day_re.search(normalized):
+        return _UNIT_NOT_HOURS, ()                        # not an hours-shaped unit at all
+    if _hours_unit_is_fully_verified(normalized):
+        return _UNIT_VERIFIED_HOURS, ()                   # proof A
+    if protected and all((h * 60 + m) in protected for _p, h, m in tokens):
+        return _UNIT_PROTECTED_SLOT, ()                   # proof B
+    return _UNIT_UNPROVEN, carried                        # unproven -> unproven is removed
+
+
+def _strip_unverified_hours(reply: str, protected: frozenset[int],
+                            *, drop_verified_hours: bool = False) -> tuple[str, tuple[int, ...]]:
+    """Drop every response unit that cannot prove its hours. Layout is preserved.
+
+    A unit is a sentence within a line, so a bulleted list is judged bullet by bullet
+    rather than collapsing into one verdict (an R1 defect the review recorded).
+
+    `drop_verified_hours` removes units kept by proof A as well. The caller sets it once it
+    knows the canonical answer is going to be appended: a partial restatement of hours the
+    canonical sentence is about to give in full is redundant, and dropping it keeps the
+    factual schedule in exactly one place. Appointment offers (proof B) are never dropped.
+    """
+    kept_lines: list[str] = []
+    rescued: set[int] = set()
+    for line in reply.split("\n"):
+        if not line.strip():
+            kept_lines.append("")
+            continue
+        kept_units: list[str] = []
+        for unit in re.split(r"(?<=[.!?])\s+", line):
+            if not unit.strip():
+                continue
+            disposition, carried = _hours_unit_survives(unit, protected)
+            if disposition == _UNIT_UNPROVEN:
+                rescued.update(carried)
+                continue
+            if disposition == _UNIT_VERIFIED_HOURS and drop_verified_hours:
+                continue
+            kept_units.append(unit.strip())
+        kept_lines.append(" ".join(kept_units))
+    cleaned = "\n".join(kept_lines)
+    # collapse the blank lines a removal left behind, without touching intended spacing
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned, tuple(sorted(rescued))
+
+
+def _regenerated_offer_es(minutes: tuple[int, ...]) -> str:
+    """Re-state slots that a removed unit carried, in the wording this engine already uses."""
+    if not minutes:
+        return ""
+    shown = [f"{m // 60:02d}:{m % 60:02d}" for m in minutes]
+    slot_list = ", ".join(shown[:-1]) + f" o {shown[-1]}" if len(shown) >= 2 else shown[0]
+    return f"Horarios disponibles: {slot_list}. ¿Alguno te viene bien?"
+
+
 _FAQ_TOPIC_SATISFIED: dict[str, tuple[str, ...]] = {
     "report": (r"\binforme\b",),
     # Correct presence statements are about the CUSTOMER not needing to attend.
@@ -2868,6 +3035,35 @@ class ConversationEngine:
         for topic in _FAQ_TOPIC_ANSWERS:          # stable order, not set order
             if topic not in topics:
                 continue
+
+            # ── R2: hours are proved, not trusted ────────────────────────────
+            # Every other topic keeps the (a)/(b) shape below. Hours do not, because for
+            # hours "the reply did not state anything I recognise as false" is not a
+            # reason to keep it — see the block above _FAQ_TOPIC_SATISFIED.
+            if topic == "business_hours":
+                protected = _protected_slot_minutes(
+                    getattr(getattr(self, "_turn_ctx", None), "state", None))
+                survived, rescued = _strip_unverified_hours(reply, protected)
+                if not _hours_prose_satisfies(_norm_lower(survived)):
+                    # The canonical answer is going to be appended, so any hours still in
+                    # the prose are a partial restatement of it. Drop them: one schedule,
+                    # in one place, from one source.
+                    survived, extra = _strip_unverified_hours(
+                        reply, protected, drop_verified_hours=True)
+                    rescued = tuple(sorted(set(rescued) | set(extra)))
+                    parts_canonical = True
+                else:
+                    parts_canonical = False
+                if survived != reply.strip():
+                    corrected.append(topic)
+                reply = survived
+                offer = _regenerated_offer_es(rescued)
+                if offer:
+                    parts.append(offer)
+                if parts_canonical:
+                    parts.append(_FAQ_TOPIC_ANSWERS[topic]())
+                continue
+
             n_primary = _norm_lower(reply)
 
             # (a) The reply states this business fact WRONGLY. Canonical truth wins: the
@@ -2895,7 +3091,9 @@ class ConversationEngine:
         if not parts:
             return reply
         self._contributing_sources = ["FAQ_RULE"]
-        return reply.rstrip() + "\n\n" + " ".join(parts)
+        body = reply.rstrip()
+        # R2 (REV-04): a reply whose every unit was removed must not open with blank lines.
+        return (body + "\n\n" + " ".join(parts)) if body else " ".join(parts)
 
     @staticmethod
     def _contradicts_canonical(topic: str, normalized_reply: str) -> bool:
