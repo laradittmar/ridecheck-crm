@@ -350,11 +350,17 @@ class HoursDisposition:
     """
     ADMIT = "ADMIT"
     SUPPRESSED_BY_SEMANTIC_AVAILABILITY = "SUPPRESSED_BY_SEMANTIC_AVAILABILITY"
+    #: G3-5A (audit F-01). The interpretation did not resolve the proposition, but the
+    #: deterministic scheduling parser the engine already trusts DID resolve a competing
+    #: one — a requested day, date or time. A lexical hours match may not answer over it
+    #: and silently discard the date the customer named.
+    SUPPRESSED_BY_DETERMINISTIC_SCHEDULING = "SUPPRESSED_BY_DETERMINISTIC_SCHEDULING"
     SUPPRESSED_AMBIGUOUS = "SUPPRESSED_AMBIGUOUS"
     SUPPRESSED_UNCORROBORATED = "SUPPRESSED_UNCORROBORATED"
     NO_CANDIDATE = "NO_CANDIDATE"
 
-    ALL = (ADMIT, SUPPRESSED_BY_SEMANTIC_AVAILABILITY, SUPPRESSED_AMBIGUOUS,
+    ALL = (ADMIT, SUPPRESSED_BY_SEMANTIC_AVAILABILITY,
+           SUPPRESSED_BY_DETERMINISTIC_SCHEDULING, SUPPRESSED_AMBIGUOUS,
            SUPPRESSED_UNCORROBORATED, NO_CANDIDATE)
 
 

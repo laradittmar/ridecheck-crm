@@ -39,6 +39,7 @@ ADMIT = "ADMIT"
 BY_AVAILABILITY = "SUPPRESSED_BY_SEMANTIC_AVAILABILITY"
 AMBIGUOUS = "SUPPRESSED_AMBIGUOUS"
 UNCORROBORATED = "SUPPRESSED_UNCORROBORATED"
+BY_DETERMINISTIC = "SUPPRESSED_BY_DETERMINISTIC_SCHEDULING"    # G3-5A
 NO_CANDIDATE = "NO_CANDIDATE"
 CLARIFY, HOLD, LOOK_UP = "CLARIFY", "HOLD", "LOOK_UP_AVAILABILITY"
 CONFIRMED = te.EvidenceStatus.CONFIRMED
@@ -207,19 +208,41 @@ class B_SemanticPrimacy(unittest.TestCase):
         self.assertEqual(burst.outcome("necesito coordinar algo para el auto"),
                          (BY_AVAILABILITY, LOOK_UP, ()))
 
-    def test_r2b_08_where_the_floor_cannot_see_it_the_interpretation_still_can(self):
-        """The documented limit: a burst with no calendar vocabulary at all.
+    def test_r2b_08_a_named_date_is_not_answered_with_opening_hours(self):
+        """INVERTED by G3-5A (audit F-01). This test used to pin the defect green.
 
-        With the interpretation absent the floor answers, which is the bounded fallback the
-        policy permits. With the interpretation present it is suppressed — which is why the
-        fallback is safe.
+        R2B recorded "¿Qué horarios tienen? ¿Hay algo mañana?" + ABSENT → business_hours as
+        a bounded limit, on the reasoning that the interpretation suppresses it when
+        present. The independent audit rejected that reasoning: timeout, absence and
+        malformed output are expected degraded modes, and the burst carries a date the
+        engine's OWN parser resolves. More evidence was buying less caution.
+
+        The date is competing scheduling evidence now, so the hours answer is withheld —
+        and it is withheld at every degraded semantic state, not only when the model
+        happens to be up.
         """
-        for text in ("¿Qué horarios tienen?\nPara revisar el auto.",
-                     "¿Qué horarios tienen? ¿Hay algo mañana?"):
-            with self.subTest(text=text[:28]):
-                self.assertEqual(Burst(mode="absent").outcome(text)[2], ("business_hours",))
-                self.assertEqual(Burst(availability=CONFIRMED).outcome(text),
-                                 (BY_AVAILABILITY, LOOK_UP, ()))
+        text = "¿Qué horarios tienen? ¿Hay algo mañana?"
+        for mode in ("absent", "raise", "malformed"):
+            with self.subTest(mode=mode):
+                disposition, authority, topics = Burst(mode=mode).outcome(text)
+                self.assertEqual(disposition, BY_DETERMINISTIC)
+                self.assertEqual(authority, HOLD)
+                self.assertEqual(topics, (), "the named date is not answered with hours")
+        self.assertEqual(Burst(availability=CONFIRMED).outcome(text),
+                         (BY_AVAILABILITY, LOOK_UP, ()))
+
+    def test_r2b_08b_the_residue_without_date_evidence_stays_with_the_interpreter(self):
+        """The limit that genuinely remains, stated honestly rather than fixed lexically.
+
+        "Para revisar el auto." names a service, not a calendar: no deterministic reader
+        resolves anything from it, so the bounded fallback still answers when the
+        interpretation is absent — and the interpretation still suppresses it when present.
+        Closing this would need new vocabulary. It is G3-5's, by assignment.
+        """
+        text = "¿Qué horarios tienen?\nPara revisar el auto."
+        self.assertEqual(Burst(mode="absent").outcome(text), (ADMIT, HOLD, ("business_hours",)))
+        self.assertEqual(Burst(availability=CONFIRMED).outcome(text),
+                         (BY_AVAILABILITY, LOOK_UP, ()))
 
 
 class C_TwoPropositions(unittest.TestCase):

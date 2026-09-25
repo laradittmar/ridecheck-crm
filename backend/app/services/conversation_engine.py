@@ -822,7 +822,126 @@ _HOURS_SUPPRESSION_REASON = {
         "the interpretation could not choose between availability and opening hours",
     "SUPPRESSED_UNCORROBORATED":
         "a weak hours candidate with no semantic corroboration (interpretation {status})",
+    "SUPPRESSED_BY_DETERMINISTIC_SCHEDULING":
+        "the deterministic scheduling parser resolved a competing request ({scheduling}) "
+        "and the interpretation did not resolve this proposition (interpretation {status})",
 }
+
+
+@dataclass(frozen=True)
+class CanonicalTurnBurst:
+    """The one reconstructed burst a turn's authority decisions are taken on.
+
+    G3-5A (audit F-02). `_availability_authority` was memoised on whichever caller ran
+    first, and its two callers pass different text: `_faq_topics_for_burst` passes
+    `current_turn_text`, built from `_current_evidence` INCLUDING messages recovered from
+    the database, while `_handle_next_available_request` passes `ai_input_messages`, which
+    is `event.unanswered_recent_user_messages` when n8n supplies it and can be a strict
+    subset. The same customer turn therefore decided differently depending on call order —
+    the burst-scoped calendar context R2B relies on is only as wide as the text it is
+    handed.
+
+    The evidence boundary is now a property of the TURN, not of a caller. This object is
+    built once, after burst recovery is complete, and every authority consumer reads it.
+    `presentation_texts` keeps `ai_input_messages` available for reply generation, where it
+    is still the right input — it simply may not define what the decision saw.
+    """
+    thread_id: object
+    turn_id: str | None
+    ordered_message_ids: tuple
+    texts: tuple                       # the COMPLETE ordered reconstructed burst
+    fingerprint: str                   # burst_hash — order-sensitive, text-proving
+    provenance: tuple                  # which reconstruction sources contributed
+    presentation_texts: tuple          # ai_input_messages; never the evidence boundary
+    requested_day_iso: str | None      # deterministic, from _parse_scheduling_text
+    requested_time_str: str | None
+    wants_next_available: bool         # deterministic, from _NEXT_AVAILABLE_PATTERNS
+    # The same deterministic readers, run over the burst units that do NOT carry the hours
+    # question. See `has_deterministic_scheduling`.
+    competing_day_iso: str | None
+    competing_time_str: str | None
+    competing_next_available: bool
+    stage_at_build: str | None         # provenance only; the authority reads live stage
+
+    @property
+    def joined(self) -> str:
+        """Exactly how production joins a burst into one string: with a space."""
+        return " ".join(self.texts)
+
+    @property
+    def has_deterministic_scheduling(self) -> bool:
+        """A COMPETING scheduling proposition the deterministic layer already resolved.
+
+        Competing means: found in a unit of the burst that is not the hours question. A
+        weekday inside the hours question belongs to that question — "¿cuándo laburan los
+        sábados?" names a day and asks nothing about the calendar — so reading the parser
+        over the whole burst would withhold the answer to the very question asked. The unit
+        boundary is `_hours_units`, the segmentation R2A already uses, and the readers are
+        the ones the engine already trusts. Nothing new interprets language.
+
+        Scoped to THIS burst. Canonical state — an outstanding offer, an accepted quote —
+        is deliberately not read here: it is not a proposition the customer advanced this
+        turn, and letting it suppress an hours answer would withhold a legitimate reply on
+        the strength of something said earlier.
+        """
+        return bool(self.competing_day_iso or self.competing_time_str
+                    or self.competing_next_available)
+
+    @property
+    def scheduling_summary(self) -> str:
+        parts = []
+        if self.competing_day_iso:
+            parts.append(f"day={self.competing_day_iso}")
+        if self.competing_time_str:
+            parts.append(f"time={self.competing_time_str}")
+        if self.competing_next_available:
+            parts.append("next_available")
+        return ",".join(parts) or "none"
+
+
+def _text_digest(normalized: str) -> str:
+    """SHA-256 of an already-normalized string. Proves WHICH text without storing it."""
+    import hashlib
+    return hashlib.sha256((normalized or "").encode("utf-8")).hexdigest()
+
+
+def _canonical_burst(*, thread_id, turn_id, ordered_message_ids, texts, provenance,
+                     presentation_texts, stage_at_build=None,
+                     wants_next_available=False) -> CanonicalTurnBurst:
+    """Build the turn's canonical burst. Deterministic evidence is resolved here, once.
+
+    The date/time parser is the one the engine already trusts for this judgement —
+    `_turn_has_scheduling_evidence` reads it the same way. Nothing new interprets language.
+    """
+    from ..schemas.hybrid_trace import burst_hash
+    ordered = tuple(t for t in (texts or ()) if isinstance(t, str))
+    day_iso = time_str = None
+    competing_day = competing_time = None
+    competing_next = False
+    try:
+        today = _business_today()
+        day_iso, time_str = _parse_scheduling_text(list(ordered), today)
+        # The units that are NOT the hours question. `_hours_units` is R2A's segmentation
+        # and `_HOURS_FAQ_DETECTION` is unchanged; neither is enlarged here.
+        rest = [u for u in _hours_units(" ".join(ordered))
+                if not any(ph in _norm_lower(u) for ph in _HOURS_FAQ_DETECTION)]
+        if rest:
+            competing_day, competing_time = _parse_scheduling_text(rest, today)
+            n = _norm_lower(" ".join(rest))
+            competing_next = any(re.search(pat, n) for pat in _NEXT_AVAILABLE_PATTERNS)
+    except Exception:            # a parser failure must never cost a turn
+        pass
+    return CanonicalTurnBurst(
+        thread_id=thread_id, turn_id=turn_id,
+        ordered_message_ids=tuple(ordered_message_ids or ()),
+        texts=ordered, fingerprint=burst_hash(list(ordered)),
+        provenance=tuple(provenance or ()),
+        presentation_texts=tuple(presentation_texts or ()),
+        requested_day_iso=day_iso, requested_time_str=time_str,
+        wants_next_available=bool(wants_next_available),
+        competing_day_iso=competing_day, competing_time_str=competing_time,
+        competing_next_available=bool(competing_next),
+        stage_at_build=stage_at_build)
 
 
 def _hours_units(text: str) -> list[str]:
@@ -2583,6 +2702,7 @@ class ConversationEngine:
         self._burst_earliest_inbound_db_id: int | None = None
         self._faq_reconciliation_burst: str | None = None
         self._availability_authority_cache = None
+        self._canonical_turn_burst = None       # G3-5A: the turn's evidence boundary
         # L4.7W5 Gate 1/2 — hybrid decision trace collection. Observational only.
         self._turn_trace_ctx = None
         self._turn_trace_before = None
@@ -2621,6 +2741,7 @@ class ConversationEngine:
         self._burst_earliest_inbound_db_id = None
         self._faq_reconciliation_burst = None
         self._availability_authority_cache = None   # G3-4: one decision per turn
+        self._canonical_turn_burst = None           # G3-5A: one burst per turn
         self._turn_burst_texts = []
         self._turn_trace_ctx = None
         self._turn_trace_before = None
@@ -3088,15 +3209,50 @@ class ConversationEngine:
         This decides only. It calls no service, writes no state, and returns a verdict the
         caller may act on through the EXISTING deterministic handlers.
         """
-        cached = getattr(self, "_availability_authority_cache", None)
-        if cached is not None:
-            return cached
-
         from ..schemas.hybrid_trace import (
             AdmissionCondition, CanonicalEffect, Classification, FloorStrength,
-            HoursDisposition, SchedulingAuthority)
+            HoursDisposition, SchedulingAuthority, normalize_burst)
 
-        deterministic = bool(self._wants_next_available(texts))
+        # ── G3-5A (audit F-02): decide on the TURN's burst, not the caller's ─────
+        #
+        # `handle` registers the complete reconstructed burst before any consumer runs, so
+        # in production this always resolves to it and the caller's `texts` never define
+        # the evidence boundary. The fallback below only fires for an engine that did not
+        # go through `handle`; it registers the first burst it sees so the turn still has
+        # exactly one, rather than silently letting the second caller's text win.
+        burst = getattr(self, "_canonical_turn_burst", None)
+        if burst is None:
+            burst = _canonical_burst(
+                thread_id=getattr(getattr(ctx, "thread", None), "id", None),
+                turn_id=getattr(self, "_correlation_id", None),
+                ordered_message_ids=(), texts=list(texts or ()),
+                provenance=("caller_supplied",), presentation_texts=list(texts or ()),
+                stage_at_build=getattr(state, "last_stage", None),
+                wants_next_available=bool(self._wants_next_available(list(texts or ()))))
+            self._canonical_turn_burst = burst
+
+        # A caller asking about a DIFFERENT burst in the same turn is a defect, not a
+        # preference. It is detected, recorded and answered from the canonical burst —
+        # never silently served a decision taken on text it did not pass.
+        #
+        # The comparison is on CONTENT, not on the caller's segmentation: `_faq_topics_for_
+        # burst` legitimately passes the burst already joined into one string, and that is
+        # the same evidence, not a different burst. What must be caught is a caller whose
+        # text is not the turn's — a strict subset, most of all.
+        caller_joined = " ".join(t for t in (texts or ()) if isinstance(t, str))
+        caller_fingerprint = normalize_burst([caller_joined])
+        divergent = caller_fingerprint != normalize_burst([burst.joined])
+
+        cached = getattr(self, "_availability_authority_cache", None)
+        if cached is not None and cached.burst_fingerprint == burst.fingerprint:
+            if divergent:
+                self._trace_burst_divergence(ctx, burst, caller_fingerprint, texts)
+            return cached
+        if divergent:
+            self._trace_burst_divergence(ctx, burst, caller_fingerprint, texts)
+
+        texts = list(burst.texts)                   # the canonical boundary, from here on
+        deterministic = bool(burst.wants_next_available)
         reading = self._semantic_reading()          # the turn's ONLY semantic read
         resolved, ambiguous = reading.availability, reading.ambiguous
         semantic = resolved is not None
@@ -3111,7 +3267,7 @@ class ConversationEngine:
             admission = AdmissionCondition.NONE
 
         stage = getattr(state, "last_stage", None)
-        floor = _hours_floor_strength(" ".join(texts))
+        floor = _hours_floor_strength(burst.joined)
 
         # Classification. Two producers on the SAME proposition is the only thing that may
         # be AGREE; a bare hours match is a different proposition and never a second
@@ -3149,14 +3305,33 @@ class ConversationEngine:
             hours_disposition = HoursDisposition.SUPPRESSED_BY_SEMANTIC_AVAILABILITY
         elif ambiguous is not None:
             hours_disposition = HoursDisposition.SUPPRESSED_AMBIGUOUS
-        elif floor == FloorStrength.STRONG:
-            # Unresolved by the interpretation, and the burst asks explicitly. This is the
-            # bounded deterministic fallback, and the only place strength still decides.
-            hours_disposition = HoursDisposition.ADMIT
-        elif floor == FloorStrength.WEAK:
-            hours_disposition = HoursDisposition.SUPPRESSED_UNCORROBORATED
-        else:
+        elif floor == FloorStrength.NONE:
             hours_disposition = HoursDisposition.NO_CANDIDATE
+        elif floor == FloorStrength.WEAK:
+            # Unchanged from R2B. A weak candidate already withholds and already asks; the
+            # competing-evidence rule below exists to displace an ADMIT, not to re-decide a
+            # case the bounded clarification already handles correctly.
+            hours_disposition = HoursDisposition.SUPPRESSED_UNCORROBORATED
+        elif burst.has_deterministic_scheduling:
+            # ── G3-5A (audit F-01) ──────────────────────────────────────────────
+            #
+            # The interpretation did not resolve the proposition, and the deterministic
+            # parser the engine ALREADY trusts for this judgement resolved a competing
+            # one: a requested day, date or time. Before G3-5A the ladder never asked it,
+            # so "¿Qué horarios tienen? ¿Hay algo mañana?" with the interpreter absent,
+            # timed out or unusable graded STRONG, answered with the weekday table, and
+            # discarded the date the customer named — more evidence buying less caution,
+            # during an outage. Nothing new reads language here: `_parse_scheduling_text`
+            # is the same reader `_turn_has_scheduling_evidence` consults.
+            #
+            # The requested date is NOT discarded: it stays on the canonical burst, it is
+            # traced, and the existing named-day handling still owns it. This decision
+            # only withholds an hours answer that would have spoken over it.
+            hours_disposition = HoursDisposition.SUPPRESSED_BY_DETERMINISTIC_SCHEDULING
+        else:
+            # STRONG, unresolved by the interpretation, no competing proposition. This is
+            # the bounded deterministic fallback, and the only place strength still decides.
+            hours_disposition = HoursDisposition.ADMIT
 
         if admission == AdmissionCondition.NONE:
             if ambiguous is not None:
@@ -3178,6 +3353,18 @@ class ConversationEngine:
                 authority, reason = (
                     SchedulingAuthority.CLARIFY,
                     "weak hours candidate the interpretation does not support")
+            elif hours_disposition == HoursDisposition.SUPPRESSED_BY_DETERMINISTIC_SCHEDULING:
+                # G3-5A (audit F-01). The date the customer named is not discarded: it is
+                # on the canonical burst, it is traced, and the existing named-day handling
+                # still owns it. This path withholds the hours answer rather than speaking
+                # over it, and claims nothing about the calendar itself. Composing a reply
+                # for BOTH propositions in a degraded turn is F-03, open for G3-5.
+                authority, reason = (
+                    SchedulingAuthority.HOLD,
+                    f"a deterministic scheduling request ({burst.scheduling_summary}) "
+                    f"stands beside the hours candidate and the interpretation "
+                    f"({reading.status.lower()}) resolved neither; the existing "
+                    f"deterministic scheduling path owns this turn")
             else:
                 authority, reason = (SchedulingAuthority.HOLD,
                                      "no producer asked about availability this turn")
@@ -3204,12 +3391,21 @@ class ConversationEngine:
             # silently by a substring in either direction.
             suppress_hours=(hours_disposition != HoursDisposition.ADMIT),
             hours_disposition=hours_disposition,
+            # G3-5A: the decision names the burst it was taken on, so a consumer that
+            # asked about another one is provable rather than merely unlikely.
+            burst=burst,
+            burst_fingerprint=burst.fingerprint,
+            burst_divergence=divergent,
+            requested_day_iso=burst.requested_day_iso,
+            requested_time_str=burst.requested_time_str,
+            scheduling_evidence=burst.has_deterministic_scheduling,
             semantic_status=reading.status,
             semantic_faq_topics=reading.faq_topics,
             hours_supported=hours_supported,
             availability_intent=resolved,
             hours_suppression_reason=_HOURS_SUPPRESSION_REASON.get(
-                hours_disposition, "").format(status=reading.status.lower(), floor=floor),
+                hours_disposition, "").format(status=reading.status.lower(), floor=floor,
+                                              scheduling=burst.scheduling_summary),
         )
         self._availability_authority_cache = decision
 
@@ -3220,7 +3416,8 @@ class ConversationEngine:
                 claim_type=ClaimType.SCHEDULING_PREFERENCE,
                 claims=self._safe_scheduling_claims(state),
                 outcome=admission, reason=reason,
-                rule_id="scheduling.availability_admission", rule_version="v1",
+                rule_id="scheduling.availability_admission", rule_version="v2",
+                evidence_ids=tuple(str(m) for m in burst.ordered_message_ids),
                 authority_result=authority,
                 canonical_effect=CanonicalEffect.NONE,
                 permitted_action=(authority if decision.admitted else None),
@@ -3228,7 +3425,11 @@ class ConversationEngine:
                     f"admitted by {admission}; deterministic={deterministic}; "
                     f"semantic={semantic}; semantic_status={reading.status}; "
                     f"hours_floor={floor}; hours_corroborated={hours_supported}; "
-                    f"hours_disposition={hours_disposition}"))
+                    f"hours_disposition={hours_disposition}; "
+                    f"burst={burst.fingerprint[:12]}; burst_messages="
+                    f"{len(burst.texts)}; burst_source={'+'.join(burst.provenance) or 'none'}; "
+                    f"burst_divergence={divergent}; "
+                    f"deterministic_scheduling={burst.scheduling_summary}"))
         except Exception:
             pass
         return decision
@@ -3388,11 +3589,52 @@ class ConversationEngine:
         self._trace_faq_topic_authority(
             ctx, topics=topics, suppressed=suppressed, reason=suppression_reason,
             floor=floor, availability=availability, stage=stage, proposed=proposed,
-            disposition=decision.hours_disposition)
+            disposition=decision.hours_disposition,
+            burst_fingerprint=decision.burst_fingerprint)
         return topics
 
+    def _trace_burst_divergence(self, ctx, burst, caller_fingerprint, texts) -> None:
+        """A consumer asked about a burst that is not the turn's. Record it; never obey it.
+
+        G3-5A (audit F-02). This is the detector the invariant needs: the canonical burst
+        always wins, and the attempt is visible rather than silently absorbed by a cache
+        hit. Observational and fail-open — a trace defect must not cost a customer turn.
+        It logs message COUNTS and fingerprints, never customer text.
+        """
+        try:
+            logger.warning(
+                "G3-5A BURST DIVERGENCE thread_id=%s canonical=%s caller=%s "
+                "canonical_messages=%d caller_messages=%d source=%s",
+                getattr(getattr(ctx, "thread", None), "id", None),
+                burst.fingerprint[:12], _text_digest(caller_fingerprint)[:12],
+                len(burst.texts), len([t for t in (texts or ()) if isinstance(t, str)]),
+                "+".join(burst.provenance) or "none")
+        except Exception:
+            pass
+        try:
+            from ..schemas.claims import ClaimType
+            from ..schemas.hybrid_trace import CanonicalEffect
+            self._trace_decision(
+                decision_site_id=DecisionSite.SCHEDULING_AVAILABILITY_AUTHORIZATION,
+                claim_type=ClaimType.SCHEDULING_PREFERENCE,
+                outcome="BURST_DIVERGENCE",
+                reason="a consumer requested an authority decision for a burst that is "
+                       "not this turn's canonical burst; the canonical burst decided",
+                rule_id="scheduling.canonical_burst_authority", rule_version="v1",
+                evidence_ids=tuple(str(m) for m in burst.ordered_message_ids),
+                canonical_effect=CanonicalEffect.NONE,
+                business_outcome=(
+                    f"canonical={burst.fingerprint[:12]}; "
+                    f"caller={_text_digest(caller_fingerprint)[:12]}; "
+                    f"canonical_messages={len(burst.texts)}; caller_messages="
+                    f"{len([t for t in (texts or ()) if isinstance(t, str)])}; "
+                    f"burst_source={'+'.join(burst.provenance) or 'none'}"))
+        except Exception:
+            pass
+
     def _trace_faq_topic_authority(self, ctx, *, topics, suppressed, reason, floor,
-                                   availability, stage, proposed, disposition=None) -> None:
+                                   availability, stage, proposed, disposition=None,
+                                   burst_fingerprint=None) -> None:
         """Record the FAQ-topic decision. Observational, fail-open, decides nothing.
 
         G3-4 makes the decision visible; it does NOT claim G3-5's full response-source
@@ -3426,7 +3668,8 @@ class ConversationEngine:
                 business_outcome=(
                     f"authorised={sorted(topics)}; suppressed={sorted(suppressed)}; "
                     f"hours_floor={floor}; hours_disposition={disposition}; "
-                    f"semantic_topics={sorted(proposed)}; stage={stage!r}"))
+                    f"semantic_topics={sorted(proposed)}; stage={stage!r}; "
+                    f"burst={(burst_fingerprint or '')[:12]}"))
         except Exception:
             pass
 
@@ -4193,6 +4436,30 @@ class ConversationEngine:
         # L4.7W5-F6: the turn's customer words, so a handler reached later (acceptance, for
         # one) can consume an intent the customer already stated instead of asking again.
         self._turn_burst_texts = list(ai_input_messages or [])
+
+        # ── G3-5A (audit F-02): the turn's canonical evidence boundary ───────────
+        #
+        # Built HERE — after `_missing_burst` recovery has completed and before any
+        # authority consumer can run — from `_current_evidence`, which is the complete
+        # reconstructed burst. `ai_input_messages` rides along as `presentation_texts`
+        # because reply generation still wants it; it no longer defines what a decision
+        # saw. Every consumer of `_availability_authority` now reads this, so caller order
+        # and a partial message subset cannot change the result.
+        self._canonical_turn_burst = _canonical_burst(
+            thread_id=getattr(getattr(ctx, "thread", None), "id", None),
+            turn_id=getattr(self, "_correlation_id", None),
+            ordered_message_ids=tuple(
+                r.get("wa_message_id") or r.get("db_id")
+                for r in (self._turn_trace_rows or ())),
+            texts=_current_evidence,
+            provenance=tuple(filter(None, (
+                "event_evidence",
+                "db_recovery" if _missing_burst else None,
+                "unanswered_recent_user_messages"
+                if event.unanswered_recent_user_messages else None))),
+            presentation_texts=ai_input_messages,
+            stage_at_build=getattr(state, "last_stage", None),
+            wants_next_available=self._wants_next_available(list(_current_evidence)))
 
         # ── L4.7B: SHADOW UNDERSTAND ──────────────────────────────────────
         # Runs on the complete raw burst BEFORE any deterministic gate can early-return,
