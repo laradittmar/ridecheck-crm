@@ -214,10 +214,16 @@ class TestStageDependencyRemoved(unittest.TestCase):
         self.assertIn("def _burst_texts_for_turn", CE_SOURCE)
 
     def test_the_scheduling_branch_still_exists_for_later_turns(self):
-        """Removing the dependency must not remove the ordinary path."""
+        """Removing the dependency must not remove the ordinary path.
+
+        G3-4-R2A reformatted this call and gave it `allow_clarification=True` — it is the one
+        site where a clarification replaces no other proposition. The guard's subject, that
+        the ordinary scheduling branch still exists behind the no-day/no-time condition, is
+        unchanged and still asserted here.
+        """
         self.assertIn("if not sched_day_iso and not sched_time_str:", CE_SOURCE)
-        self.assertIn("forward = self._handle_next_available_request(ctx, state, ai_input_messages)",
-                      CE_SOURCE)
+        self.assertIn("forward = self._handle_next_available_request(", CE_SOURCE)
+        self.assertIn("ctx, state, ai_input_messages, allow_clarification=True", CE_SOURCE)
 
 
 class TestExactWildRegression(unittest.TestCase):

@@ -227,17 +227,25 @@ class S4_FaqAuthority(unittest.TestCase):
         harness = Harness(status=te.EvidenceStatus.CONFIRMED)
         self.assertEqual(harness.faq("cual es el horario de atencion?"), {"business_hours"})
 
-    def test_g34_19_a_weak_match_survives_when_nothing_outranks_it(self):
-        """Semantic silence leaves the deterministic floor as the only evidence there is."""
-        self.assertEqual(Harness(status=None).faq(LIVE), {"business_hours"})
+    def test_g34_19_a_weak_match_no_longer_survives_semantic_silence(self):
+        """INVERTED BY G3-4-R2 (audit R34-01).
+
+        This asserted the defect: with no semantic evidence the bare token answered on its
+        own, so a provider failure became business certainty. A weak floor is now evidence
+        and never authority, and the turn clarifies instead.
+        """
+        self.assertEqual(Harness(status=None).faq(LIVE), set())
 
     def test_g34_20_semantic_failure_does_not_auto_answer_from_a_weak_match(self):
-        """Scenario 12: the floor still answers, but only because it is ALL the evidence —
-        and the decision is recorded, where before nothing was."""
+        """INVERTED BY G3-4-R2 (audit R34-01).
+
+        The name was always right; the assertion contradicted it. A raising provider now
+        yields no hours answer at all — failure is not certainty.
+        """
         traces = []
         harness = Harness(status=None, traces=traces)
         harness.engine._semantic_turn_evidence = lambda: (_ for _ in ()).throw(RuntimeError())
-        self.assertEqual(harness.faq(LIVE), {"business_hours"})
+        self.assertEqual(harness.faq(LIVE), set())
 
     def test_g34_21_the_detector_was_not_enlarged(self):
         self.assertEqual(set(_HOURS_FAQ_DETECTION), {
@@ -390,10 +398,14 @@ class S7_CorpusAlignment(unittest.TestCase):
                                  AGREE if decision.admission == ADMIT_BOTH else SINGLE)
 
     def test_g34_34_a_business_hours_case_is_not_admitted_as_availability(self):
+        """G3-4-R2 changed the authority for an UNADMITTED turn from HOLD to CLARIFY when a
+        weak hours token is the only evidence. What this case is about — an hours question is
+        never admitted as an availability enquiry — is unchanged and still asserted."""
         case = [c for c in self.corpus() if c["expected_faq_topic"] == "business_hours"][0]
         decision = Harness(status=None).authority([case["text"]])
         self.assertEqual(decision.admission, ADMIT_NONE)
-        self.assertEqual(decision.authority, HOLD)
+        self.assertNotEqual(decision.authority, LOOK_UP)
+        self.assertIn(decision.authority, (HOLD, CLARIFY))
 
     def test_g34_35_no_production_module_reads_the_corpus(self):
         for path in (BACKEND / "app").rglob("*.py"):

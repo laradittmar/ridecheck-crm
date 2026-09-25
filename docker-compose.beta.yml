@@ -41,6 +41,13 @@ services:
     mem_reservation: 256m
     restart: unless-stopped
     environment:
+      # L4.7W5-G3-4-R2: the customer's calendar boundary, declared in the file that SHIPS
+      # with this branch. It was previously set only in the base compose, which lives
+      # outside this repository — restore that file from git and every relative date
+      # silently moves to UTC midnight, so between 21:00 and 00:00 local "hoy" resolves to
+      # tomorrow. `schedule.business_today()` now names the zone explicitly as well; this
+      # keeps logs and anything else reading local time on the same calendar.
+      TZ: "America/Argentina/Buenos_Aires"
       DATABASE_URL: postgresql+psycopg://crm:${POSTGRES_PASSWORD}@postgres:5432/crm_test
       OUTBOUND_ENABLED: "${BETA_OUTBOUND_ENABLED:-false}"
       CLOSED_BETA_ALLOWED_WA_IDS: "5491153368330"

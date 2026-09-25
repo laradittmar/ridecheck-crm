@@ -66,6 +66,34 @@ class OccupiedSlot:
     zone_group: str | None = None
 
 
+# ── L4.7W5-G3-4-R2: the business calendar, stated rather than inherited ──────
+#
+# Relative days ("hoy", "mañana") are answers about the CUSTOMER's calendar, and the
+# customer is in Argentina. Before R2 that was true only because the base compose happened
+# to set TZ; a container without it silently moved the boundary to UTC midnight, so between
+# 21:00 and 00:00 local "hoy" resolved to tomorrow — and the sealed test suite, which runs
+# with no TZ at all, passed identically either way (audit R34-05).
+#
+# The zone is now named here and the date is computed from it, so the answer no longer
+# depends on how the process happened to be started. `TZ` is still declared in the shipped
+# compose override as defence in depth for logs and for anything else that reads local time.
+BUSINESS_TIMEZONE = "America/Argentina/Buenos_Aires"
+
+
+def business_today() -> date:
+    """Today on the business's own calendar. Never the host clock, never UTC."""
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo(BUSINESS_TIMEZONE)).date()
+
+
+def business_date_at(moment: datetime) -> date:
+    """The business calendar date of an arbitrary instant — the boundary, made testable."""
+    from zoneinfo import ZoneInfo
+    if moment.tzinfo is None:
+        raise ValueError("business_date_at requires an aware datetime")
+    return moment.astimezone(ZoneInfo(BUSINESS_TIMEZONE)).date()
+
+
 # ── L4.3 Phase B: single business-hours authority ─────────────────────────────
 # `_business_hours()` below delegates here so that every consumer (ScheduleService,
 # CE FAQ answers, rejection explanations) reads ONE source for operating hours.

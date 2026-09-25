@@ -279,8 +279,10 @@ class TraceAndInspector(unittest.TestCase):
             body = ast.unparse(node)
             if "AVAILABILITY_ENQUIRY" in body or "scheduling_intents" in body:
                 readers.add(node.name)
-        self.assertEqual(readers, {"_semantic_availability_enquiry"},
-                         "only the G3-4 reader may touch the family")
+        # G3-4-R2 made `_semantic_reading` the turn's single read; the named projection
+        # remains. Any OTHER consumer still fails this guard.
+        self.assertEqual(readers, {"_semantic_reading"},
+                         "exactly one reader touches the family — the R2 single read")
 
 
 class NoAuthority(unittest.TestCase):

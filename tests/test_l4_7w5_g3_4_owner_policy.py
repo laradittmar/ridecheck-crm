@@ -140,9 +140,11 @@ class B_DateResolution(unittest.TestCase):
         site = inspect.getsource(ConversationEngine._process_text)
         self.assertIn("if not sched_day_iso and not sched_time_str:", site)
         index_guard = site.index("if not sched_day_iso and not sched_time_str:")
-        index_call = site.index("_handle_next_available_request(ctx, state, ai_input_messages)")
+        index_call = site.index("_handle_next_available_request(")
         self.assertLess(index_guard, index_call,
                         "a customer-proposed date is queried first, by construction")
+        self.assertIn("allow_clarification=True", site,
+                      "R2A: this is the one site where a clarification replaces nothing")
 
 
 class C_ContextAndStaleness(unittest.TestCase):

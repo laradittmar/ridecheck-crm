@@ -32,6 +32,31 @@ COMPETING_OBJECTS: frozenset[str] = frozenset({
     "llamada", "llamadas", "mecanico", "mecanicos", "taller", "talleres",
 })
 
+# ── L4.7W5-G3-4-R2A: which proposition an hours noun belongs to ──────────────
+#
+# "Horario" belongs to two different questions, and the burst itself says which:
+#
+#   OPERATION_PREDICATES  bind the hours to RideCheck OPERATING — what hours we do, have,
+#                         work, open, close, attend. An hours noun with one of these is an
+#                         explicit question about the business's own hours.
+#   AVAILABILITY_OBJECTS  bind the hours to the CALENDAR — what is free. An hours noun with
+#                         one of these is asking what the agenda has, not when we open.
+#
+# Both are single words, held here with the project's other scheduling nouns rather than in
+# the engine, and neither is a sentence, a phrasing or an exception list. They are the
+# minimum compositional evidence needed to tell two propositions apart when the semantic
+# interpreter is unavailable; when it IS available, its reading decides and these are not
+# consulted for the decision at all.
+OPERATION_PREDICATES: frozenset[str] = frozenset({
+    "hacen", "hacian", "tienen", "trabajan", "laburan", "atienden",
+    "abren", "cierran", "atencion",
+})
+
+AVAILABILITY_OBJECTS: frozenset[str] = frozenset({
+    "disponible", "disponibles", "disponibilidad", "libre", "libres",
+    "vacante", "vacantes", "cupo", "cupos",
+})
+
 # Universal negative quantifier: ningun / ninguno / ninguna (+ plural, which people write).
 # "ningún" arrives accent-stripped as "ningun". This is a morphological shape, not a phrase.
 UNIVERSAL_NEGATIVE = re.compile(r"\bningun(?:o|a|os|as)?\b")

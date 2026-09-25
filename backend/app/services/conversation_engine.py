@@ -813,15 +813,54 @@ _HOURS_FAQ_DETECTION: frozenset[str] = frozenset({
 _HOURS_STRONG_MARKERS: tuple[str, ...] = ("atencion", "trabajan", "laburan")
 
 
+def _hours_units(text: str) -> list[str]:
+    """The burst, split into the units a question can live in: lines, then sentences.
+
+    R2A. Strength is a property of the evidence CARRYING the question. Judging the whole
+    burst let composition downgrade it: "Al final el Focus se cayó. Tengo un Toyota Corolla
+    2020." + "¿Qué horarios tienen?" is an explicit hours question standing beside a vehicle
+    correction, and reading the two together turned the question into a vague mention.
+    """
+    units: list[str] = []
+    for line in str(text or "").split("\n"):
+        for unit in re.split(r"(?<=[.!?¿])\s+|(?<=[.!?])$", line):
+            if unit and unit.strip():
+                units.append(unit.strip())
+    return units or [str(text or "")]
+
+
 def _hours_floor_strength(text: str) -> str:
-    """NONE | WEAK | STRONG for the deterministic hours floor on this burst."""
+    """NONE | WEAK | STRONG for the deterministic hours floor on this burst.
+
+    STRONG means: some unit of the burst asks about RideCheck's own operating hours, and
+    says so compositionally — an hours noun bound to a predicate about the business
+    OPERATING (hacen, tienen, trabajan, abren, atención), with nothing in that same unit
+    binding the hours to the CALENDAR instead (disponible, libre, cupo). The second half is
+    what keeps "qué horarios tienen disponibles" out: the customer is asking what is free,
+    not when we open, and that is a different proposition.
+
+    WEAK means an hours noun appears and nothing establishes which question it belongs to.
+    A weak floor is evidence, never authority (G3-4-R2).
+
+    Two earlier versions of this were wrong and both are worth remembering. The first graded
+    the matched catalogue ENTRIES rather than the customer's words, so a question naming the
+    business's activity came out weak. The second graded the whole burst at once, so an
+    explicit question was diluted by whatever else the customer said in the same breath.
+    """
     from ..schemas.hybrid_trace import FloorStrength
-    n = _norm_lower(text)
-    matched = [p for p in _HOURS_FAQ_DETECTION if p in n]
-    if not matched:
+    from .scheduling_lexicon import AVAILABILITY_OBJECTS, OPERATION_PREDICATES
+    whole = _norm_lower(text)
+    if not any(p in whole for p in _HOURS_FAQ_DETECTION):
         return FloorStrength.NONE
-    if any(m in phrase for phrase in matched for m in _HOURS_STRONG_MARKERS):
-        return FloorStrength.STRONG
+    for unit in _hours_units(text):
+        n = _norm_lower(unit)
+        if not any(p in n for p in _HOURS_FAQ_DETECTION):
+            continue
+        words = set(re.findall(r"[a-z0-9]+", n))
+        if words & AVAILABILITY_OBJECTS or any(o in n for o in AVAILABILITY_OBJECTS):
+            continue                      # this unit is about the calendar, not the hours
+        if words & OPERATION_PREDICATES:
+            return FloorStrength.STRONG   # an explicit question, in its own right
     return FloorStrength.WEAK
 
 
@@ -899,6 +938,17 @@ _FAQ_SCOPE_ANSWER = (
 # A topic with no authoritative answer is deliberately absent from this table. The
 # interpreter can emit `coverage` and `duration`; we do not have canonical answers for
 # them, and inventing one is exactly what this layer exists to prevent.
+# ── L4.7W5-G3-4-R2: the one bounded clarification ────────────────────────────
+#
+# Asked when the system genuinely cannot tell the two questions apart: a bare time noun with
+# nothing corroborating it. It names the two readings and nothing else — it claims no
+# availability, states no hours, books nothing, escalates to nobody and writes no state.
+# One constant, deliberately: a second variant would be the beginning of a catalogue.
+_AVAILABILITY_VS_HOURS_CLARIFICATION = (
+    "¿Querés conocer los turnos disponibles para una revisión o nuestros "
+    "horarios de atención?"
+)
+
 _FAQ_TOPIC_ANSWERS: dict[str, object] = {
     "business_hours": lambda: _faq_hours_answer(),
     "report": lambda: _FAQ_REPORT_ANSWER,
@@ -1439,6 +1489,12 @@ def _reply_already_asks_location(reply: str) -> bool:
     return any(probe in n for probe in _LOCATION_ASK_PROBES)
 
 
+def _business_today():
+    """Today on the business calendar. One import point, so the contract is checkable."""
+    from .schedule import business_today
+    return business_today()
+
+
 def _norm_lower(s: str) -> str:
     """Accent-strip, lowercase, and collapse whitespace — for keyword matching."""
     return " ".join(_strip_accents(s).lower().split())
@@ -1728,7 +1784,7 @@ def _rejection_is_about_scheduling(texts: list[str], offer_outstanding: bool = F
         return False
     if names_scheduling_object(normalized):
         return True
-    day, time_str = _parse_scheduling_text(list(texts), date.today())
+    day, time_str = _parse_scheduling_text(list(texts), _business_today())
     if day or time_str:
         return True
     if any(p.search(normalized) for p in _PHONE_CALL_PATTERNS):
@@ -1949,7 +2005,7 @@ def _should_escalate_scheduling_to_human(
         except (json.JSONDecodeError, TypeError):
             offered = []
         if offered:  # real alternatives were actually offered
-            parsed_day, parsed_time = _parse_scheduling_text(texts, date.today())
+            parsed_day, parsed_time = _parse_scheduling_text(texts, _business_today())
             if parsed_time and parsed_time == str(state.last_requested_time):
                 # Only escalate when the user hasn't switched to a new date
                 if parsed_day is None or parsed_day == str(state.active_requested_date):
@@ -2921,20 +2977,34 @@ class ConversationEngine:
 
     # ── G3-4: semantic availability enquiry — read, never re-derived ─────────
 
-    def _semantic_availability_enquiry(self):
-        """(resolved_enquiry, ambiguous_enquiry) from THIS burst's interpretation.
+    def _semantic_reading(self):
+        """Everything this decision needs, from ONE read of the burst's interpretation.
 
-        Reads the evidence the single interpretation already produced. It never parses the
-        burst again, never calls the provider, and never invents an intent the model did
-        not emit — absence here is absence, not a guess.
+        R2 (audit R34-03): the authority and the FAQ path each used to read the evidence
+        separately and recompute the same judgement, so one decision existed in two places
+        and could diverge. There is now a single read, and `status` distinguishes the three
+        outcomes that used to collapse into "nothing":
+
+            OK          an interpretation exists and was parsed
+            ABSENT      no interpretation for this turn (flag off, or none produced)
+            UNAVAILABLE the provider timed out, raised, or the evidence was unusable
+
+        That distinction is the whole of R34-01: a weak lexical candidate may not become an
+        answer when the interpreter never got to disagree with it.
         """
-        # Fail-open, like every other reader of semantic evidence in this file. A turn is a
-        # customer waiting: a provider timeout, a disabled flag or a missing dependency is
-        # ABSENCE of semantic evidence, never an exception into the scheduling path.
         try:
             evidence = self._semantic_turn_evidence()
-            if evidence is None:
-                return None, None
+        except Exception as exc:
+            try:
+                logger.warning("G3-4-R2 semantic evidence unavailable: %s", type(exc).__name__)
+            except Exception:
+                pass
+            return SimpleNamespace(status="UNAVAILABLE", availability=None,
+                                   ambiguous=None, faq_topics=frozenset())
+        if evidence is None:
+            return SimpleNamespace(status="ABSENT", availability=None,
+                                   ambiguous=None, faq_topics=frozenset())
+        try:
             from ..schemas.turn_evidence import SchedulingIntentKind, UNRESOLVED_STATUSES
             resolved = ambiguous = None
             for item in getattr(evidence, "scheduling_intents", ()) or ():
@@ -2946,13 +3016,31 @@ class ConversationEngine:
                     ambiguous = ambiguous or item
                 else:
                     resolved = resolved or item
-            return resolved, ambiguous
+            topics = set()
+            for intent in getattr(evidence, "faq_intents", ()) or ():
+                topic = getattr(intent, "topic", None) or getattr(intent, "value", None)
+                topic = getattr(topic, "value", topic)
+                if isinstance(topic, str) and topic in _FAQ_TOPIC_ANSWERS:
+                    topics.add(topic)
+            return SimpleNamespace(status="OK", availability=resolved, ambiguous=ambiguous,
+                                   faq_topics=frozenset(topics))
         except Exception as exc:
             try:
-                logger.warning("G3-4 availability intent unavailable: %s", type(exc).__name__)
+                logger.warning("G3-4-R2 semantic evidence unusable: %s", type(exc).__name__)
             except Exception:
                 pass
-            return None, None
+            return SimpleNamespace(status="UNAVAILABLE", availability=None,
+                                   ambiguous=None, faq_topics=frozenset())
+
+    def _semantic_availability_enquiry(self):
+        """(resolved, ambiguous) availability intent — a thin view over the one read.
+
+        Kept as the named reader the G3-3 contract test pins. R2 made `_semantic_reading`
+        the single read for the turn; this simply projects it, so there is one place where
+        the evidence is consulted and one place where it can fail.
+        """
+        reading = self._semantic_reading()
+        return reading.availability, reading.ambiguous
 
     def _safe_scheduling_claims(self, state):
         """Claims for the trace only. An observer may never raise into a decision."""
@@ -2983,7 +3071,8 @@ class ConversationEngine:
             SchedulingAuthority)
 
         deterministic = bool(self._wants_next_available(texts))
-        resolved, ambiguous = self._semantic_availability_enquiry()
+        reading = self._semantic_reading()          # the turn's ONLY semantic read
+        resolved, ambiguous = reading.availability, reading.ambiguous
         semantic = resolved is not None
 
         if deterministic and semantic:
@@ -3013,10 +3102,27 @@ class ConversationEngine:
         # semantic-only admission: a deterministic admission must behave exactly as it did
         # before G3-4, because its call sites already carry the stage and prerequisite
         # guards and narrowing them here would be a regression, not a safeguard.
+        hours_supported = "business_hours" in reading.faq_topics
         if admission == AdmissionCondition.NONE:
             if ambiguous is not None:
                 authority, reason = (SchedulingAuthority.CLARIFY,
                                      "the interpreter itself reported an ambiguous reading")
+            elif (floor == FloorStrength.WEAK and not hours_supported
+                    and reading.status != "OK"):
+                # R34-01, inverted. A bare time noun is the vocabulary of BOTH questions.
+                # When the interpreter is absent or unavailable nothing corroborates it, and
+                # a weak candidate alone may not answer — provider failure is not business
+                # certainty. CLARIFY is the bounded, existing, typed result.
+                authority, reason = (
+                    SchedulingAuthority.CLARIFY,
+                    f"weak hours candidate with no semantic corroboration "
+                    f"(interpretation {reading.status.lower()})")
+            elif floor == FloorStrength.WEAK and not hours_supported:
+                # The interpreter ran and said this is neither an availability enquiry nor
+                # an hours question. A bare token still may not answer on its own.
+                authority, reason = (
+                    SchedulingAuthority.CLARIFY,
+                    "weak hours candidate the interpretation does not support")
             else:
                 authority, reason = (SchedulingAuthority.HOLD,
                                      "no producer asked about availability this turn")
@@ -3041,8 +3147,19 @@ class ConversationEngine:
             # A weak floor match loses to a resolved enquiry, and it also loses when the
             # interpreter itself could not choose: an ambiguous turn must not be settled
             # silently by a substring in either direction.
-            suppress_hours=((semantic or authority == SchedulingAuthority.CLARIFY)
-                            and floor == FloorStrength.WEAK),
+            # A WEAK candidate survives only when the interpretation corroborates it.
+            suppress_hours=(floor == FloorStrength.WEAK
+                            and not hours_supported
+                            and (semantic or authority == SchedulingAuthority.CLARIFY)),
+            semantic_status=reading.status,
+            semantic_faq_topics=reading.faq_topics,
+            hours_supported=hours_supported,
+            availability_intent=resolved,
+            hours_suppression_reason=(
+                "bare hours token outranked by a resolved availability enquiry"
+                if semantic else
+                f"bare hours token with no semantic corroboration "
+                f"(interpretation {reading.status.lower()})"),
         )
         self._availability_authority_cache = decision
 
@@ -3059,7 +3176,8 @@ class ConversationEngine:
                 permitted_action=(authority if decision.admitted else None),
                 business_outcome=(
                     f"admitted by {admission}; deterministic={deterministic}; "
-                    f"semantic={semantic}; hours_floor={floor}"))
+                    f"semantic={semantic}; semantic_status={reading.status}; "
+                    f"hours_floor={floor}; hours_corroborated={hours_supported}"))
         except Exception:
             pass
         return decision
@@ -3154,14 +3272,15 @@ class ConversationEngine:
         3. a topic already answered in this cycle is not repeated unless asked again.
         """
         explicit = self._explicit_faq_topics(text)
-        proposed = set()
-        try:
-            proposed = self._semantic_faq_topics()
-        except Exception as exc:      # semantic absence is never an error path
-            logger.warning("L4.7W1-F4 semantic FAQ topics unavailable: %s", exc)
-
         state = state if state is not None else getattr(ctx, "state", None)
         stage = getattr(state, "last_stage", None)
+
+        # R2 (audit R34-03): ONE decision, consumed here. The authority already read the
+        # interpretation for this turn; re-reading it to recompute the same judgement is how
+        # two code paths came to own one decision. `_availability_authority` is memoised, so
+        # whichever path runs first decides and the other consumes.
+        decision = self._availability_authority(ctx, state, [text])
+        proposed = set(decision.semantic_faq_topics)
 
         # (2) availability beats opening-hours when the turn is a scheduling request.
         if "business_hours" in (proposed - explicit):
@@ -3187,27 +3306,20 @@ class ConversationEngine:
         # that is a genuinely different proposition and the two stand in parallel.
         suppressed: set = set()
         suppression_reason = None
-        floor = _hours_floor_strength(text)
-        availability = None
-        if "business_hours" in explicit:
-            ambiguous = None
-            try:
-                availability, ambiguous = self._semantic_availability_enquiry()
-            except Exception:
-                availability = None
-            from ..schemas.hybrid_trace import FloorStrength
-            if (availability is not None or ambiguous is not None) and floor == FloorStrength.WEAK:
-                explicit = explicit - {"business_hours"}
-                suppressed.add("business_hours")
-                suppression_reason = (
-                    "bare hours token outranked by a resolved availability enquiry"
-                    if availability is not None else
-                    "bare hours token cannot settle a reading the interpreter called "
-                    "ambiguous")
-                logger.info(
-                    "G3-4 FAQ AUTHORITY thread_id=%s topic=business_hours "
-                    "outcome=suppressed floor=%s reason=semantic_availability_enquiry",
-                    getattr(getattr(ctx, "thread", None), "id", None), floor)
+        floor = decision.floor
+        availability = decision.availability_intent
+        if "business_hours" in explicit and decision.suppress_hours:
+            # R34-01 inverted: a WEAK candidate answers only when the interpretation
+            # corroborates it. Absence, unavailability and a reading that says otherwise all
+            # withhold the answer — provider failure is not business certainty.
+            explicit = explicit - {"business_hours"}
+            suppressed.add("business_hours")
+            suppression_reason = decision.hours_suppression_reason
+            logger.info(
+                "G3-4-R2 FAQ AUTHORITY thread_id=%s topic=business_hours outcome=suppressed "
+                "floor=%s semantic_status=%s authority=%s",
+                getattr(getattr(ctx, "thread", None), "id", None), floor,
+                decision.semantic_status, decision.authority)
 
         topics = explicit | proposed
 
@@ -4185,7 +4297,7 @@ class ConversationEngine:
             _sched_auth = (self._authorize_scheduling_progression(ctx, state)
                            if self._acceptance_authority_on() else None)
             _progression_allowed = (_sched_auth is None or _sched_auth.allows)
-            sched_day_iso, sched_time_str = _parse_scheduling_text(ai_input_messages, date.today())
+            sched_day_iso, sched_time_str = _parse_scheduling_text(ai_input_messages, _business_today())
             period = _detect_time_period(ai_input_messages)
             # L4.3: the customer may offer two days at once ("mñ 15hs? o el jueves").
             # Evaluate the explicit PRIMARY preference before the FALLBACK.
@@ -4307,7 +4419,7 @@ class ConversationEngine:
             and not state.needs_human
             and not state.flow_booking_token
         ):
-            sched_day_iso, sched_time_str = _parse_scheduling_text(ai_input_messages, date.today())
+            sched_day_iso, sched_time_str = _parse_scheduling_text(ai_input_messages, _business_today())
             # Detect period once — used by both the period-only and day+period branches.
             period = _detect_time_period(ai_input_messages)
 
@@ -4315,7 +4427,13 @@ class ConversationEngine:
             #     thing available. No day is named and none is needed: ScheduleService
             #     searches forward and the Flow opens on the first day with capacity.
             if not sched_day_iso and not sched_time_str:
-                forward = self._handle_next_available_request(ctx, state, ai_input_messages)
+                # R2A: the ONLY site that may clarify. Reached when no day and no time were
+                # parsed and every earlier deterministic gate declined, so no other
+                # proposition has claimed this turn — a clarification here replaces nothing.
+                # From `_consume_scheduling_intent` an acceptance has already been resolved,
+                # and a weak hours token must never displace it.
+                forward = self._handle_next_available_request(
+                    ctx, state, ai_input_messages, allow_clarification=True)
                 if forward is not None:
                     return forward
 
@@ -5143,7 +5261,7 @@ class ConversationEngine:
             # Deterministic parser runs first to prevent AI hallucinating dates.
             # This handles the ráfaga case where "si" + "mañana 12hs" arrive together
             # and the AI transitions from QUOTED→SCHEDULING in the same turn.
-            det_day, det_time = _parse_scheduling_text(ai_input_messages, date.today())
+            det_day, det_time = _parse_scheduling_text(ai_input_messages, _business_today())
             pday = det_day or state.preferred_day or state.active_requested_date
             # FIX 3 (RISK-04): when a NEW deterministic day is established this turn,
             # do not inherit a stale state.preferred_time from a prior scheduling attempt.
@@ -5168,7 +5286,7 @@ class ConversationEngine:
         if stage == STAGE_SCHEDULING and not state.needs_human and not state.flow_booking_token:
             ai_reply_text = decision.get("reply") or ""
             if ai_reply_text and state.active_requested_date and not state.preferred_time:
-                _, ai_proposed_time = _parse_scheduling_text([ai_reply_text], date.today())
+                _, ai_proposed_time = _parse_scheduling_text([ai_reply_text], _business_today())
                 if ai_proposed_time:
                     state.preferred_time = ai_proposed_time
                     logger.info(
@@ -6049,7 +6167,7 @@ class ConversationEngine:
         Uses the scheduling parser the router already runs, so "el viernes no, pero el
         sábado sí" is a selection no matter how the first half sounds. No new vocabulary.
         """
-        day, time_str = _parse_scheduling_text(texts, date.today())
+        day, time_str = _parse_scheduling_text(texts, _business_today())
         return bool(day or time_str)
 
     def _semantic_handoff_requested(self, state) -> bool:
@@ -6628,7 +6746,7 @@ class ConversationEngine:
         except Exception:
             pass
         try:
-            day_iso, time_str = _parse_scheduling_text(texts, date.today())
+            day_iso, time_str = _parse_scheduling_text(texts, _business_today())
             return bool(day_iso or time_str)
         except Exception:
             return False
@@ -7574,7 +7692,7 @@ class ConversationEngine:
         if forward is not None:
             return forward
 
-        day_iso, time_str = _parse_scheduling_text(texts, date.today())
+        day_iso, time_str = _parse_scheduling_text(texts, _business_today())
         if not day_iso:
             return None
         period = _detect_time_period(texts)
@@ -8266,6 +8384,8 @@ class ConversationEngine:
         ctx: _Context,
         state: WhatsAppThreadState,
         texts: list[str],
+        *,
+        allow_clarification: bool = False,
     ) -> ConversationHandleOut | None:
         """Search forward for the first day with capacity and open the Booking Flow.
 
@@ -8282,11 +8402,31 @@ class ConversationEngine:
         # `scheduling.availability.authorization`.
         from ..schemas.hybrid_trace import SchedulingAuthority
         decision = self._availability_authority(ctx, state, texts)
+        if decision.authority == SchedulingAuthority.CLARIFY and allow_clarification:
+            # R2 (audit R34-02): CLARIFY used to be produced and never consumed, so a
+            # decision the trace called "clarify" reached the customer as unconstrained
+            # prose — or, after the weak floor was suppressed, as nothing at all. It now has
+            # a production consumer: one canonical question naming the two readings.
+            # It claims no availability, states no hours, books nothing and escalates to
+            # nobody; ScheduleService is not consulted and no canonical field is written.
+            self._answer_source = "DETERMINISTIC_RULE"
+            self._decision_log(ctx, "availability_clarification",
+                               reason=decision.reason, floor=decision.floor,
+                               semantic_status=decision.semantic_status)
+            try:
+                sent_id = self._send_text_to_wa(ctx, _AVAILABILITY_VS_HOURS_CLARIFICATION)
+            except OutboundBlockedError:
+                # The PLANNED action stays visible; only delivery was blocked.
+                self.db.commit()
+                return _out("blocked_dispatch", detail="availability_clarification",
+                            answer_source="DETERMINISTIC_RULE")
+            return _out("replied", wa_message_id=sent_id,
+                        answer_source="DETERMINISTIC_RULE")
         if not decision.admitted:
             return None
         if decision.authority != SchedulingAuthority.LOOK_UP_AVAILABILITY:
-            # REQUEST_PREREQUISITE / CLARIFY / HOLD: the existing canonical path owns this
-            # turn. The authority is recorded; nothing here acts on it.
+            # REQUEST_PREREQUISITE / HOLD: the existing canonical path owns this turn. The
+            # authority is recorded; nothing here acts on it.
             return None
 
         self._answer_source = "SCHEDULING_SERVICE"
