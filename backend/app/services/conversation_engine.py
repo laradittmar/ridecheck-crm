@@ -796,6 +796,35 @@ _HOURS_FAQ_DETECTION: frozenset[str] = frozenset({
     "cuando laburan", "cuando trabajan", "a que hora",
     "horario de atencion",
 })
+# ── L4.7W5-GATE3-G3-4: the hours floor is evidence, not authority ────────────
+#
+# G3-2 DEF-03: this set won outright on a bare substring, so "horarios" — which is equally
+# the vocabulary of asking about the AGENDA — selected the opening-hours answer, and no
+# decision was recorded anywhere. The set is NOT enlarged here and not one entry is added.
+# It is PARTITIONED by what the phrase names:
+#
+#   STRONG  the phrase names the business's own activity or its attention hours, so the
+#           customer is asking when the business operates;
+#   WEAK    the phrase is a bare time noun or a bare "at what time", which an Argentine
+#           customer uses just as readily to ask what the calendar has free.
+#
+# The partition is a rule over the existing members, derived at import, so a future entry
+# is classified by the same rule rather than by being added to a second list.
+_HOURS_STRONG_MARKERS: tuple[str, ...] = ("atencion", "trabajan", "laburan")
+
+
+def _hours_floor_strength(text: str) -> str:
+    """NONE | WEAK | STRONG for the deterministic hours floor on this burst."""
+    from ..schemas.hybrid_trace import FloorStrength
+    n = _norm_lower(text)
+    matched = [p for p in _HOURS_FAQ_DETECTION if p in n]
+    if not matched:
+        return FloorStrength.NONE
+    if any(m in phrase for phrase in matched for m in _HOURS_STRONG_MARKERS):
+        return FloorStrength.STRONG
+    return FloorStrength.WEAK
+
+
 _REPORT_FAQ_DETECTION: frozenset[str] = frozenset({
     "mandan informe", "manda informe", "mandan informes", "manda informes",
 })
@@ -2471,6 +2500,7 @@ class ConversationEngine:
         self._burst_message_count: int = 1
         self._burst_earliest_inbound_db_id: int | None = None
         self._faq_reconciliation_burst: str | None = None
+        self._availability_authority_cache = None
         # L4.7W5 Gate 1/2 — hybrid decision trace collection. Observational only.
         self._turn_trace_ctx = None
         self._turn_trace_before = None
@@ -2508,6 +2538,7 @@ class ConversationEngine:
         self._burst_message_count = 1
         self._burst_earliest_inbound_db_id = None
         self._faq_reconciliation_burst = None
+        self._availability_authority_cache = None   # G3-4: one decision per turn
         self._turn_burst_texts = []
         self._turn_trace_ctx = None
         self._turn_trace_before = None
@@ -2888,6 +2919,151 @@ class ConversationEngine:
             "Si te parece bien, podemos avanzar."
         )
 
+    # ── G3-4: semantic availability enquiry — read, never re-derived ─────────
+
+    def _semantic_availability_enquiry(self):
+        """(resolved_enquiry, ambiguous_enquiry) from THIS burst's interpretation.
+
+        Reads the evidence the single interpretation already produced. It never parses the
+        burst again, never calls the provider, and never invents an intent the model did
+        not emit — absence here is absence, not a guess.
+        """
+        # Fail-open, like every other reader of semantic evidence in this file. A turn is a
+        # customer waiting: a provider timeout, a disabled flag or a missing dependency is
+        # ABSENCE of semantic evidence, never an exception into the scheduling path.
+        try:
+            evidence = self._semantic_turn_evidence()
+            if evidence is None:
+                return None, None
+            from ..schemas.turn_evidence import SchedulingIntentKind, UNRESOLVED_STATUSES
+            resolved = ambiguous = None
+            for item in getattr(evidence, "scheduling_intents", ()) or ():
+                kind = getattr(getattr(item, "kind", None), "value",
+                               getattr(item, "kind", None))
+                if kind != SchedulingIntentKind.AVAILABILITY_ENQUIRY.value:
+                    continue
+                if getattr(item, "status", None) in UNRESOLVED_STATUSES:
+                    ambiguous = ambiguous or item
+                else:
+                    resolved = resolved or item
+            return resolved, ambiguous
+        except Exception as exc:
+            try:
+                logger.warning("G3-4 availability intent unavailable: %s", type(exc).__name__)
+            except Exception:
+                pass
+            return None, None
+
+    def _safe_scheduling_claims(self, state):
+        """Claims for the trace only. An observer may never raise into a decision."""
+        try:
+            return self._semantic_scheduling_claims(state)
+        except Exception:
+            return []
+
+    def _availability_authority(self, ctx, state, texts: list[str]):
+        """Decide — once per turn — whether an availability enquiry may be acted on.
+
+        G3-2 DEF-02: the only route into the scheduling path required the DETERMINISTIC
+        parser to have found a day or a time, and the semantic reading was consulted INSIDE
+        that route. CE silence was therefore an absolute veto on semantic scheduling
+        evidence, which is the opposite of the ratified policy. Admission is now a
+        disjunction — deterministic evidence OR a resolved semantic intent — and the
+        decision records which half opened it.
+
+        This decides only. It calls no service, writes no state, and returns a verdict the
+        caller may act on through the EXISTING deterministic handlers.
+        """
+        cached = getattr(self, "_availability_authority_cache", None)
+        if cached is not None:
+            return cached
+
+        from ..schemas.hybrid_trace import (
+            AdmissionCondition, CanonicalEffect, Classification, FloorStrength,
+            SchedulingAuthority)
+
+        deterministic = bool(self._wants_next_available(texts))
+        resolved, ambiguous = self._semantic_availability_enquiry()
+        semantic = resolved is not None
+
+        if deterministic and semantic:
+            admission = AdmissionCondition.BOTH
+        elif deterministic:
+            admission = AdmissionCondition.DETERMINISTIC
+        elif semantic:
+            admission = AdmissionCondition.SEMANTIC
+        else:
+            admission = AdmissionCondition.NONE
+
+        stage = getattr(state, "last_stage", None)
+        floor = _hours_floor_strength(" ".join(texts))
+
+        # Classification. Two producers on the SAME proposition is the only thing that may
+        # be AGREE; a bare hours match is a different proposition and never a second
+        # producer of this one.
+        if admission == AdmissionCondition.BOTH:
+            classification = Classification.AGREE
+        elif admission == AdmissionCondition.NONE:
+            classification = (Classification.AMBIGUOUS_EVIDENCE if ambiguous is not None
+                              else Classification.NO_EVIDENCE)
+        else:
+            classification = Classification.SINGLE_PRODUCER
+
+        # Authority. No phrase is consulted, and the stage test applies ONLY to the new
+        # semantic-only admission: a deterministic admission must behave exactly as it did
+        # before G3-4, because its call sites already carry the stage and prerequisite
+        # guards and narrowing them here would be a regression, not a safeguard.
+        if admission == AdmissionCondition.NONE:
+            if ambiguous is not None:
+                authority, reason = (SchedulingAuthority.CLARIFY,
+                                     "the interpreter itself reported an ambiguous reading")
+            else:
+                authority, reason = (SchedulingAuthority.HOLD,
+                                     "no producer asked about availability this turn")
+        elif deterministic:
+            authority, reason = (SchedulingAuthority.LOOK_UP_AVAILABILITY,
+                                 "deterministic scheduling evidence: existing behaviour, "
+                                 "unchanged by G3-4")
+        elif stage in (STAGE_SCHEDULING, STAGE_QUOTED, STAGE_FLOW_SENT):
+            authority, reason = (SchedulingAuthority.LOOK_UP_AVAILABILITY,
+                                 "availability enquiry in a scheduling-capable stage; "
+                                 "the deterministic scheduling service decides what exists")
+        else:
+            authority, reason = (SchedulingAuthority.REQUEST_PREREQUISITE,
+                                 f"stage={stage!r}: semantic-only admission, and the "
+                                 "canonical prerequisite ordering still owns this turn")
+
+        decision = SimpleNamespace(
+            admission=admission, authority=authority, reason=reason,
+            classification=classification, stage=stage, floor=floor,
+            deterministic=deterministic, semantic=semantic,
+            admitted=admission != AdmissionCondition.NONE,
+            # A weak floor match loses to a resolved enquiry, and it also loses when the
+            # interpreter itself could not choose: an ambiguous turn must not be settled
+            # silently by a substring in either direction.
+            suppress_hours=((semantic or authority == SchedulingAuthority.CLARIFY)
+                            and floor == FloorStrength.WEAK),
+        )
+        self._availability_authority_cache = decision
+
+        try:
+            from ..schemas.claims import ClaimType
+            self._trace_decision(
+                decision_site_id=DecisionSite.SCHEDULING_AVAILABILITY_AUTHORIZATION,
+                claim_type=ClaimType.SCHEDULING_PREFERENCE,
+                claims=self._safe_scheduling_claims(state),
+                outcome=admission, reason=reason,
+                rule_id="scheduling.availability_admission", rule_version="v1",
+                authority_result=authority,
+                canonical_effect=CanonicalEffect.NONE,
+                permitted_action=(authority if decision.admitted else None),
+                business_outcome=(
+                    f"admitted by {admission}; deterministic={deterministic}; "
+                    f"semantic={semantic}; hours_floor={floor}"))
+        except Exception:
+            pass
+        return decision
+
     def _semantic_faq_topics(self) -> set:
         """FAQ topics the semantic interpreter found in THIS burst. Never an answer.
 
@@ -2997,6 +3173,42 @@ class ConversationEngine:
                     "outcome=deferred_to_scheduling stage=%s scheduling_evidence=%s",
                     getattr(getattr(ctx, "thread", None), "id", None), stage, scheduling_now)
 
+        # ── (2b) G3-4: a bare literal is a candidate, not a winner ───────────────
+        #
+        # DEF-03. Rule (1) above — "an explicit literal ask always wins and is never
+        # suppressed" — made `_HOURS_FAQ_DETECTION` an absolute authority, and the live
+        # turn was decided by the bare word "horarios" while the interpreter was saying,
+        # confirmed, that the customer was asking about the AGENDA. The guard at (2) could
+        # not help: it only ever governed a PROPOSED topic.
+        #
+        # A weak floor match — a bare time noun, which an Argentine customer uses just as
+        # readily for the calendar — now loses to a resolved availability enquiry. A STRONG
+        # match, one naming the business's own attention hours or working days, survives:
+        # that is a genuinely different proposition and the two stand in parallel.
+        suppressed: set = set()
+        suppression_reason = None
+        floor = _hours_floor_strength(text)
+        availability = None
+        if "business_hours" in explicit:
+            ambiguous = None
+            try:
+                availability, ambiguous = self._semantic_availability_enquiry()
+            except Exception:
+                availability = None
+            from ..schemas.hybrid_trace import FloorStrength
+            if (availability is not None or ambiguous is not None) and floor == FloorStrength.WEAK:
+                explicit = explicit - {"business_hours"}
+                suppressed.add("business_hours")
+                suppression_reason = (
+                    "bare hours token outranked by a resolved availability enquiry"
+                    if availability is not None else
+                    "bare hours token cannot settle a reading the interpreter called "
+                    "ambiguous")
+                logger.info(
+                    "G3-4 FAQ AUTHORITY thread_id=%s topic=business_hours "
+                    "outcome=suppressed floor=%s reason=semantic_availability_enquiry",
+                    getattr(getattr(ctx, "thread", None), "id", None), floor)
+
         topics = explicit | proposed
 
         # (3) do not answer the same business truth twice in one cycle.
@@ -3007,7 +3219,52 @@ class ConversationEngine:
                             getattr(getattr(ctx, "thread", None), "id", None),
                             sorted(repeated))
                 topics -= repeated
+                suppressed |= repeated
+                suppression_reason = suppression_reason or "already answered this cycle"
+
+        self._trace_faq_topic_authority(
+            ctx, topics=topics, suppressed=suppressed, reason=suppression_reason,
+            floor=floor, availability=availability, stage=stage, proposed=proposed)
         return topics
+
+    def _trace_faq_topic_authority(self, ctx, *, topics, suppressed, reason, floor,
+                                   availability, stage, proposed) -> None:
+        """Record the FAQ-topic decision. Observational, fail-open, decides nothing.
+
+        G3-4 makes the decision visible; it does NOT claim G3-5's full response-source
+        instrumentation. What this row says is which topics were authorised, which
+        candidates lost and why — not who wrote the sentence that eventually went out.
+        """
+        try:
+            from ..schemas.claims import ClaimType
+            from ..schemas.hybrid_trace import (
+                CanonicalEffect, Classification, FaqAuthority, FloorStrength)
+            if not topics and not suppressed:
+                authority, classification = FaqAuthority.NO_TOPIC, Classification.NO_EVIDENCE
+            elif suppressed and not topics:
+                authority, classification = FaqAuthority.SUPPRESS, Classification.SINGLE_PRODUCER
+            else:
+                authority = FaqAuthority.ANSWER_CANONICAL
+                # An availability enquiry and an hours question are DIFFERENT propositions:
+                # both genuinely present is parallel evidence, never agreement.
+                classification = (Classification.PARALLEL_EVIDENCE
+                                  if (availability is not None and "business_hours" in topics)
+                                  else Classification.SINGLE_PRODUCER)
+            self._trace_decision(
+                decision_site_id=DecisionSite.FAQ_TOPIC_AUTHORIZATION,
+                claim_type=ClaimType.FAQ_TOPIC, claims=(),
+                outcome=authority,
+                reason=(reason or f"authorised={sorted(topics)}"),
+                rule_id="faq.topic_authority", rule_version="v1",
+                authority_result=authority,
+                canonical_effect=CanonicalEffect.NONE,
+                permitted_action=(authority if topics else None),
+                business_outcome=(
+                    f"authorised={sorted(topics)}; suppressed={sorted(suppressed)}; "
+                    f"hours_floor={floor}; semantic_topics={sorted(proposed)}; "
+                    f"stage={stage!r}"))
+        except Exception:
+            pass
 
     def _build_faq_supplement(self, text: str) -> str:
         """WILD-04R-F2: detect FAQ signals in burst text, return canonical answers.
@@ -8018,7 +8275,18 @@ class ConversationEngine:
         The customer never has to name a day. ScheduleService decides what exists; the
         model only told us the customer wanted the earliest option.
         """
-        if not self._wants_next_available(texts):
+        # G3-4: admission is a DISJUNCTION. The deterministic patterns still admit exactly
+        # what they always did — not one has been added — and a resolved semantic
+        # AVAILABILITY_ENQUIRY now admits the turn too, so CE silence is no longer a veto
+        # (DEF-02). The decision is taken once per turn and traced at
+        # `scheduling.availability.authorization`.
+        from ..schemas.hybrid_trace import SchedulingAuthority
+        decision = self._availability_authority(ctx, state, texts)
+        if not decision.admitted:
+            return None
+        if decision.authority != SchedulingAuthority.LOOK_UP_AVAILABILITY:
+            # REQUEST_PREREQUISITE / CLARIFY / HOLD: the existing canonical path owns this
+            # turn. The authority is recorded; nothing here acts on it.
             return None
 
         self._answer_source = "SCHEDULING_SERVICE"

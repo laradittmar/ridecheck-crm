@@ -262,12 +262,25 @@ class TraceAndInspector(unittest.TestCase):
         self.assertEqual(classify_row((), semantic_available=True), "NOT_ROUTED")
         self.assertEqual(not_routed_for((), True), ("SEMANTIC",))
 
-    def test_g33_20_no_decision_site_consumes_the_new_family(self):
-        """G3-4's work, not this milestone's — asserted so it cannot drift in unnoticed."""
-        engine = (BACKEND / "app/services/conversation_engine.py").read_text(encoding="utf-8")
-        self.assertNotIn("scheduling_intents", engine)
-        self.assertNotIn("SchedulingIntentEvidence", engine)
-        self.assertNotIn("AVAILABILITY_ENQUIRY", engine)
+    def test_g33_20_the_family_is_consumed_only_by_the_g3_4_authority_site(self):
+        """G3-3 asserted the engine did not mention the family at all, so routing could not
+        drift in unnoticed. G3-4 is the milestone authorised to route it, so the guard now
+        pins WHERE it may be read: the availability-authority decision, and nowhere that
+        writes state. An unapproved consumer still fails here.
+        """
+        import ast, inspect
+        from app.services import conversation_engine as engine_mod
+        readers = set()
+        source = (BACKEND / "app/services/conversation_engine.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            body = ast.unparse(node)
+            if "AVAILABILITY_ENQUIRY" in body or "scheduling_intents" in body:
+                readers.add(node.name)
+        self.assertEqual(readers, {"_semantic_availability_enquiry"},
+                         "only the G3-4 reader may touch the family")
 
 
 class NoAuthority(unittest.TestCase):

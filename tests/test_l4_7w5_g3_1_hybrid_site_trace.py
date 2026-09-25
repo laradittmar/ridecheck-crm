@@ -851,7 +851,15 @@ class DomainVerdictGuard(unittest.TestCase):
         calls = sum(1 for n in ast.walk(tree)
                     if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
                     and n.func.attr == "_semantic_turn_evidence")
-        self.assertEqual(calls, 5, "the same five pre-existing consumers, no more")
+        # G3-4 added ONE authorised consumer — `_semantic_availability_enquiry`, the reader
+        # behind the availability-authority decision. It reads the evidence the single
+        # interpretation already produced; it makes no provider call, which is what this
+        # guard protects. An unauthorised sixth reader still fails here.
+        self.assertEqual(calls, 6, "five pre-existing consumers plus the G3-4 reader")
+        readers = {n.name for n in ast.walk(tree)
+                   if isinstance(n, ast.FunctionDef)
+                   and "_semantic_turn_evidence()" in ast.unparse(n)}
+        self.assertIn("_semantic_availability_enquiry", readers)
 
 
 class ObserverFailureDiagnostics(unittest.TestCase):

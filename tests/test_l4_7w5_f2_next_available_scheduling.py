@@ -208,7 +208,12 @@ class TestAuthorityContract(unittest.TestCase):
         fn = next(ast.unparse(n) for n in ast.walk(ast.parse(CE_SOURCE))
                   if isinstance(n, ast.FunctionDef)
                   and n.name == "_handle_next_available_request")
-        self.assertIn("if not self._wants_next_available(texts):", fn)
+        # G3-4 replaced the single deterministic guard with a traced admission decision:
+        # `_wants_next_available` is now ONE of two admission conditions, and the handler
+        # still returns None for a turn neither condition admits. The intent of this guard
+        # — the named-day path stays untouched — is unchanged and still asserted.
+        self.assertIn("decision = self._availability_authority(ctx, state, texts)", fn)
+        self.assertIn("if not decision.admitted:", fn)
         self.assertIn("return None", fn)
 
     def test_no_booking_is_created_by_searching(self):

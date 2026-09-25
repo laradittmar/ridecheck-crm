@@ -172,7 +172,10 @@ class TestConsumptionWiring(unittest.TestCase):
         self.assertIn("if consumed is not None", fn)
         self.assertIn("¿Qué día y horario te viene mejor", fn)
         handler = _fn(CE_SOURCE, "_handle_next_available_request")
-        self.assertIn("if not self._wants_next_available(texts):", handler)
+        # G3-4: the deterministic guard became one half of a traced admission decision.
+        # A turn neither producer admits still returns None, which is what SCHED-08 is about.
+        self.assertIn("decision = self._availability_authority(ctx, state, texts)", handler)
+        self.assertIn("if not decision.admitted:", handler)
         self.assertIn("return None", handler)
 
     def test_sched_09_scheduling_authorisation_still_governs(self):

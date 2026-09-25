@@ -283,11 +283,77 @@ class DecisionSite:
     QUOTE_ACCEPTANCE_AUTHORIZATION = "quote.acceptance.authorization"
     HANDOFF_SEMANTIC_REQUEST = "handoff.semantic.request"
     LOCALITY_SEMANTIC_RECOVERY = "locality.semantic.recovery"
+    # ── G3-4: the two decisions that were being made invisibly, by absence and by
+    # substring. Availability admission used to require the deterministic parser to find a
+    # day first, so CE silence vetoed a semantic enquiry; FAQ topic selection used to be
+    # won outright by a literal match, with no decision recorded anywhere.
+    SCHEDULING_AVAILABILITY_AUTHORIZATION = "scheduling.availability.authorization"
+    FAQ_TOPIC_AUTHORIZATION = "faq.topic.authorization"
 
     ALL = (VEHICLE_IDENTITY_APPLY, LOCATION_INSPECTION_APPLY,
            VEHICLE_FUZZY_ADMISSIBILITY,
            SCHEDULING_REQUEST_RECONCILIATION, QUOTE_ACCEPTANCE_AUTHORIZATION,
-           HANDOFF_SEMANTIC_REQUEST, LOCALITY_SEMANTIC_RECOVERY)
+           HANDOFF_SEMANTIC_REQUEST, LOCALITY_SEMANTIC_RECOVERY,
+           SCHEDULING_AVAILABILITY_AUTHORIZATION, FAQ_TOPIC_AUTHORIZATION)
+
+
+class SchedulingAuthority:
+    """What an availability decision permitted. Bounded and typed, never free text.
+
+    An availability ENQUIRY can never reach a booking outcome: there is no ACCEPT and no
+    BOOK member, so no policy branch can produce one. Real slots come from ScheduleService
+    and from nowhere else; these values say only what the turn was allowed to go and ask.
+    """
+    LOOK_UP_AVAILABILITY = "LOOK_UP_AVAILABILITY"     # consult ScheduleService, then answer
+    REQUEST_DATE = "REQUEST_DATE"                      # ask which day, per existing policy
+    REQUEST_PREREQUISITE = "REQUEST_PREREQUISITE"      # vehicle / location / quote first
+    CLARIFY = "CLARIFY"                                # the interpreter itself was ambiguous
+    HOLD = "HOLD"                                      # no admission, or unresolved conflict
+    DEFER_TO_DETERMINISTIC = "DEFER_TO_DETERMINISTIC"  # CE already owns this turn
+
+    ALL = (LOOK_UP_AVAILABILITY, REQUEST_DATE, REQUEST_PREREQUISITE, CLARIFY, HOLD,
+           DEFER_TO_DETERMINISTIC)
+
+
+class AdmissionCondition:
+    """Which producer let a scheduling turn reach its decision site.
+
+    G3-2 DEF-02: the only route in required the deterministic parser to have found a day or
+    a time, and the semantic reading was read INSIDE that route — so CE silence was an
+    absolute veto on semantic scheduling evidence. Admission is now a disjunction, and
+    which half opened it is recorded.
+    """
+    DETERMINISTIC = "DETERMINISTIC_EVIDENCE"
+    SEMANTIC = "SEMANTIC_INTENT"
+    BOTH = "BOTH_PRODUCERS"
+    NONE = "NOT_ADMITTED"
+
+    ALL = (DETERMINISTIC, SEMANTIC, BOTH, NONE)
+
+
+class FaqAuthority:
+    """What a FAQ-topic decision permitted."""
+    ANSWER_CANONICAL = "ANSWER_CANONICAL"      # emit RideCheck's own business truth
+    SUPPRESS = "SUPPRESS"                      # a candidate lost; the reason is recorded
+    NO_TOPIC = "NO_TOPIC"                      # nothing was asked
+
+    ALL = (ANSWER_CANONICAL, SUPPRESS, NO_TOPIC)
+
+
+class FloorStrength:
+    """How much a deterministic FAQ floor match is worth as evidence.
+
+    G3-2 DEF-03: `_HOURS_FAQ_DETECTION` won outright on a bare substring, so the word
+    "horarios" — which is equally the vocabulary of asking about the AGENDA — selected the
+    opening-hours answer and no decision was recorded. The set is unchanged and is not
+    enlarged here; it is PARTITIONED, so a match that names the business's activity can
+    still carry a decision and a bare time-noun cannot win against clear semantic evidence.
+    """
+    NONE = "NONE"
+    WEAK = "WEAK"       # a bare time noun: ambiguous between opening hours and the agenda
+    STRONG = "STRONG"   # names the business's own hours or working days
+
+    ALL = (NONE, WEAK, STRONG)
 
 
 #: What each decision site is actually deciding, in the operator's language.
