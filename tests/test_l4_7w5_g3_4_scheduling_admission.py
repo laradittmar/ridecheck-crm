@@ -60,11 +60,16 @@ PARALLEL = "PARALLEL_EVIDENCE"
 DETERMINISTIC_TEXT = "para cuando tenes turno"
 
 
-def evidence_with(status, kind="AVAILABILITY_ENQUIRY"):
-    if status is None:
+def evidence_with(status, kind="AVAILABILITY_ENQUIRY", faq_topics=()):
+    """R2B: semantic FAQ topics now reach the decision through the EVIDENCE, because the
+    FAQ path consumes the one reading instead of calling `_semantic_faq_topics` itself."""
+    if status is None and not faq_topics:
         return None
-    return te.TurnEvidence(scheduling_intents=(te.SchedulingIntentEvidence(
-        kind=te.SchedulingIntentKind(kind), value=kind, status=status),))
+    return te.TurnEvidence(
+        scheduling_intents=((te.SchedulingIntentEvidence(
+            kind=te.SchedulingIntentKind(kind), value=kind, status=status),)
+            if status else ()),
+        faq_intents=tuple(te.FaqIntentEvidence(topic=t, value=t) for t in faq_topics))
 
 
 class Harness:
@@ -77,7 +82,7 @@ class Harness:
         engine = ConversationEngine.__new__(ConversationEngine)
         engine._availability_authority_cache = None
         engine._hybrid_trace_on = lambda: False
-        engine._semantic_turn_evidence = lambda: evidence_with(status)
+        engine._semantic_turn_evidence = lambda: evidence_with(status, faq_topics=faq_topics)
         engine._semantic_scheduling_claims = lambda st: []
         engine._semantic_faq_topics = lambda: set(faq_topics)
         engine._topics_already_answered_this_cycle = lambda c: set(answered)
@@ -222,9 +227,22 @@ class S4_FaqAuthority(unittest.TestCase):
                 self.assertEqual(Harness(status=None, stage=STAGE_QUALIFYING).faq(text),
                                  {"business_hours"})
 
-    def test_g34_18_a_strong_match_survives_a_concurrent_availability_enquiry(self):
-        """Different propositions stand in parallel; the hours answer is not suppressed."""
+    def test_g34_18_a_strong_match_does_not_outrank_a_resolved_availability_enquiry(self):
+        """INVERTED BY G3-4-R2B (audit R2A-01).
+
+        This asserted the blocker: a STRONG deterministic grade kept the hours answer even
+        though the interpretation had resolved the burst as an availability enquiry — CE
+        assertion vetoing semantic evidence. Semantic primacy now decides the hours
+        proposition at EVERY floor strength. An hours answer still stands on its own when
+        the interpretation confirms `business_hours`, which g34_18b asserts.
+        """
         harness = Harness(status=te.EvidenceStatus.CONFIRMED)
+        self.assertEqual(harness.faq("cual es el horario de atencion?"), set())
+
+    def test_g34_18b_semantic_business_hours_still_authorises_the_answer(self):
+        """The other half of primacy: the interpretation's own hours evidence admits it,
+        and coexists with an availability enquiry rather than being replaced by it."""
+        harness = Harness(status=te.EvidenceStatus.CONFIRMED, faq_topics=("business_hours",))
         self.assertEqual(harness.faq("cual es el horario de atencion?"), {"business_hours"})
 
     def test_g34_19_a_weak_match_no_longer_survives_semantic_silence(self):
@@ -301,7 +319,11 @@ class S5_TraceEvidence(unittest.TestCase):
         self.assertEqual(row["authority_result"], "SUPPRESS")
         self.assertIn("suppressed=['business_hours']", row["business_outcome"])
         self.assertIn("hours_floor=WEAK", row["business_outcome"])
-        self.assertIn("outranked", row["reason"])
+        # G3-4-R2B renamed the reason to name the EVIDENCE that withheld the answer rather
+        # than the strength contest that used to decide it.
+        self.assertIn("appointment-availability enquiry", row["reason"])
+        self.assertIn("hours_disposition=SUPPRESSED_BY_SEMANTIC_AVAILABILITY",
+                      row["business_outcome"])
 
     def test_g34_26_one_decision_per_turn(self):
         harness, traces = self.traced(status=te.EvidenceStatus.CONFIRMED)

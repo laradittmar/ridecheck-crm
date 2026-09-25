@@ -813,6 +813,18 @@ _HOURS_FAQ_DETECTION: frozenset[str] = frozenset({
 _HOURS_STRONG_MARKERS: tuple[str, ...] = ("atencion", "trabajan", "laburan")
 
 
+#: Why the hours candidate lost, keyed by disposition. Named once so the trace, the log and
+#: the operator all read the same sentence.
+_HOURS_SUPPRESSION_REASON = {
+    "SUPPRESSED_BY_SEMANTIC_AVAILABILITY":
+        "the interpretation resolved this burst as an appointment-availability enquiry",
+    "SUPPRESSED_AMBIGUOUS":
+        "the interpretation could not choose between availability and opening hours",
+    "SUPPRESSED_UNCORROBORATED":
+        "a weak hours candidate with no semantic corroboration (interpretation {status})",
+}
+
+
 def _hours_units(text: str) -> list[str]:
     """The burst, split into the units a question can live in: lines, then sentences.
 
@@ -848,18 +860,32 @@ def _hours_floor_strength(text: str) -> str:
     explicit question was diluted by whatever else the customer said in the same breath.
     """
     from ..schemas.hybrid_trace import FloorStrength
-    from .scheduling_lexicon import AVAILABILITY_OBJECTS, OPERATION_PREDICATES
+    from .scheduling_lexicon import (AVAILABILITY_OBJECTS, OPERATION_PREDICATES,
+                                     SCHEDULING_OBJECTS)
     whole = _norm_lower(text)
     if not any(p in whole for p in _HOURS_FAQ_DETECTION):
         return FloorStrength.NONE
+    # R2B (audit R2A-02). The calendar context is read at BURST scope, not inside the graded
+    # unit. Judging each unit alone discarded whatever the customer said in the sentence or
+    # message next door: "¿Qué horarios tienen?" followed by "Para sacar un turno." was
+    # graded an explicit opening-hours question, and the live defect returned intact. One
+    # customer, one burst, one proposition — a sentence boundary is not a change of subject.
+    # The calendar context is anything that names a vacancy or an appointment object. Both
+    # sets already exist; `SCHEDULING_OBJECTS` minus the hours nouns is what remains once the
+    # word under dispute is removed from its own evidence — "turno", "fecha", "opción". No
+    # vocabulary is added here, and the subtraction is what stops the hours noun matching
+    # itself.
+    calendar_context = (AVAILABILITY_OBJECTS
+                        | (SCHEDULING_OBJECTS - {"horario", "horarios", "hora", "horas"}))
+    burst_words = set(re.findall(r"[a-z0-9]+", whole))
+    if (burst_words & calendar_context
+            or any(o in whole for o in AVAILABILITY_OBJECTS)):
+        return FloorStrength.WEAK
     for unit in _hours_units(text):
         n = _norm_lower(unit)
         if not any(p in n for p in _HOURS_FAQ_DETECTION):
             continue
-        words = set(re.findall(r"[a-z0-9]+", n))
-        if words & AVAILABILITY_OBJECTS or any(o in n for o in AVAILABILITY_OBJECTS):
-            continue                      # this unit is about the calendar, not the hours
-        if words & OPERATION_PREDICATES:
+        if set(re.findall(r"[a-z0-9]+", n)) & OPERATION_PREDICATES:
             return FloorStrength.STRONG   # an explicit question, in its own right
     return FloorStrength.WEAK
 
@@ -3068,7 +3094,7 @@ class ConversationEngine:
 
         from ..schemas.hybrid_trace import (
             AdmissionCondition, CanonicalEffect, Classification, FloorStrength,
-            SchedulingAuthority)
+            HoursDisposition, SchedulingAuthority)
 
         deterministic = bool(self._wants_next_available(texts))
         reading = self._semantic_reading()          # the turn's ONLY semantic read
@@ -3103,11 +3129,40 @@ class ConversationEngine:
         # before G3-4, because its call sites already carry the stage and prerequisite
         # guards and narrowing them here would be a regression, not a safeguard.
         hours_supported = "business_hours" in reading.faq_topics
+
+        # ── R2B (audit R2A-01): the hours proposition, decided on its own evidence ──
+        #
+        # Before R2B this was `floor == WEAK and …`, so a STRONG deterministic grade made a
+        # resolved semantic reading irrelevant: the interpreter said, confirmed, that the
+        # customer was asking about the AGENDA and the substring answered with opening
+        # hours anyway. G3-2 DEF-02 was CE SILENCE vetoing semantic evidence; that was CE
+        # ASSERTION vetoing it — the same error, mirrored.
+        #
+        # The deterministic floor is a fallback for a proposition the interpretation did not
+        # resolve. It is never a vote against one it did.
+        if hours_supported:
+            # The interpretation confirms the hours question itself. It stands on its own
+            # evidence, and it may coexist with an availability enquiry in the same burst —
+            # two propositions, composed once each, neither lending authority to the other.
+            hours_disposition = HoursDisposition.ADMIT
+        elif resolved is not None:
+            hours_disposition = HoursDisposition.SUPPRESSED_BY_SEMANTIC_AVAILABILITY
+        elif ambiguous is not None:
+            hours_disposition = HoursDisposition.SUPPRESSED_AMBIGUOUS
+        elif floor == FloorStrength.STRONG:
+            # Unresolved by the interpretation, and the burst asks explicitly. This is the
+            # bounded deterministic fallback, and the only place strength still decides.
+            hours_disposition = HoursDisposition.ADMIT
+        elif floor == FloorStrength.WEAK:
+            hours_disposition = HoursDisposition.SUPPRESSED_UNCORROBORATED
+        else:
+            hours_disposition = HoursDisposition.NO_CANDIDATE
+
         if admission == AdmissionCondition.NONE:
             if ambiguous is not None:
                 authority, reason = (SchedulingAuthority.CLARIFY,
                                      "the interpreter itself reported an ambiguous reading")
-            elif (floor == FloorStrength.WEAK and not hours_supported
+            elif (hours_disposition == HoursDisposition.SUPPRESSED_UNCORROBORATED
                     and reading.status != "OK"):
                 # R34-01, inverted. A bare time noun is the vocabulary of BOTH questions.
                 # When the interpreter is absent or unavailable nothing corroborates it, and
@@ -3117,7 +3172,7 @@ class ConversationEngine:
                     SchedulingAuthority.CLARIFY,
                     f"weak hours candidate with no semantic corroboration "
                     f"(interpretation {reading.status.lower()})")
-            elif floor == FloorStrength.WEAK and not hours_supported:
+            elif hours_disposition == HoursDisposition.SUPPRESSED_UNCORROBORATED:
                 # The interpreter ran and said this is neither an availability enquiry nor
                 # an hours question. A bare token still may not answer on its own.
                 authority, reason = (
@@ -3147,19 +3202,14 @@ class ConversationEngine:
             # A weak floor match loses to a resolved enquiry, and it also loses when the
             # interpreter itself could not choose: an ambiguous turn must not be settled
             # silently by a substring in either direction.
-            # A WEAK candidate survives only when the interpretation corroborates it.
-            suppress_hours=(floor == FloorStrength.WEAK
-                            and not hours_supported
-                            and (semantic or authority == SchedulingAuthority.CLARIFY)),
+            suppress_hours=(hours_disposition != HoursDisposition.ADMIT),
+            hours_disposition=hours_disposition,
             semantic_status=reading.status,
             semantic_faq_topics=reading.faq_topics,
             hours_supported=hours_supported,
             availability_intent=resolved,
-            hours_suppression_reason=(
-                "bare hours token outranked by a resolved availability enquiry"
-                if semantic else
-                f"bare hours token with no semantic corroboration "
-                f"(interpretation {reading.status.lower()})"),
+            hours_suppression_reason=_HOURS_SUPPRESSION_REASON.get(
+                hours_disposition, "").format(status=reading.status.lower(), floor=floor),
         )
         self._availability_authority_cache = decision
 
@@ -3177,7 +3227,8 @@ class ConversationEngine:
                 business_outcome=(
                     f"admitted by {admission}; deterministic={deterministic}; "
                     f"semantic={semantic}; semantic_status={reading.status}; "
-                    f"hours_floor={floor}; hours_corroborated={hours_supported}"))
+                    f"hours_floor={floor}; hours_corroborated={hours_supported}; "
+                    f"hours_disposition={hours_disposition}"))
         except Exception:
             pass
         return decision
@@ -3336,11 +3387,12 @@ class ConversationEngine:
 
         self._trace_faq_topic_authority(
             ctx, topics=topics, suppressed=suppressed, reason=suppression_reason,
-            floor=floor, availability=availability, stage=stage, proposed=proposed)
+            floor=floor, availability=availability, stage=stage, proposed=proposed,
+            disposition=decision.hours_disposition)
         return topics
 
     def _trace_faq_topic_authority(self, ctx, *, topics, suppressed, reason, floor,
-                                   availability, stage, proposed) -> None:
+                                   availability, stage, proposed, disposition=None) -> None:
         """Record the FAQ-topic decision. Observational, fail-open, decides nothing.
 
         G3-4 makes the decision visible; it does NOT claim G3-5's full response-source
@@ -3373,8 +3425,8 @@ class ConversationEngine:
                 permitted_action=(authority if topics else None),
                 business_outcome=(
                     f"authorised={sorted(topics)}; suppressed={sorted(suppressed)}; "
-                    f"hours_floor={floor}; semantic_topics={sorted(proposed)}; "
-                    f"stage={stage!r}"))
+                    f"hours_floor={floor}; hours_disposition={disposition}; "
+                    f"semantic_topics={sorted(proposed)}; stage={stage!r}"))
         except Exception:
             pass
 

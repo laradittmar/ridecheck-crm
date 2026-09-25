@@ -340,6 +340,24 @@ class FaqAuthority:
     ALL = (ANSWER_CANONICAL, SUPPRESS, NO_TOPIC)
 
 
+class HoursDisposition:
+    """What became of the business-hours candidate, and on whose evidence.
+
+    R2B. This replaced a boolean that keyed on deterministic strength, which let a STRONG
+    substring overrule a resolved semantic reading. Naming the outcomes makes the policy
+    legible in the trace: an operator can see not merely THAT the hours answer was withheld
+    but which evidence withheld it.
+    """
+    ADMIT = "ADMIT"
+    SUPPRESSED_BY_SEMANTIC_AVAILABILITY = "SUPPRESSED_BY_SEMANTIC_AVAILABILITY"
+    SUPPRESSED_AMBIGUOUS = "SUPPRESSED_AMBIGUOUS"
+    SUPPRESSED_UNCORROBORATED = "SUPPRESSED_UNCORROBORATED"
+    NO_CANDIDATE = "NO_CANDIDATE"
+
+    ALL = (ADMIT, SUPPRESSED_BY_SEMANTIC_AVAILABILITY, SUPPRESSED_AMBIGUOUS,
+           SUPPRESSED_UNCORROBORATED, NO_CANDIDATE)
+
+
 class FloorStrength:
     """How much a deterministic FAQ floor match is worth as evidence.
 
