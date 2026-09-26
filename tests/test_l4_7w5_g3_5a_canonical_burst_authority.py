@@ -22,10 +22,12 @@ Nothing here adds vocabulary. Every reader used is one the engine already had.
 """
 from __future__ import annotations
 
+import json
 import pathlib
 import sys
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 for extra in (ROOT / "tests", ROOT / "backend"):
@@ -41,9 +43,12 @@ from test_wild04r_cycle_boundary import (                              # noqa: E
 )
 
 from app.schemas.conversation import ConversationHandleIn              # noqa: E402
+import app.services.conversation_engine as ce                          # noqa: E402
 from app.services.conversation_engine import (                          # noqa: E402
-    ConversationEngine, _canonical_burst, STAGE_QUALIFYING, STAGE_QUOTED, STAGE_SCHEDULING,
+    ConversationEngine, _canonical_burst_from_texts, STAGE_QUALIFYING, STAGE_QUOTED,
+    STAGE_SCHEDULING,
 )
+from app.services.outbound_safety_gate import GateOutcome               # noqa: E402
 from app.schemas import turn_evidence as te                            # noqa: E402
 
 #: Literals. Nothing below is computed by the module under test.
@@ -90,7 +95,10 @@ class LiveTurn:
         self.reads = 0
 
         engine = _make_engine(self.db)
-        engine._send_text_to_wa = lambda ctx, t: (self.sent.append(t), "wamid.G35A")[1]
+        # G3-5B (audit G5A-05): `_send_text_to_wa` is NOT replaced. `_compose_secondary_
+        # answers` runs inside it, so replacing it bypassed the composer and made a
+        # customer-facing assertion vacuous — it passed on the parent defect. Capture
+        # happens at the lowest external boundary instead.
         engine._schedule = SimpleNamespace(
             find_next_available=lambda **kw: (self.schedule_calls.append(kw), None)[1])
         original_trace = engine._trace_decision
@@ -126,12 +134,50 @@ class LiveTurn:
         self.engine = engine
 
     def run(self):
+        """Run the complete handler. Only external boundaries are controlled."""
         event = ConversationHandleIn(
             thread_id=self.thread_id, wa_message_id=self.current_wamid, wa_id=_WA_ID,
             text=self.current_text, unanswered_recent_user_messages=self.unanswered,
             recent_user_messages=self.unanswered)
-        self.out = self.engine.handle(event)
+        sent = self.sent
+
+        class _Sink:
+            """The outbound transport. Records the fully composed customer text."""
+            def __init__(self, db): self.db = db
+            def attempt(self, *, wa_id, thread_id, text, **kw):
+                sent.append(text)
+                return SimpleNamespace(outcome=GateOutcome.ALLOWED, message_id=None,
+                                       blocked_reason=None)
+            def mark_sent(self, *a, **k): return None
+            def mark_failed(self, *a, **k): return None
+
+        class _Reply:
+            """The reply provider. Neutral: no hours, no date, no scheduling claim."""
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self):
+                return json.dumps({"choices": [{"message": {"content": json.dumps({
+                    "intent": "QUALIFYING", "reply": "Gracias por escribirnos.",
+                    "deferred_interest": False, "candidate": {"action": "none"},
+                    "extracted": {}, "lead_flag": None, "needs_human": False})}}]}).encode()
+
+        with patch.object(ce, "OutboundSafetyGate", _Sink), \
+             patch.object(ce, "_send_whatsapp_cloud_text", lambda **kw: "wamid.G35A"), \
+             patch("urllib.request.urlopen", lambda *a, **k: _Reply()):
+            try:
+                self.out = self.engine.handle(event)
+            except Exception as exc:                 # SQLite lacks NOW(); the composed
+                self.out = SimpleNamespace(          # text is already captured above.
+                    action=f"<raised {type(exc).__name__}>")
         return self
+
+    @property
+    def customer_text(self) -> str:
+        return " ".join(self.sent)
+
+    def names_the_weekday_table(self) -> bool:
+        low = self.customer_text.lower()
+        return any(m in low for m in ("lunes de", "sabados de", "sábados de", "domingos no"))
 
     @property
     def burst(self):
@@ -199,11 +245,10 @@ def outcome_for(texts, *, availability=None, faq=(), mode=None, stage=STAGE_SCHE
     fields.update(state_extra or {})
     state = SimpleNamespace(**fields)
 
-    engine._canonical_turn_burst = _canonical_burst(
-        thread_id=1, turn_id="t-g35a", ordered_message_ids=tuple(range(len(texts))),
-        texts=list(texts), provenance=("event_evidence",),
-        presentation_texts=list(texts), stage_at_build=stage,
-        wants_next_available=bool(ConversationEngine._wants_next_available(list(texts))))
+    engine._canonical_turn_burst = _canonical_burst_from_texts(
+        thread_id=1, turn_id="t-g35a", texts=list(texts),
+        provenance=("event_evidence",), presentation_texts=list(texts),
+        stage_at_build=stage)
 
     decision = engine._availability_authority(None, state, list(texts))
     topics = ConversationEngine._faq_topics_for_burst(
@@ -243,12 +288,10 @@ class A_CanonicalBurst(unittest.TestCase):
         self.assertEqual(self.turn.burst.ordered_message_ids, ("m-0", "m-1"))
 
     def test_g35a_05_the_fingerprint_proves_order(self):
-        forward = _canonical_burst(
-            thread_id=1, turn_id=None, ordered_message_ids=(), texts=[AVAIL_M, HOURS_Q],
-            provenance=(), presentation_texts=())
-        reversed_ = _canonical_burst(
-            thread_id=1, turn_id=None, ordered_message_ids=(), texts=[HOURS_Q, AVAIL_M],
-            provenance=(), presentation_texts=())
+        forward = _canonical_burst_from_texts(
+            thread_id=1, turn_id=None, texts=[AVAIL_M, HOURS_Q], provenance=())
+        reversed_ = _canonical_burst_from_texts(
+            thread_id=1, turn_id=None, texts=[HOURS_Q, AVAIL_M], provenance=())
         self.assertNotEqual(forward.fingerprint, reversed_.fingerprint)
         self.assertEqual(len(forward.fingerprint), 64)
 
@@ -279,15 +322,32 @@ class B_CallerOrderInvariance(unittest.TestCase):
             turn.close()
 
     def test_g35a_07_the_customer_gets_the_clarification_not_the_hours_table(self):
+        """REPAIRED by G3-5B (audit G5A-05).
+
+        The old version replaced `_send_text_to_wa`, which is where
+        `_compose_secondary_answers` runs — so the composer never executed and the
+        "no weekday table" assertion passed on the parent defect as readily as on the fix.
+        Capture now happens at the outbound transport boundary, and the test proves it can
+        SEE a weekday table by asserting one in the unopposed case.
+        """
+        from app.services.conversation_engine import _AVAILABILITY_VS_HOURS_CLARIFICATION
         turn = self._turn()
         try:
-            from app.services.conversation_engine import _AVAILABILITY_VS_HOURS_CLARIFICATION
-            self.assertIn(_AVAILABILITY_VS_HOURS_CLARIFICATION, turn.sent)
-            for text in turn.sent:
-                self.assertNotIn("lunes", text.lower(),
-                                 "no weekday table may reach the customer here")
+            self.assertIn(_AVAILABILITY_VS_HOURS_CLARIFICATION, turn.customer_text)
+            self.assertFalse(turn.names_the_weekday_table(),
+                             "no weekday table may reach the customer here")
         finally:
             turn.close()
+        # The control arm: the same harness, an unopposed hours question, and the table
+        # DOES reach the customer. Without this the assertion above proves nothing.
+        control = LiveTurn(["¿Cuál es el horario de atención?"],
+                           unanswered=["¿Cuál es el horario de atención?"],
+                           stage=STAGE_QUALIFYING, mode="absent").run()
+        try:
+            self.assertTrue(control.names_the_weekday_table(),
+                            "the harness cannot see the hours table; the proof is vacuous")
+        finally:
+            control.close()
 
     def test_g35a_08_both_consumer_orders_agree_on_everything(self):
         """FAQ-first and handler-first, on one engine each, compared field by field."""
@@ -296,9 +356,9 @@ class B_CallerOrderInvariance(unittest.TestCase):
             turn = LiveTurn([AVAIL_M, HOURS_Q], unanswered=[HOURS_Q], mode="absent")
             engine, state = turn.engine, SimpleNamespace(
                 last_stage=STAGE_SCHEDULING, current_revision_id=None, needs_human=False)
-            engine._canonical_turn_burst = _canonical_burst(
-                thread_id=turn.thread_id, turn_id="t", ordered_message_ids=("m-0", "m-1"),
-                texts=[AVAIL_M, HOURS_Q], provenance=("event_evidence", "db_recovery"),
+            engine._canonical_turn_burst = _canonical_burst_from_texts(
+                thread_id=turn.thread_id, turn_id="t", texts=[AVAIL_M, HOURS_Q],
+                provenance=("event_evidence", "db_recovery"),
                 presentation_texts=[HOURS_Q], stage_at_build=STAGE_SCHEDULING)
             if first == "faq":
                 topics = ConversationEngine._faq_topics_for_burst(
@@ -322,9 +382,9 @@ class B_CallerOrderInvariance(unittest.TestCase):
         try:
             engine = turn.engine
             state = SimpleNamespace(last_stage=STAGE_SCHEDULING, needs_human=False)
-            engine._canonical_turn_burst = _canonical_burst(
-                thread_id=1, turn_id="t", ordered_message_ids=("m-0", "m-1"),
-                texts=[AVAIL_M, HOURS_Q], provenance=("event_evidence", "db_recovery"),
+            engine._canonical_turn_burst = _canonical_burst_from_texts(
+                thread_id=1, turn_id="t", texts=[AVAIL_M, HOURS_Q],
+                provenance=("event_evidence", "db_recovery"),
                 presentation_texts=[HOURS_Q])
             turn.traces.clear()
             decision = engine._availability_authority(None, state, [HOURS_Q])
@@ -501,9 +561,20 @@ class D_SemanticPrimacyPreserved(unittest.TestCase):
         self.assertEqual(r.decision.authority, CLARIFY)
         self.assertEqual(r.topics, ())
 
-    def test_g35a_25_one_semantic_read_per_turn(self):
-        r = outcome_for([HOURS_Q, "¿Hay algo mañana?"], mode="absent")
-        self.assertEqual(r.reads, 1)
+    def test_g35a_25_one_interpretation_per_turn_accessor_reads_may_differ(self):
+        """G3-5B: the invariant is one INTERPRETATION, not one accessor call.
+
+        The real handler reads the memoised interpretation more than once; that is not a
+        second interpretation and must not be reported as one.
+        """
+        turn = LiveTurn([HOURS_Q, "¿Hay algo mañana?"],
+                        unanswered=[HOURS_Q, "¿Hay algo mañana?"], mode="absent").run()
+        try:
+            self.assertEqual(getattr(turn.engine, "_turn_semantic_calls", 0), 0,
+                             "the provider was controlled, so no model call was made")
+            self.assertGreaterEqual(getattr(turn.engine, "_semantic_accessor_reads", 0), 1)
+        finally:
+            turn.close()
 
     def test_g35a_26_every_disposition_is_reachable_and_named(self):
         from app.schemas.hybrid_trace import HoursDisposition

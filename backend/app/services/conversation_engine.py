@@ -829,6 +829,55 @@ _HOURS_SUPPRESSION_REASON = {
 
 
 @dataclass(frozen=True)
+class CanonicalMessage:
+    """One customer message, as one atomic record.
+
+    G3-5B (audit G5A-02). Identity and text used to be assembled into two parallel lists
+    and deduplicated by DIFFERENT rules: `_turn_trace_rows` kept every persisted row while
+    `_missing_burst` compared TEXT, so a customer who sent the same words twice ended with
+    three identifiers and two texts — and one real message erased. Identity and text are
+    now one record, and every derived view is projected from the same ordered collection,
+    so they cannot drift.
+    """
+    message_id: str            # stable identity — WAMID where one exists
+    text: str
+    index: int                 # position in the reconstructed turn
+    timestamp: str | None      # ISO-8601, where the record carries one
+    source: str                # which reconstruction path contributed this message
+
+
+@dataclass(frozen=True)
+class DecisionStateSnapshot:
+    """The canonical state the authority decision is entitled to read.
+
+    G3-5B (audit G5A-03). `stage` was read live at decision time and the decision was
+    memoised, so the stage that decided was whichever the FIRST consumer happened to
+    observe — silently. The fields here are exactly the ones the decision consumes, taken
+    from executable reads:
+
+        `_availability_authority`   `state.last_stage`
+        `_faq_topics_for_burst`     `state.last_stage`, `self._turn_scheduling_requested`
+
+    Nothing else is frozen, so a legitimate same-turn canonical update is not ignored: it
+    produces a DIFFERENT snapshot, which opens a new, explicit decision phase instead of
+    silently reusing the first memo.
+    """
+    stage: str | None
+    scheduling_requested: bool
+
+    @property
+    def digest(self) -> str:
+        return _text_digest(f"stage={self.stage!r}|sched={bool(self.scheduling_requested)}")
+
+
+def _decision_snapshot(state, engine) -> DecisionStateSnapshot:
+    """Capture the decision-phase state. Read-only; never mutates."""
+    return DecisionStateSnapshot(
+        stage=getattr(state, "last_stage", None),
+        scheduling_requested=bool(getattr(engine, "_turn_scheduling_requested", False)))
+
+
+@dataclass(frozen=True)
 class CanonicalTurnBurst:
     """The one reconstructed burst a turn's authority decisions are taken on.
 
@@ -837,22 +886,20 @@ class CanonicalTurnBurst:
     `current_turn_text`, built from `_current_evidence` INCLUDING messages recovered from
     the database, while `_handle_next_available_request` passes `ai_input_messages`, which
     is `event.unanswered_recent_user_messages` when n8n supplies it and can be a strict
-    subset. The same customer turn therefore decided differently depending on call order —
-    the burst-scoped calendar context R2B relies on is only as wide as the text it is
-    handed.
+    subset. The same customer turn therefore decided differently depending on call order.
 
-    The evidence boundary is now a property of the TURN, not of a caller. This object is
-    built once, after burst recovery is complete, and every authority consumer reads it.
-    `presentation_texts` keeps `ai_input_messages` available for reply generation, where it
-    is still the right input — it simply may not define what the decision saw.
+    G3-5B (audit G5A-01, G5A-02). The boundary is now UNIFIED rather than merely canonical
+    for the deterministic half: `messages` is the single ordered atomic collection, and the
+    semantic interpreter is dispatched from it too, so the producer with semantic primacy
+    interprets the same turn the reconciler authorizes. `presentation_texts` keeps
+    `ai_input_messages` available for reply generation, where it is still the right input;
+    it defines neither semantic nor authority evidence.
     """
     thread_id: object
     turn_id: str | None
-    ordered_message_ids: tuple
-    texts: tuple                       # the COMPLETE ordered reconstructed burst
-    fingerprint: str                   # burst_hash — order-sensitive, text-proving
+    messages: tuple                    # tuple[CanonicalMessage] — the single source of truth
     provenance: tuple                  # which reconstruction sources contributed
-    presentation_texts: tuple          # ai_input_messages; never the evidence boundary
+    presentation_texts: tuple          # ai_input_messages; never an evidence boundary
     requested_day_iso: str | None      # deterministic, from _parse_scheduling_text
     requested_time_str: str | None
     wants_next_available: bool         # deterministic, from _NEXT_AVAILABLE_PATTERNS
@@ -861,7 +908,33 @@ class CanonicalTurnBurst:
     competing_day_iso: str | None
     competing_time_str: str | None
     competing_next_available: bool
-    stage_at_build: str | None         # provenance only; the authority reads live stage
+    stage_at_build: str | None         # provenance only; the decision reads its own snapshot
+
+    # ── every view below is PROJECTED from `messages`; none is stored separately ──
+
+    @property
+    def texts(self) -> tuple:
+        return tuple(m.text for m in self.messages)
+
+    @property
+    def ordered_message_ids(self) -> tuple:
+        return tuple(m.message_id for m in self.messages)
+
+    @property
+    def message_count(self) -> int:
+        return len(self.messages)
+
+    @property
+    def fingerprint(self) -> str:
+        """Proves membership, order, identity AND the id-to-text association.
+
+        Each record contributes `id\x1ftext`, so two messages with the same words but
+        different identities hash differently, and swapping two messages changes the digest.
+        No customer text is stored — only the digest travels.
+        """
+        from ..schemas.hybrid_trace import normalize_burst
+        parts = [f"{m.message_id}\x1f{normalize_burst([m.text])}" for m in self.messages]
+        return _text_digest("\x1e".join(parts))
 
     @property
     def joined(self) -> str:
@@ -905,22 +978,110 @@ def _text_digest(normalized: str) -> str:
     return hashlib.sha256((normalized or "").encode("utf-8")).hexdigest()
 
 
-def _canonical_burst(*, thread_id, turn_id, ordered_message_ids, texts, provenance,
-                     presentation_texts, stage_at_build=None,
-                     wants_next_available=False) -> CanonicalTurnBurst:
+def _canonical_messages(*, db_rows=(), event_wamid=None, event_text=None,
+                        presentation_texts=(), turn_id=None) -> tuple:
+    """Merge every reconstruction source into ONE ordered collection of atomic records.
+
+    G3-5B (audit G5A-02). The deduplication key is MESSAGE IDENTITY, never normalized text.
+
+        same identity delivered twice                -> one canonical message
+        different identities with identical text     -> two canonical messages
+        a persisted row whose text is NULL and whose
+          identity is the triggering event           -> the event's transcript, with the
+                                                        row's identity and timestamp
+                                                        (M21.1.1 audio behaviour, kept)
+        an n8n text with no persisted counterpart    -> its own record, identified by
+                                                        provenance and position
+        the triggering event matching such a record  -> that record's identity is UPGRADED
+                                                        to the real WAMID; it is one
+                                                        message, not two
+
+    Order: everything the database timestamps comes first, chronologically; anything n8n
+    supplied without a persisted counterpart keeps the order n8n gave it. The triggering
+    message keeps its place in that order rather than being moved to either end — moving it
+    reversed a two-message burst and changed a live reply. Equal timestamps tie-break on
+    persisted row id, then on arrival index, so the order is total and deterministic.
+    """
+    records: list = []          # [timestamp, arrival, message_id, text, source]
+    seen_ids: set = set()
+
+    def add(message_id, text, timestamp, source):
+        if not isinstance(text, str) or not text:
+            return False
+        if message_id in seen_ids:                  # same message delivered twice
+            return False
+        seen_ids.add(message_id)
+        records.append([timestamp, len(records), message_id, text, source])
+        return True
+
+    ordered_rows = sorted(
+        list(db_rows or ()),
+        key=lambda r: ((getattr(r, "timestamp", None).isoformat()
+                        if getattr(r, "timestamp", None) else ""),
+                       getattr(r, "id", 0) or 0))
+    for row in ordered_rows:
+        wamid = getattr(row, "wa_message_id", None)
+        identity = wamid or f"db:{getattr(row, 'id', None)}"
+        text = getattr(row, "text", None)
+        if text is None and wamid is not None and wamid == event_wamid:
+            text = event_text                        # a transcript the row never stored
+        ts = getattr(row, "timestamp", None)
+        add(identity, text, ts.isoformat() if ts else None, "db_recovery")
+
+    # Whatever n8n reported that has no persisted counterpart. Matched by text ONE
+    # occurrence at a time, so a repeated message is matched once and the second copy
+    # survives as its own record rather than being erased.
+    unmatched = [r[3] for r in records]
+    for idx, text in enumerate(presentation_texts or ()):
+        if not isinstance(text, str) or not text:
+            continue
+        if text in unmatched:
+            unmatched.remove(text)
+            continue
+        # A stable, deterministic provenance identity — position plus a content digest,
+        # with no random component, so the same burst delivered twice fingerprints the same.
+        from ..schemas.hybrid_trace import normalize_burst
+        add(f"n8n:{idx}:{_text_digest(normalize_burst([text]))[:12]}", text, None,
+            "unanswered_recent_user_messages")
+
+    # The triggering message. When one of the records above is the same message reported
+    # without an identity, that record is UPGRADED rather than duplicated.
+    if event_wamid is not None and str(event_wamid) not in seen_ids:
+        upgraded = False
+        for rec in reversed(records):
+            if rec[4] == "unanswered_recent_user_messages" and rec[3] == event_text:
+                seen_ids.discard(rec[2])
+                rec[2] = str(event_wamid)
+                rec[4] = "event_evidence"
+                seen_ids.add(rec[2])
+                upgraded = True
+                break
+        if not upgraded:
+            add(str(event_wamid), event_text, None, "event_evidence")
+
+    records.sort(key=lambda r: (r[0] is None, r[0] or "", r[1]))
+    return tuple(CanonicalMessage(message_id=mid, text=txt, index=n, timestamp=ts,
+                                  source=src)
+                 for n, (ts, _arrival, mid, txt, src) in enumerate(records))
+
+
+def _canonical_burst(*, thread_id, turn_id, messages, provenance, presentation_texts,
+                     stage_at_build=None) -> CanonicalTurnBurst:
     """Build the turn's canonical burst. Deterministic evidence is resolved here, once.
 
     The date/time parser is the one the engine already trusts for this judgement —
     `_turn_has_scheduling_evidence` reads it the same way. Nothing new interprets language.
     """
-    from ..schemas.hybrid_trace import burst_hash
-    ordered = tuple(t for t in (texts or ()) if isinstance(t, str))
+    ordered = tuple(m.text for m in messages)
     day_iso = time_str = None
     competing_day = competing_time = None
     competing_next = False
+    wants_next = False
     try:
         today = _business_today()
         day_iso, time_str = _parse_scheduling_text(list(ordered), today)
+        whole = _norm_lower(" ".join(ordered))
+        wants_next = any(re.search(pat, whole) for pat in _NEXT_AVAILABLE_PATTERNS)
         # The units that are NOT the hours question. `_hours_units` is R2A's segmentation
         # and `_HOURS_FAQ_DETECTION` is unchanged; neither is enlarged here.
         rest = [u for u in _hours_units(" ".join(ordered))
@@ -932,15 +1093,32 @@ def _canonical_burst(*, thread_id, turn_id, ordered_message_ids, texts, provenan
     except Exception:            # a parser failure must never cost a turn
         pass
     return CanonicalTurnBurst(
-        thread_id=thread_id, turn_id=turn_id,
-        ordered_message_ids=tuple(ordered_message_ids or ()),
-        texts=ordered, fingerprint=burst_hash(list(ordered)),
+        thread_id=thread_id, turn_id=turn_id, messages=tuple(messages),
         provenance=tuple(provenance or ()),
         presentation_texts=tuple(presentation_texts or ()),
         requested_day_iso=day_iso, requested_time_str=time_str,
-        wants_next_available=bool(wants_next_available),
+        wants_next_available=bool(wants_next),
         competing_day_iso=competing_day, competing_time_str=competing_time,
         competing_next_available=bool(competing_next),
+        stage_at_build=stage_at_build)
+
+
+def _canonical_burst_from_texts(*, thread_id=None, turn_id=None, texts=(),
+                                provenance=("caller_supplied",), presentation_texts=None,
+                                stage_at_build=None) -> CanonicalTurnBurst:
+    """A canonical burst for a caller that has texts but no message identities.
+
+    Used only where no reconstruction ran — an engine that did not go through `handle`.
+    Identities are positional and stable, never random.
+    """
+    msgs = tuple(
+        CanonicalMessage(message_id=f"caller:{i}", text=t, index=i,
+                         timestamp=None, source="caller_supplied")
+        for i, t in enumerate(t for t in (texts or ()) if isinstance(t, str) and t))
+    return _canonical_burst(
+        thread_id=thread_id, turn_id=turn_id, messages=msgs, provenance=provenance,
+        presentation_texts=(presentation_texts if presentation_texts is not None
+                            else [m.text for m in msgs]),
         stage_at_build=stage_at_build)
 
 
@@ -2703,6 +2881,10 @@ class ConversationEngine:
         self._faq_reconciliation_burst: str | None = None
         self._availability_authority_cache = None
         self._canonical_turn_burst = None       # G3-5A: the turn's evidence boundary
+        self._availability_authority_phases = {}  # G3-5B: one decision per phase
+        self._turn_semantic_burst = None           # G3-5B: which burst was interpreted
+        self._turn_semantic_calls = 0              # model invocations
+        self._semantic_accessor_reads = 0          # reads of that one interpretation
         # L4.7W5 Gate 1/2 — hybrid decision trace collection. Observational only.
         self._turn_trace_ctx = None
         self._turn_trace_before = None
@@ -2742,6 +2924,10 @@ class ConversationEngine:
         self._faq_reconciliation_burst = None
         self._availability_authority_cache = None   # G3-4: one decision per turn
         self._canonical_turn_burst = None           # G3-5A: one burst per turn
+        self._availability_authority_phases = {}    # G3-5B: one decision per phase
+        self._turn_semantic_burst = None
+        self._turn_semantic_calls = 0
+        self._semantic_accessor_reads = 0
         self._turn_burst_texts = []
         self._turn_trace_ctx = None
         self._turn_trace_before = None
@@ -3139,6 +3325,24 @@ class ConversationEngine:
         That distinction is the whole of R34-01: a weak lexical candidate may not become an
         answer when the interpreter never got to disagree with it.
         """
+        self._semantic_accessor_reads = getattr(self, "_semantic_accessor_reads", 0) + 1
+        # ── G3-5B (audit G5A-01): the interpretation must belong to THIS burst ──
+        #
+        # An interpretation dispatched from some other message set may not hold primacy
+        # over the reconciler. When the bindings disagree the reading is treated as
+        # UNAVAILABLE — the deterministic floor's own bounded behaviour — rather than
+        # silently outranking evidence it never saw.
+        burst = getattr(self, "_canonical_turn_burst", None)
+        bound = getattr(self, "_turn_semantic_burst", None)
+        if burst is not None and bound is not None and bound != burst.fingerprint:
+            try:
+                logger.warning(
+                    "G3-5B SEMANTIC BURST MISMATCH canonical=%s semantic=%s",
+                    burst.fingerprint[:12], str(bound)[:12])
+            except Exception:
+                pass
+            return SimpleNamespace(status="UNAVAILABLE", availability=None,
+                                   ambiguous=None, faq_topics=frozenset())
         try:
             evidence = self._semantic_turn_evidence()
         except Exception as exc:
@@ -3222,13 +3426,11 @@ class ConversationEngine:
         # exactly one, rather than silently letting the second caller's text win.
         burst = getattr(self, "_canonical_turn_burst", None)
         if burst is None:
-            burst = _canonical_burst(
+            burst = _canonical_burst_from_texts(
                 thread_id=getattr(getattr(ctx, "thread", None), "id", None),
                 turn_id=getattr(self, "_correlation_id", None),
-                ordered_message_ids=(), texts=list(texts or ()),
-                provenance=("caller_supplied",), presentation_texts=list(texts or ()),
-                stage_at_build=getattr(state, "last_stage", None),
-                wants_next_available=bool(self._wants_next_available(list(texts or ()))))
+                texts=list(texts or ()), provenance=("caller_supplied",),
+                stage_at_build=getattr(state, "last_stage", None))
             self._canonical_turn_burst = burst
 
         # A caller asking about a DIFFERENT burst in the same turn is a defect, not a
@@ -3243,8 +3445,23 @@ class ConversationEngine:
         caller_fingerprint = normalize_burst([caller_joined])
         divergent = caller_fingerprint != normalize_burst([burst.joined])
 
-        cached = getattr(self, "_availability_authority_cache", None)
-        if cached is not None and cached.burst_fingerprint == burst.fingerprint:
+        # ── G3-5B (audit G5A-03): one snapshot per decision PHASE ───────────────
+        #
+        # `stage` used to be read live and the decision memoised, so the stage that decided
+        # was whichever the first consumer observed — silently. The snapshot below holds
+        # exactly the canonical fields the decision consumes, and the memo is keyed on
+        # (evidence, snapshot). Two consumers in the same phase therefore share one
+        # decision regardless of order, and a legitimate same-turn canonical update opens a
+        # NEW, explicitly identified phase instead of being answered from a stale memo.
+        snapshot = _decision_snapshot(state, self)
+        phase_id = f"{burst.fingerprint[:12]}:{snapshot.digest[:12]}"
+        phases = getattr(self, "_availability_authority_phases", None)
+        if phases is None:
+            phases = {}
+            self._availability_authority_phases = phases
+        cached = phases.get(phase_id)
+        if cached is not None:
+            self._availability_authority_cache = cached
             if divergent:
                 self._trace_burst_divergence(ctx, burst, caller_fingerprint, texts)
             return cached
@@ -3266,7 +3483,7 @@ class ConversationEngine:
         else:
             admission = AdmissionCondition.NONE
 
-        stage = getattr(state, "last_stage", None)
+        stage = snapshot.stage               # G3-5B: the phase's snapshot, not a live read
         floor = _hours_floor_strength(burst.joined)
 
         # Classification. Two producers on the SAME proposition is the only thing that may
@@ -3396,6 +3613,12 @@ class ConversationEngine:
             burst=burst,
             burst_fingerprint=burst.fingerprint,
             burst_divergence=divergent,
+            # G3-5B: which evidence and which canonical state this decision belongs to.
+            decision_phase_id=phase_id,
+            state_snapshot=snapshot,
+            state_snapshot_digest=snapshot.digest,
+            semantic_burst_fingerprint=getattr(self, "_turn_semantic_burst", None),
+            evidence_ids=tuple(burst.ordered_message_ids),
             requested_day_iso=burst.requested_day_iso,
             requested_time_str=burst.requested_time_str,
             scheduling_evidence=burst.has_deterministic_scheduling,
@@ -3408,6 +3631,7 @@ class ConversationEngine:
                                               scheduling=burst.scheduling_summary),
         )
         self._availability_authority_cache = decision
+        phases[phase_id] = decision
 
         try:
             from ..schemas.claims import ClaimType
@@ -3427,8 +3651,14 @@ class ConversationEngine:
                     f"hours_floor={floor}; hours_corroborated={hours_supported}; "
                     f"hours_disposition={hours_disposition}; "
                     f"burst={burst.fingerprint[:12]}; burst_messages="
-                    f"{len(burst.texts)}; burst_source={'+'.join(burst.provenance) or 'none'}; "
+                    f"{burst.message_count}; "
+                    f"burst_source={'+'.join(burst.provenance) or 'none'}; "
                     f"burst_divergence={divergent}; "
+                    f"semantic_burst={str(getattr(self, '_turn_semantic_burst', None))[:12]}; "
+                    f"decision_phase={phase_id}; state_snapshot={snapshot.digest[:12]}; "
+                    f"snapshot_stage={snapshot.stage!r}; "
+                    f"snapshot_scheduling_requested={snapshot.scheduling_requested}; "
+                    f"semantic_model_calls={getattr(self, '_turn_semantic_calls', 0)}; "
                     f"deterministic_scheduling={burst.scheduling_summary}"))
         except Exception:
             pass
@@ -3525,7 +3755,6 @@ class ConversationEngine:
         """
         explicit = self._explicit_faq_topics(text)
         state = state if state is not None else getattr(ctx, "state", None)
-        stage = getattr(state, "last_stage", None)
 
         # R2 (audit R34-03): ONE decision, consumed here. The authority already read the
         # interpretation for this turn; re-reading it to recompute the same judgement is how
@@ -3533,10 +3762,13 @@ class ConversationEngine:
         # whichever path runs first decides and the other consumes.
         decision = self._availability_authority(ctx, state, [text])
         proposed = set(decision.semantic_faq_topics)
+        # G3-5B (audit G5A-03): both consumers read the SAME decision-phase snapshot, so
+        # neither the stage nor the scheduling flag can differ between them by call order.
+        stage = decision.state_snapshot.stage
 
         # (2) availability beats opening-hours when the turn is a scheduling request.
         if "business_hours" in (proposed - explicit):
-            scheduling_now = bool(getattr(self, "_turn_scheduling_requested", False))
+            scheduling_now = bool(decision.state_snapshot.scheduling_requested)
             if scheduling_now or stage in (STAGE_SCHEDULING, STAGE_FLOW_SENT):
                 proposed.discard("business_hours")
                 logger.info(
@@ -3590,7 +3822,9 @@ class ConversationEngine:
             ctx, topics=topics, suppressed=suppressed, reason=suppression_reason,
             floor=floor, availability=availability, stage=stage, proposed=proposed,
             disposition=decision.hours_disposition,
-            burst_fingerprint=decision.burst_fingerprint)
+            burst_fingerprint=decision.burst_fingerprint,
+            evidence_ids=decision.evidence_ids,
+            decision_phase_id=decision.decision_phase_id)
         return topics
 
     def _trace_burst_divergence(self, ctx, burst, caller_fingerprint, texts) -> None:
@@ -3634,7 +3868,8 @@ class ConversationEngine:
 
     def _trace_faq_topic_authority(self, ctx, *, topics, suppressed, reason, floor,
                                    availability, stage, proposed, disposition=None,
-                                   burst_fingerprint=None) -> None:
+                                   burst_fingerprint=None, evidence_ids=(),
+                                   decision_phase_id=None) -> None:
         """Record the FAQ-topic decision. Observational, fail-open, decides nothing.
 
         G3-4 makes the decision visible; it does NOT claim G3-5's full response-source
@@ -3661,7 +3896,8 @@ class ConversationEngine:
                 claim_type=ClaimType.FAQ_TOPIC, claims=(),
                 outcome=authority,
                 reason=(reason or f"authorised={sorted(topics)}"),
-                rule_id="faq.topic_authority", rule_version="v1",
+                rule_id="faq.topic_authority", rule_version="v2",
+                evidence_ids=tuple(str(m) for m in (evidence_ids or ())),
                 authority_result=authority,
                 canonical_effect=CanonicalEffect.NONE,
                 permitted_action=(authority if topics else None),
@@ -3669,7 +3905,8 @@ class ConversationEngine:
                     f"authorised={sorted(topics)}; suppressed={sorted(suppressed)}; "
                     f"hours_floor={floor}; hours_disposition={disposition}; "
                     f"semantic_topics={sorted(proposed)}; stage={stage!r}; "
-                    f"burst={(burst_fingerprint or '')[:12]}"))
+                    f"burst={(burst_fingerprint or '')[:12]}; "
+                    f"decision_phase={decision_phase_id}"))
         except Exception:
             pass
 
@@ -4413,10 +4650,27 @@ class ConversationEngine:
              "timestamp": (m.timestamp.isoformat() if getattr(m, "timestamp", None) else None)}
             for m in _burst_msgs
         ]
-        _existing_evidence_set = set(_current_evidence)
-        _missing_burst = [t for t in _burst_db_texts if t not in _existing_evidence_set]
+        # ── G3-5B (audit G5A-02): ONE ordered atomic collection ─────────────────
+        #
+        # The text-set comparison this replaces deduplicated by STRING, so a customer who
+        # sent the same words in two messages had one of them erased while both WAMIDs
+        # stayed in the trace — three identifiers, two texts. Identity is the key now, and
+        # every view (texts, ids, count, fingerprint, semantic input, deterministic input,
+        # trace evidence ids) is projected from this one collection.
+        _canonical_messages_tuple = _canonical_messages(
+            db_rows=_burst_msgs,
+            event_wamid=getattr(event, "wa_message_id", None),
+            event_text=event.text,
+            presentation_texts=list(event.unanswered_recent_user_messages or []),
+            turn_id=getattr(self, "_correlation_id", None))
+        _recovered = [m for m in _canonical_messages_tuple
+                      if m.source == "db_recovery"
+                      and m.text not in set(event.unanswered_recent_user_messages or [])
+                      and m.text != event.text]
+        if _canonical_messages_tuple:
+            _current_evidence = [m.text for m in _canonical_messages_tuple]
+        _missing_burst = _recovered
         if _missing_burst:
-            _current_evidence = _missing_burst + _current_evidence
             logger.debug(
                 "WILD-04R burst completeness added %d messages thread_id=%s",
                 len(_missing_burst), ctx.thread.id,
@@ -4448,18 +4702,12 @@ class ConversationEngine:
         self._canonical_turn_burst = _canonical_burst(
             thread_id=getattr(getattr(ctx, "thread", None), "id", None),
             turn_id=getattr(self, "_correlation_id", None),
-            ordered_message_ids=tuple(
-                r.get("wa_message_id") or r.get("db_id")
-                for r in (self._turn_trace_rows or ())),
-            texts=_current_evidence,
-            provenance=tuple(filter(None, (
-                "event_evidence",
-                "db_recovery" if _missing_burst else None,
-                "unanswered_recent_user_messages"
-                if event.unanswered_recent_user_messages else None))),
+            messages=(_canonical_messages_tuple
+                      or _canonical_burst_from_texts(texts=_current_evidence).messages),
+            provenance=tuple(sorted({m.source for m in _canonical_messages_tuple})
+                             or ("event_evidence",)),
             presentation_texts=ai_input_messages,
-            stage_at_build=getattr(state, "last_stage", None),
-            wants_next_available=self._wants_next_available(list(_current_evidence)))
+            stage_at_build=getattr(state, "last_stage", None))
 
         # ── L4.7B: SHADOW UNDERSTAND ──────────────────────────────────────
         # Runs on the complete raw burst BEFORE any deterministic gate can early-return,
@@ -4470,7 +4718,12 @@ class ConversationEngine:
         self._fuzzy_advisory = None      # L4.7W1-F2: advisory is per-turn, never sticky
         self._turn_ctx = ctx             # L4.7W3-F1: FAQ reconciliation needs this turn
         self._turn_scheduling_requested = False
-        self._run_shadow_understand(ctx, event, ai_input_messages)
+        # G3-5B (audit G5A-01): the interpreter is dispatched from the CANONICAL burst, not
+        # from the presentation subset. The producer that holds semantic primacy over every
+        # deterministic signal now interprets the same turn the reconciler authorizes.
+        self._run_shadow_understand(
+            ctx, event, list(self._canonical_turn_burst.texts),
+            burst=self._canonical_turn_burst)
 
         # ── M21.1.1 Layer A: Motorcycle pre-gate (all stages) ─────────────
         if self._is_motorcycle_enquiry(current_turn_text):
@@ -6140,7 +6393,8 @@ class ConversationEngine:
         return context
 
     def _run_shadow_understand(
-        self, ctx: "_Context", event: "ConversationHandleIn", messages: list[str]
+        self, ctx: "_Context", event: "ConversationHandleIn", messages: list[str],
+        *, burst=None,
     ) -> None:
         """Interpret the burst in shadow and record it. Never affects this turn.
 
@@ -6153,6 +6407,11 @@ class ConversationEngine:
         no state and raises nothing.
         """
         self._turn_semantic = None
+        # G3-5B (audit G5A-01): which burst this interpretation belongs to. Authority
+        # compares it with the canonical burst and fails safe when they differ, so a
+        # reading of some other message set can never hold primacy over the reconciler.
+        self._turn_semantic_burst = getattr(burst, "fingerprint", None)
+        self._turn_semantic_calls = 0
         try:
             # Strict identity check: only a real boolean True enables the shadow path, so a
             # MagicMock settings object in a test can never trigger a model call.
@@ -6168,10 +6427,11 @@ class ConversationEngine:
             interpreter = SemanticTurnInterpreter(self.settings)
             burst_id = getattr(self, "_correlation_id", None)
             thread_id = getattr(ctx.thread, "id", None)
-            message_ids = tuple(
-                str(m) for m in [getattr(event, "wa_message_id", None)] if m
-            )
-            burst_texts = list(messages)
+            # The canonical burst's ordered identities, not just the triggering WAMID.
+            message_ids = (tuple(str(m) for m in burst.ordered_message_ids)
+                           if burst is not None else
+                           tuple(str(m) for m in [getattr(event, "wa_message_id", None)] if m))
+            burst_texts = list(burst.texts) if burst is not None else list(messages)
             deployment_id = get_deployment_id()
             raw_path = getattr(self.settings, "shadow_evidence_path", "")
             evidence_path = raw_path if isinstance(raw_path, str) and raw_path else None
@@ -6196,6 +6456,11 @@ class ConversationEngine:
             # turn, the claim projection, the reconciler, the recorder below) reads this same
             # provider, so same-turn authority costs no extra model call.
             def _interpret():
+                # G3-5B: the architectural invariant is ONE interpretation per decision
+                # turn. This counter is incremented where the provider is actually
+                # invoked, so it measures model calls and not the accessor reads that
+                # legitimately happen more than once.
+                self._turn_semantic_calls = getattr(self, "_turn_semantic_calls", 0) + 1
                 return interpreter.interpret(
                     burst_texts,
                     thread_id=thread_id,
@@ -6209,6 +6474,9 @@ class ConversationEngine:
                                             burst_id=burst_id)
             self._turn_semantic = provider
             self._turn_semantic_texts = list(burst_texts)
+            # The interpretation is bound to the burst it interpreted, by fingerprint.
+            self._turn_semantic_burst = (getattr(burst, "fingerprint", None)
+                                         if burst is not None else None)
 
             def _work() -> None:
                 result = provider.get()
@@ -6760,15 +7028,29 @@ class ConversationEngine:
             before = self._turn_trace_before or CanonicalSnapshot()
             after = snapshot_state(getattr(ctx, "state", None), lead)
 
-            texts = list(getattr(self, "_turn_burst_texts", []) or [])
-            if not texts and getattr(event, "text", None):
-                texts = [event.text]
-            rows = list(getattr(self, "_turn_trace_rows", []) or [])
-            if not rows:
-                # A turn that early-returned before burst reconstruction, or a thread's very
-                # first message: the triggering WAMID is genuinely all that exists.
-                rows = [{"db_id": None, "wa_message_id": getattr(event, "wa_message_id", None),
-                         "timestamp": None}]
+            # ── G3-5B (audit G5A-01): the envelope describes ONE boundary ───────────
+            #
+            # `input_hash` used to be computed from `_turn_burst_texts` (the presentation
+            # subset) while `ordered_message_ids` came from the database rows, so the hash
+            # and the identifiers described different sets of messages and their counts
+            # could disagree. Both now project from the canonical burst — the same records
+            # the interpreter, the deterministic readers and the authority all used.
+            canonical = getattr(self, "_canonical_turn_burst", None)
+            if canonical is not None and canonical.messages:
+                texts = list(canonical.texts)
+                rows = [{"db_id": None, "wa_message_id": m.message_id,
+                         "timestamp": m.timestamp} for m in canonical.messages]
+            else:
+                texts = list(getattr(self, "_turn_burst_texts", []) or [])
+                if not texts and getattr(event, "text", None):
+                    texts = [event.text]
+                rows = list(getattr(self, "_turn_trace_rows", []) or [])
+                if not rows:
+                    # A turn that early-returned before burst reconstruction, or a thread's
+                    # very first message: the triggering WAMID is all that exists.
+                    rows = [{"db_id": None,
+                             "wa_message_id": getattr(event, "wa_message_id", None),
+                             "timestamp": None}]
 
             semantic = semantic_evidence_from(
                 getattr(self, "_turn_semantic", None),

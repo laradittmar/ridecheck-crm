@@ -122,8 +122,11 @@ def _observe(db: Session, thread, contact, n8n_list, *, trigger_wamid, trace_ena
     engine = ce.ConversationEngine(
         db, settings or Settings(hybrid_trace_enabled=trace_enabled))
 
-    def capture_shadow(self, ctx, event, messages):
+    def capture_shadow(self, ctx, event, messages, *, burst=None, **kw):
+        # G3-5B: the dispatch now carries the canonical burst. `messages` is the
+        # interpreter's actual input either way, which is what these tests observe.
         obs.semantic = list(messages)
+        obs.semantic_burst = burst
         self._turn_semantic = None       # no model call, and no provider to read
 
     engine._run_shadow_understand = types.MethodType(capture_shadow, engine)
@@ -204,12 +207,18 @@ class SharedBurstBoundary(unittest.TestCase):
         self.assertNotEqual(burst_hash(WILD_BURST), burst_hash(WILD_BURST + ["y bueno"]))
 
     def test_bnd_09_one_variable_feeds_both_producers(self):
-        """Structural backstop: both call sites must still name `ai_input_messages`.
+        """INVERTED by G3-5B (audit G5A-01). The shared variable is now the CANONICAL burst.
 
-        The runtime tests above compare content. This one compares source, so a change that
-        hands a *different but coincidentally equal* list to one engine is still caught.
+        This used to require that the interpreter be dispatched from `ai_input_messages`.
+        The independent G3-5A audit found that exact line to be the defect: authority
+        decided on `_current_evidence` while the producer holding semantic primacy
+        interpreted the presentation subset. The interpreter is now dispatched from the
+        canonical burst; `ai_input_messages` survives only as presentation input.
         """
-        self.assertIn("self._run_shadow_understand(ctx, event, ai_input_messages)", CE_SOURCE)
+        self.assertIn("self._run_shadow_understand(\n            ctx, event, "
+                      "list(self._canonical_turn_burst.texts),", CE_SOURCE)
+        self.assertNotIn("self._run_shadow_understand(ctx, event, ai_input_messages)",
+                         CE_SOURCE, "the presentation subset must not feed the interpreter")
         self.assertIn("self._turn_burst_texts = list(ai_input_messages or [])", CE_SOURCE)
         for call in ("_is_human_request(ai_input_messages)",
                      "self._earliest_option_rejected(ai_input_messages)",
@@ -220,12 +229,13 @@ class SharedBurstBoundary(unittest.TestCase):
 # ── ASY: the disclosed pre-gate asymmetry ────────────────────────────────────
 
 class PreGateAsymmetry(unittest.TestCase):
-    """The motorcycle and phone-call pre-gates read `_current_evidence`, not the burst.
+    """INVERTED by G3-5B (audit G5A-01): the asymmetry these tests pinned is closed.
 
-    After WILD-04R burst completion `_current_evidence` can be a strict superset: it holds
-    messages n8n omitted but the database has. Those two gates therefore decide on evidence
-    the trace does not hash. This is pre-existing engine behaviour, and these tests exist so
-    it is recorded as an asymmetry rather than silently described as agreement.
+    The pre-gates read `_current_evidence` and the interpreter read `ai_input_messages`, so
+    the two decided on different evidence and the trace hashed only the narrower one. The
+    interpreter is now dispatched from the canonical burst, and `_current_evidence` is
+    projected from the same atomic records — so one boundary feeds every producer. The class
+    name is kept so the history is traceable to the finding it records.
     """
 
     @classmethod
@@ -236,22 +246,23 @@ class PreGateAsymmetry(unittest.TestCase):
         cls.obs = _observe(cls.db, thread, contact, WILD_BURST,   # n8n sent two
                            trigger_wamid="wamid.B2")
 
-    def test_asy_01_the_pre_gate_sees_a_wider_boundary(self):
+    def test_asy_01_the_pre_gate_and_the_interpreter_see_one_boundary(self):
+        """The DB holds three messages and n8n reported two. Both producers see three."""
         self.assertEqual(self.obs.pre_gate, self.db_texts)
-        self.assertEqual(self.obs.semantic, WILD_BURST)
-        self.assertGreater(len(self.obs.pre_gate), len(self.obs.semantic),
-                           "the asymmetry this test pins no longer reproduces")
+        self.assertEqual(self.obs.semantic, self.db_texts,
+                         "the interpreter must receive the recovered message too")
+        self.assertEqual(len(self.obs.pre_gate), len(self.obs.semantic))
 
-    def test_asy_02_the_trace_hashes_the_narrow_boundary_not_the_wide_one(self):
+    def test_asy_02_the_trace_hashes_that_one_boundary(self):
         self.assertEqual(self.obs.trace["input_hash"], burst_hash(self.obs.semantic))
-        self.assertNotEqual(self.obs.trace["input_hash"], burst_hash(self.obs.pre_gate))
+        self.assertEqual(self.obs.trace["input_hash"], burst_hash(self.obs.pre_gate))
 
-    def test_asy_03_message_count_follows_the_database_not_the_hash(self):
-        """Disclosed: ordered ids come from the DB burst, the hash from n8n's list."""
+    def test_asy_03_message_count_agrees_with_the_hashed_boundary(self):
+        """Closed: ordered ids, count and hash now describe the same set of messages."""
         self.assertEqual(self.obs.trace["ordered_message_ids"],
                          ["wamid.B0", "wamid.B1", "wamid.B2"])
         self.assertEqual(self.obs.trace["message_count"], 3)
-        self.assertNotEqual(self.obs.trace["message_count"], len(self.obs.semantic))
+        self.assertEqual(self.obs.trace["message_count"], len(self.obs.semantic))
 
     def test_asy_04_the_two_pre_gate_call_sites_are_still_the_only_ones(self):
         self.assertIn("current_turn_text = \" \".join(_current_evidence)", CE_SOURCE)
