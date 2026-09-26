@@ -842,8 +842,13 @@ class CanonicalMessage:
     message_id: str            # stable identity — WAMID where one exists
     text: str
     index: int                 # position in the reconstructed turn
-    timestamp: str | None      # ISO-8601, where the record carries one
+    timestamp: str | None      # ISO-8601, where the record carries one; None means UNKNOWN
     source: str                # which reconstruction path contributed this message
+    #: G3-5C. How this record's place in the turn was established. `timestamp` is a proven
+    #: clock order; `row_order` is a persisted row with no clock; `upstream_position` is a
+    #: message only the transport reported, placed between the neighbours it was reported
+    #: between. Uncertainty is named here rather than papered over with a fabricated time.
+    order_basis: str = "timestamp"
 
 
 @dataclass(frozen=True)
@@ -909,6 +914,11 @@ class CanonicalTurnBurst:
     competing_time_str: str | None
     competing_next_available: bool
     stage_at_build: str | None         # provenance only; the decision reads its own snapshot
+    #: G3-5C. Structural evidence from the merge itself. `payload_conflicts` records where one
+    #: identity carried two payloads and which source won; `format_variations` counts messages
+    #: the transport reported with different formatting than the persisted copy. Digests only.
+    payload_conflicts: tuple = ()
+    format_variations: int = 0
 
     # ── every view below is PROJECTED from `messages`; none is stored separately ──
 
@@ -978,91 +988,188 @@ def _text_digest(normalized: str) -> str:
     return hashlib.sha256((normalized or "").encode("utf-8")).hexdigest()
 
 
+class CanonicalMessages(tuple):
+    """The ordered records, plus anything structural worth recording about the merge.
+
+    A `tuple` subclass so every existing consumer keeps working unchanged; `conflicts` and
+    `variations` carry the merge's own evidence for the trace.
+    """
+
+    def __new__(cls, records, *, conflicts=(), variations=0):
+        self = super().__new__(cls, records)
+        self.conflicts = tuple(conflicts)
+        self.variations = int(variations)
+        return self
+
+
+def _norm_message(text: str) -> str:
+    """The project's own burst normalization, applied to one message.
+
+    G3-5C (audit G5B-01): raw string equality was the last text-matching step in the merge,
+    and any formatting difference between the transport's copy and the persisted copy turned
+    one real message into two canonical records. Matching uses this instead. It is the SAME
+    normalization the fingerprint uses, so identity and digest cannot disagree.
+    """
+    from ..schemas.hybrid_trace import normalize_burst
+    return normalize_burst([text])
+
+
 def _canonical_messages(*, db_rows=(), event_wamid=None, event_text=None,
-                        presentation_texts=(), turn_id=None) -> tuple:
+                        presentation_texts=(), turn_id=None) -> "CanonicalMessages":
     """Merge every reconstruction source into ONE ordered collection of atomic records.
 
-    G3-5B (audit G5A-02). The deduplication key is MESSAGE IDENTITY, never normalized text.
+    Deduplication keys on MESSAGE IDENTITY, never on text. Where no identity exists, the
+    transport's copy is matched to a persisted record by NORMALIZED text, one occurrence at
+    a time — so a repeated message is matched once and the second copy survives.
 
-        same identity delivered twice                -> one canonical message
-        different identities with identical text     -> two canonical messages
-        a persisted row whose text is NULL and whose
-          identity is the triggering event           -> the event's transcript, with the
-                                                        row's identity and timestamp
-                                                        (M21.1.1 audio behaviour, kept)
-        an n8n text with no persisted counterpart    -> its own record, identified by
-                                                        provenance and position
-        the triggering event matching such a record  -> that record's identity is UPGRADED
-                                                        to the real WAMID; it is one
-                                                        message, not two
+        same identity delivered twice                 -> one canonical message
+        same message, formatting differs              -> one canonical message (G3-5C)
+        different identities with identical text      -> two canonical messages
+        persisted NULL text + the triggering event    -> the transcript, keeping the row's
+                                                         identity and timestamp (M21.1.1)
+        transport copy with no persisted counterpart  -> its own record, identified by
+                                                         content and occurrence (G3-5C)
+        the triggering event matching such a record   -> that record's identity is UPGRADED
+                                                         to the real WAMID, not duplicated
 
-    Order: everything the database timestamps comes first, chronologically; anything n8n
-    supplied without a persisted counterpart keeps the order n8n gave it. The triggering
-    message keeps its place in that order rather than being moved to either end — moving it
-    reversed a two-message burst and changed a live reply. Equal timestamps tie-break on
-    persisted row id, then on arrival index, so the order is total and deterministic.
+    IDENTITY PRECEDENCE (G3-5C, audit G5B-03)
+        1. the real WAMID, wherever one exists — persisted row or triggering event;
+        2. the persisted row's internal database id (`db:<id>`) when it carries no WAMID;
+        3. only when neither exists, `n8n:<content digest>:<occurrence>` — no absolute list
+           position, so the same message keeps its identity when the transport reports a
+           different subset, and two genuinely repeated messages stay distinct.
+        No lookup is added: a record with no persisted counterpart has, by definition, none
+        in the recovered range, and searching the thread's history by text would reintroduce
+        exactly the text matching this milestone removes.
+
+    ORDER (G3-5C, audit G5B-02)
+        Persisted rows order by timestamp, tie-breaking on row id. A message only the
+        transport reported has no clock, so it is placed at the position the transport
+        reported it — between the neighbours it was reported between — rather than being
+        pushed behind every timestamped record. No timestamp is invented; `order_basis`
+        records which kind of evidence placed each record.
     """
-    records: list = []          # [timestamp, arrival, message_id, text, source]
+    persisted: list = []        # [message_id, text, ts_iso, basis]
     seen_ids: set = set()
+    conflicts: list = []
+    variations = 0
 
-    def add(message_id, text, timestamp, source):
-        if not isinstance(text, str) or not text:
-            return False
-        if message_id in seen_ids:                  # same message delivered twice
-            return False
-        seen_ids.add(message_id)
-        records.append([timestamp, len(records), message_id, text, source])
-        return True
-
+    # ── 1. the persisted rows: authoritative identity, text and clock ──
     ordered_rows = sorted(
         list(db_rows or ()),
         key=lambda r: ((getattr(r, "timestamp", None).isoformat()
                         if getattr(r, "timestamp", None) else ""),
                        getattr(r, "id", 0) or 0))
-    for row in ordered_rows:
-        wamid = getattr(row, "wa_message_id", None)
-        identity = wamid or f"db:{getattr(row, 'id', None)}"
-        text = getattr(row, "text", None)
+    for r in ordered_rows:
+        wamid = getattr(r, "wa_message_id", None)
+        row_id = getattr(r, "id", None)
+        identity = wamid or f"db:{row_id}"
+        text = getattr(r, "text", None)
+        ts = getattr(r, "timestamp", None)
+        ts_iso = ts.isoformat() if ts else None
         if text is None and wamid is not None and wamid == event_wamid:
             text = event_text                        # a transcript the row never stored
-        ts = getattr(row, "timestamp", None)
-        add(identity, text, ts.isoformat() if ts else None, "db_recovery")
+        elif (text and event_wamid is not None and wamid == event_wamid
+                and isinstance(event_text, str) and event_text
+                and _norm_message(text) != _norm_message(event_text)):
+            # G3-5C: one identity, two payloads. The persisted text wins — the precedence
+            # that already existed — and the conflict is now recorded structurally.
+            conflicts.append({
+                "identity_tail": str(identity)[-6:],
+                "selected": "persisted",
+                "discarded": "event_payload",
+                "selected_digest": _text_digest(_norm_message(text))[:12],
+                "discarded_digest": _text_digest(_norm_message(event_text))[:12]})
+        if not isinstance(text, str) or not text or identity in seen_ids:
+            continue
+        seen_ids.add(identity)
+        persisted.append([identity, text, ts_iso,
+                          "timestamp" if ts_iso else "row_order"])
 
-    # Whatever n8n reported that has no persisted counterpart. Matched by text ONE
-    # occurrence at a time, so a repeated message is matched once and the second copy
-    # survives as its own record rather than being erased.
-    unmatched = [r[3] for r in records]
-    for idx, text in enumerate(presentation_texts or ()):
+    # ── 2. the transport's copies, matched by NORMALIZED text, one occurrence each ──
+    #
+    # Two passes, because placement needs to look FORWARD. An unmatched message followed
+    # later in the transport's list by a matched one is known to precede that message; one
+    # with no following match is placed after the last match it follows. Nothing is
+    # anchored by absolute list position and no timestamp is invented.
+    available = [(_norm_message(t), k, t) for k, (_i, t, _ts, _b) in enumerate(persisted)]
+    plan: list = []             # ("match", persisted_index) | ("new", text)
+    for text in (presentation_texts or ()):
         if not isinstance(text, str) or not text:
             continue
-        if text in unmatched:
-            unmatched.remove(text)
+        norm = _norm_message(text)
+        hit = next((h for h, (n, _k, _t) in enumerate(available) if n == norm), None)
+        if hit is not None:
+            _n, k, persisted_text = available.pop(hit)
+            if text != persisted_text:
+                # The same message, reported with different formatting. Counted so the
+                # trace can show that normalization did real work; the persisted text wins.
+                variations += 1
+            plan.append(("match", k))
+        else:
+            plan.append(("new", text))
+
+    # Each new item's anchor: the persisted index it must precede, or len(persisted).
+    anchors: list = []
+    for pos, (kind, payload) in enumerate(plan):
+        if kind != "new":
             continue
-        # A stable, deterministic provenance identity — position plus a content digest,
-        # with no random component, so the same burst delivered twice fingerprints the same.
-        from ..schemas.hybrid_trace import normalize_burst
-        add(f"n8n:{idx}:{_text_digest(normalize_burst([text]))[:12]}", text, None,
-            "unanswered_recent_user_messages")
+        following = next((p for (k2, p) in (
+            (kind2, payload2) for kind2, payload2 in plan[pos + 1:]) if k2 == "match"), None)
+        anchors.append((payload, following if following is not None else len(persisted)))
 
-    # The triggering message. When one of the records above is the same message reported
-    # without an identity, that record is UPGRADED rather than duplicated.
+    # ── 3. the triggering message, upgraded onto its own record where possible ──
+    trailing_event = None
     if event_wamid is not None and str(event_wamid) not in seen_ids:
-        upgraded = False
-        for rec in reversed(records):
-            if rec[4] == "unanswered_recent_user_messages" and rec[3] == event_text:
-                seen_ids.discard(rec[2])
-                rec[2] = str(event_wamid)
-                rec[4] = "event_evidence"
-                seen_ids.add(rec[2])
-                upgraded = True
-                break
-        if not upgraded:
-            add(str(event_wamid), event_text, None, "event_evidence")
+        target = _norm_message(event_text) if isinstance(event_text, str) else None
+        upgraded_at = None
+        if target:
+            for h in range(len(anchors) - 1, -1, -1):
+                if _norm_message(anchors[h][0]) == target:
+                    upgraded_at = h
+                    break
+        if upgraded_at is None and isinstance(event_text, str) and event_text:
+            trailing_event = event_text
+    else:
+        upgraded_at = None
 
-    records.sort(key=lambda r: (r[0] is None, r[0] or "", r[1]))
-    return tuple(CanonicalMessage(message_id=mid, text=txt, index=n, timestamp=ts,
-                                  source=src)
-                 for n, (ts, _arrival, mid, txt, src) in enumerate(records))
+    # ── 4. emit in order ──
+    out: list = []
+    new_ids: dict = {}
+
+    def synthetic(text):
+        digest = _text_digest(_norm_message(text))[:12]
+        n = new_ids.get(digest, 0)
+        new_ids[digest] = n + 1
+        return f"n8n:{digest}:{n}"
+
+    def emit_new(h):
+        text = anchors[h][0]
+        identity = (str(event_wamid) if h == upgraded_at else synthetic(text))
+        source = ("event_evidence" if h == upgraded_at
+                  else "unanswered_recent_user_messages")
+        if identity in seen_ids:
+            return
+        seen_ids.add(identity)
+        out.append([identity, text, None, source, "upstream_position"])
+
+    for k in range(len(persisted) + 1):
+        for h, (_text, anchor) in enumerate(anchors):
+            if anchor == k:
+                emit_new(h)
+        if k < len(persisted):
+            identity, text, ts_iso, basis = persisted[k]
+            out.append([identity, text, ts_iso, "db_recovery", basis])
+    if trailing_event is not None and str(event_wamid) not in seen_ids:
+        seen_ids.add(str(event_wamid))
+        out.append([str(event_wamid), trailing_event, None, "event_evidence",
+                    "upstream_position"])
+
+    return CanonicalMessages(
+        (CanonicalMessage(message_id=mid, text=txt, index=n, timestamp=ts, source=src,
+                          order_basis=basis)
+         for n, (mid, txt, ts, src, basis) in enumerate(out)),
+        conflicts=conflicts, variations=variations)
 
 
 def _canonical_burst(*, thread_id, turn_id, messages, provenance, presentation_texts,
@@ -1100,7 +1207,9 @@ def _canonical_burst(*, thread_id, turn_id, messages, provenance, presentation_t
         wants_next_available=bool(wants_next),
         competing_day_iso=competing_day, competing_time_str=competing_time,
         competing_next_available=bool(competing_next),
-        stage_at_build=stage_at_build)
+        stage_at_build=stage_at_build,
+        payload_conflicts=tuple(getattr(messages, "conflicts", ()) or ()),
+        format_variations=int(getattr(messages, "variations", 0) or 0))
 
 
 def _canonical_burst_from_texts(*, thread_id=None, turn_id=None, texts=(),
@@ -2883,6 +2992,7 @@ class ConversationEngine:
         self._canonical_turn_burst = None       # G3-5A: the turn's evidence boundary
         self._availability_authority_phases = {}  # G3-5B: one decision per phase
         self._turn_semantic_burst = None           # G3-5B: which burst was interpreted
+        self._turn_semantic_dispatched = False      # G3-5C: arms the fail-closed check
         self._turn_semantic_calls = 0              # model invocations
         self._semantic_accessor_reads = 0          # reads of that one interpretation
         # L4.7W5 Gate 1/2 — hybrid decision trace collection. Observational only.
@@ -2926,6 +3036,7 @@ class ConversationEngine:
         self._canonical_turn_burst = None           # G3-5A: one burst per turn
         self._availability_authority_phases = {}    # G3-5B: one decision per phase
         self._turn_semantic_burst = None
+        self._turn_semantic_dispatched = False
         self._turn_semantic_calls = 0
         self._semantic_accessor_reads = 0
         self._turn_burst_texts = []
@@ -3334,11 +3445,17 @@ class ConversationEngine:
         # silently outranking evidence it never saw.
         burst = getattr(self, "_canonical_turn_burst", None)
         bound = getattr(self, "_turn_semantic_burst", None)
-        if burst is not None and bound is not None and bound != burst.fingerprint:
+        dispatched = bool(getattr(self, "_turn_semantic_dispatched", False))
+        # G3-5C (audit G5B-05): fail CLOSED. Once an interpretation has been dispatched for
+        # this turn its evidence is admissible only when it is POSITIVELY bound to the
+        # canonical burst. A foreign binding and a missing binding are the same answer —
+        # UNAVAILABLE, the deterministic floor's own bounded behaviour. Nothing here calls
+        # the provider, so a rejection can never cost a second model call.
+        if dispatched and burst is not None and bound != burst.fingerprint:
             try:
                 logger.warning(
-                    "G3-5B SEMANTIC BURST MISMATCH canonical=%s semantic=%s",
-                    burst.fingerprint[:12], str(bound)[:12])
+                    "G3-5C SEMANTIC BINDING REFUSED canonical=%s semantic=%s",
+                    burst.fingerprint[:12], (str(bound)[:12] if bound else "absent"))
             except Exception:
                 pass
             return SimpleNamespace(status="UNAVAILABLE", availability=None,
@@ -3659,6 +3776,9 @@ class ConversationEngine:
                     f"snapshot_stage={snapshot.stage!r}; "
                     f"snapshot_scheduling_requested={snapshot.scheduling_requested}; "
                     f"semantic_model_calls={getattr(self, '_turn_semantic_calls', 0)}; "
+                    f"payload_conflicts={len(burst.payload_conflicts)}; "
+                    f"format_variations={burst.format_variations}; "
+                    f"order_basis={'+'.join(sorted({m.order_basis for m in burst.messages})) or 'none'}; "
                     f"deterministic_scheduling={burst.scheduling_summary}"))
         except Exception:
             pass
@@ -6411,6 +6531,7 @@ class ConversationEngine:
         # compares it with the canonical burst and fails safe when they differ, so a
         # reading of some other message set can never hold primacy over the reconciler.
         self._turn_semantic_burst = getattr(burst, "fingerprint", None)
+        self._turn_semantic_dispatched = True      # G3-5C: arms the fail-closed check
         self._turn_semantic_calls = 0
         try:
             # Strict identity check: only a real boolean True enables the shadow path, so a

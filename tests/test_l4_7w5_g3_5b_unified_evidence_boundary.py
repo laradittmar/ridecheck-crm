@@ -348,13 +348,31 @@ class B_DuplicateEvidence(unittest.TestCase):
         self.assertEqual(len(msgs), 1)
         self.assertEqual(msgs[0].message_id, "w1")
 
-    def test_g35b_11_same_identity_with_a_payload_variation_stays_one_message(self):
-        msgs = _canonical_messages(
-            db_rows=[SimpleNamespace(wa_message_id="w1", id=1, text="Hola",
-                                     timestamp=None)],
-            event_wamid="w1", event_text="hola ", presentation_texts=["Hola"])
-        self.assertEqual(len(msgs), 1, "one identity is one message, whatever the payload")
-        self.assertEqual(msgs[0].text, "Hola", "the persisted text is authoritative")
+    def test_g35b_11_one_message_reported_with_different_formatting_is_one_record(self):
+        """REWRITTEN by G3-5C (audit G5B-04). The old version tested nothing.
+
+        It varied `event_text`, which production precedence never reads when the persisted
+        row carries text, and it handed the presentation loop a byte-identical copy — so it
+        passed without exercising the matching step at all, and the real defect (the
+        transport's copy differing from the persisted copy) went undetected.
+
+        The variation now sits where production actually compares: `presentation_texts`.
+        Against 2b5c344 this produces TWO records — the real WAMID plus a synthetic one for
+        the same sentence.
+        """
+        for label, reported in (("trailing space", "¿Qué horarios tienen? "),
+                                ("case", "¿qué horarios tienen?"),
+                                ("non-breaking space", "¿Qué horarios\u00a0tienen?")):
+            with self.subTest(variation=label):
+                msgs = _canonical_messages(
+                    db_rows=[SimpleNamespace(wa_message_id="w1", id=1,
+                                             text="¿Qué horarios tienen?", timestamp=None)],
+                    event_wamid="w1", event_text="¿Qué horarios tienen?",
+                    presentation_texts=[reported])
+                self.assertEqual(len(msgs), 1, "one real message became two records")
+                self.assertEqual(msgs[0].message_id, "w1", "the real identity must survive")
+                self.assertEqual(msgs[0].text, "¿Qué horarios tienen?",
+                                 "the persisted text is authoritative")
 
     def test_g35b_12_different_identities_with_identical_text_are_two_messages(self):
         msgs = _canonical_messages(
