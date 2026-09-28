@@ -60,14 +60,23 @@ import unicodedata
 from dataclasses import dataclass, field, asdict
 from typing import Any, Optional
 
-TRACE_VERSION = "hybrid-decision-trace/1.3"
+TRACE_VERSION = "hybrid-decision-trace/1.4"
+#: G3-5E. 1.4 splits `response_plan_source` — which was `answer_source`, and therefore
+#: answered three questions at once — into decision authority, fact sources, renderer source
+#: and dispatch result, and adds the reply-generation role and the shadow response plan. A
+#: 1.3 row carries none of those fields, so a reader must render them as UNAVAILABLE rather
+#: than as empty 1.4 fields; `response_plan_source` on a 1.3 row keeps its old meaning.
+TRACE_VERSION_1_3 = "hybrid-decision-trace/1.3"
 TRACE_VERSION_1_2 = "hybrid-decision-trace/1.2"
 TRACE_VERSION_1_1 = "hybrid-decision-trace/1.1"
 #: The first contract. Its reconciliation rows carry no producer provenance, so a
 #: reader must never treat their absent 1.1 fields as empty 1.1 fields.
 TRACE_VERSION_1_0 = "hybrid-decision-trace/1.0"
-READABLE_VERSIONS = (TRACE_VERSION, TRACE_VERSION_1_2, TRACE_VERSION_1_1,
-                     TRACE_VERSION_1_0)
+READABLE_VERSIONS = (TRACE_VERSION, TRACE_VERSION_1_3, TRACE_VERSION_1_2,
+                     TRACE_VERSION_1_1, TRACE_VERSION_1_0)
+#: Contracts predating the G3-5E attribution split. A reader must not infer the new fields.
+VERSIONS_WITHOUT_ATTRIBUTION_SPLIT = (TRACE_VERSION_1_3, TRACE_VERSION_1_2,
+                                      TRACE_VERSION_1_1, TRACE_VERSION_1_0)
 
 
 class Classification:
@@ -362,6 +371,246 @@ class HoursDisposition:
     ALL = (ADMIT, SUPPRESSED_BY_SEMANTIC_AVAILABILITY,
            SUPPRESSED_BY_DETERMINISTIC_SCHEDULING, SUPPRESSED_AMBIGUOUS,
            SUPPRESSED_UNCORROBORATED, NO_CANDIDATE)
+
+
+class DecisionAuthority:
+    """WHO authorized the action or the canonical mutation.
+
+    G3-5E (audit G5D-04/G5D-10). `answer_source` conflated three different questions —
+    who decided, who supplied the facts and who wrote the words — and forced
+    `DETERMINISTIC_RULE` onto every blocked dispatch, so the Inspector reported a rule as
+    the author of prose a model had written. These four vocabularies answer one question
+    each. `answer_source` is kept untouched beside them: it is what every existing consumer
+    reads, and replacing it would change behaviour this milestone may not change.
+    """
+    RECONCILER = "RECONCILER"                     # `_availability_authority` and successors
+    DETERMINISTIC_RULE = "DETERMINISTIC_RULE"     # a CE handler's own gate
+    #: Truthful name for the authority the G3-5D audit found in the reply model: it applies
+    #: extracted fields, creates candidates, can force a motorcycle handoff and can reset
+    #: the commercial stage. Named, not corrected — removal belongs to a later milestone.
+    LEGACY_REPLY_MODEL_EXTRACTION = "LEGACY_REPLY_MODEL_EXTRACTION"
+    HUMAN_HANDOFF_POLICY = "HUMAN_HANDOFF_POLICY"
+    FLOW_TRANSACTION = "FLOW_TRANSACTION"
+    PRICING_SERVICE = "PRICING_SERVICE"
+    SCHEDULING_SERVICE = "SCHEDULING_SERVICE"
+    NONE = "NONE"
+
+    ALL = (RECONCILER, DETERMINISTIC_RULE, LEGACY_REPLY_MODEL_EXTRACTION,
+           HUMAN_HANDOFF_POLICY, FLOW_TRANSACTION, PRICING_SERVICE, SCHEDULING_SERVICE,
+           NONE)
+
+
+class FactSource:
+    """WHICH producers supplied the facts in the response. Several may apply."""
+    SEMANTIC_EVIDENCE = "SEMANTIC_EVIDENCE"
+    DETERMINISTIC_EVIDENCE = "DETERMINISTIC_EVIDENCE"
+    CANONICAL_STATE = "CANONICAL_STATE"
+    PRICING_SERVICE = "PRICING_SERVICE"
+    SCHEDULING_SERVICE = "SCHEDULING_SERVICE"
+    FAQ_CANONICAL = "FAQ_CANONICAL"
+    FLOW_TRANSACTION = "FLOW_TRANSACTION"
+
+    ALL = (SEMANTIC_EVIDENCE, DETERMINISTIC_EVIDENCE, CANONICAL_STATE, PRICING_SERVICE,
+           SCHEDULING_SERVICE, FAQ_CANONICAL, FLOW_TRANSACTION)
+
+
+class RendererSource:
+    """WHO produced the customer's words."""
+    DETERMINISTIC_TEMPLATE = "DETERMINISTIC_TEMPLATE"
+    REPLY_MODEL = "REPLY_MODEL"
+    META_FLOW = "META_FLOW"
+    COMPOSED_MIXED = "COMPOSED_MIXED"      # model prose plus a canonical answer appended
+    NO_PROSE = "NO_PROSE"
+
+    ALL = (DETERMINISTIC_TEMPLATE, REPLY_MODEL, META_FLOW, COMPOSED_MIXED, NO_PROSE)
+
+
+class DispatchPath:
+    """WHICH transport attempted delivery."""
+    TEXT = "TEXT"
+    META_FLOW = "META_FLOW"
+    NONE = "NONE"
+
+    ALL = (TEXT, META_FLOW, NONE)
+
+
+class DispatchResult:
+    """WHAT the outbound safety gate decided. Never a source of reasoning or prose."""
+    ALLOWED = "ALLOWED"
+    BLOCKED = "BLOCKED"
+    FAILED = "FAILED"
+    DUPLICATE_SUPPRESSED = "DUPLICATE_SUPPRESSED"
+    NOT_ATTEMPTED = "NOT_ATTEMPTED"
+
+    ALL = (ALLOWED, BLOCKED, FAILED, DUPLICATE_SUPPRESSED, NOT_ATTEMPTED)
+
+
+class ResponseItemKind:
+    """What one planned contribution to the customer's turn is."""
+    TEXT = "TEXT"
+    CLARIFICATION = "CLARIFICATION"
+    FAQ_ANSWER = "FAQ_ANSWER"
+    HANDOFF_ACK = "HANDOFF_ACK"
+    FLOW_INTRO_TEXT = "FLOW_INTRO_TEXT"
+    META_FLOW = "META_FLOW"
+    #: P5. Authorized ONLY after a Flow completion the backend validated, accepted and
+    #: committed. Represented here so the composition milestone can activate it against a
+    #: pinned contract; G3-5E never emits it.
+    FLOW_COMPLETION_ACK = "FLOW_COMPLETION_ACK"
+    SUPPRESSED = "SUPPRESSED"
+    NO_RESPONSE = "NO_RESPONSE"
+
+    ALL = (TEXT, CLARIFICATION, FAQ_ANSWER, HANDOFF_ACK, FLOW_INTRO_TEXT, META_FLOW,
+           FLOW_COMPLETION_ACK, SUPPRESSED, NO_RESPONSE)
+
+
+class CoexistencePolicy:
+    """Whether an item may stand beside others in one turn."""
+    REQUIRED = "REQUIRED"        # must be present if authorized
+    COMPATIBLE = "COMPATIBLE"    # may stand beside other items
+    EXCLUSIVE = "EXCLUSIVE"      # owns the turn; suppresses the rest
+
+    ALL = (REQUIRED, COMPATIBLE, EXCLUSIVE)
+
+
+class TransportMultiplicity:
+    """P3/P4. How many transport messages one turn's plan may occupy."""
+    SINGLE_MESSAGE = "SINGLE_MESSAGE"
+    #: The one approved exception: a short introduction followed by the Meta Flow, typed as
+    #: two items of one sequence so it can never become two unrelated free-text replies.
+    FLOW_INTRO_THEN_FLOW = "FLOW_INTRO_THEN_FLOW"
+
+    ALL = (SINGLE_MESSAGE, FLOW_INTRO_THEN_FLOW)
+
+
+class ResponsePolicy:
+    """The owner-approved policies this contract must be able to express (G3-5E §4)."""
+    P1_HOLD_PLUS_SAFE_FAQ = "P1_HOLD_PLUS_SAFE_FAQ"
+    P2_HUMAN_HANDOFF_EXCLUSIVE = "P2_HUMAN_HANDOFF_EXCLUSIVE"
+    P3_SINGLE_MESSAGE_DEFAULT = "P3_SINGLE_MESSAGE_DEFAULT"
+    P4_FLOW_INTRO_SEQUENCE = "P4_FLOW_INTRO_SEQUENCE"
+    P5_FLOW_COMPLETION_ACK = "P5_FLOW_COMPLETION_ACK"
+    P6_NO_ROUTINE_FACT_REPETITION = "P6_NO_ROUTINE_FACT_REPETITION"
+    P7_SEMANTIC_ONLY_PERMISSIONS = "P7_SEMANTIC_ONLY_PERMISSIONS"
+
+    ALL = (P1_HOLD_PLUS_SAFE_FAQ, P2_HUMAN_HANDOFF_EXCLUSIVE, P3_SINGLE_MESSAGE_DEFAULT,
+           P4_FLOW_INTRO_SEQUENCE, P5_FLOW_COMPLETION_ACK, P6_NO_ROUTINE_FACT_REPETITION,
+           P7_SEMANTIC_ONLY_PERMISSIONS)
+
+
+#: P5 — every condition that must hold before FLOW_COMPLETION_ACK may be authorized. Pinned
+#: as data so the composition milestone cannot quietly relax one of them.
+FLOW_COMPLETION_ACK_CONDITIONS: tuple = (
+    "flow_submitted",              # not merely opened, and not an internal navigation
+    "signature_verified",
+    "token_valid",
+    "payload_complete",
+    "validation_passed",
+    "persistence_committed",
+    "not_already_acknowledged",
+)
+
+
+@dataclass(frozen=True)
+class ResponseItem:
+    """One authorized (or suppressed) contribution to a customer turn.
+
+    Deduplication is by `proposition_id` — a stable family+subject key — never by comparing
+    rendered text. Two producers saying the same thing are one item; two different
+    propositions that happen to share wording are two.
+    """
+    kind: str
+    claim_family: str
+    proposition_id: str
+    evidence_ids: tuple = ()
+    classification: Optional[str] = None      # the existing `Classification` vocabulary
+    decision_authority: str = DecisionAuthority.NONE
+    fact_sources: tuple = ()
+    renderer_source: str = RendererSource.NO_PROSE
+    required_action: Optional[str] = None
+    priority: int = 100
+    coexistence: str = CoexistencePolicy.COMPATIBLE
+    mutation_authorized: bool = False
+    dispatch_path: str = DispatchPath.NONE
+    included: bool = True
+    suppression_reason: Optional[str] = None
+    policy: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ResponsePlan:
+    """What one decision phase owed the customer.
+
+    G3-5E builds this in SHADOW only: it is constructed from the decision path that already
+    ran, compared with what actually happened, and traced. It cannot dispatch, cannot mutate
+    canonical state, cannot cause a model call and cannot create a second reply. Exactly one
+    plan exists per decision phase.
+    """
+    plan_id: str
+    turn_id: Optional[str]
+    burst_fingerprint: Optional[str]
+    decision_phase_id: Optional[str]
+    items: tuple = ()
+    transport_multiplicity: str = TransportMultiplicity.SINGLE_MESSAGE
+    renderer_source: str = RendererSource.NO_PROSE
+    dispatch_path: str = DispatchPath.NONE
+    dispatch_result: str = DispatchResult.NOT_ATTEMPTED
+    shadow: bool = True
+    outcome: Optional[str] = None
+
+    @property
+    def included_items(self) -> tuple:
+        return tuple(i for i in self.items if i.included)
+
+    @property
+    def suppressed_items(self) -> tuple:
+        return tuple(i for i in self.items if not i.included)
+
+    def to_payload(self) -> dict:
+        return {
+            "plan_id": self.plan_id, "turn_id": self.turn_id,
+            "burst_fingerprint": self.burst_fingerprint,
+            "decision_phase_id": self.decision_phase_id,
+            "transport_multiplicity": self.transport_multiplicity,
+            "renderer_source": self.renderer_source,
+            "dispatch_path": self.dispatch_path, "dispatch_result": self.dispatch_result,
+            "shadow": self.shadow, "outcome": self.outcome,
+            "item_count": len(self.included_items),
+            "suppressed_count": len(self.suppressed_items),
+            "item_kinds": [i.kind for i in self.included_items],
+            "items": [
+                {"kind": i.kind, "claim_family": i.claim_family,
+                 "proposition_id": i.proposition_id,
+                 "evidence_ids": list(i.evidence_ids),
+                 "classification": i.classification,
+                 "decision_authority": i.decision_authority,
+                 "fact_sources": list(i.fact_sources),
+                 "renderer_source": i.renderer_source,
+                 "required_action": i.required_action, "priority": i.priority,
+                 "coexistence": i.coexistence,
+                 "mutation_authorized": i.mutation_authorized,
+                 "dispatch_path": i.dispatch_path, "included": i.included,
+                 "suppression_reason": i.suppression_reason, "policy": i.policy}
+                for i in self.items],
+        }
+
+
+@dataclass
+class ReplyModelRecord:
+    """The reply-generation role, recorded separately from the semantic role.
+
+    One configured model may serve both; the roles are distinguished by call site, prompt
+    and consumer, so attribution stays truthful even when the model name is identical.
+    """
+    model: Optional[str] = None
+    prompt_version: Optional[str] = None
+    calls: int = 0
+    latency_ms: Optional[int] = None
+    status: str = "ABSENT"          # ABSENT | OK | ERROR | TIMEOUT
+
+    def to_payload(self) -> dict:
+        return {"model": self.model, "prompt_version": self.prompt_version,
+                "calls": self.calls, "latency_ms": self.latency_ms, "status": self.status}
 
 
 class FloorStrength:
@@ -673,7 +922,27 @@ class HybridDecisionTrace:
     result_kind: str = ResultKind.NO_ACTION
     reason_code: Optional[str] = None
     response_plan_kind: Optional[str] = None
+    #: LEGACY (1.0–1.3): this is `answer_source`, which conflates decision, facts and prose.
+    #: Kept verbatim so existing consumers and older rows keep their meaning. The truthful
+    #: separation is in the four fields below.
     response_plan_source: Optional[str] = None
+    # ── G3-5E (audit G5D-04/05/08), contract 1.4 ────────────────────────────
+    decision_authority: Optional[str] = None      # who authorized the action
+    fact_sources: tuple = ()                      # who supplied the facts (several)
+    renderer_source: Optional[str] = None         # who wrote the words
+    dispatch_path: Optional[str] = None           # which transport attempted it
+    dispatch_result: Optional[str] = None         # what the gate decided — never a source
+    reply: Optional[Any] = None                   # ReplyModelRecord payload
+    response_plan: Optional[Any] = None           # shadow ResponsePlan payload
+    response_plan_id: Optional[str] = None
+    response_item_count: Optional[int] = None
+    response_item_kinds: tuple = ()
+    suppressed_item_count: Optional[int] = None
+    suppressed_reasons: tuple = ()
+    final_message_count: Optional[int] = None
+    flow_participation: Optional[str] = None
+    burst_fingerprint: Optional[str] = None
+    decision_phase_id: Optional[str] = None
     outbound_message_id: Optional[int] = None
     outbound_path_id: Optional[str] = None
     outbound_status: Optional[str] = None

@@ -734,6 +734,68 @@ def _no_response_produced(trace: dict) -> tuple:
     return False, False
 
 
+#: Rendered where a contract older than 1.4 simply cannot answer the question. It must never
+#: be confused with "the field is empty".
+UNAVAILABLE_BEFORE_1_4 = "no disponible en este contrato"
+
+DISPATCH_NOTE = ("La compuerta de salida decide si el mensaje se envía. Nunca es el autor "
+                 "del razonamiento ni del texto.")
+
+
+def _unavailable_before_1_4(trace: dict):
+    """A renderer for the 1.4 fields that tells the truth about older rows."""
+    from ..schemas.hybrid_trace import VERSIONS_WITHOUT_ATTRIBUTION_SPLIT
+    old_contract = str(trace.get("trace_version") or "") in VERSIONS_WITHOUT_ATTRIBUTION_SPLIT
+
+    def render(value):
+        if old_contract or value is None:
+            return f'<span class="note">{html.escape(UNAVAILABLE_BEFORE_1_4)}</span>'
+        return _e(value)
+    return render
+
+
+def _response_plan_card(trace: dict) -> str:
+    """The shadow response plan. Observational in G3-5E: it dispatched nothing."""
+    plan = trace.get("response_plan")
+    if not isinstance(plan, dict):
+        return ""
+    rows = [
+        ("Plan", _e(plan.get("plan_id"))),
+        ("Modo", "sombra (no despacha)" if plan.get("shadow") else _e("activo")),
+        ("Ítems planificados", _e(plan.get("item_count"))),
+        ("Tipos", _e(", ".join(plan.get("item_kinds") or []) or None)),
+        ("Ítems suprimidos", _e(plan.get("suppressed_count"))),
+        ("Multiplicidad de transporte", _e(plan.get("transport_multiplicity"))),
+        ("Mensajes realmente enviados", _e(trace.get("final_message_count"))),
+    ]
+    suppressed = [i for i in (plan.get("items") or []) if not i.get("included")]
+    body = '<div class="card"><h2>Plan de respuesta (sombra)</h2>' + _kv(rows)
+    if suppressed:
+        body += "<ul>" + "".join(
+            f'<li>{_e(i.get("kind"))} · {_e(i.get("proposition_id"))} — '
+            f'{_e(i.get("suppression_reason"))}</li>' for i in suppressed) + "</ul>"
+    return body + "</div>"
+
+
+def _reply_model_card(trace: dict) -> str:
+    """The reply-generation role, never merged with the semantic one."""
+    reply = trace.get("reply")
+    if not isinstance(reply, dict):
+        return ""
+    return '<div class="card"><h2>Modelo de redacción</h2>' + _kv([
+        ("Modelo", _e(reply.get("model"))),
+        ("Versión del prompt", _e(reply.get("prompt_version"))),
+        ("Llamadas", _e(reply.get("calls"))),
+        ("Latencia (ms)", _e(reply.get("latency_ms"))),
+        ("Estado", _e(reply.get("status"))),
+    ]) + (f'<p class="note">{html.escape(REPLY_ROLE_NOTE)}</p></div>')
+
+
+REPLY_ROLE_NOTE = ("El mismo modelo configurado puede servir al intérprete semántico y a la "
+                   "redacción. Son roles distintos: distinto sitio de llamada, distinto "
+                   "prompt y distinto consumidor. Las llamadas se cuentan por separado.")
+
+
 def _outcome_card(trace: dict) -> str:
     path = trace.get("outbound_path_id")
     flow_row = ""
@@ -741,10 +803,25 @@ def _outcome_card(trace: dict) -> str:
         flow_row = (f'<p class="note"><span class="badge flow">'
                     f'{_e(FLOW_TRANSACTION_LABEL)}</span> '
                     f'{html.escape(FLOW_TRANSACTION_NOTE)}</p>')
+    # ── G3-5E: four questions, four answers ─────────────────────────────────
+    #
+    # "Fuente de la respuesta" used to be `answer_source`, which answered "who decided",
+    # "who supplied the facts" and "who wrote the words" with one value — and was forced to
+    # DETERMINISTIC_RULE on every blocked dispatch, so a turn the reply model wrote read as
+    # a deterministic rule's work merely because outbound was off. The legacy value is kept
+    # and labelled as legacy; the truthful split is shown beside it. A trace written before
+    # contract 1.4 has none of the new fields, so they render as unavailable rather than as
+    # empty 1.4 fields.
+    _legacy = _unavailable_before_1_4(trace)
     body = '<div class="card"><h2>Resultado</h2>' + _kv([
         ("Cómo se produjo", _e(trace.get("result_kind"))),
         ("Acción", _e(trace.get("response_plan_kind"))),
-        ("Fuente de la respuesta", _e(trace.get("response_plan_source"))),
+        ("Autoridad de la decisión", _legacy(trace.get("decision_authority"))),
+        ("Fuentes de los hechos", _legacy(", ".join(trace.get("fact_sources") or []) or None)),
+        ("Quién redactó", _legacy(trace.get("renderer_source"))),
+        ("Transporte", _legacy(trace.get("dispatch_path"))),
+        ("Resultado del envío (compuerta)", _legacy(trace.get("dispatch_result"))),
+        ("Fuente de la respuesta (legado)", _e(trace.get("response_plan_source"))),
         ("Motivo", _e(trace.get("reason_code"))),
         ("Permitido", _e(trace.get("allowed"))),
         ("Transición", _e(trace.get("transition"))),
@@ -832,6 +909,8 @@ def render_turn_trace_page(record: Optional[dict], turn_id: str = "") -> str:
                                semantic=trace.get("semantic") or {})
         + _state_card(trace.get("canonical_before") or {}, trace.get("canonical_after") or {})
         + _outcome_card(trace)
+        + _reply_model_card(trace)
+        + _response_plan_card(trace)
         + f"<details><summary>Traza completa (JSON)</summary><pre>{dumped}</pre></details>"
         + _glossary_card()
         + '<p><a href="/control">← Volver al panel de control</a></p>')

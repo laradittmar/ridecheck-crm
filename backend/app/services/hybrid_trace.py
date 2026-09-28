@@ -926,7 +926,14 @@ def result_kind_for(action: Optional[str], snapshot_before: CanonicalSnapshot,
 def build_trace(*, turn_id, thread_id, lead_id, deployment_sha, started_at, completed_at,
                 duration_ms, ordered_message_ids, message_timestamps, burst_texts,
                 semantic, ce_rules, reconciliations, before, after, action, detail,
-                answer_source, outbound) -> HybridDecisionTrace:
+                answer_source, outbound,
+                # ── G3-5E, contract 1.4. All optional so a caller that predates the split
+                # still produces a valid trace; the fields then render as unavailable
+                # rather than as empty 1.4 fields.
+                decision_authority=None, fact_sources=(), renderer_source=None,
+                dispatch_path=None, dispatch_result=None, reply=None, response_plan=None,
+                final_message_count=None, flow_participation=None,
+                burst_fingerprint=None, decision_phase_id=None) -> HybridDecisionTrace:
     kind = result_kind_for(action, before, after, answer_source, ce_rules)
     # Rows are captured while the turn runs, when the interpreter may not have answered
     # yet. Settle the one question that needs the whole turn before anything reads them.
@@ -952,6 +959,26 @@ def build_trace(*, turn_id, thread_id, lead_id, deployment_sha, started_at, comp
         outbound_path_id=(outbound or {}).get("path_id"),
         outbound_status=(outbound or {}).get("status"),
         outbound_wamid_tail=(outbound or {}).get("wamid_tail"),
+        decision_authority=decision_authority,
+        fact_sources=tuple(fact_sources or ()),
+        renderer_source=renderer_source,
+        dispatch_path=dispatch_path, dispatch_result=dispatch_result,
+        reply=(reply.to_payload() if hasattr(reply, "to_payload") else reply),
+        response_plan=(response_plan.to_payload()
+                       if hasattr(response_plan, "to_payload") else response_plan),
+        response_plan_id=getattr(response_plan, "plan_id", None),
+        response_item_count=(len(response_plan.included_items)
+                             if hasattr(response_plan, "included_items") else None),
+        response_item_kinds=(tuple(i.kind for i in response_plan.included_items)
+                             if hasattr(response_plan, "included_items") else ()),
+        suppressed_item_count=(len(response_plan.suppressed_items)
+                               if hasattr(response_plan, "suppressed_items") else None),
+        suppressed_reasons=(tuple(i.suppression_reason or i.kind
+                                  for i in response_plan.suppressed_items)
+                            if hasattr(response_plan, "suppressed_items") else ()),
+        final_message_count=final_message_count,
+        flow_participation=flow_participation,
+        burst_fingerprint=burst_fingerprint, decision_phase_id=decision_phase_id,
     )
     trace.badges = badges_for(trace, classify(semantic, ce_rules, reconciliations))
     return trace

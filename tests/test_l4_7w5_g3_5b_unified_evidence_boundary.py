@@ -708,7 +708,7 @@ class E_FreezeAndVocabulary(unittest.TestCase):
         self.assertIn('or "gpt-4o-mini"', interp)
         self.assertIn('PROMPT_VERSION = "understand/1.19"', interp)
         self.assertEqual(te.SCHEMA_VERSION, "turn-evidence/1.3")
-        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.3")
+        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.4")
 
     def test_g35b_37_no_customer_text_reaches_the_trace_metadata(self):
         t = Turn((("w0", HOURS_Q, 0), ("w1", "¿Hay algo mañana?", 5)), evidence=None).run()

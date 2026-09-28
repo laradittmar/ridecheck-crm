@@ -56,6 +56,11 @@ from ..schemas.conversation import (
     ConversationHandleOut,
 )
 from ..schemas.hybrid_trace import DecisionSite
+# G3-5E: the attribution vocabulary. `schemas.hybrid_trace` imports nothing from services,
+# so this is a module-level import rather than the file's usual local-import style.
+from ..schemas.hybrid_trace import (
+    DecisionAuthority, DispatchPath, DispatchResult, FactSource, RendererSource,
+)
 
 # G3-1 trace prose for the semantic handoff site. Hoisted out of
 # `_semantic_handoff_requested` on purpose: F7C-23 forbids multi-word string literals
@@ -980,6 +985,28 @@ class CanonicalTurnBurst:
         if self.competing_next_available:
             parts.append("next_available")
         return ",".join(parts) or "none"
+
+
+# ── L4.7W5-GATE3-G3-5E — the reply-generation role, named and versioned ──────
+#
+# G3-5D found one configured model (`settings.openai_chat_model`) serving two
+# architecturally distinct roles, with the semantic side versioned (`understand/1.19`) and
+# the reply side carrying no version at all — so no trace could say which prose contract
+# produced a message. The roles are distinguished here by call site, prompt builder and
+# consumer, which stays true even when the model name is identical.
+#
+# `_build_ai_messages` is the ONE prompt builder for both reply call sites, so one version
+# covers both; the ROLE is recorded separately per call site.
+REPLY_PROMPT_VERSION = "reply/1.0"
+REPLY_PROMPT_ID = "conversation_engine._build_ai_messages"
+
+
+class ReplyRole:
+    """Which reply-generation call site produced the prose."""
+    COMMERCIAL_TURN = "COMMERCIAL_TURN"        # `_process_text`, the main AI path
+    GENERAL_INFORMATION = "GENERAL_INFORMATION"  # `_handle_general_information_ai`
+
+    ALL = (COMMERCIAL_TURN, GENERAL_INFORMATION)
 
 
 def _text_digest(normalized: str) -> str:
@@ -2995,6 +3022,20 @@ class ConversationEngine:
         self._turn_semantic_dispatched = False      # G3-5C: arms the fail-closed check
         self._turn_semantic_calls = 0              # model invocations
         self._semantic_accessor_reads = 0          # reads of that one interpretation
+        # ── G3-5E: the reply-generation role, counted and attributed separately ──
+        self._reply_calls = 0
+        self._reply_latency_ms = None
+        self._reply_status = "ABSENT"
+        self._reply_role = None
+        self._reply_burst = None                   # the burst the reply model was given
+        self._turn_decision_authority = None
+        self._turn_fact_sources: list[str] = []
+        self._turn_renderer_source = None
+        self._turn_dispatch_path = None
+        self._turn_dispatch_result = None
+        self._turn_flow_dispatched = False
+        self._turn_text_dispatches = 0
+        self._turn_response_plan = None
         # L4.7W5 Gate 1/2 — hybrid decision trace collection. Observational only.
         self._turn_trace_ctx = None
         self._turn_trace_before = None
@@ -3039,6 +3080,19 @@ class ConversationEngine:
         self._turn_semantic_dispatched = False
         self._turn_semantic_calls = 0
         self._semantic_accessor_reads = 0
+        self._reply_calls = 0                       # G3-5E
+        self._reply_latency_ms = None
+        self._reply_status = "ABSENT"
+        self._reply_role = None
+        self._reply_burst = None
+        self._turn_decision_authority = None
+        self._turn_fact_sources = []
+        self._turn_renderer_source = None
+        self._turn_dispatch_path = None
+        self._turn_dispatch_result = None
+        self._turn_flow_dispatched = False
+        self._turn_text_dispatches = 0
+        self._turn_response_plan = None
         self._turn_burst_texts = []
         self._turn_trace_ctx = None
         self._turn_trace_before = None
@@ -3118,6 +3172,10 @@ class ConversationEngine:
         # final and after every response-shaping branch above, so it can observe the real
         # outcome; it writes in its own transaction and returns None on every failure, so a
         # trace defect can never cost a customer turn.
+        # G3-5E: the shadow plan describes the turn whether or not tracing is armed, so
+        # "what this turn owed the customer" is observable on its own terms. It reads state
+        # the decision path already recorded; it calls nothing and changes nothing.
+        self._turn_response_plan = self._shadow_response_plan(out)
         self._write_hybrid_trace(event, out, _trace_started_at,
                                  int((_time.perf_counter() - _ce_t0) * 1000))
         return out
@@ -5627,8 +5685,15 @@ class ConversationEngine:
         )
 
         try:
-            ai_raw = self._call_openai(messages_for_ai)
+            ai_raw = self._call_openai(messages_for_ai,
+                                       role=ReplyRole.COMMERCIAL_TURN)
             decision = json.loads(ai_raw)
+            self._turn_renderer_source = RendererSource.REPLY_MODEL
+            # G3-5E (audit G5D-01): named, not corrected. Everything this decision drives
+            # below — extracted fields, candidates, the motorcycle handoff, stage resets —
+            # is authority the reply model holds today. Removing it belongs to the
+            # structured-authority milestone; mislabelling it would hide the finding.
+            self._turn_decision_authority = DecisionAuthority.LEGACY_REPLY_MODEL_EXTRACTION
             if _use_narrative:
                 _narr = parse_narrative_interpretation(decision)
         except Exception as exc:
@@ -7134,6 +7199,122 @@ class ConversationEngine:
         except Exception:
             return {}
 
+    def _shadow_response_plan(self, out):
+        """Describe, in typed terms, what this turn owed the customer — and observe only.
+
+        G3-5E. This is a SHADOW representation of behaviour that already happened. It is
+        built after the turn from state the decision path recorded, so by construction it
+        cannot dispatch, cannot mutate canonical state, cannot cause a model call and cannot
+        create a second reply: it reads, it never calls. Exactly one plan exists per
+        decision phase — the phase id is part of its identity.
+
+        The next milestone turns this into the live authority. Until then the plan's job is
+        to be comparable with what actually happened, so a divergence is visible before it
+        is load-bearing.
+        """
+        from ..schemas.hybrid_trace import (
+            CoexistencePolicy, ResponseItem, ResponseItemKind, ResponsePlan,
+            ResponsePolicy, TransportMultiplicity)
+        try:
+            burst = getattr(self, "_canonical_turn_burst", None)
+            decision = getattr(self, "_availability_authority_cache", None)
+            phase = getattr(decision, "decision_phase_id", None)
+            fingerprint = getattr(burst, "fingerprint", None)
+            evidence_ids = tuple(getattr(burst, "ordered_message_ids", ()) or ())
+            action = getattr(out, "action", None)
+            renderer = (getattr(self, "_turn_renderer_source", None)
+                        or RendererSource.NO_PROSE)
+            authority = getattr(self, "_turn_decision_authority", None) or (
+                DecisionAuthority.RECONCILER if decision is not None
+                else DecisionAuthority.DETERMINISTIC_RULE)
+            dispatch_path = getattr(self, "_turn_dispatch_path", None) or DispatchPath.NONE
+            dispatch_result = (getattr(self, "_turn_dispatch_result", None)
+                               or DispatchResult.NOT_ATTEMPTED)
+            facts = tuple(dict.fromkeys(getattr(self, "_turn_fact_sources", None) or ()))
+
+            items: list = []
+            if getattr(self, "_turn_flow_dispatched", False):
+                # P4: a Flow is a typed two-part sequence, never two free-text replies.
+                items.append(ResponseItem(
+                    kind=ResponseItemKind.FLOW_INTRO_TEXT, claim_family="scheduling",
+                    proposition_id="scheduling.flow_intro", evidence_ids=evidence_ids,
+                    decision_authority=authority, fact_sources=facts,
+                    renderer_source=RendererSource.DETERMINISTIC_TEMPLATE,
+                    coexistence=CoexistencePolicy.REQUIRED, priority=10,
+                    dispatch_path=DispatchPath.TEXT,
+                    policy=ResponsePolicy.P4_FLOW_INTRO_SEQUENCE))
+                items.append(ResponseItem(
+                    kind=ResponseItemKind.META_FLOW, claim_family="scheduling",
+                    proposition_id="scheduling.booking_flow", evidence_ids=evidence_ids,
+                    decision_authority=authority, fact_sources=facts,
+                    renderer_source=RendererSource.META_FLOW,
+                    coexistence=CoexistencePolicy.REQUIRED, priority=20,
+                    dispatch_path=DispatchPath.META_FLOW,
+                    policy=ResponsePolicy.P4_FLOW_INTRO_SEQUENCE))
+                multiplicity = TransportMultiplicity.FLOW_INTRO_THEN_FLOW
+            else:
+                multiplicity = TransportMultiplicity.SINGLE_MESSAGE
+                if (action in ("replied", "blocked_dispatch")
+                        or getattr(self, "_turn_text_dispatches", 0)):
+                    kind = (ResponseItemKind.CLARIFICATION
+                            if getattr(decision, "authority", None) == "CLARIFY"
+                            else ResponseItemKind.TEXT)
+                    items.append(ResponseItem(
+                        kind=kind, claim_family="turn",
+                        proposition_id="turn.primary_reply", evidence_ids=evidence_ids,
+                        classification=getattr(decision, "classification", None),
+                        decision_authority=authority, fact_sources=facts,
+                        renderer_source=renderer,
+                        required_action=getattr(decision, "authority", None),
+                        coexistence=CoexistencePolicy.REQUIRED, priority=10,
+                        dispatch_path=dispatch_path,
+                        policy=ResponsePolicy.P3_SINGLE_MESSAGE_DEFAULT))
+                elif action in ("skipped_human",):
+                    items.append(ResponseItem(
+                        kind=ResponseItemKind.NO_RESPONSE, claim_family="handoff",
+                        proposition_id="handoff.human_owned", evidence_ids=evidence_ids,
+                        decision_authority=DecisionAuthority.HUMAN_HANDOFF_POLICY,
+                        fact_sources=(FactSource.CANONICAL_STATE,),
+                        renderer_source=RendererSource.NO_PROSE,
+                        coexistence=CoexistencePolicy.EXCLUSIVE, priority=0,
+                        policy=ResponsePolicy.P2_HUMAN_HANDOFF_EXCLUSIVE))
+                else:
+                    items.append(ResponseItem(
+                        kind=ResponseItemKind.NO_RESPONSE, claim_family="turn",
+                        proposition_id="turn.no_response", evidence_ids=evidence_ids,
+                        decision_authority=authority,
+                        renderer_source=RendererSource.NO_PROSE, priority=100))
+
+            # The one suppression this milestone can observe truthfully: the hours
+            # proposition the authority withheld and the reason it gave.
+            if decision is not None and getattr(decision, "suppress_hours", False):
+                items.append(ResponseItem(
+                    kind=ResponseItemKind.SUPPRESSED, claim_family="faq",
+                    proposition_id="faq.business_hours", evidence_ids=evidence_ids,
+                    classification=getattr(decision, "classification", None),
+                    decision_authority=DecisionAuthority.RECONCILER,
+                    fact_sources=(FactSource.FAQ_CANONICAL,),
+                    renderer_source=RendererSource.NO_PROSE,
+                    coexistence=CoexistencePolicy.COMPATIBLE, priority=50,
+                    included=False,
+                    suppression_reason=(getattr(decision, "hours_suppression_reason", None)
+                                        or getattr(decision, "hours_disposition", None)),
+                    policy=ResponsePolicy.P1_HOLD_PLUS_SAFE_FAQ))
+
+            return ResponsePlan(
+                plan_id=f"{(fingerprint or '')[:12]}:{(phase or 'nophase')}",
+                turn_id=getattr(self, "_correlation_id", None),
+                burst_fingerprint=fingerprint, decision_phase_id=phase,
+                items=tuple(items), transport_multiplicity=multiplicity,
+                renderer_source=renderer, dispatch_path=dispatch_path,
+                dispatch_result=dispatch_result, shadow=True, outcome=action)
+        except Exception as exc:      # observational: never costs a customer turn
+            try:
+                logger.warning("G3-5E shadow plan failed: %s", type(exc).__name__)
+            except Exception:
+                pass
+            return None
+
     def _write_hybrid_trace(self, event, out, started_at: str, duration_ms: int) -> None:
         if not self._hybrid_trace_on():
             return
@@ -7178,6 +7359,17 @@ class ConversationEngine:
                 "async" if self._shadow_async() else "sync")
             ce_rules = ce_evidence_for(texts, before, out.action)
 
+            plan = getattr(self, "_turn_response_plan", None)
+            from ..schemas.hybrid_trace import ReplyModelRecord
+            reply_record = ReplyModelRecord(
+                model=((getattr(self.settings, "openai_chat_model", "") or "gpt-4o-mini")
+                       if getattr(self, "_reply_calls", 0) else None),
+                prompt_version=(REPLY_PROMPT_VERSION
+                                if getattr(self, "_reply_calls", 0) else None),
+                calls=getattr(self, "_reply_calls", 0),
+                latency_ms=getattr(self, "_reply_latency_ms", None),
+                status=getattr(self, "_reply_status", "ABSENT"))
+
             trace = build_trace(
                 turn_id=getattr(self, "_correlation_id", None) or "",
                 thread_id=thread_id,
@@ -7196,6 +7388,22 @@ class ConversationEngine:
                 action=out.action, detail=out.detail,
                 answer_source=out.answer_source,
                 outbound=self._trace_outbound_for_turn(thread_id),
+                # ── G3-5E contract 1.4 ──
+                decision_authority=getattr(self, "_turn_decision_authority", None),
+                fact_sources=tuple(dict.fromkeys(
+                    getattr(self, "_turn_fact_sources", None) or ())),
+                renderer_source=getattr(self, "_turn_renderer_source", None),
+                dispatch_path=getattr(self, "_turn_dispatch_path", None),
+                dispatch_result=getattr(self, "_turn_dispatch_result", None),
+                reply=reply_record, response_plan=plan,
+                final_message_count=getattr(self, "_turn_text_dispatches", 0),
+                flow_participation=("META_FLOW"
+                                    if getattr(self, "_turn_flow_dispatched", False)
+                                    else None),
+                burst_fingerprint=getattr(canonical, "fingerprint", None),
+                decision_phase_id=getattr(
+                    getattr(self, "_availability_authority_cache", None),
+                    "decision_phase_id", None),
             )
             persist(self.db, trace)
         except Exception as exc:
@@ -8323,8 +8531,13 @@ class ConversationEngine:
         messages = self._build_ai_messages(ctx, event, ai_input_messages)
 
         try:
-            ai_raw = self._call_openai(messages)
+            ai_raw = self._call_openai(messages, role=ReplyRole.GENERAL_INFORMATION)
             decision = json.loads(ai_raw)
+            # G3-5E (audit G5D-05): this route returns `answer_source="FAQ_RULE"`, but the
+            # words came from the reply model. `answer_source` is legacy and untouched; the
+            # renderer attribution below is the truthful one.
+            self._turn_renderer_source = RendererSource.REPLY_MODEL
+            self._turn_decision_authority = DecisionAuthority.DETERMINISTIC_RULE
         except Exception as exc:
             logger.warning(
                 "M21.1.1 FAQ AI call failed thread_id=%s: %s", ctx.thread.id, exc
@@ -9530,6 +9743,22 @@ class ConversationEngine:
 
     # ── AI prompt ─────────────────────────────────────────────────────────
 
+    def _reply_input_texts(self, fallback: list[str]) -> list[str]:
+        """The customer language the reply-generation model may read.
+
+        G3-5E (audit G5D-02). The reply model used to be handed `ai_input_messages`, the
+        presentation subset — the same defect G3-5B closed for the semantic interpreter,
+        left open for the one component that can also mutate canonical state. It now reads
+        the certified `CanonicalTurnBurst`, in canonical order. `fallback` is used only
+        where no burst was reconstructed (an engine that did not go through `handle`).
+        """
+        burst = getattr(self, "_canonical_turn_burst", None)
+        if burst is not None and burst.messages:
+            self._reply_burst = burst.fingerprint
+            return list(burst.texts)
+        self._reply_burst = None
+        return list(fallback or [])
+
     def _build_ai_messages(
         self,
         ctx: _Context,
@@ -9539,6 +9768,9 @@ class ConversationEngine:
         real_price_quote: "PricingQuote | None" = None,
         include_narrative: bool = False,
     ) -> list[dict]:
+        # G3-5E: the canonical burst replaces the presentation subset as the reply model's
+        # customer-language input. Every other argument is unchanged.
+        ai_input_messages = self._reply_input_texts(ai_input_messages)
         lead = ctx.lead
         assert lead is not None
         state = ctx.state
@@ -9718,8 +9950,30 @@ Respondé SOLO con JSON válido:
 
     # ── OpenAI HTTP call (no sdk dependency) ─────────────────────────────
 
-    def _call_openai(self, messages: list[dict]) -> str:
-        self._ai_invoked = True  # WILD-04R observability: mark actual OpenAI execution
+    def _call_openai(self, messages: list[dict], *, role: str | None = None) -> str:
+        """The reply-generation provider. Counted and timed separately from the semantic one.
+
+        G3-5E (audit G5D-06). `semantic_model_calls` counts the interpreter; this counts the
+        renderer. One configured model may serve both — the roles are told apart by call
+        site, prompt version and consumer, never by the model name.
+        """
+        # The provider-call marker stays HERE, at the single boundary every reply call
+        # crosses, so the one-place accounting guard keeps holding after the G3-5E split.
+        self._ai_invoked = True
+        self._reply_calls = getattr(self, "_reply_calls", 0) + 1
+        self._reply_role = role or getattr(self, "_reply_role", None)
+        _t0 = _time.perf_counter()
+        try:
+            out = self._call_openai_inner(messages)
+        except Exception:
+            self._reply_status = "ERROR"
+            self._reply_latency_ms = int((_time.perf_counter() - _t0) * 1000)
+            raise
+        self._reply_status = "OK"
+        self._reply_latency_ms = int((_time.perf_counter() - _t0) * 1000)
+        return out
+
+    def _call_openai_inner(self, messages: list[dict]) -> str:
         api_key = (self.settings.openai_api_key or "").strip()
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY not configured")
@@ -10795,7 +11049,17 @@ Respondé SOLO con JSON válido:
         _burst = getattr(self, "_faq_reconciliation_burst", None)
         if _burst:
             self._faq_reconciliation_burst = None  # consume — fires once per turn
+            _before_compose = text
             text = self._compose_secondary_answers(text, _burst)
+            if text != _before_compose:
+                # G3-5E: a canonical answer was appended to (or stripped from) prose this
+                # function did not author. The renderer is genuinely mixed from here on.
+                self._turn_renderer_source = RendererSource.COMPOSED_MIXED
+                _facts = getattr(self, "_turn_fact_sources", None)
+                if _facts is None:
+                    _facts = self._turn_fact_sources = []
+                if FactSource.FAQ_CANONICAL not in _facts:
+                    _facts.append(FactSource.FAQ_CANONICAL)
 
         # WILD-04R-F5.1: deterministic required-next-info gate.
         # Runs after FAQ reconciliation so duplicate detection also covers
@@ -10822,17 +11086,28 @@ Respondé SOLO con JSON válido:
             correlation_id=self._turn_correlation_id(),
             causal_inbound_wa_message_id=ctx.inbound_wa_message_id,
         )
+        # ── G3-5E: the transport records WHAT the gate decided, never WHO reasoned ──
+        self._turn_dispatch_path = DispatchPath.TEXT
+        if getattr(self, "_turn_renderer_source", None) is None:
+            self._turn_renderer_source = RendererSource.DETERMINISTIC_TEMPLATE
         if result.outcome != GateOutcome.ALLOWED:
+            self._turn_dispatch_result = (
+                DispatchResult.DUPLICATE_SUPPRESSED
+                if result.outcome == GateOutcome.BLOCKED_DUPLICATE
+                else DispatchResult.BLOCKED)
             raise OutboundBlockedError(
                 sender_path="engine._send_text_to_wa", kind="text",
                 to_wa_id=wa_id, thread_id=ctx.thread.id, text=text,
                 gate_outcome=result.outcome.value,
             )
+        self._turn_dispatch_result = DispatchResult.ALLOWED
+        self._turn_text_dispatches = getattr(self, "_turn_text_dispatches", 0) + 1
         wa_message_id: str | None = None
         try:
             wa_message_id, _ = _send_whatsapp_cloud_text(to_wa_id=wa_id, text=text)
             gate.mark_sent(result.message_id, wa_message_id)
         except MetaSendError as exc:
+            self._turn_dispatch_result = DispatchResult.FAILED
             logger.error("M18 send_text MetaSendError thread_id=%s: %s", ctx.thread.id, exc)
             gate.mark_failed(
                 result.message_id,
@@ -10866,6 +11141,11 @@ Respondé SOLO con JSON válido:
             flow_id = (self.settings.whatsapp_flow_id or "").strip()
         if not flow_id:
             raise RuntimeError("WHATSAPP_FLOW_ID not configured")
+        # G3-5E: the Flow is its own transport, attributed separately from text.
+        self._turn_flow_dispatched = True
+        self._turn_dispatch_path = DispatchPath.META_FLOW
+        if getattr(self, "_turn_renderer_source", None) in (None, RendererSource.NO_PROSE):
+            self._turn_renderer_source = RendererSource.META_FLOW
 
         # L4.7D: the Flow button body is customer-facing text and is validated too.
         body_text = self._validate_outbound_text(body_text, ctx, ctx.state)
