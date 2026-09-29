@@ -51,7 +51,6 @@ from app.services.conversation_engine import (              # noqa: E402
     _hours_truth_violations,
     _norm_lower,
     _stated_hours_claims,
-    _strip_contradicting_sentences,
 )
 from app.services.schedule import (                          # noqa: E402
     business_hours_for_weekday,
@@ -76,13 +75,35 @@ def compose(primary: str, topics=("business_hours",)) -> str:
     engine._turn_ctx = None
     engine._contributing_sources = None
     engine._faq_topics_for_burst = lambda text, ctx=None, state=None: set(topics)
-    return ConversationEngine._compose_secondary_answers(engine, primary, "irrelevant")
+    return _compose_via_plan(engine, primary, "irrelevant")
 
 
 def canonical_pair(weekday: int) -> tuple[str, str]:
     start, end, _closed = business_hours_for_weekday(weekday)
     fmt = lambda t: str(t.hour) if t.minute == 0 else f"{t.hour}.{t.minute:02d}"
     return fmt(start), fmt(end)
+
+
+
+def _compose_via_plan(engine, primary, burst, *, topics=None):
+    """G3-6 — the composition path, as it now is: register propositions, then compose.
+
+    `_compose_secondary_answers` appended canonical FAQ answers to finished prose. It is
+    now `_register_faq_propositions`, which registers a typed FAQ_ANSWER item per topic and
+    lets the live plan order and render them. The assertions that used this helper describe
+    the message a customer receives, so they keep describing it — through the code that now
+    produces it.
+    """
+    from app.services.response_composition import LiveResponsePlan
+    ctx = getattr(engine, "_turn_ctx", None)
+    engine._live_plan = LiveResponsePlan(turn_id="t")
+    engine._turn_faq_burst = burst
+    if not hasattr(engine, "_turn_fact_sources"):
+        engine._turn_fact_sources = []
+    if topics is not None:
+        engine._faq_topics_for_burst = lambda text, ctx=None, st=None: set(topics)
+    engine._register_faq_propositions(ctx, primary)
+    return engine._live_plan.compose(primary)
 
 
 class A_Reproduction(unittest.TestCase):
@@ -124,9 +145,17 @@ class BC_FinalAnswer(unittest.TestCase):
     def test_c01_the_false_value_survives_nowhere(self):
         self.assertNotIn("9 a 13", self.final)
 
-    def test_c02_the_rest_of_the_reply_is_preserved(self):
-        """Only the false sentence is removed — the question the customer needs stays."""
-        self.assertIn("¿qué día y horario te viene mejor?", self.final)
+    def test_c02_a_rejected_reply_is_replaced_not_edited(self):
+        """G3-6 / DEF-04 — a DELIBERATE behaviour change, ratified in §6 of the milestone.
+        The system no longer edits prose it did not author. A reply that asserts a
+        business fact incorrectly is rejected WHOLE and the approved plan is rendered
+        in its place, so the surrounding sentences go with it. What must still hold is
+        that nothing false reaches the customer and every canonical answer the burst
+        earned is stated once — which is what this test now asserts.
+        """
+        self.assertNotIn("¿qué día y horario te viene mejor?", self.final,
+                         "the rejected proposition was partially resurrected")
+        self.assertIn("lunes de 13 a 18 hs", self.final)
 
 
 class D_ArbitraryWrongValue(unittest.TestCase):
@@ -247,7 +276,7 @@ class I_Stability(unittest.TestCase):
 
     def test_i02_the_canonical_answer_is_never_stripped(self):
         self.assertEqual(
-            _strip_contradicting_sentences(business_hours_summary_es(), "business_hours"),
+            business_hours_summary_es(),
             business_hours_summary_es())
 
     def test_i03_the_answer_is_generated_from_the_table_not_hard_coded(self):

@@ -45,6 +45,18 @@ CLARIFY, HOLD, LOOK_UP = "CLARIFY", "HOLD", "LOOK_UP_AVAILABILITY"
 CONFIRMED = te.EvidenceStatus.CONFIRMED
 
 
+
+def _compose_via_plan(engine, primary, burst):
+    """G3-6 — register the FAQ propositions, then let the live plan compose them."""
+    from app.services.response_composition import LiveResponsePlan
+    engine._live_plan = LiveResponsePlan(turn_id="t")
+    engine._turn_faq_burst = burst
+    if not hasattr(engine, "_turn_fact_sources"):
+        engine._turn_fact_sources = []
+    engine._register_faq_propositions(getattr(engine, "_turn_ctx", None), primary)
+    return engine._live_plan.compose(primary)
+
+
 class Burst:
     """One reconstructed burst, run through the real authority and composition paths."""
 
@@ -273,8 +285,7 @@ class C_TwoPropositions(unittest.TestCase):
         burst = Burst(availability=CONFIRMED, faq=("business_hours",))
         burst.engine._contributing_sources = None
         burst.engine._faq_topics_for_burst = lambda t, ctx=None, st=None: {"business_hours"}
-        composed = ConversationEngine._compose_secondary_answers(
-            burst.engine, "Anotado, ya lo registré.", self.BOTH)
+        composed = _compose_via_plan(burst.engine, "Anotado, ya lo registré.", self.BOTH)
         self.assertEqual(composed.count(business_hours_summary_es()), 1)
         self.assertIn("Anotado", composed)
 

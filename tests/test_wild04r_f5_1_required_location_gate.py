@@ -43,6 +43,24 @@ from sqlalchemy import create_engine, event, select, text as sql_text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 
+
+def _required_next_question(eng, text, ctx, _turn_text=None):
+    """G3-6 — the same gate, through the producer that replaced the finalizer.
+
+    `_apply_required_next_question` appended the canonical location question to finished
+    prose. It is now `_register_clarification_proposition`, which registers a typed
+    CLARIFICATION item that the live plan renders. Every gate condition below is unchanged,
+    so these tests keep asserting the same business outcome — is the customer asked for the
+    inspection location, once, and only when canonical state genuinely lacks it — through
+    the code that now decides it.
+    """
+    from app.services.response_composition import LiveResponsePlan
+    eng._live_plan = LiveResponsePlan(turn_id="t")
+    eng._turn_clarification_burst = _turn_text
+    eng._register_clarification_proposition(ctx, text)
+    return eng._live_plan.compose(text)
+
+
 class Base(DeclarativeBase):
     pass
 
@@ -174,7 +192,7 @@ def _make_engine(db: Session) -> ConversationEngine:
     eng._ai_invoked = False
     eng._answer_source = None
     eng._contributing_sources = None
-    eng._faq_reconciliation_burst = None
+    eng._turn_faq_burst = None
     eng._burst_message_count = 1
     eng._burst_earliest_inbound_db_id = None
     return eng
@@ -415,12 +433,12 @@ class TestApplyRequiredNextQuestion(unittest.TestCase):
     def test_gate_appends_when_location_missing_and_not_in_reply(self):
         ctx = self._make_ctx_qualifying_no_zone()
         reply = "¡Hola! Sí, hacemos revisiones. No es necesario estar presente."
-        result = self.eng._apply_required_next_question(reply, ctx)
+        result = _required_next_question(self.eng, reply, ctx)
         self.assertIn("localidad o barrio", result.lower())
 
     def test_gate_appends_canonical_phrase(self):
         ctx = self._make_ctx_qualifying_no_zone()
-        result = self.eng._apply_required_next_question("Sí, hacemos revisiones.", ctx)
+        result = _required_next_question(self.eng, "Sí, hacemos revisiones.", ctx)
         self.assertIn(_CANONICAL_LOCATION_ASK.strip(), result)
 
     # ── Gate does not fire ────────────────────────────────────────────────────
@@ -429,58 +447,58 @@ class TestApplyRequiredNextQuestion(unittest.TestCase):
         """Case A: AI asked for location — gate must be a no-op."""
         ctx = self._make_ctx_qualifying_no_zone()
         reply = "¡Hola! ¿En qué zona o barrio está el auto?"
-        self.assertEqual(self.eng._apply_required_next_question(reply, ctx), reply)
+        self.assertEqual(_required_next_question(self.eng, reply, ctx), reply)
 
     def test_no_append_when_candidate_zone_known(self):
         ctx = self._make_ctx_qualifying_no_zone()
         ctx.candidates[0].zone_group = "CABA"
         ctx.candidates[0].zone_detail = "Palermo"
         reply = "Revisión en el lugar del auto."
-        self.assertEqual(self.eng._apply_required_next_question(reply, ctx), reply)
+        self.assertEqual(_required_next_question(self.eng, reply, ctx), reply)
 
     def test_no_append_when_state_zone_known(self):
         ctx = self._make_ctx_qualifying_no_zone()
         ctx.state.home_zone_group = "CABA"
         ctx.state.home_zone_detail = "Palermo"
         reply = "Revisión en el lugar del auto."
-        self.assertEqual(self.eng._apply_required_next_question(reply, ctx), reply)
+        self.assertEqual(_required_next_question(self.eng, reply, ctx), reply)
 
     def test_no_append_when_needs_human(self):
         ctx = self._make_ctx_qualifying_no_zone()
         ctx.state.needs_human = True
         reply = "Un asesor se va a comunicar con vos."
-        self.assertEqual(self.eng._apply_required_next_question(reply, ctx), reply)
+        self.assertEqual(_required_next_question(self.eng, reply, ctx), reply)
 
     def test_no_append_when_stage_quoted(self):
         ctx = self._make_ctx_qualifying_no_zone()
         ctx.state.last_stage = STAGE_QUOTED
         reply = "El precio es $150.000."
-        self.assertEqual(self.eng._apply_required_next_question(reply, ctx), reply)
+        self.assertEqual(_required_next_question(self.eng, reply, ctx), reply)
 
     def test_no_append_when_stage_scheduling(self):
         ctx = self._make_ctx_qualifying_no_zone()
         ctx.state.last_stage = STAGE_SCHEDULING
         reply = "¿Qué día te viene bien?"
-        self.assertEqual(self.eng._apply_required_next_question(reply, ctx), reply)
+        self.assertEqual(_required_next_question(self.eng, reply, ctx), reply)
 
     def test_no_append_when_no_candidates(self):
         ctx = self._make_ctx_qualifying_no_zone()
         ctx.candidates = []
         ctx.state.current_focus_candidate_id = None
         reply = "Revisión en el lugar del auto."
-        self.assertEqual(self.eng._apply_required_next_question(reply, ctx), reply)
+        self.assertEqual(_required_next_question(self.eng, reply, ctx), reply)
 
     def test_no_append_when_tipo_unknown(self):
         ctx = self._make_ctx_qualifying_no_zone()
         ctx.candidates[0].tipo_vehiculo = None
         reply = "¿Qué tipo de vehículo tenés?"
-        self.assertEqual(self.eng._apply_required_next_question(reply, ctx), reply)
+        self.assertEqual(_required_next_question(self.eng, reply, ctx), reply)
 
     def test_no_append_when_state_is_none(self):
         ctx = self._make_ctx_qualifying_no_zone()
         ctx.state = None
         reply = "Revisión en el lugar del auto."
-        self.assertEqual(self.eng._apply_required_next_question(reply, ctx), reply)
+        self.assertEqual(_required_next_question(self.eng, reply, ctx), reply)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -525,13 +543,13 @@ class TestExactLiveBurst(unittest.TestCase):
         captured: list[str] = []
 
         def _intercepted_send(self_eng, ctx, text):
-            _burst = getattr(self_eng, "_faq_reconciliation_burst", None)
+            _burst = getattr(self_eng, "_turn_faq_burst", None)
             if _burst:
-                self_eng._faq_reconciliation_burst = None
-                text = self_eng._compose_secondary_answers(text, _burst)
+                self_eng._turn_faq_burst = None
+                pass  # G3-6: the FAQ answer is a registered proposition now
             # Mirror CE's _send_text_to_wa: pass _burst as _turn_text so the
             # soft-close guard can inspect the original customer turn text.
-            text = self_eng._apply_required_next_question(text, ctx, _turn_text=_burst)
+            text = _required_next_question(self_eng, text, ctx, _turn_text=_burst)
             captured.append(text)
             return "wamid.FAKE001"
 
@@ -667,12 +685,12 @@ class TestNextTurnZoneProvided(unittest.TestCase):
     def test_no_location_question_when_zone_known_caba(self):
         ctx = self._make_ctx_with_zone("CABA", "Palermo")
         reply = "Perfecto, Palermo. Te paso el precio ahora."
-        self.assertEqual(self.eng._apply_required_next_question(reply, ctx), reply)
+        self.assertEqual(_required_next_question(self.eng, reply, ctx), reply)
 
     def test_no_location_question_when_zone_known_gba(self):
         ctx = self._make_ctx_with_zone("Oeste", "San Miguel")
         reply = "Perfecto, San Miguel. Te paso el precio."
-        self.assertEqual(self.eng._apply_required_next_question(reply, ctx), reply)
+        self.assertEqual(_required_next_question(self.eng, reply, ctx), reply)
 
 
 if __name__ == "__main__":

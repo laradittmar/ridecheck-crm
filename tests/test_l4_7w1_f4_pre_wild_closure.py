@@ -57,6 +57,28 @@ def engine(semantic_topics=()):
     return eng
 
 
+
+def _compose_via_plan(engine, primary, burst, *, topics=None):
+    """G3-6 — the composition path, as it now is: register propositions, then compose.
+
+    `_compose_secondary_answers` appended canonical FAQ answers to finished prose. It is
+    now `_register_faq_propositions`, which registers a typed FAQ_ANSWER item per topic and
+    lets the live plan order and render them. The assertions that used this helper describe
+    the message a customer receives, so they keep describing it — through the code that now
+    produces it.
+    """
+    from app.services.response_composition import LiveResponsePlan
+    ctx = getattr(engine, "_turn_ctx", None)
+    engine._live_plan = LiveResponsePlan(turn_id="t")
+    engine._turn_faq_burst = burst
+    if not hasattr(engine, "_turn_fact_sources"):
+        engine._turn_fact_sources = []
+    if topics is not None:
+        engine._faq_topics_for_burst = lambda text, ctx=None, st=None: set(topics)
+    engine._register_faq_propositions(ctx, primary)
+    return engine._live_plan.compose(primary)
+
+
 class TestCEOwnership(unittest.TestCase):
 
     def test_prewild_01_blocked_dispatch_is_owned_by_ce(self):
@@ -234,7 +256,7 @@ class TestFaqCutover(unittest.TestCase):
         """A topic already covered by the primary reply is not appended twice."""
         eng = engine(semantic_topics=("report", "presence"))
         primary = "Al finalizar la revisión te enviamos un informe detallado."
-        out = eng._compose_secondary_answers(primary, WILD_2)
+        out = _compose_via_plan(eng, primary, WILD_2)
         self.assertEqual(out.count("informe detallado"), 1, "no duplicate report answer")
         self.assertIn(_FAQ_PRESENCE_ANSWER, out, "the unanswered topic is still added")
 

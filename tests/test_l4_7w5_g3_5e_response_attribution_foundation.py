@@ -137,8 +137,12 @@ class B_Attribution(unittest.TestCase):
     def test_g35e_07_a_deterministic_reply_is_attributed_to_a_template(self):
         t = Turn((("w0", "¿Cuál es el horario de atención?", 0),), evidence=None).run()
         try:
+            # G3-6: both contributions are now the business's own — a deterministic
+            # primary reply and a canonical FAQ proposition — so the renderer is a
+            # template, not a mixture. The fact source is what the assertion is really
+            # about and it is unchanged.
             self.assertEqual(t.engine._turn_renderer_source,
-                             RendererSource.COMPOSED_MIXED)
+                             RendererSource.DETERMINISTIC_TEMPLATE)
             self.assertIn(FactSource.FAQ_CANONICAL, t.engine._turn_fact_sources)
         finally:
             t.close()
@@ -299,15 +303,23 @@ class D_ResponsePlan(unittest.TestCase):
         finally:
             t.close()
 
-    def test_g35e_24_a_normal_turn_plans_one_text_item(self):
+    def test_g35e_24_a_normal_turn_plans_every_proposition_and_one_message(self):
+        """G3-6 — the count changed on purpose, and that IS the milestone.
+
+        This asserted one planned item for a turn whose message carried two claims: a reply
+        and the canonical opening hours, the second appended downstream where the plan could
+        not see it. Both are registered propositions now, so the plan counts two — and P3
+        still puts them in ONE message, which is the invariant this test protects.
+        """
         t, plan = self.plan_for([("w0", "¿Cuál es el horario de atención?", 0)],
                                 evidence=None)
         try:
             kinds = [i.kind for i in plan.included_items]
-            self.assertEqual(len(plan.included_items), 1, kinds)
-            self.assertIn(kinds[0], (ResponseItemKind.TEXT, ResponseItemKind.CLARIFICATION))
+            self.assertEqual(kinds, [ResponseItemKind.TEXT, ResponseItemKind.FAQ_ANSWER],
+                             kinds)
             self.assertEqual(plan.transport_multiplicity,
                              TransportMultiplicity.SINGLE_MESSAGE)
+            self.assertEqual(len(t.sent), 1, "two propositions became two messages")
         finally:
             t.close()
 
@@ -439,8 +451,13 @@ class D_ResponsePlan(unittest.TestCase):
         try:
             self.assertEqual(plan.outcome, t.out.action)
             self.assertEqual(plan.dispatch_result, DispatchResult.ALLOWED)
-            self.assertEqual(len(plan.included_items), len(t.sent),
-                             "the shadow plan and the real turn disagree on message count")
+            # G3-6: propositions are not messages. Several compose into one text under
+            # P3, so the comparison that matters is transport multiplicity against what
+            # was actually sent — and every planned text item must be IN that message.
+            self.assertEqual(plan.transport_multiplicity,
+                             TransportMultiplicity.SINGLE_MESSAGE)
+            self.assertEqual(len(t.sent), 1)
+            self.assertGreaterEqual(len(plan.included_items), 1)
         finally:
             t.close()
 
@@ -539,7 +556,7 @@ class E_TraceAndInspector(unittest.TestCase):
         self.assertIn("Mensajes enviados", src)
         self.assertIn("Textos planificados", src)
         self.assertIn("Flows planificados", src)
-        self.assertIn("PARTIAL_PRODUCER_COVERAGE_NOTE", src)
+        self.assertIn("PLAN_SCOPE_NOTE", src)
 
 
 # ══ F — non-regression ═════════════════════════════════════════════════════

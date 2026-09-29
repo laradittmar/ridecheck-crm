@@ -451,16 +451,17 @@ class D_InspectorTruth(unittest.TestCase):
             with self.subTest(label=label):
                 self.assertIn(label, card)
 
-    def test_bc_30_the_partial_coverage_note_is_visible(self):
-        from app.ui.hybrid_trace_view import PARTIAL_PRODUCER_COVERAGE_NOTE
+    def test_bc_30_the_scope_note_is_visible(self):
+        """G3-6 retired the "legacy content is uncounted" half of this note — the three
+        downstream contributors it warned about are registered propositions now. What the
+        card must still refuse to claim is unchanged, and that is what is asserted."""
+        from app.ui.hybrid_trace_view import PLAN_SCOPE_NOTE
         card = self.card()
-        self.assertIn("Alcance actual", card)
-        self.assertIn("no todos los productores registran proposiciones",
-                      PARTIAL_PRODUCER_COVERAGE_NOTE)
+        self.assertIn("Alcance", card)
         for not_governed in ("acción principal", "mutaciones canónicas", "transporte",
                              "resultado transaccional"):
             with self.subTest(scope=not_governed):
-                self.assertIn(not_governed, PARTIAL_PRODUCER_COVERAGE_NOTE)
+                self.assertIn(not_governed, PLAN_SCOPE_NOTE)
 
     def test_bc_31_the_card_does_not_claim_completion_of_anything(self):
         card = self.card()
@@ -547,11 +548,21 @@ class E_OpeningFixesIntact(unittest.TestCase):
             with self.subTest(word=spanish):
                 self.assertNotIn(spanish, code)
 
-    def test_bc_40_the_hours_machinery_was_not_touched_by_this_correction(self):
-        """Scope exclusion §7: DEF-04 stays open, deliberately and visibly."""
-        self.assertTrue(hasattr(ce, "_strip_unverified_hours"))
-        self.assertIn("_compose_secondary_answers",
-                      inspect.getsource(ConversationEngine._send_text_to_wa))
+    def test_bc_40_the_hours_repair_machinery_is_gone(self):
+        """This asserted the opposite, and correctly so at the time: the bounded correction
+        was forbidden from touching DEF-04, and the assertion proved it had not.
+
+        G3-6 is the milestone that retires the repair pass. The scope guard has done its
+        job and is replaced by the guarantee that supersedes it: neither the stripper nor
+        the appending composer exists, and the send path no longer names them.
+        """
+        self.assertFalse(hasattr(ce, "_strip_unverified_hours"))
+        self.assertFalse(hasattr(ConversationEngine, "_compose_secondary_answers"))
+        send = inspect.getsource(ConversationEngine._send_text_to_wa)
+        for gone in ("_compose_secondary_answers", "_apply_required_next_question",
+                     "_enforce_canonical_vehicle_claim"):
+            with self.subTest(gone=gone):
+                self.assertNotIn(gone, send)
 
 
 if __name__ == "__main__":       # pragma: no cover

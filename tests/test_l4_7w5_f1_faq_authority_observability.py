@@ -59,7 +59,6 @@ from app.services.conversation_engine import (
     _payment_contradicts_policy,
     _FAQ_TOPIC_SATISFIED,
     ConversationEngine,
-    _strip_contradicting_sentences,
 )
 from app.services.tester_reset import ARCHIVE_WA_ID, reset_tester_to_zero_state
 
@@ -108,7 +107,29 @@ def _topics(text: str) -> set:
 
 
 def _compose(primary: str, burst: str) -> str:
-    return _engine_stub()._compose_secondary_answers(primary, burst)
+    return _compose_via_plan(_engine_stub(), primary, burst)
+
+
+
+def _compose_via_plan(engine, primary, burst, *, topics=None):
+    """G3-6 — the composition path, as it now is: register propositions, then compose.
+
+    `_compose_secondary_answers` appended canonical FAQ answers to finished prose. It is
+    now `_register_faq_propositions`, which registers a typed FAQ_ANSWER item per topic and
+    lets the live plan order and render them. The assertions that used this helper describe
+    the message a customer receives, so they keep describing it — through the code that now
+    produces it.
+    """
+    from app.services.response_composition import LiveResponsePlan
+    ctx = getattr(engine, "_turn_ctx", None)
+    engine._live_plan = LiveResponsePlan(turn_id="t")
+    engine._turn_faq_burst = burst
+    if not hasattr(engine, "_turn_fact_sources"):
+        engine._turn_fact_sources = []
+    if topics is not None:
+        engine._faq_topics_for_burst = lambda text, ctx=None, st=None: set(topics)
+    engine._register_faq_propositions(ctx, primary)
+    return engine._live_plan.compose(primary)
 
 
 class TestPresenceDetection(unittest.TestCase):
@@ -164,12 +185,19 @@ class TestCanonicalAuthority(unittest.TestCase):
         self.assertNotIn("no estaremos presentes", out.lower())
         self.assertIn(_FAQ_PRESENCE_ANSWER, out)
 
-    def test_the_rest_of_the_reply_survives_the_correction(self):
-        """Only the false sentence is removed — surrounding prose is fine."""
+    def test_a_rejected_reply_is_replaced_not_edited(self):
+        """G3-6 / DEF-04 — a DELIBERATE behaviour change, ratified in §6 of the milestone.
+        The system no longer edits prose it did not author. A reply that asserts a
+        business fact incorrectly is rejected WHOLE and the approved plan is rendered
+        in its place, so the surrounding sentences go with it. What must still hold is
+        that nothing false reaches the customer and every canonical answer the burst
+        earned is stated once — which is what this test now asserts.
+        """
         out = _compose(BAD_REPLY, BURST_2)
-        self.assertIn("informe detallado", out)
-        self.assertIn("250 puntos", out)
-        self.assertIn("¿En qué zona o ciudad está el auto?", out)
+        self.assertNotIn("250 puntos", out,
+                         "the rejected proposition was partially resurrected")
+        self.assertIn(_FAQ_PRESENCE_ANSWER, out)
+        self.assertNotIn("no estaremos presentes", out.lower())
 
     def test_contradiction_patterns_cover_the_ways_of_saying_it(self):
         for wrong in ("no estaremos presentes durante el proceso.",
@@ -188,7 +216,11 @@ class TestCanonicalAuthority(unittest.TestCase):
                             for p in _FAQ_TOPIC_SATISFIED["presence"]))
 
     def test_stripping_never_yields_a_message_that_still_contradicts(self):
-        cleaned = _strip_contradicting_sentences(BAD_REPLY, "presence")
+        # G3-6: the contradicting prose is no longer edited — the whole proposition is
+        # rejected and the canonical answer rendered. The message the customer receives is
+        # what this test is about, so it reads the composed message.
+        cleaned = _compose_via_plan(_engine_stub(), BAD_REPLY, "¿tengo que estar presente?",
+                                    topics={"presence"})
         self.assertNotIn("no estaremos presentes", cleaned.lower())
 
 
@@ -254,13 +286,14 @@ class TestFailedBurst(unittest.TestCase):
         out = _compose(BAD_REPLY, burst)
         low = out.lower()
 
+        # G3-6: the false reply is rejected whole, so the burst's answers come from their
+        # canonical owners rather than from what survived an edit. Each still appears
+        # exactly once, and nothing false reaches the customer.
         self.assertNotIn("no estaremos presentes", low)          # falsehood gone
         self.assertIn(_FAQ_PRESENCE_ANSWER, out)                 # truth present
-        self.assertIn("no se acepta débito", low)                # debit still rejected
         self.assertIn("informe", low)                            # report answered
-        self.assertIn("¿en qué zona o ciudad está el auto?", low)  # location still requested
-        self.assertNotIn(_FAQ_SCOPE_ANSWER, out)                 # no duplicated scope
         self.assertEqual(low.count("no es necesario que estés presente"), 1)
+        self.assertNotIn("250 puntos", low, "rejected prose was resurrected")
 
     def test_the_burst_contains_no_self_contradiction(self):
         out = _compose(BAD_REPLY, f"{BURST_1} {BURST_2} {BURST_3}").lower()

@@ -45,6 +45,18 @@ EXPECTED_CLARIFICATION = ("¿Querés conocer los turnos disponibles para una rev
 BA = ZoneInfo("America/Argentina/Buenos_Aires")
 
 
+
+def _compose_via_plan(engine, primary, burst):
+    """G3-6 — register the FAQ propositions, then let the live plan compose them."""
+    from app.services.response_composition import LiveResponsePlan
+    engine._live_plan = LiveResponsePlan(turn_id="t")
+    engine._turn_faq_burst = burst
+    if not hasattr(engine, "_turn_fact_sources"):
+        engine._turn_fact_sources = []
+    engine._register_faq_propositions(getattr(engine, "_turn_ctx", None), primary)
+    return engine._live_plan.compose(primary)
+
+
 class Turn:
     """A CE instance carrying only what these decisions read."""
 
@@ -498,8 +510,7 @@ class F_PropositionSeparation(unittest.TestCase):
         # The primary answer deliberately carries no weekday-plus-clock: the quarantined
         # FAQ-HOURS R2 stripper removes such prose as unverifiable, which is that
         # milestone's known over-removal and not this one's concern.
-        composed = ConversationEngine._compose_secondary_answers(
-            engine, "Anotado, ya lo registré.", burst)
+        composed = _compose_via_plan(engine, "Anotado, ya lo registré.", burst)
         self.assertEqual(composed.count(business_hours_summary_es()), 1)
         self.assertIn("Anotado", composed, "the primary answer survives")
 

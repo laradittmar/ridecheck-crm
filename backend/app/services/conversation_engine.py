@@ -58,8 +58,8 @@ from ..schemas.conversation import (
 from ..schemas.hybrid_trace import DecisionSite
 from .response_composition import (LiveResponsePlan, Proposition, PropositionId,
                                    SuppressionReason, flow_completion_ack_authorized)
-from ..schemas.hybrid_trace import (FLOW_COMPLETION_ACK_CONDITIONS, ResponseItemKind,
-                                    ResponsePolicy)
+from ..schemas.hybrid_trace import (CoexistencePolicy, FLOW_COMPLETION_ACK_CONDITIONS,
+                                    ResponseItemKind, ResponsePolicy)
 # G3-5E: the attribution vocabulary. `schemas.hybrid_trace` imports nothing from services,
 # so this is a module-level import rather than the file's usual local-import style.
 from ..schemas.hybrid_trace import (
@@ -1778,40 +1778,38 @@ def _hours_unit_survives(unit: str, protected: frozenset[int]) -> tuple[str, tup
     return _UNIT_UNPROVEN, carried                        # unproven -> unproven is removed
 
 
-def _strip_unverified_hours(reply: str, protected: frozenset[int],
-                            *, drop_verified_hours: bool = False) -> tuple[str, tuple[int, ...]]:
-    """Drop every response unit that cannot prove its hours. Layout is preserved.
 
-    A unit is a sentence within a line, so a bulleted list is judged bullet by bullet
-    rather than collapsing into one verdict (an R1 defect the review recorded).
+def _hours_conflict_in(reply: str, protected: frozenset[int]) -> tuple[bool, tuple[int, ...]]:
+    """Does this prose state hours it cannot prove — and what appointment times did it carry?
 
-    `drop_verified_hours` removes units kept by proof A as well. The caller sets it once it
-    knows the canonical answer is going to be appended: a partial restatement of hours the
-    canonical sentence is about to give in full is redundant, and dropping it keeps the
-    factual schedule in exactly one place. Appointment offers (proof B) are never dropped.
+    G3-6 / DEF-04. This is DETECTION, and detection is all that survives. `_hours_unit_
+    survives` still judges each unit exactly as it did, but the answer is no longer used to
+    rebuild a message with the offending sentences cut out. It is used to decide that the
+    whole proposition is unsendable, so the plan can render the canonical answer in its
+    place. The rescued minutes let an appointment offer the rejected prose carried be
+    re-registered FROM STATE — never recovered from the prose.
     """
-    kept_lines: list[str] = []
     rescued: set[int] = set()
-    for line in reply.split("\n"):
-        if not line.strip():
-            kept_lines.append("")
-            continue
-        kept_units: list[str] = []
+    conflicts = False
+    for line in (reply or "").split("\n"):
         for unit in re.split(r"(?<=[.!?])\s+", line):
             if not unit.strip():
                 continue
             disposition, carried = _hours_unit_survives(unit, protected)
             if disposition == _UNIT_UNPROVEN:
-                rescued.update(carried)
-                continue
-            if disposition == _UNIT_VERIFIED_HOURS and drop_verified_hours:
-                continue
-            kept_units.append(unit.strip())
-        kept_lines.append(" ".join(kept_units))
-    cleaned = "\n".join(kept_lines)
-    # collapse the blank lines a removal left behind, without touching intended spacing
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
-    return cleaned, tuple(sorted(rescued))
+                conflicts = True
+            rescued.update(carried)
+    if conflicts:
+        # The WHOLE proposition is about to be withheld, so every appointment time the
+        # thread really holds must be rescued — not only the ones the offending units
+        # carried. A slot named in a unit that would have survived on its own is still
+        # lost when the proposition goes, and canonical state proves it, so it is
+        # re-registered from state rather than left to disappear with the prose.
+        normalized = _norm_lower(reply or "")
+        for _p, hour, minute in _clock_tokens(normalized):
+            if (hour * 60 + minute) in protected:
+                rescued.add(hour * 60 + minute)
+    return conflicts, tuple(sorted(rescued))
 
 
 def _regenerated_offer_es(minutes: tuple[int, ...]) -> str:
@@ -1850,29 +1848,6 @@ _FAQ_TOPIC_SATISFIED: dict[str, tuple[str, ...]] = {
         r"\ba\s+domicilio\b",
     ),
 }
-def _strip_contradicting_sentences(reply: str, topic: str) -> str:
-    """Remove the sentences that state `topic` incorrectly, keeping the rest of the reply.
-
-    Sentence-level rather than whole-message, because the surrounding prose is usually
-    fine — in the observed failure only one clause of a five-sentence answer was false.
-    """
-    patterns = _FAQ_TOPIC_CONTRADICTS.get(topic, ())
-    predicate = _FAQ_TOPIC_CONTRADICT_FN.get(topic)
-    if not patterns and predicate is None:
-        return reply
-    kept: list[str] = []
-    for sentence in re.split(r"(?<=[.!?])\s+", reply):
-        probe = _norm_lower(sentence)
-        if predicate is not None and predicate(probe):
-            continue
-        if patterns and any(re.search(pat, probe) for pat in patterns):
-            continue
-        kept.append(sentence)
-    cleaned = " ".join(part for part in (s.strip() for s in kept) if part)
-    # Never return an empty message: if every sentence was contradictory the canonical
-    # answer alone is the whole reply, which is correct and still answers the customer.
-    return cleaned if cleaned.strip() else ""
-
 
 _FAQ_TOPIC_CONTRADICTS: dict[str, tuple[str, ...]] = {
     # "no estaremos presentes" / "no vamos a estar" — RideCheck performs the inspection, so
@@ -3088,7 +3063,7 @@ class ConversationEngine:
         self._contributing_sources: list[str] | None = None
         self._burst_message_count: int = 1
         self._burst_earliest_inbound_db_id: int | None = None
-        self._faq_reconciliation_burst: str | None = None
+        self._turn_faq_burst: str | None = None
         self._availability_authority_cache = None
         self._canonical_turn_burst = None       # G3-5A: the turn's evidence boundary
         self._availability_authority_phases = {}  # G3-5B: one decision per phase
@@ -3253,7 +3228,7 @@ class ConversationEngine:
         self._contributing_sources = None
         self._burst_message_count = 1
         self._burst_earliest_inbound_db_id = None
-        self._faq_reconciliation_burst = None
+        self._turn_faq_burst = None
         self._availability_authority_cache = None   # G3-4: one decision per turn
         self._canonical_turn_burst = None           # G3-5A: one burst per turn
         self._availability_authority_phases = {}    # G3-5B: one decision per phase
@@ -4445,81 +4420,6 @@ class ConversationEngine:
         topics = self._faq_topics_for_burst(text, ctx=getattr(self, "_turn_ctx", None))
         return " ".join(_FAQ_TOPIC_ANSWERS[t]() for t in _FAQ_TOPIC_ANSWERS if t in topics)
 
-    def _compose_secondary_answers(self, primary_reply: str, burst_text: str) -> str:
-        """F3: append unanswered same-burst FAQ signals to an already-composed reply.
-
-        Probe-based duplicate detection checks the normalized primary reply for key
-        phrases before appending each canonical answer. Fires from _send_text_to_wa
-        when _faq_reconciliation_burst is armed for the current turn.
-        Does NOT alter state, price, candidate, zone, or scheduling.
-        """
-        topics = self._faq_topics_for_burst(burst_text, ctx=getattr(self, "_turn_ctx", None))
-        reply = primary_reply
-        parts: list[str] = []
-        corrected: list[str] = []
-
-        for topic in _FAQ_TOPIC_ANSWERS:          # stable order, not set order
-            if topic not in topics:
-                continue
-
-            # ── R2: hours are proved, not trusted ────────────────────────────
-            # Every other topic keeps the (a)/(b) shape below. Hours do not, because for
-            # hours "the reply did not state anything I recognise as false" is not a
-            # reason to keep it — see the block above _FAQ_TOPIC_SATISFIED.
-            if topic == "business_hours":
-                protected = _protected_slot_minutes(
-                    getattr(getattr(self, "_turn_ctx", None), "state", None))
-                survived, rescued = _strip_unverified_hours(reply, protected)
-                if not _hours_prose_satisfies(_norm_lower(survived)):
-                    # The canonical answer is going to be appended, so any hours still in
-                    # the prose are a partial restatement of it. Drop them: one schedule,
-                    # in one place, from one source.
-                    survived, extra = _strip_unverified_hours(
-                        reply, protected, drop_verified_hours=True)
-                    rescued = tuple(sorted(set(rescued) | set(extra)))
-                    parts_canonical = True
-                else:
-                    parts_canonical = False
-                if survived != reply.strip():
-                    corrected.append(topic)
-                reply = survived
-                offer = _regenerated_offer_es(rescued)
-                if offer:
-                    parts.append(offer)
-                if parts_canonical:
-                    parts.append(_FAQ_TOPIC_ANSWERS[topic]())
-                continue
-
-            n_primary = _norm_lower(reply)
-
-            # (a) The reply states this business fact WRONGLY. Canonical truth wins: the
-            #     offending sentence is removed and the authoritative answer emitted. Both
-            #     may not stand — a message that contradicts itself is worse than either half.
-            if self._contradicts_canonical(topic, n_primary):
-                reply = _strip_contradicting_sentences(reply, topic)
-                parts.append(_FAQ_TOPIC_ANSWERS[topic]())
-                corrected.append(topic)
-                continue
-
-            # (b) The reply already conveys the fact correctly — do not say it twice.
-            if self._satisfies_canonical(topic, n_primary):
-                continue
-
-            parts.append(_FAQ_TOPIC_ANSWERS[topic]())
-
-        if corrected:
-            logger.warning(
-                "L4.7W5-F1 FAQ CANONICAL OVERRIDE thread_id=%s topics=%s "
-                "reason=generated_prose_contradicted_business_truth",
-                getattr(getattr(getattr(self, "_turn_ctx", None), "thread", None), "id", None),
-                ",".join(corrected),
-            )
-        if not parts:
-            return reply
-        self._contributing_sources = ["FAQ_RULE"]
-        body = reply.rstrip()
-        # R2 (REV-04): a reply whose every unit was removed must not open with blank lines.
-        return (body + "\n\n" + " ".join(parts)) if body else " ".join(parts)
 
     @staticmethod
     def _contradicts_canonical(topic: str, normalized_reply: str) -> bool:
@@ -4549,51 +4449,6 @@ class ConversationEngine:
         probe = _norm_lower(_FAQ_TOPIC_PROBES.get(topic, ""))
         return bool(probe) and probe in normalized_reply
 
-    def _apply_required_next_question(
-        self, text: str, ctx: "_Context", *, _turn_text: str | None = None
-    ) -> str:
-        """WILD-04R-F5.1 D1 — Deterministic required-next-info finalizer.
-
-        When the business prerequisite (inspection location) is unmet and the
-        outbound text doesn't already ask for it, append the canonical location
-        question.  Fires after FAQ reconciliation so the duplicate probe also
-        catches location questions appended by _compose_secondary_answers.
-
-        Gate conditions (all must hold):
-          - Stage is QUALIFYING or None (not QUOTED / SCHEDULING / terminal)
-          - not needs_human
-          - Active candidate exists with tipo_vehiculo known
-          - Active inspection location is missing (group AND detail null)
-          - Text does not already ask for location
-          - Current customer turn is not a soft-close / FAQ-only message
-        """
-        state = ctx.state
-        if state is None:
-            return text
-        if state.needs_human:
-            return text
-        if state.last_stage not in (STAGE_QUALIFYING, None):
-            return text
-        focus = self._focus_candidate(ctx)
-        if focus is None or not focus.tipo_vehiculo:
-            return text
-        zone_grp, zone_det = self._get_active_inspection_location(ctx, state)
-        if zone_grp or zone_det:
-            return text
-        if _reply_already_asks_location(text):
-            return text
-        # Don't append when the customer's turn is a soft-close or pure-FAQ message
-        # with no active inspection intent (e.g. "gracias, lo dejo para más adelante").
-        # Commercial bursts that contain both FAQ phrases AND an inspection request
-        # ("quiero revisar... ¿mandan informes?") must still trigger the gate.
-        if _turn_text and _is_general_faq_or_soft_close(_turn_text):
-            if not self._detect_explicit_inspection_request(_norm_lower(_turn_text)):
-                return text
-        logger.info(
-            "WILD04R-F5.1 required-location appended thread_id=%s candidate=%s",
-            ctx.thread.id, focus.id,
-        )
-        return text.rstrip() + _CANONICAL_LOCATION_ASK
 
     def _process_vehicle_fallback_response(
         self,
@@ -5283,7 +5138,7 @@ class ConversationEngine:
         # F3: arm same-burst FAQ reconciliation for all commercial-progression paths.
         # Motorcycle / phone / service / FAQ-bypass / inspectability / website-form
         # all returned above and will not trigger reconciliation.
-        self._faq_reconciliation_burst = current_turn_text
+        self._turn_faq_burst = current_turn_text
 
         # ── Deterministic price re-query (pre-AI) ────────────────────────
         # Customer asks the price again while already in QUOTED or SCHEDULING.
@@ -8388,54 +8243,6 @@ class ConversationEngine:
 
     # ── L4.6 Phase B/D — canonical response/state consistency ────────────────
 
-    def _enforce_canonical_vehicle_claim(
-        self, text: str, ctx: "_Context", state: "WhatsAppThreadState | None"
-    ) -> str:
-        """Never let a reply speak of a vehicle that canonical state does not hold.
-
-        Wild B answered "hacemos el servicio de revisión para un 2008 del 2014" with zero
-        candidate rows, then asked the customer to confirm the same vehicle without arming
-        any pending state (findings VEH-B / LOC-B).  When no candidate exists this
-        finalizer converts an implied certainty into an explicit, deterministic
-        confirmation question AND arms the pending state, so a later "sí" resolves the
-        vehicle and replays the evidence of the originating turn.
-        """
-        if state is None or getattr(state, "needs_human", False):
-            return text
-        if state.last_stage not in (STAGE_QUALIFYING, None):
-            return text
-        if ctx.candidates or getattr(state, "current_focus_candidate_id", None):
-            return text  # canonical state holds the vehicle — speaking of it is correct
-        if not text:
-            return text
-
-        hit = lookup_vehicle(text)
-        if hit is None:
-            _mdy = extract_model_del_year(text)
-            if _mdy is not None:
-                hit = _mdy[0]
-        if hit is None:
-            hit = _contextual_numeric_model_lookup(text)
-        if hit is None:
-            return text  # reply names no specific vehicle — nothing to reconcile
-
-        question = _FUZZY_CONFIRMATION_TEMPLATE.format(marca=hit.marca, modelo=hit.modelo)
-        if getattr(state, "pending_fuzzy_catalog_key", None) is None:
-            state.pending_fuzzy_catalog_key = f"{hit.marca}||{hit.modelo}"
-            state.pending_turn_evidence_text = (
-                getattr(self, "_turn_text", None) or None
-            )
-        self._decision_log(
-            ctx, "response_state_reconciled",
-            marca=hit.marca, modelo=hit.modelo, candidate="none",
-            pending_armed=True,
-        )
-        if self._norm_text(question) in self._norm_text(text):
-            return text
-        return (
-            f"{text.rstrip()}\n\n"
-            f"Todavía no tengo confirmado el vehículo, así que te confirmo: {question}"
-        )
 
     def _apply_zone_from_text(
         self,
@@ -9005,7 +8812,7 @@ class ConversationEngine:
 
     def _burst_texts_for_turn(self, ctx: "_Context") -> list[str]:
         """The customer's words for this turn, as the reconcilers already saw them."""
-        for attr in ("_turn_burst_texts", "_faq_reconciliation_burst"):
+        for attr in ("_turn_burst_texts", "_turn_faq_burst"):
             value = getattr(self, attr, None)
             if isinstance(value, str) and value.strip():
                 return [value]
@@ -9301,7 +9108,7 @@ class ConversationEngine:
                 # The Flow body cannot carry one, and dropping "¿aceptan débito?" to save a
                 # round trip on slots is a bad trade: an unanswered question is worse than a
                 # list. Those turns keep the composed text reply, which carries both.
-                if not getattr(self, "_faq_reconciliation_burst", None):
+                if not self._turn_owes_faq_answer():
                     self.db.commit()
                     flow_out = self._dispatch_booking_flow_for_day(
                         ctx, state, day_iso=preferred_day_iso, date_human=date_human,
@@ -11500,6 +11307,242 @@ Respondé SOLO con JSON válido:
 
     # ── WhatsApp sends ────────────────────────────────────────────────────
 
+
+    # ── G3-6 — the response-proposition producers ────────────────────────────────
+    #
+    # Everything below used to happen AFTER the message was composed, as three passes that
+    # inspected finished prose and appended to it, stripped from it, or replaced parts of
+    # it. They ran inside `_send_text_to_wa`, so the plan that claimed to describe the turn
+    # could not see them and reported one item for a message carrying three claims — the
+    # falsehood the G3-5F review recorded as G5F-A02 — while the hours pass was DEF-04
+    # itself: substring surgery on words the system did not author.
+    #
+    # They are producers now. Each REGISTERS a typed proposition with a stable identity and
+    # its canonical owner as renderer; the plan decides inclusion, order and suppression;
+    # and nothing appends anything once the text exists.
+
+    def _turn_owes_faq_answer(self) -> bool:
+        """Does this burst still owe the customer a canonical FAQ answer?
+
+        G3-6. The scheduling path asks this to decide whether it may replace a composed
+        text reply with a Flow — the Flow body cannot carry an FAQ answer, and dropping
+        "¿aceptan débito?" to save a round trip is a bad trade. It used to read the raw
+        side-channel string; it now asks a named question, so the meaning is in the name
+        rather than in the truthiness of a variable.
+        """
+        return bool(getattr(self, "_turn_faq_burst", None))
+
+    def _register_response_propositions(self, ctx, text: str) -> None:
+        """Register every proposition this turn owes the customer beside the primary reply.
+
+        Called once, at the dispatch boundary, before composition. It reads canonical state
+        and the burst; it writes only to the plan — with one deliberate exception, the
+        pending-vehicle arming below, which is a canonical decision the L4.6 gate has always
+        made and which belongs to the PRODUCER, never to a renderer.
+        """
+        plan = getattr(self, "_live_plan", None)
+        if plan is None:
+            return
+        try:
+            self._register_faq_propositions(ctx, text)
+            self._register_clarification_proposition(ctx, text)
+            self._register_canonical_vehicle_proposition(ctx, text)
+        except Exception as exc:          # a producer defect must never cost a turn
+            logger.warning("G3-6 proposition producer failed: %s: %s",
+                           type(exc).__name__, exc, exc_info=True)
+
+    # ── 1. FAQ ───────────────────────────────────────────────────────────────────
+
+    def _register_faq_propositions(self, ctx, text: str) -> None:
+        """One registered proposition per FAQ topic the burst raised.
+
+        Replaces `_compose_secondary_answers`. The three judgements it used to make are all
+        still made — they were never the problem — but each now produces a typed outcome
+        instead of an edit:
+
+            the prose already states the fact correctly  ->  redundant (P6, ALREADY_STATED)
+            the prose states the fact WRONGLY            ->  the PRIMARY conflicts (DEF-04)
+            the prose does not state it                  ->  the canonical answer is included
+
+        The renderers are `_FAQ_TOPIC_ANSWERS`, which read their own canonical owners —
+        `schedule.business_hours_for_weekday` for hours — so no consequential value is ever
+        model-authored.
+        """
+        burst = getattr(self, "_turn_faq_burst", None)
+        if not burst:
+            return
+        self._turn_faq_burst = None                  # consume — once per turn
+        plan = self._live_plan
+        if plan.human_owns_turn:                      # P2 owns the turn; nothing is added
+            return
+        topics = self._faq_topics_for_burst(burst, ctx=ctx)
+        normalized = _norm_lower(text or "")
+        state = getattr(ctx, "state", None)
+        protected = _protected_slot_minutes(state)
+
+        for topic in _FAQ_TOPIC_ANSWERS:              # stable order, not set order
+            if topic not in topics:
+                continue
+            renderer = _FAQ_TOPIC_ANSWERS[topic]
+            if topic == "business_hours":
+                conflicts, rescued = _hours_conflict_in(text or "", protected)
+                satisfied = _hours_prose_satisfies(normalized)
+                if conflicts:
+                    # DEF-04: the prose asserts hours it cannot prove. The whole primary
+                    # proposition is rejected below; the canonical answer stands in its
+                    # place, and any appointment time the rejected prose carried is
+                    # re-registered from STATE, never recovered from the prose.
+                    self._mark_primary_conflict(ctx, topic, rescued, protected)
+                    satisfied = False
+                self._register_faq_topic(topic, renderer, redundant=satisfied)
+                continue
+            if self._contradicts_canonical(topic, normalized):
+                self._mark_primary_conflict(ctx, topic, (), protected)
+                self._register_faq_topic(topic, renderer, redundant=False)
+                continue
+            self._register_faq_topic(
+                topic, renderer,
+                redundant=self._satisfies_canonical(topic, normalized))
+
+    def _register_faq_topic(self, topic: str, renderer, *, redundant: bool) -> None:
+        self._live_plan.register(Proposition(
+            proposition_id=PropositionId.faq(topic), kind=ResponseItemKind.FAQ_ANSWER,
+            claim_family="faq", render=renderer,
+            decision_authority=DecisionAuthority.DETERMINISTIC_RULE,
+            fact_sources=(FactSource.FAQ_CANONICAL,),
+            renderer_source=RendererSource.DETERMINISTIC_TEMPLATE,
+            policy=ResponsePolicy.P1_HOLD_PLUS_SAFE_FAQ, priority=50,
+            redundant=redundant, locked_values=((f"faq.{topic}", "canonical"),)))
+        if not redundant:
+            self._note_fact_source(FactSource.FAQ_CANONICAL)
+            # `contributing_sources` is the legacy observability field every existing
+            # consumer reads; a canonical FAQ answer that reaches the customer still
+            # contributes, exactly as it did when the appending pass set this.
+            self._contributing_sources = ["FAQ_RULE"]
+
+    def _mark_primary_conflict(self, ctx, topic: str, rescued, protected) -> None:
+        """DEF-04. Reject the primary proposition WHOLE, and rescue what state can prove."""
+        plan = self._live_plan
+        primary = next((p for p in plan.propositions
+                        if p.proposition_id == PropositionId.PRIMARY_REPLY), None)
+        if primary is None:
+            primary = Proposition(
+                proposition_id=PropositionId.PRIMARY_REPLY, kind=ResponseItemKind.TEXT,
+                claim_family="turn", priority=10,
+                coexistence=CoexistencePolicy.REQUIRED,
+                policy=ResponsePolicy.P3_SINGLE_MESSAGE_DEFAULT)
+            plan.propositions.insert(0, primary)
+        primary.conflicts_with_canonical = True
+        primary.locked_values = tuple(dict.fromkeys(
+            tuple(primary.locked_values) + ((f"faq.{topic}", "canonical"),)))
+        logger.warning(
+            "G3-6 DEF-04 PRIMARY REJECTED thread_id=%s topic=%s "
+            "reason=prose_contradicted_canonical_truth",
+            getattr(getattr(ctx, "thread", None), "id", None), topic)
+        if rescued:
+            # The offer is re-stated from `last_visible_slots` / `last_offered_slots`, which
+            # is why it may survive a rejected reply: the thread really holds these times.
+            minutes = tuple(m for m in rescued if m in protected)
+            if minutes:
+                plan.register(Proposition(
+                    proposition_id=PropositionId.SLOT_OFFER,
+                    kind=ResponseItemKind.SLOT_OFFER, claim_family="scheduling",
+                    render=lambda: _regenerated_offer_es(minutes),
+                    decision_authority=DecisionAuthority.SCHEDULING_SERVICE,
+                    fact_sources=(FactSource.CANONICAL_STATE,),
+                    renderer_source=RendererSource.DETERMINISTIC_TEMPLATE,
+                    priority=40, locked_values=(("scheduling.slots", "canonical_state"),)))
+
+    # ── 2. required next information ─────────────────────────────────────────────
+
+    def _register_clarification_proposition(self, ctx, text: str) -> None:
+        """The one required-next-information question, as a typed proposition.
+
+        Replaces `_apply_required_next_question`. Every gate condition is unchanged — it is
+        the same deterministic judgement about the same canonical state — but the outcome is
+        a `CLARIFICATION` item keyed by the FIELD it is missing, so two producers asking for
+        the same field are one proposition and a field canonical state already holds is
+        never asked for at all.
+        """
+        state = getattr(ctx, "state", None)
+        if state is None or getattr(state, "needs_human", False):
+            return
+        if state.last_stage not in (STAGE_QUALIFYING, None):
+            return
+        focus = self._focus_candidate(ctx)
+        if focus is None or not focus.tipo_vehiculo:
+            return
+        zone_grp, zone_det = self._get_active_inspection_location(ctx, state)
+        if zone_grp or zone_det:
+            return                                   # P6: canonical state already has it
+        turn_text = getattr(self, "_turn_clarification_burst", None)
+        if turn_text and _is_general_faq_or_soft_close(turn_text):
+            if not self._detect_explicit_inspection_request(_norm_lower(turn_text)):
+                return
+        already = _reply_already_asks_location(text or "")
+        self._live_plan.register(Proposition(
+            proposition_id=PropositionId.clarification("inspection_location"),
+            kind=ResponseItemKind.CLARIFICATION, claim_family="clarification",
+            render=lambda: _CANONICAL_LOCATION_ASK.strip(),
+            decision_authority=DecisionAuthority.DETERMINISTIC_RULE,
+            fact_sources=(FactSource.CANONICAL_STATE,),
+            renderer_source=RendererSource.DETERMINISTIC_TEMPLATE,
+            policy=ResponsePolicy.P1_HOLD_PLUS_SAFE_FAQ, priority=70,
+            redundant=already,
+            locked_values=(("clarification.field", "inspection_location"),)))
+        if not already:
+            logger.info("G3-6 clarification planned thread_id=%s field=inspection_location "
+                        "candidate=%s", ctx.thread.id, focus.id)
+
+    # ── 3. canonical vehicle ─────────────────────────────────────────────────────
+
+    def _register_canonical_vehicle_proposition(self, ctx, text: str) -> None:
+        """Reconcile a vehicle the reply speaks of that canonical state does not hold.
+
+        Replaces `_enforce_canonical_vehicle_claim`. The detection and the canonical
+        decision are unchanged, including arming `pending_fuzzy_catalog_key` — that is a
+        PRODUCER's decision about canonical state and it stays here, where it can be seen,
+        rather than inside a renderer, which §14 requires to be pure.
+        """
+        state = getattr(ctx, "state", None)
+        if state is None or getattr(state, "needs_human", False):
+            return
+        if state.last_stage not in (STAGE_QUALIFYING, None):
+            return
+        if ctx.candidates or getattr(state, "current_focus_candidate_id", None):
+            return                                   # P6: canonical state holds it
+        if not text:
+            return
+        hit = lookup_vehicle(text)
+        if hit is None:
+            _mdy = extract_model_del_year(text)
+            if _mdy is not None:
+                hit = _mdy[0]
+        if hit is None:
+            hit = _contextual_numeric_model_lookup(text)
+        if hit is None:
+            return                                   # names no specific vehicle
+        question = _FUZZY_CONFIRMATION_TEMPLATE.format(marca=hit.marca, modelo=hit.modelo)
+        # The customer-facing wording is unchanged from the finalizer this replaces: the
+        # reconciliation says out loud that the vehicle is not confirmed, then asks.
+        rendered = (f"Todavía no tengo confirmado el vehículo, "
+                    f"así que te confirmo: {question}")
+        if getattr(state, "pending_fuzzy_catalog_key", None) is None:
+            state.pending_fuzzy_catalog_key = f"{hit.marca}||{hit.modelo}"
+            state.pending_turn_evidence_text = getattr(self, "_turn_text", None) or None
+        self._decision_log(
+            ctx, "response_state_reconciled",
+            marca=hit.marca, modelo=hit.modelo, candidate="none", pending_armed=True)
+        self._live_plan.register(Proposition(
+            proposition_id=PropositionId.CANONICAL_VEHICLE,
+            kind=ResponseItemKind.CANONICAL_FACT, claim_family="vehicle",
+            render=lambda: rendered,
+            decision_authority=DecisionAuthority.DETERMINISTIC_RULE,
+            fact_sources=(FactSource.DETERMINISTIC_EVIDENCE, FactSource.CANONICAL_STATE),
+            renderer_source=RendererSource.DETERMINISTIC_TEMPLATE, priority=60,
+            redundant=self._norm_text(question) in self._norm_text(text),
+            locked_values=(("vehicle.marca", hit.marca), ("vehicle.modelo", hit.modelo))))
+
     def _send_text_to_wa(self, ctx: _Context, text: str) -> str | None:
         # ── G3-5F §6/§9: the live plan composes; this function transports ──────────
         #
@@ -11520,41 +11563,23 @@ Respondé SOLO con JSON válido:
                 to_wa_id=ctx.contact.wa_id, thread_id=ctx.thread.id, text=text,
                 gate_outcome="BLOCKED_SINGLE_MESSAGE_POLICY",
             )
-        # F3: apply same-burst FAQ reconciliation if armed for this turn.
-        _burst = getattr(self, "_faq_reconciliation_burst", None)
-        if _burst and (plan is None or not plan.human_owns_turn):
-            self._faq_reconciliation_burst = None  # consume — fires once per turn
-            _before_compose = text
-            text = self._compose_secondary_answers(text, _burst)
-            if text != _before_compose:
-                # G3-5E: a canonical answer was appended to (or stripped from) prose this
-                # function did not author. The renderer is genuinely mixed from here on.
-                self._turn_renderer_source = RendererSource.COMPOSED_MIXED
-                _facts = getattr(self, "_turn_fact_sources", None)
-                if _facts is None:
-                    _facts = self._turn_fact_sources = []
-                if FactSource.FAQ_CANONICAL not in _facts:
-                    _facts.append(FactSource.FAQ_CANONICAL)
-
-        # WILD-04R-F5.1: deterministic required-next-info gate.
-        # Runs after FAQ reconciliation so duplicate detection also covers
-        # FAQ-appended text.  No-ops for QUOTED/SCHEDULING/terminal states.
-        # _burst (before consume) carries the customer turn text — passed so
-        # the gate can skip appending on soft-close turns.
-        text = self._apply_required_next_question(text, ctx, _turn_text=_burst)
-
-        # L4.6 Phase B/D: a reply must never assert a vehicle canonical state lacks.
-        text = self._enforce_canonical_vehicle_claim(text, ctx, ctx.state)
-
-        # L4.7D: canonical response validation — the last step before the safety gate.
+        # L4.7D: canonical response validation — the last check on the handler's own prose,
+        # before it is offered to the plan as a proposition.
         text = self._validate_outbound_text(text, ctx, ctx.state)
 
-        # ── G3-5F: the plan composes the final message from its ordered propositions ──
-        # The handler's prose enters as PRIMARY_REPLY and is policed like any other
-        # contribution; anything else the turn registered (a Flow-completion
-        # acknowledgement, a suppressed claim) is applied here, once, in plan order.
+        # ── G3-6: producers register, THEN the plan composes ─────────────────────────
+        #
+        # The FAQ answer, the required-next-information question and the canonical vehicle
+        # reconciliation used to run here as three passes over finished prose. They are
+        # producers now: they register typed propositions and the plan renders them, so
+        # every claim in the final message is counted, attributed, deduplicated by identity
+        # and suppressible by policy — and nothing appends a fact after composition.
+        self._turn_clarification_burst = getattr(self, "_turn_faq_burst", None)
         if plan is not None:
+            self._register_response_propositions(ctx, text)
             text = plan.compose(text)
+            if plan.mixed_renderers:
+                self._turn_renderer_source = RendererSource.COMPOSED_MIXED
             if not text:
                 # Every proposition was suppressed — P2's exclusivity does this. Nothing
                 # is sent, and nothing is invented to fill the silence.

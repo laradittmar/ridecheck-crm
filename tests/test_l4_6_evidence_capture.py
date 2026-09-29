@@ -192,6 +192,23 @@ def _candidate(marca=None, modelo=None, anio=None, tipo="SUV_4X4_DEPORTIVO",
 
 # ── PHASE A — evidence-driven vehicle capture ────────────────────────────────
 
+
+def _enforce_canonical_vehicle_claim(eng, text, ctx, state):
+    """G3-6 — the same reconciliation, through the producer that replaced the finalizer.
+
+    `_enforce_canonical_vehicle_claim` appended a confirmation question to finished prose
+    and armed `pending_fuzzy_catalog_key`. It is now
+    `_register_canonical_vehicle_proposition`: the detection, the gate conditions and the
+    canonical arming are unchanged and still happen in the producer, but the question is a
+    typed CANONICAL_FACT item the live plan renders. These tests keep asserting the same
+    business outcome through the code that now produces it.
+    """
+    from app.services.response_composition import LiveResponsePlan
+    eng._live_plan = LiveResponsePlan(turn_id="t")
+    eng._register_canonical_vehicle_proposition(ctx, text)
+    return eng._live_plan.compose(text)
+
+
 class TestVehicleEvidenceCapture(unittest.TestCase):
 
     def _run(self, text, state=None):
@@ -278,7 +295,7 @@ class TestResponseStateConsistency(unittest.TestCase):
         state = _make_state(current_focus_candidate_id=1)
         ctx = _make_ctx(state, candidates=[_candidate("Peugeot", "2008", 2014)])
         reply = "Sí, hacemos la revisión del Peugeot 2008 2014."
-        self.assertEqual(eng._enforce_canonical_vehicle_claim(reply, ctx, state), reply)
+        self.assertEqual(_enforce_canonical_vehicle_claim(eng, reply, ctx, state), reply)
 
     def test_state_02_reply_cannot_assert_vehicle_without_candidate(self):
         """STATE-02 the exact Wild B reply is reconciled with canonical state."""
@@ -287,7 +304,7 @@ class TestResponseStateConsistency(unittest.TestCase):
         ctx = _make_ctx(state)
         eng._turn_text = WILD_B_T1
         reply = "¡Hola! Sí, hacemos el servicio de revisión para un 2008 del 2014."
-        out = eng._enforce_canonical_vehicle_claim(reply, ctx, state)
+        out = _enforce_canonical_vehicle_claim(eng, reply, ctx, state)
         self.assertNotEqual(out, reply)
         self.assertIn("¿Es un Peugeot 2008?", out)
         self.assertIn("Todavía no tengo confirmado el vehículo", out)
@@ -298,8 +315,7 @@ class TestResponseStateConsistency(unittest.TestCase):
         state = _make_state()
         ctx = _make_ctx(state)
         eng._turn_text = WILD_B_T1
-        eng._enforce_canonical_vehicle_claim(
-            "Sí, hacemos el servicio para un 2008 del 2014.", ctx, state)
+        _enforce_canonical_vehicle_claim(eng, "Sí, hacemos el servicio para un 2008 del 2014.", ctx, state)
         self.assertEqual(state.pending_fuzzy_catalog_key, "Peugeot||2008")
         self.assertEqual(state.pending_turn_evidence_text, WILD_B_T1)
 
@@ -308,7 +324,7 @@ class TestResponseStateConsistency(unittest.TestCase):
         state = _make_state()
         ctx = _make_ctx(state)
         reply = "¡Hola! Contanos qué necesitás y te ayudamos."
-        self.assertEqual(eng._enforce_canonical_vehicle_claim(reply, ctx, state), reply)
+        self.assertEqual(_enforce_canonical_vehicle_claim(eng, reply, ctx, state), reply)
 
 
 # ── PHASE C — location evidence with an origin clause ────────────────────────
@@ -427,7 +443,7 @@ class TestConfirmationContract(unittest.TestCase):
         self.eng._turn_text = WILD_B_T1
         ai_reply = ("Genial! Para poder cotizar, ¿podrías confirmarme el tipo de vehículo "
                     "que querés revisar? En este caso, un 2008 del 2014. ¿Es correcto?")
-        out = self.eng._enforce_canonical_vehicle_claim(ai_reply, ctx, state)
+        out = _enforce_canonical_vehicle_claim(self.eng, ai_reply, ctx, state)
         self.assertEqual(state.pending_fuzzy_catalog_key, "Peugeot||2008")
         self.assertIn("¿Es un Peugeot 2008?", out)
 

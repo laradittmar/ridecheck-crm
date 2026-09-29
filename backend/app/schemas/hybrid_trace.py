@@ -472,11 +472,18 @@ class ResponseItemKind:
     #: committed. Represented here so the composition milestone can activate it against a
     #: pinned contract; G3-5E never emits it.
     FLOW_COMPLETION_ACK = "FLOW_COMPLETION_ACK"
+    #: G3-6. A fact canonical state holds that the response must state or reconcile — the
+    #: vehicle confirmation the L4.6 finalizer used to append to finished prose.
+    CANONICAL_FACT = "CANONICAL_FACT"
+    #: G3-6. Appointment times the thread really has, from `last_visible_slots` /
+    #: `last_offered_slots`. Typed apart from FAQ_ANSWER because an offer is never
+    #: redundant with the opening-hours answer and must survive a rejected primary reply.
+    SLOT_OFFER = "SLOT_OFFER"
     SUPPRESSED = "SUPPRESSED"
     NO_RESPONSE = "NO_RESPONSE"
 
     ALL = (TEXT, CLARIFICATION, FAQ_ANSWER, HANDOFF_ACK, FLOW_INTRO_TEXT, META_FLOW,
-           FLOW_COMPLETION_ACK, SUPPRESSED, NO_RESPONSE)
+           FLOW_COMPLETION_ACK, CANONICAL_FACT, SLOT_OFFER, SUPPRESSED, NO_RESPONSE)
 
 
 class CoexistencePolicy:
@@ -550,6 +557,10 @@ class ResponseItem:
     included: bool = True
     suppression_reason: Optional[str] = None
     policy: Optional[str] = None
+    #: G3-6. The canonical values this item is answerable for, as
+    #: `field -> digest-or-safe-token`. Recorded so an operator can see WHICH fact was
+    #: locked without the trace carrying a customer's data.
+    locked_values: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -585,7 +596,8 @@ class ResponsePlan:
     #: and `META_FLOW` is a Flow — counting it as text is what made "one message" ambiguous.
     _TEXT_KINDS = (ResponseItemKind.TEXT, ResponseItemKind.CLARIFICATION,
                    ResponseItemKind.FAQ_ANSWER, ResponseItemKind.HANDOFF_ACK,
-                   ResponseItemKind.FLOW_INTRO_TEXT, ResponseItemKind.FLOW_COMPLETION_ACK)
+                   ResponseItemKind.FLOW_INTRO_TEXT, ResponseItemKind.FLOW_COMPLETION_ACK,
+                   ResponseItemKind.CANONICAL_FACT, ResponseItemKind.SLOT_OFFER)
 
     @property
     def planned_text_items(self) -> tuple:
@@ -633,7 +645,8 @@ class ResponsePlan:
                  "coexistence": i.coexistence,
                  "mutation_authorized": i.mutation_authorized,
                  "dispatch_path": i.dispatch_path, "included": i.included,
-                 "suppression_reason": i.suppression_reason, "policy": i.policy}
+                 "suppression_reason": i.suppression_reason, "policy": i.policy,
+                 "locked_values": [list(pair) for pair in i.locked_values]}
                 for i in self.items],
         }
 

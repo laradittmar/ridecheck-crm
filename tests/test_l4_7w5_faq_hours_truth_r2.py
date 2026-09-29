@@ -63,15 +63,28 @@ LIVE_GENERATED = (
 
 
 def compose(primary: str, slots=None, armed: bool = True) -> str:
-    """The real composition path, with a controlled topic set and canonical slot state."""
+    """The real composition path, with a controlled topic set and canonical slot state.
+
+    G3-6 rewrote what "the real composition path" IS. The FAQ answer is no longer appended
+    to finished prose by `_compose_secondary_answers`; it is a proposition a producer
+    registers, which the live plan then orders and renders. This helper drives that
+    sequence — register, then compose — so every assertion below still describes the
+    message a customer would receive, through the code that now produces it.
+    """
+    from app.services.response_composition import LiveResponsePlan
     raw = json.dumps(list(slots)) if slots else None
     state = SimpleNamespace(last_visible_slots=raw, last_offered_slots=raw)
+    ctx = SimpleNamespace(state=state, thread=SimpleNamespace(id=None))
     engine = ConversationEngine.__new__(ConversationEngine)
-    engine._turn_ctx = SimpleNamespace(state=state, thread=SimpleNamespace(id=None))
+    engine._turn_ctx = ctx
     engine._contributing_sources = None
+    engine._turn_fact_sources = []
+    engine._turn_faq_burst = "irrelevant" if armed else None
+    engine._live_plan = LiveResponsePlan(turn_id="t")
     engine._faq_topics_for_burst = (
         lambda text, ctx=None, st=None: {"business_hours"} if armed else set())
-    return ConversationEngine._compose_secondary_answers(engine, primary, "irrelevant")
+    engine._register_faq_propositions(ctx, primary)
+    return engine._live_plan.compose(primary)
 
 
 def hours_units(text: str) -> list[str]:
@@ -135,8 +148,24 @@ class ADV_RequiredCases(unittest.TestCase):
         self.assertNotIn("9 a 13", final)
         self.assertIn("sábados de 9 a 15 hs", final)
 
-    def test_adv_05_the_non_hours_part_of_the_live_reply_survives(self):
-        self.assertIn("¿qué día y horario te viene mejor?", compose(LIVE_GENERATED))
+    def test_adv_05_a_rejected_reply_is_replaced_not_edited(self):
+        """G3-6 / DEF-04 — a DELIBERATE behaviour change, ratified in §6 of the milestone.
+
+        This test used to assert that the conversational half of a reply survived while the
+        false hours sentence was cut out of it. That surgery is the defect: the system was
+        editing words it did not author, fragment by fragment, and deciding which halves of
+        a model's sentence were true. The owner policy is now explicit — reject the
+        conflicting proposition WHOLE and render the approved plan in its place.
+
+        So the customer no longer receives the model's question, and does receive the
+        canonical schedule. What must still hold, and is asserted here, is that the
+        rejection loses nothing the plan had authorized and states no falsehood.
+        """
+        final = compose(LIVE_GENERATED)
+        self.assertNotIn("¿qué día y horario te viene mejor?", final,
+                         "the rejected proposition was partially resurrected")
+        self.assertIn("lunes de 13 a 18 hs", final)
+        self.assertFalse(_hours_truth_violations(_norm_lower(final)))
 
     def test_adv_06_a_correct_saturday_statement_is_not_contradicted(self):
         final = compose("Trabajamos sábados de 9 a 15 hs.")
@@ -184,9 +213,18 @@ class ADV_RequiredCases(unittest.TestCase):
         self.assertEqual(final.count(CANONICAL), 1)
 
     def test_adv_14_a_bulleted_list_is_judged_bullet_by_bullet(self):
-        final = compose("Horarios:\n- lunes de 13 a 18 hs\n- sábados de 9 a 13 hs")
+        """The per-unit judgement is unchanged — it is what DETECTS the conflict.
+
+        What changed is the consequence: a list with one unprovable bullet is no longer
+        rebuilt without that bullet, it is rejected whole. The detection this test was
+        written for is asserted directly, on the units.
+        """
+        listing = "Horarios:\n- lunes de 13 a 18 hs\n- sábados de 9 a 13 hs"
+        conflicts, _ = ce._hours_conflict_in(listing, frozenset())
+        self.assertTrue(conflicts, "the false Saturday bullet was not detected")
+        final = compose(listing)
         self.assertNotIn("9 a 13 hs", final)
-        self.assertIn("Horarios:", final)
+        self.assertIn("sábados de 9 a 15 hs", final, "the canonical Saturday is missing")
 
     def test_adv_15_a_fully_removed_reply_does_not_start_with_blank_lines(self):
         final = compose("Trabajamos sábados de 9 a 13 hs.")
@@ -383,7 +421,9 @@ class SCOPE_Boundaries(unittest.TestCase):
         added = "\n".join(inspect.getsource(getattr(ce, name)) for name in (
             "_clock_tokens", "_hours_claim_spans", "_hours_unit_is_fully_verified",
             "_protected_slot_minutes", "_hours_unit_survives",
-            "_strip_unverified_hours", "_regenerated_offer_es"))
+            # `_strip_unverified_hours` was the repair pass; G3-6 retired it and
+            # `_hours_conflict_in` — detection only — took its place in this scan.
+            "_hours_conflict_in", "_regenerated_offer_es"))
         for phrase in ("cerramos", "hasta", "cierra", "abrimos", "atendemos", "taller"):
             with self.subTest(phrase=phrase):
                 self.assertNotIn(phrase, added)

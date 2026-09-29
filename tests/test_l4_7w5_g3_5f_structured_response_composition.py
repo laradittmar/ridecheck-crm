@@ -652,7 +652,10 @@ class E_TraceAndInspector(unittest.TestCase):
         # transaction — and content added downstream reaches the customer uncounted.
         self.assertIn("composición", card)
         self.assertNotIn("autoridad", card)
-        self.assertIn("Alcance actual", card)
+        # G3-6 replaced the temporary "legacy content is uncounted" warning with a standing
+        # scope statement: every proposition is counted now, and the plan still refuses to
+        # claim the action, mutation, transport or transaction authorities.
+        self.assertIn("Alcance", card)
         self.assertIn("turn.primary_reply", card)
         self.assertIn("DETERMINISTIC_RULE", card)
 

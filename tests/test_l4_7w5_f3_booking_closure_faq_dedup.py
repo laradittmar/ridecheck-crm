@@ -72,6 +72,28 @@ def _fn_code(source: str, name: str) -> str:
     return "\n".join(ast.unparse(stmt) for stmt in body)
 
 
+
+def _compose_via_plan(engine, primary, burst, *, topics=None):
+    """G3-6 — the composition path, as it now is: register propositions, then compose.
+
+    `_compose_secondary_answers` appended canonical FAQ answers to finished prose. It is
+    now `_register_faq_propositions`, which registers a typed FAQ_ANSWER item per topic and
+    lets the live plan order and render them. The assertions that used this helper describe
+    the message a customer receives, so they keep describing it — through the code that now
+    produces it.
+    """
+    from app.services.response_composition import LiveResponsePlan
+    ctx = getattr(engine, "_turn_ctx", None)
+    engine._live_plan = LiveResponsePlan(turn_id="t")
+    engine._turn_faq_burst = burst
+    if not hasattr(engine, "_turn_fact_sources"):
+        engine._turn_fact_sources = []
+    if topics is not None:
+        engine._faq_topics_for_burst = lambda text, ctx=None, st=None: set(topics)
+    engine._register_faq_propositions(ctx, primary)
+    return engine._live_plan.compose(primary)
+
+
 class TestBookingReceipt(unittest.TestCase):
 
     def test_book_end_01_a_successful_booking_sends_one_receipt(self):
@@ -228,7 +250,7 @@ class TestScopeDedup(unittest.TestCase):
         primary = ("¡Genial! Sí, hacemos revisiones de vehículos como el Peugeot 2008 del "
                    "2014. Revisamos el auto en el lugar donde está y al finalizar, te "
                    "enviamos un informe detallado con más de 250 puntos de control.")
-        out = eng._compose_secondary_answers(primary, "¿en qué consiste el servicio?")
+        out = _compose_via_plan(eng, primary, "¿en qué consiste el servicio?")
         self.assertNotIn(_FAQ_SCOPE_ANSWER, out)
         self.assertEqual(out.lower().count("en el lugar"), 1)
 
@@ -242,7 +264,7 @@ class TestScopeDedup(unittest.TestCase):
         eng._turn_scheduling_requested = False
         wrong = ("Revisamos el auto en el lugar donde está y no estaremos presentes "
                  "durante el proceso.")
-        out = eng._compose_secondary_answers(wrong, "¿tengo que estar presente?")
+        out = _compose_via_plan(eng, wrong, "¿tengo que estar presente?")
         self.assertNotIn("no estaremos presentes", out.lower())
         self.assertIn("No es necesario que estés presente", out)
 

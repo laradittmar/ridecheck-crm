@@ -742,20 +742,16 @@ UNAVAILABLE_BEFORE_1_4 = "no disponible en este contrato"
 #: described. It must never be confused with "the plan decided nothing".
 UNAVAILABLE_BEFORE_1_5 = "no disponible en este contrato"
 
-#: G3-5F-BOUNDED-CORRECTION (audit G5F-A02). The card used to be headed "(autoridad)" and to
-#: report its item count as though it were the number of propositions the customer received.
-#: At this contract stage that is false: only some producers register propositions, and
-#: content added downstream of the plan — the same-burst FAQ answer, the required-next-info
-#: question, the canonical vehicle guard — reaches the customer inside the primary text
-#: without ever being counted here. The plan governs what it was given, and the card now
-#: says so, so an operator does not read a count of 1 as "the customer was told one thing".
-PARTIAL_PRODUCER_COVERAGE_NOTE = (
-    "Alcance actual: el plan ordena y compone las proposiciones REGISTRADAS. En esta etapa "
-    "del contrato no todos los productores registran proposiciones, y puede haber contenido "
-    "heredado agregado después del plan (FAQ de la misma ráfaga, pregunta de dato faltante, "
-    "validación canónica) que viaja dentro del texto principal y no está contado acá. El "
-    "plan no decide la acción principal, ni las mutaciones canónicas, ni el transporte, ni "
-    "el resultado transaccional.")
+#: G3-6. The temporary warning added by the bounded correction is GONE, because the thing it
+#: warned about is gone: the same-burst FAQ answer, the required-next-information question
+#: and the canonical vehicle reconciliation are registered propositions now, so every claim
+#: in the message is counted here. What the heading still does NOT claim — and must not — is
+#: authority over the principal action, canonical mutation, transport or the transaction;
+#: that is why it reads "(composición)" rather than "(autoridad)".
+PLAN_SCOPE_NOTE = (
+    "Alcance: el plan ordena, deduplica y compone todas las proposiciones del mensaje. "
+    "No decide la acción principal, ni las mutaciones canónicas, ni el transporte, ni el "
+    "resultado transaccional.")
 
 DISPATCH_NOTE = ("La compuerta de salida decide si el mensaje se envía. Nunca es el autor "
                  "del razonamiento ni del texto.")
@@ -812,7 +808,7 @@ def _response_plan_card(trace: dict) -> str:
     ]
     body = f'<div class="card"><h2>{heading}</h2>'
     if not shadow:
-        body += f'<p class="note">{html.escape(PARTIAL_PRODUCER_COVERAGE_NOTE)}</p>'
+        body += f'<p class="note">{html.escape(PLAN_SCOPE_NOTE)}</p>'
     body += _kv(rows)
     if items:
         body += "<h3>Proposiciones</h3><ul>" + "".join(

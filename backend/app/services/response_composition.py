@@ -56,10 +56,23 @@ class PropositionId:
     BOOKING_FLOW = "scheduling.booking_flow"
     BOOKING_RECEIPT = "booking.receipt"
     FLOW_COMPLETION_ACK = "booking.flow_completion_ack"
+    #: G3-6. The one required-next-information question, keyed by the field it is missing,
+    #: so two producers asking for the same field are one proposition.
+    CLARIFICATION_REQUIRED = "clarification.required"
+    #: G3-6. A canonical fact the response must reconcile rather than imply.
+    CANONICAL_VEHICLE = "canonical.vehicle"
+    #: G3-6. Appointment times the thread really holds.
+    SLOT_OFFER = "scheduling.slot_offer"
+    #: G3-6. Why the principal action is held, when P1 needs it said out loud.
+    HOLD_EXPLANATION = "turn.hold_explanation"
 
     @staticmethod
     def faq(topic: str) -> str:
         return f"faq.{topic}"
+
+    @staticmethod
+    def clarification(field: str) -> str:
+        return f"clarification.{field}"
 
 
 class SuppressionReason:
@@ -69,6 +82,12 @@ class SuppressionReason:
     DUPLICATE_PROPOSITION = "DUPLICATE_PROPOSITION"
     SINGLE_MESSAGE_POLICY = "SINGLE_MESSAGE_POLICY"
     NOT_AUTHORIZED = "NOT_AUTHORIZED"
+    #: G3-6 / DEF-04. The proposition asserted a consequential value that disagrees with the
+    #: canonical one. The WHOLE proposition is withheld and the approved plan is rendered in
+    #: its place — the prose is never edited fragment by fragment.
+    CONFLICTS_WITH_CANONICAL = "CONFLICTS_WITH_CANONICAL"
+    #: The producer registered it and the turn had nothing to say for it.
+    NOTHING_TO_RENDER = "NOTHING_TO_RENDER"
 
 
 @dataclass
@@ -93,8 +112,23 @@ class Proposition:
     required_action: Optional[str] = None
     dispatch_path: str = DispatchPath.TEXT
     #: Set when the producer has already established the claim is redundant this turn —
-    #: P5's "do not repeat known facts mechanically".
+    #: P6's "do not repeat known facts mechanically".
+    #:
+    #: G3-6: for every producer that exists today this is PROSE-derived — the claim is
+    #: redundant because the primary reply already states it. That matters: if the primary
+    #: is then rejected for contradicting canonical truth, the prose that made this claim
+    #: redundant never reaches the customer, and suppressing it would lose the fact
+    #: altogether. `_apply_policies` therefore restores every prose-derived redundancy when
+    #: the primary is rejected. A producer whose redundancy comes from CANONICAL STATE must
+    #: not register the proposition at all — it has nothing to say, not something to hide.
     redundant: bool = False
+    #: G3-6 / DEF-04. Set when this proposition asserts a consequential value that
+    #: contradicts the canonical one. A conflicting proposition is withheld WHOLE; the
+    #: approved plan is rendered in its place. Nothing edits the text.
+    conflicts_with_canonical: bool = False
+    #: `(field, safe_token)` pairs naming the canonical values this item is answerable for.
+    #: Never customer data — a field name and a value the business owns.
+    locked_values: tuple = ()
     included: bool = True
     suppression_reason: Optional[str] = None
 
@@ -156,6 +190,28 @@ class LiveResponsePlan:
         turn, no automated factual answer may stand beside the acknowledgement, so the
         later policies have nothing left to weigh.
         """
+        # ── DEF-04: a proposition that contradicts canonical truth is withheld WHOLE ──
+        # This runs FIRST because it is not a preference: a message that states a business
+        # fact incorrectly may not be sent, and the previous design's answer — cut the
+        # offending sentence out of prose the system did not author and staple the canonical
+        # answer to what is left — is the defect itself. Here the whole proposition drops
+        # and every OTHER authorized proposition still composes, so the customer gets the
+        # canonical answer plus anything else the turn owed them, rendered by its owner.
+        rejected_primary = False
+        for p in self.propositions:
+            if p.conflicts_with_canonical:
+                p.included = False
+                p.suppression_reason = SuppressionReason.CONFLICTS_WITH_CANONICAL
+                if p.proposition_id == PropositionId.PRIMARY_REPLY:
+                    rejected_primary = True
+        if rejected_primary:
+            # The prose that made other claims redundant is not being sent, so those claims
+            # are not stated anywhere. Restoring them is what makes the replacement
+            # complete rather than merely safe: the customer gets every authorized
+            # proposition, not only the one that caused the rejection.
+            for p in self.propositions:
+                if p.redundant and not p.conflicts_with_canonical:
+                    p.redundant = False
         # ── P2: human handoff owns the turn ───────────────────────────────────
         if self.human_owns_turn:
             for p in self.propositions:
@@ -209,12 +265,26 @@ class LiveResponsePlan:
         else:
             primary.render = lambda: primary_text
         self._apply_policies()
+        # A rejected primary must not leave the turn silent when the plan still holds
+        # authorized propositions: composition continues from those below. If it holds
+        # none, the turn genuinely has nothing it may truthfully say, and says nothing.
         parts = [t for t in (p.text() for p in self._ordered_included()) if t]
         self.composed = True
         if not parts:
             return ""
         head, *rest = parts
         return head if not rest else (head.rstrip() + "\n\n" + " ".join(rest))
+
+    @property
+    def mixed_renderers(self) -> bool:
+        """True when the composed message carries words from more than one author.
+
+        The primary reply is usually the model's; a canonical FAQ answer, a clarification
+        and a vehicle reconciliation are their owners'. When both kinds are included the
+        renderer really is mixed, and the attribution has to say so.
+        """
+        kinds = {p.renderer_source for p in self._ordered_included()}
+        return len(kinds) > 1
 
     def refuse_additional_text(self) -> None:
         """P3. A second free-text message in one decision turn is not a plan, it is a leak."""
@@ -255,7 +325,8 @@ class LiveResponsePlan:
                 required_action=p.required_action,
                 priority=p.priority, coexistence=p.coexistence,
                 dispatch_path=p.dispatch_path, included=p.included,
-                suppression_reason=p.suppression_reason, policy=p.policy)
+                suppression_reason=p.suppression_reason, policy=p.policy,
+                locked_values=tuple(p.locked_values))
             for p in sorted(self.propositions,
                             key=lambda p: (p.priority, p.proposition_id))
         ]

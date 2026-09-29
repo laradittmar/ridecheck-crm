@@ -364,7 +364,11 @@ class C_Attribution(unittest.TestCase):
         try:
             self.assertEqual(a["authority"], DecisionAuthority.DETERMINISTIC_RULE)
             self.assertIn(FactSource.FAQ_CANONICAL, a["facts"])
-            self.assertEqual(a["renderer"], RendererSource.COMPOSED_MIXED)
+            # G3-6: the hours turn is now composed from a deterministic primary reply and
+            # a canonical FAQ proposition — both authored by the business, so the renderer
+            # is no longer "mixed". COMPOSED_MIXED meant "a canonical answer was stapled to
+            # prose this engine did not author"; that mechanism is gone.
+            self.assertEqual(a["renderer"], RendererSource.DETERMINISTIC_TEMPLATE)
             self.assertEqual((a["path"], a["result"]),
                              (DispatchPath.TEXT, DispatchResult.ALLOWED))
         finally:
