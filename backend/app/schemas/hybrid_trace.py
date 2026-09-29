@@ -604,12 +604,18 @@ class ReplyModelRecord:
     """
     model: Optional[str] = None
     prompt_version: Optional[str] = None
+    #: G3-5E2 (audit G5E-05). WHICH reply call site ran — COMMERCIAL_TURN or
+    #: GENERAL_INFORMATION. The 1.4 contract promised it and 1.4 shipped without it.
+    role: Optional[str] = None
+    #: The typed admission verdict for this turn's reply result (G3-5E2, audit G5E-01).
+    admission: Optional[str] = None
     calls: int = 0
     latency_ms: Optional[int] = None
     status: str = "ABSENT"          # ABSENT | OK | ERROR | TIMEOUT
 
     def to_payload(self) -> dict:
         return {"model": self.model, "prompt_version": self.prompt_version,
+                "role": self.role, "admission": self.admission,
                 "calls": self.calls, "latency_ms": self.latency_ms, "status": self.status}
 
 

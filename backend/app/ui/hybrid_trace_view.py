@@ -785,6 +785,8 @@ def _reply_model_card(trace: dict) -> str:
     return '<div class="card"><h2>Modelo de redacción</h2>' + _kv([
         ("Modelo", _e(reply.get("model"))),
         ("Versión del prompt", _e(reply.get("prompt_version"))),
+        ("Rol", _e(reply.get("role"))),
+        ("Admisión del resultado", _e(reply.get("admission"))),
         ("Llamadas", _e(reply.get("calls"))),
         ("Latencia (ms)", _e(reply.get("latency_ms"))),
         ("Estado", _e(reply.get("status"))),

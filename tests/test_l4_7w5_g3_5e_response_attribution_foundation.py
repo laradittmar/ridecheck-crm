@@ -177,8 +177,11 @@ class B_Attribution(unittest.TestCase):
         self.assertIn("LEGACY_REPLY_MODEL_EXTRACTION", src)
         self.assertIn(DecisionAuthority.LEGACY_REPLY_MODEL_EXTRACTION,
                       DecisionAuthority.ALL)
-        self.assertIn("self._turn_decision_authority = "
-                      "DecisionAuthority.LEGACY_REPLY_MODEL_EXTRACTION", src)
+        self.assertIn("DecisionAuthority.LEGACY_REPLY_MODEL_EXTRACTION", src)
+        import inspect
+        commercial = inspect.getsource(ConversationEngine._process_text)
+        self.assertIn("LEGACY_REPLY_MODEL_EXTRACTION", commercial,
+                      "the commercial reply path must still name its real authority")
 
     def test_g35e_12_a_blocked_dispatch_keeps_the_real_producer(self):
         """G5D-04. The gate records a RESULT; it never becomes the source."""

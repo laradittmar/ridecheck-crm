@@ -1001,6 +1001,48 @@ REPLY_PROMPT_VERSION = "reply/1.0"
 REPLY_PROMPT_ID = "conversation_engine._build_ai_messages"
 
 
+#: G3-5E2 (audit G5E-02). `decision_authority` and `fact_sources` were `None`/empty on five
+#: of six real paths, and the shadow plan papered over it with `RECONCILER if decision is not
+#: None`. The fix is not another default: every producing handler ALREADY declares itself by
+#: assigning `_answer_source` at the point it decides, so the typed attribution is recorded
+#: from that same statement. The mapping is source-of-truth, not inference — each row names
+#: what that component decided and which producer supplied the facts it used.
+_ANSWER_SOURCE_ATTRIBUTION: dict = {
+    "DETERMINISTIC_RULE": ("DETERMINISTIC_RULE", ("CANONICAL_STATE",)),
+    "PRICING_SERVICE":    ("PRICING_SERVICE", ("PRICING_SERVICE", "CANONICAL_STATE")),
+    "SCHEDULING_SERVICE": ("SCHEDULING_SERVICE", ("SCHEDULING_SERVICE", "CANONICAL_STATE")),
+    "VEHICLE_RESOLVER":   ("DETERMINISTIC_RULE",
+                           ("DETERMINISTIC_EVIDENCE", "CANONICAL_STATE")),
+    "LOCATION_RESOLVER":  ("DETERMINISTIC_RULE",
+                           ("DETERMINISTIC_EVIDENCE", "CANONICAL_STATE")),
+    "FAQ_RULE":           ("DETERMINISTIC_RULE", ("FAQ_CANONICAL",)),
+    "HUMAN":              ("HUMAN_HANDOFF_POLICY", ("CANONICAL_STATE",)),
+    "FLOW_RESPONSE":      ("FLOW_TRANSACTION", ("FLOW_TRANSACTION",)),
+    "CE_AI":              ("LEGACY_REPLY_MODEL_EXTRACTION", ()),
+    # A dispatch outcome is NOT an authority and NOT a fact source. Listed explicitly so
+    # the mapping refuses it rather than leaving it to a lookup miss.
+    "ERROR_FALLBACK":     (None, ()),
+}
+
+
+class ReplyAdmission:
+    """Whether the reply model's output may be consumed at all.
+
+    G3-5E2 (audit G5E-01). G3-5E recorded `_reply_burst` and no code ever read it, so a
+    result bound to some other burst — or to none — could still mutate canonical state,
+    create a candidate, force a handoff, write prose and dispatch. The semantic side has
+    had a fail-closed guard since G3-5C; this is its reply-side counterpart, and it is a
+    typed state rather than a boolean so the trace can say WHY a result was refused.
+    """
+    ADMITTED = "ADMITTED"
+    REJECTED_FOREIGN_BURST = "REJECTED_FOREIGN_BURST"
+    REJECTED_MISSING_BINDING = "REJECTED_MISSING_BINDING"
+    NOT_DISPATCHED = "NOT_DISPATCHED"
+
+    ALL = (ADMITTED, REJECTED_FOREIGN_BURST, REJECTED_MISSING_BINDING, NOT_DISPATCHED)
+    REJECTED = (REJECTED_FOREIGN_BURST, REJECTED_MISSING_BINDING)
+
+
 class ReplyRole:
     """Which reply-generation call site produced the prose."""
     COMMERCIAL_TURN = "COMMERCIAL_TURN"        # `_process_text`, the main AI path
@@ -3010,7 +3052,7 @@ class ConversationEngine:
         self._pricing = PricingService(repository=PricingRepository())
         self._schedule = ScheduleService(db=db)
         self._ai_invoked: bool = False
-        self._answer_source: str | None = None
+        self._answer_source_value: str | None = None
         self._contributing_sources: list[str] | None = None
         self._burst_message_count: int = 1
         self._burst_earliest_inbound_db_id: int | None = None
@@ -3028,6 +3070,7 @@ class ConversationEngine:
         self._reply_status = "ABSENT"
         self._reply_role = None
         self._reply_burst = None                   # the burst the reply model was given
+        self._reply_admission_state = None          # G3-5E2 typed admission verdict
         self._turn_decision_authority = None
         self._turn_fact_sources: list[str] = []
         self._turn_renderer_source = None
@@ -3050,6 +3093,58 @@ class ConversationEngine:
         "inspectability_gate_blocked", "blocked_dispatch",
     })
     _VEHICLE_RESOLVER_SOURCE_ACTIONS: frozenset[str] = frozenset({"vehicle_fuzzy_blocked"})
+
+    @property
+    def _answer_source(self):
+        return getattr(self, "_answer_source_value", None)
+
+    @_answer_source.setter
+    def _answer_source(self, value):
+        """Recording the legacy field also records the typed attribution.
+
+        G3-5E2. The ~42 handlers that assign this already name the component that decided;
+        this makes that statement populate `decision_authority` and `fact_sources` too,
+        without a second declaration to drift from the first and without a default. An
+        unmapped or cleared value records nothing rather than guessing.
+        """
+        self._answer_source_value = value
+        if value is None:
+            # An explicit clear means "no handler owns this turn yet" — the AI path does
+            # exactly this before claiming CE_AI. Stale attribution must go with it.
+            self._turn_decision_authority = None
+            self._turn_fact_sources = []
+            return
+        authority, facts = _ANSWER_SOURCE_ATTRIBUTION.get(value, (None, ()))
+        if authority is not None:
+            self._turn_decision_authority = authority
+        for fact in facts:
+            existing = getattr(self, "_turn_fact_sources", None)
+            if existing is None:
+                existing = self._turn_fact_sources = []
+            if fact not in existing:
+                existing.append(fact)
+
+    def _record_blocked_dispatch(self, path: str) -> None:
+        """An early kill-switch exit records WHAT the gate did, and nothing else.
+
+        G3-5E2 (audit G5E-03). Seven paths read `OUTBOUND_ENABLED` themselves and return
+        `blocked_dispatch` without passing through `_send_text_to_wa`, so the very case
+        `DispatchResult.BLOCKED` exists for recorded nothing and the Inspector showed it as
+        unavailable. This records the intended transport and the gate's verdict. It does
+        not touch the decision authority, the fact sources or the renderer — those belong
+        to whoever produced the content, and the gate is never their author.
+        """
+        self._turn_dispatch_path = path
+        self._turn_dispatch_result = DispatchResult.BLOCKED
+
+    def _note_fact_source(self, *sources) -> None:
+        """Record an additional producer of the facts in this turn's response."""
+        existing = getattr(self, "_turn_fact_sources", None)
+        if existing is None:
+            existing = self._turn_fact_sources = []
+        for source in sources:
+            if source and source not in existing:
+                existing.append(source)
 
     def _turn_correlation_id(self) -> str:
         """L4.3 Phase F: one correlation id per CE turn, shared by every outbound row."""
@@ -3085,6 +3180,7 @@ class ConversationEngine:
         self._reply_status = "ABSENT"
         self._reply_role = None
         self._reply_burst = None
+        self._reply_admission_state = None
         self._turn_decision_authority = None
         self._turn_fact_sources = []
         self._turn_renderer_source = None
@@ -3150,8 +3246,17 @@ class ConversationEngine:
         if out.answer_source is None:
             if out.action in ("flow_button_sent", "booking_created"):
                 out.answer_source = "FLOW_RESPONSE"
+                self._turn_decision_authority = DecisionAuthority.FLOW_TRANSACTION
+                self._note_fact_source(FactSource.FLOW_TRANSACTION)
             elif out.action == "skipped_human":
                 out.answer_source = "HUMAN"
+                # G3-5E2: this resolution is truthful — the human-ownership policy really
+                # did own the turn — so the typed attribution is recorded with it. The
+                # action-derived branches below are NOT adopted: `blocked_dispatch` naming
+                # DETERMINISTIC_RULE is the very conflation G5D-04 recorded, and an
+                # ERROR_FALLBACK is an outcome, not an authority.
+                self._turn_decision_authority = DecisionAuthority.HUMAN_HANDOFF_POLICY
+                self._note_fact_source(FactSource.CANONICAL_STATE)
             elif out.action in self._DETERMINISTIC_SOURCE_ACTIONS:
                 out.answer_source = "DETERMINISTIC_RULE"
             elif out.action in self._VEHICLE_RESOLVER_SOURCE_ACTIONS:
@@ -4563,6 +4668,7 @@ class ConversationEngine:
             "M20 vehicle_flow_direct thread_id=%s flow_id=%s", ctx.thread.id, flow_id
         )
         if os.environ.get("OUTBOUND_ENABLED") != "true":
+            self._record_blocked_dispatch(DispatchPath.META_FLOW)
             OutboundSafetyGate(self.db).attempt(
                 wa_id=ctx.contact.wa_id, thread_id=ctx.thread.id, text=intro,
                 path_id=OutboundPathId.CE_FLOW.value,
@@ -4600,6 +4706,7 @@ class ConversationEngine:
             ctx.thread.id, flow_id, concern,
         )
         if os.environ.get("OUTBOUND_ENABLED") != "true":
+            self._record_blocked_dispatch(DispatchPath.META_FLOW)
             OutboundSafetyGate(self.db).attempt(
                 wa_id=ctx.contact.wa_id, thread_id=ctx.thread.id, text=body,
                 path_id=OutboundPathId.CE_FLOW.value,
@@ -4626,6 +4733,7 @@ class ConversationEngine:
             ctx.lead.necesita_humano = True
         logger.info("M20 coverage_response thread_id=%s", ctx.thread.id)
         if os.environ.get("OUTBOUND_ENABLED") != "true":
+            self._record_blocked_dispatch(DispatchPath.META_FLOW)
             OutboundSafetyGate(self.db).attempt(
                 wa_id=ctx.contact.wa_id,
                 thread_id=ctx.thread.id,
@@ -4688,6 +4796,7 @@ class ConversationEngine:
                     "la revisión mecánica."
                 )
                 if os.environ.get("OUTBOUND_ENABLED") != "true":
+                    self._record_blocked_dispatch(DispatchPath.META_FLOW)
                     OutboundSafetyGate(self.db).attempt(
                         wa_id=ctx.contact.wa_id, thread_id=ctx.thread.id, text=body,
                         path_id=OutboundPathId.CE_FLOW.value,
@@ -4708,6 +4817,7 @@ class ConversationEngine:
                     "¿Me podés indicar la marca y el modelo?"
                 )
                 if os.environ.get("OUTBOUND_ENABLED") != "true":
+                    self._record_blocked_dispatch(DispatchPath.META_FLOW)
                     OutboundSafetyGate(self.db).attempt(
                         wa_id=ctx.contact.wa_id, thread_id=ctx.thread.id, text=reply,
                         path_id=OutboundPathId.CE_TEXT.value,
@@ -4747,6 +4857,7 @@ class ConversationEngine:
                     "de la revisión."
                 )
                 if os.environ.get("OUTBOUND_ENABLED") != "true":
+                    self._record_blocked_dispatch(DispatchPath.META_FLOW)
                     OutboundSafetyGate(self.db).attempt(
                         wa_id=ctx.contact.wa_id, thread_id=ctx.thread.id, text=body,
                         path_id=OutboundPathId.CE_FLOW.value,
@@ -4766,6 +4877,7 @@ class ConversationEngine:
                     "Por ejemplo: Palermo, Tigre, Dock Sud o Lomas de Zamora."
                 )
                 if os.environ.get("OUTBOUND_ENABLED") != "true":
+                    self._record_blocked_dispatch(DispatchPath.META_FLOW)
                     OutboundSafetyGate(self.db).attempt(
                         wa_id=ctx.contact.wa_id, thread_id=ctx.thread.id, text=reply,
                         path_id=OutboundPathId.CE_TEXT.value,
@@ -5688,14 +5800,25 @@ class ConversationEngine:
             ai_raw = self._call_openai(messages_for_ai,
                                        role=ReplyRole.COMMERCIAL_TURN)
             decision = json.loads(ai_raw)
-            self._turn_renderer_source = RendererSource.REPLY_MODEL
-            # G3-5E (audit G5D-01): named, not corrected. Everything this decision drives
-            # below — extracted fields, candidates, the motorcycle handoff, stage resets —
-            # is authority the reply model holds today. Removing it belongs to the
-            # structured-authority milestone; mislabelling it would hide the finding.
-            self._turn_decision_authority = DecisionAuthority.LEGACY_REPLY_MODEL_EXTRACTION
-            if _use_narrative:
-                _narr = parse_narrative_interpretation(decision)
+            # ── G3-5E2 (audit G5E-01): the binding decides, before anything reads a field ──
+            _admission = self._reply_admission()
+            self._reply_admission_state = _admission
+            if _admission in ReplyAdmission.REJECTED:
+                decision = self._refuse_reply(ctx, _admission, ReplyRole.COMMERCIAL_TURN)
+                _use_narrative = False
+                self._turn_renderer_source = RendererSource.DETERMINISTIC_TEMPLATE
+                self._turn_decision_authority = DecisionAuthority.DETERMINISTIC_RULE
+            else:
+                self._turn_renderer_source = RendererSource.REPLY_MODEL
+                # G3-5E (audit G5D-01): named, not corrected. Everything this decision
+                # drives below — extracted fields, candidates, the motorcycle handoff,
+                # stage resets — is authority the reply model holds today. Removing it
+                # belongs to the structured-authority milestone; mislabelling it would hide
+                # the finding.
+                self._turn_decision_authority = (
+                    DecisionAuthority.LEGACY_REPLY_MODEL_EXTRACTION)
+                if _use_narrative:
+                    _narr = parse_narrative_interpretation(decision)
         except Exception as exc:
             logger.warning("M18 AI call failed thread_id=%s: %s", ctx.thread.id, exc)
             decision = {
@@ -7224,9 +7347,10 @@ class ConversationEngine:
             action = getattr(out, "action", None)
             renderer = (getattr(self, "_turn_renderer_source", None)
                         or RendererSource.NO_PROSE)
-            authority = getattr(self, "_turn_decision_authority", None) or (
-                DecisionAuthority.RECONCILER if decision is not None
-                else DecisionAuthority.DETERMINISTIC_RULE)
+            # G3-5E2 (audit G5E-02): no default. The plan projects exactly what the
+            # producing path recorded; where nothing decided, it says so.
+            authority = (getattr(self, "_turn_decision_authority", None)
+                         or DecisionAuthority.NONE)
             dispatch_path = getattr(self, "_turn_dispatch_path", None) or DispatchPath.NONE
             dispatch_result = (getattr(self, "_turn_dispatch_result", None)
                                or DispatchResult.NOT_ATTEMPTED)
@@ -7302,7 +7426,11 @@ class ConversationEngine:
                     policy=ResponsePolicy.P1_HOLD_PLUS_SAFE_FAQ))
 
             return ResponsePlan(
-                plan_id=f"{(fingerprint or '')[:12]}:{(phase or 'nophase')}",
+                # G3-5E2 (audit G5E-06): the phase id already begins with the burst
+                # fingerprint, so repeating it produced "fp:fp:snapshot". A typed prefix
+                # plus the phase identity is deterministic, unique per phase and carries
+                # no customer text.
+                plan_id=f"response-plan:{phase or 'nophase'}",
                 turn_id=getattr(self, "_correlation_id", None),
                 burst_fingerprint=fingerprint, decision_phase_id=phase,
                 items=tuple(items), transport_multiplicity=multiplicity,
@@ -7366,6 +7494,8 @@ class ConversationEngine:
                        if getattr(self, "_reply_calls", 0) else None),
                 prompt_version=(REPLY_PROMPT_VERSION
                                 if getattr(self, "_reply_calls", 0) else None),
+                role=getattr(self, "_reply_role", None),
+                admission=getattr(self, "_reply_admission_state", None),
                 calls=getattr(self, "_reply_calls", 0),
                 latency_ms=getattr(self, "_reply_latency_ms", None),
                 status=getattr(self, "_reply_status", "ABSENT"))
@@ -8533,10 +8663,18 @@ class ConversationEngine:
         try:
             ai_raw = self._call_openai(messages, role=ReplyRole.GENERAL_INFORMATION)
             decision = json.loads(ai_raw)
-            # G3-5E (audit G5D-05): this route returns `answer_source="FAQ_RULE"`, but the
-            # words came from the reply model. `answer_source` is legacy and untouched; the
-            # renderer attribution below is the truthful one.
-            self._turn_renderer_source = RendererSource.REPLY_MODEL
+            # ── G3-5E2 (audit G5E-01): the same guard, before the prose is read ──
+            _admission = self._reply_admission()
+            self._reply_admission_state = _admission
+            if _admission in ReplyAdmission.REJECTED:
+                decision = self._refuse_reply(ctx, _admission,
+                                              ReplyRole.GENERAL_INFORMATION)
+                self._turn_renderer_source = RendererSource.DETERMINISTIC_TEMPLATE
+            else:
+                # G3-5E (audit G5D-05): this route returns `answer_source="FAQ_RULE"`, but
+                # the words came from the reply model. `answer_source` is legacy and
+                # untouched; the renderer attribution here is the truthful one.
+                self._turn_renderer_source = RendererSource.REPLY_MODEL
             self._turn_decision_authority = DecisionAuthority.DETERMINISTIC_RULE
         except Exception as exc:
             logger.warning(
@@ -9759,6 +9897,58 @@ class ConversationEngine:
         self._reply_burst = None
         return list(fallback or [])
 
+    def _reply_admission(self) -> str:
+        """May this turn's reply-model output be consumed? Typed, and fail-closed.
+
+        G3-5E2. Called immediately after the provider returns and BEFORE any field of the
+        result is read, so one check protects every consumer — extracted fields, the
+        candidate, the narrative interpretation, the motorcycle handoff, the lead flag, the
+        stage reset and the prose alike. It reads state only; it can never call the
+        provider again, so a rejection costs nothing.
+
+        Every production reply call is made from `_process_text`, which builds the canonical
+        burst before any gate can return — so a reply without a burst is not a legitimate
+        route and is refused rather than trusted. A test asserts that property against the
+        real call sites.
+        """
+        if not getattr(self, "_reply_calls", 0):
+            # The engine's own provider boundary was never crossed — only reachable when a
+            # caller substitutes `_call_openai` itself. There is no dispatch to bind, so
+            # this is not a failure: §4 forbids manufacturing an error where the route
+            # never used the reply model.
+            return ReplyAdmission.NOT_DISPATCHED
+        burst = getattr(self, "_canonical_turn_burst", None)
+        bound = getattr(self, "_reply_burst", None)
+        if burst is None or bound is None:
+            return ReplyAdmission.REJECTED_MISSING_BINDING
+        if bound != burst.fingerprint:
+            return ReplyAdmission.REJECTED_FOREIGN_BURST
+        return ReplyAdmission.ADMITTED
+
+    def _refuse_reply(self, ctx, admission: str, role: str) -> dict:
+        """The bounded, non-mutating result a refused reply is replaced with.
+
+        Deliberately NOT the provider-failure fallback: that one sets `needs_human=True`,
+        and escalating a customer to a human because a binding check failed would be a
+        canonical mutation caused by the guard itself. This decision drives nothing —
+        no candidate, no extracted field, no flag — and carries the same bounded sentence
+        the provider-failure path already uses.
+        """
+        self._reply_admission_state = admission
+        try:
+            logger.warning(
+                "G3-5E2 REPLY BINDING REFUSED thread_id=%s role=%s reason=%s canonical=%s "
+                "bound=%s",
+                getattr(getattr(ctx, "thread", None), "id", None), role, admission,
+                str(getattr(getattr(self, "_canonical_turn_burst", None), "fingerprint",
+                            None))[:12],
+                str(getattr(self, "_reply_burst", None) or "absent")[:12])
+        except Exception:
+            pass
+        return {"intent": "OTHER", "reply": "Disculpá la demora, ya te ayudamos.",
+                "deferred_interest": False, "candidate": {"action": "none"},
+                "extracted": {}, "lead_flag": None, "needs_human": False}
+
     def _build_ai_messages(
         self,
         ctx: _Context,
@@ -9962,6 +10152,12 @@ Respondé SOLO con JSON válido:
         self._ai_invoked = True
         self._reply_calls = getattr(self, "_reply_calls", 0) + 1
         self._reply_role = role or getattr(self, "_reply_role", None)
+        # G3-5E2 (audit G5E-01): the binding is taken HERE, at the provider boundary, so it
+        # records the burst that was current when the request was actually dispatched. The
+        # admission check then compares it with the burst current at consumption time — a
+        # result may only be consumed while the evidence it was asked about still stands.
+        _burst = getattr(self, "_canonical_turn_burst", None)
+        self._reply_burst = getattr(_burst, "fingerprint", None)
         _t0 = _time.perf_counter()
         try:
             out = self._call_openai_inner(messages)
