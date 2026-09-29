@@ -11344,12 +11344,83 @@ Respondé SOLO con JSON válido:
         if plan is None:
             return
         try:
+            self._register_price_proposition(ctx, text)
             self._register_faq_propositions(ctx, text)
             self._register_clarification_proposition(ctx, text)
             self._register_canonical_vehicle_proposition(ctx, text)
         except Exception as exc:          # a producer defect must never cost a turn
             logger.warning("G3-6 proposition producer failed: %s: %s",
                            type(exc).__name__, exc, exc_info=True)
+
+    # ── 0. canonical price ───────────────────────────────────────────────────────
+
+    def _register_price_proposition(self, ctx, text: str) -> None:
+        """The price the pricing service authorized for this turn, as its own proposition.
+
+        G3-6-BOUNDED-CORRECTION (audit G36-03). G3-6 made an opaque primary reply
+        rejectable when it contradicts canonical truth, which is right — but a reply that
+        says "La revisión sale $85.000. Trabajamos sábados de 9 a 13 hs." carries a verified
+        business fact beside the falsehood, and rejecting the sentence took the price with
+        it. The customer asked what the revision costs; the answer belongs to the pricing
+        service, not to the sentence that happened to contain it.
+
+        AUTHORIZATION IS TYPED, AND IT IS THE ONLY SOURCE.
+        Two conditions, both canonical, neither derived from the words:
+
+            `_turn_price_quote`             the pricing service computed and stored a quote
+                                            for this turn (set inside `_compute_price_quote`,
+                                            from vehicle type and zone)
+            `_answer_source == PRICING_SERVICE`
+                                            the handler that owns this turn declared the
+                                            pricing service as the component answering it
+
+        Nothing here reads a number out of prose, matches a phrase, or decides that a price
+        was "requested". If the pricing path did not authorize a quote, no proposition is
+        registered and no price is invented — which is also what happens when a model
+        invents one: it is rejected with the primary and never resurrected.
+
+        THE RENDERER COMPUTES NOTHING. The customer-facing sentence is built HERE, once,
+        by `_build_quote_reply` from the canonical quote, and the callable returns that
+        finished string. A renderer that could compute a price would be a second pricing
+        authority.
+
+        REDUNDANT BY DEFAULT. On an ordinary quote turn the primary reply IS the quote, so
+        the proposition is registered redundant: it stays visible in the trace and the
+        customer is not told the price twice. It becomes included only when the primary is
+        withheld — the same restoration G3-6 already applies to every claim whose redundancy
+        came from prose that is no longer being sent.
+        """
+        plan = getattr(self, "_live_plan", None)
+        if plan is None:
+            return
+        quote = getattr(self, "_turn_price_quote", None)
+        if quote is None:
+            return                                  # the pricing path authorized nothing
+        if getattr(self, "_answer_source", None) != "PRICING_SERVICE":
+            return                                  # this turn is not delivering the quote
+        total = getattr(quote, "precio_total", None)
+        if not total:
+            return
+        state = getattr(ctx, "state", None)
+        focus = self._focus_candidate(ctx)
+        _, detail = self._get_active_inspection_location(ctx, state)
+        rendered = self._build_quote_reply(
+            (focus.marca or "").strip() or None if focus else None,
+            (focus.modelo or "").strip() or None if focus else None,
+            detail,
+            int(total),
+            focus.anio if focus else None)
+        plan.register(Proposition(
+            proposition_id=PropositionId.CANONICAL_PRICE,
+            kind=ResponseItemKind.CANONICAL_FACT, claim_family="pricing",
+            render=lambda: rendered,
+            decision_authority=DecisionAuthority.PRICING_SERVICE,
+            fact_sources=(FactSource.PRICING_SERVICE, FactSource.CANONICAL_STATE),
+            renderer_source=RendererSource.DETERMINISTIC_TEMPLATE,
+            policy=ResponsePolicy.P6_NO_ROUTINE_FACT_REPETITION, priority=30,
+            redundant=True,
+            locked_values=(("pricing.precio_total", str(int(total))),)))
+        self._note_fact_source(FactSource.PRICING_SERVICE)
 
     # ── 1. FAQ ───────────────────────────────────────────────────────────────────
 

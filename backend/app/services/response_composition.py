@@ -61,6 +61,11 @@ class PropositionId:
     CLARIFICATION_REQUIRED = "clarification.required"
     #: G3-6. A canonical fact the response must reconcile rather than imply.
     CANONICAL_VEHICLE = "canonical.vehicle"
+    #: G3-6-BC (audit G36-03). The price the pricing service authorized for THIS turn. It is
+    #: registered so it can survive the rejection of an opaque primary reply that happened to
+    #: carry a false fact beside it — the customer asked what the revision costs, and the
+    #: answer is owned by the pricing service, not by the sentence that contained it.
+    CANONICAL_PRICE = "canonical.price"
     #: G3-6. Appointment times the thread really holds.
     SLOT_OFFER = "scheduling.slot_offer"
     #: G3-6. Why the principal action is held, when P1 needs it said out loud.

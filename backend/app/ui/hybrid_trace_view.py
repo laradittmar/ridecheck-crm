@@ -742,16 +742,28 @@ UNAVAILABLE_BEFORE_1_4 = "no disponible en este contrato"
 #: described. It must never be confused with "the plan decided nothing".
 UNAVAILABLE_BEFORE_1_5 = "no disponible en este contrato"
 
-#: G3-6. The temporary warning added by the bounded correction is GONE, because the thing it
-#: warned about is gone: the same-burst FAQ answer, the required-next-information question
-#: and the canonical vehicle reconciliation are registered propositions now, so every claim
-#: in the message is counted here. What the heading still does NOT claim — and must not — is
-#: authority over the principal action, canonical mutation, transport or the transaction;
-#: that is why it reads "(composición)" rather than "(autoridad)".
+#: G3-6-BOUNDED-CORRECTION (audit G36-01 / G36-02). G3-6 removed the coverage warning on the
+#: grounds that the three migrated families made the count complete. The independent review
+#: proved it does not: `turn.primary_reply` is still ONE opaque item and a model-authored
+#: reply can carry several business claims inside it — "Sale $85.000 y podés pagar con
+#: transferencia" is one item and two claims — and the outbound validator removes or
+#: rewrites price, vehicle, location, availability, booking and acceptance claims BEFORE the
+#: plan sees the prose, leaving no plan item and no suppression record.
+#:
+#: The note therefore says both halves, precisely: what IS counted (every registered
+#: proposition — the FAQ answers, the clarification, the canonical vehicle and price facts,
+#: with their suppressions) and what is NOT (claims inside the opaque primary, and the
+#: validator's own edits). It must not be broadened into "the plan implements nothing", which
+#: would be just as untrue in the other direction.
 PLAN_SCOPE_NOTE = (
-    "Alcance: el plan ordena, deduplica y compone todas las proposiciones del mensaje. "
-    "No decide la acción principal, ni las mutaciones canónicas, ni el transporte, ni el "
-    "resultado transaccional.")
+    "Alcance: se cuentan las proposiciones REGISTRADAS en el plan — las respuestas canónicas "
+    "de FAQ, la pregunta de dato faltante, el vehículo canónico y el precio canónico — con "
+    "sus supresiones y sus motivos. NO se cuentan por separado las afirmaciones que viajan "
+    "dentro de «turn.primary_reply», que sigue siendo un ítem opaco y puede contener varias "
+    "afirmaciones de negocio; tampoco se representan como supresiones del plan las frases que "
+    "el validador de salida quita o reescribe antes de componer. El número de ítems todavía "
+    "no es el total de afirmaciones del texto final. El plan no decide la acción principal, "
+    "ni las mutaciones canónicas, ni el transporte, ni el resultado transaccional.")
 
 DISPATCH_NOTE = ("La compuerta de salida decide si el mensaje se envía. Nunca es el autor "
                  "del razonamiento ni del texto.")
