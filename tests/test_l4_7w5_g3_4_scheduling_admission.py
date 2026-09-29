@@ -385,7 +385,13 @@ class S6_NoAuthorityLeak(unittest.TestCase):
         import re
         engine = (BACKEND / "app/services/conversation_engine.py").read_text(encoding="utf-8")
         interp = (BACKEND / "app/services/semantic_interpreter.py").read_text(encoding="utf-8")
-        self.assertEqual(len(re.findall(r"self\._call_openai\(", engine)), 2)
+        # G3-5F §4.3 put both consumers behind ONE provider boundary
+        # (`_reply_decision`), so the number of places that can issue a reply
+        # request fell from two to one. The guarantee this asserts — that no
+        # milestone added a provider call — is unchanged and now stricter: the
+        # two consumers are counted separately, so a third would still fail.
+        self.assertEqual(len(re.findall(r"self\._call_openai\(", engine)), 1)
+        self.assertEqual(len(re.findall(r"self\._reply_decision\(", engine)), 2)
         self.assertEqual(len(re.findall(r"self\._ai_invoked = True", engine)), 1)
         self.assertEqual(len(re.findall(r"self\._transport\(", interp)), 1)
         self.assertIn('or "gpt-4o-mini"', interp, "the model is unchanged")

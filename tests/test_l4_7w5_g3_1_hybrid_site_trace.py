@@ -590,14 +590,18 @@ class CrossCutting(unittest.TestCase):
 
 class PrivacyHistoryContract(unittest.TestCase):
 
-    def test_site_38_contract_version_is_1_4_and_older_stay_readable(self):
-        """Renamed by G3-5E: the contract moved to 1.4 and 1.3 joined the readable set."""
+    def test_site_38_contract_version_is_current_and_older_stay_readable(self):
+        """G3-5F moved the contract to 1.5; 1.4 joined the readable set.
+
+        The property is the one this test has always asserted and the one that protects
+        every persisted row: a version bump never drops a contract from the readable set.
+        """
         from app.schemas.hybrid_trace import (READABLE_VERSIONS, TRACE_VERSION_1_0,
                                               TRACE_VERSION_1_1, TRACE_VERSION_1_2,
-                                              TRACE_VERSION_1_3)
-        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.4")
+                                              TRACE_VERSION_1_3, TRACE_VERSION_1_4)
+        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.5")
         for older in (TRACE_VERSION_1_0, TRACE_VERSION_1_1, TRACE_VERSION_1_2,
-                      TRACE_VERSION_1_3):
+                      TRACE_VERSION_1_3, TRACE_VERSION_1_4):
             self.assertIn(older, READABLE_VERSIONS)
 
     def test_site_39_the_preserved_trace_is_byte_identical(self):

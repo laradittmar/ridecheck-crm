@@ -323,7 +323,13 @@ class NoAuthority(unittest.TestCase):
         interpreter = (BACKEND / "app/services/semantic_interpreter.py").read_text(encoding="utf-8")
         engine = (BACKEND / "app/services/conversation_engine.py").read_text(encoding="utf-8")
         self.assertEqual(len(re.findall(r"self\._transport\(", interpreter)), 1)
-        self.assertEqual(len(re.findall(r"self\._call_openai\(", engine)), 2)
+        # G3-5F §4.3 put both consumers behind ONE provider boundary
+        # (`_reply_decision`), so the number of places that can issue a reply
+        # request fell from two to one. The guarantee this asserts — that no
+        # milestone added a provider call — is unchanged and now stricter: the
+        # two consumers are counted separately, so a third would still fail.
+        self.assertEqual(len(re.findall(r"self\._call_openai\(", engine)), 1)
+        self.assertEqual(len(re.findall(r"self\._reply_decision\(", engine)), 2)
         self.assertEqual(len(re.findall(r"self\._ai_invoked = True", engine)), 1)
 
     def test_g33_24_parsing_is_a_pure_function_of_the_payload(self):

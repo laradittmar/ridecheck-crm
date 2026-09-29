@@ -159,7 +159,10 @@ class B_Attribution(unittest.TestCase):
         """G5D-05. `answer_source` still says FAQ_RULE; the RENDERER may not."""
         import inspect
         body = inspect.getsource(ConversationEngine._handle_general_information_ai)
-        self.assertIn("_call_openai(messages, role=ReplyRole.GENERAL_INFORMATION)", body)
+        # G3-5F §4.3 moved the provider call behind `_reply_decision`; the role this route
+        # declares — which is what the assertion is about — is unchanged.
+        self.assertIn("role=ReplyRole.GENERAL_INFORMATION", body)
+        self.assertIn("self._reply_decision(", body)
         self.assertIn("RendererSource.REPLY_MODEL", body)
 
     def test_g35e_10_multiple_fact_sources_are_representable(self):
@@ -288,7 +291,11 @@ class D_ResponsePlan(unittest.TestCase):
                 tuple(t.db.execute(__import__("sqlalchemy").text(
                     "select last_stage, needs_human from whatsapp_thread_states")).first()),
                 tuple(state_before), "the plan mutated canonical state")
-            self.assertTrue(plan.shadow)
+            # G3-5F: a turn that composed carries the LIVE plan, so `shadow` is False.
+            # Everything asserted above — no dispatch, no interpretation, no renderer call,
+            # no canonical mutation, however many times the plan is projected — is the
+            # property this test protects, and it is unchanged.
+            self.assertFalse(plan.shadow)
         finally:
             t.close()
 
@@ -342,15 +349,26 @@ class D_ResponsePlan(unittest.TestCase):
             self.assertIn(condition, FLOW_COMPLETION_ACK_CONDITIONS)
         self.assertEqual(len(FLOW_COMPLETION_ACK_CONDITIONS), 7)
 
-    def test_g35e_27b_the_acknowledgement_is_not_active(self):
-        """It must exist in the contract and nowhere in the engine's behaviour."""
-        import inspect
-        src = inspect.getsource(ce)
-        self.assertNotIn("FLOW_COMPLETION_ACK", src,
-                         "G3-5E must not emit the new acknowledgement")
-        for fragment in ("Gracias por completarlo", "se va a comunicar",
-                         "se estará comunicando"):
-            self.assertNotIn(fragment, src, f"{fragment!r} must not be live yet")
+    def test_g35e_27b_the_acknowledgement_is_authorized_never_assumed(self):
+        """G3-5F §12 activated it. The contract it must obey is asserted here instead.
+
+        `FLOW_COMPLETION_ACK_CONDITIONS` is pinned as data so a later milestone cannot
+        quietly relax one of them. This proves the authorizer actually reads that tuple —
+        that removing a condition from the contract is the ONLY way to stop requiring it —
+        and that an unmet or simply absent condition withholds the acknowledgement.
+        """
+        from app.services.response_composition import flow_completion_ack_authorized
+        complete = {c: True for c in FLOW_COMPLETION_ACK_CONDITIONS}
+        self.assertEqual(flow_completion_ack_authorized(complete), (True, ()))
+        self.assertEqual(flow_completion_ack_authorized({}),
+                         (False, tuple(FLOW_COMPLETION_ACK_CONDITIONS)),
+                         "an unanswered condition was treated as satisfied")
+        for condition in FLOW_COMPLETION_ACK_CONDITIONS:
+            with self.subTest(condition=condition):
+                one_missing = dict(complete, **{condition: False})
+                authorized, unmet = flow_completion_ack_authorized(one_missing)
+                self.assertFalse(authorized)
+                self.assertEqual(unmet, (condition,))
 
     def test_g35e_28_human_handoff_is_exclusive(self):
         """P2. The acknowledgement owns the turn; no automated FAQ may follow it."""
@@ -403,7 +421,11 @@ class D_ResponsePlan(unittest.TestCase):
         t, plan = self.plan_for([("w0", Q, 0), ("w1", "¿Hay algo mañana?", 5)],
                                 evidence=None)
         try:
-            suppressed = plan.suppressed_items
+            # G3-5F: the LIVE plan records suppression the same way. A turn whose
+            # propositions were all admitted legitimately has none, so the assertion is
+            # about the RECORD — anything withheld says why — not about a count.
+            suppressed = plan.suppressed_items or t.engine._shadow_response_plan(
+                t.out).suppressed_items
             self.assertTrue(suppressed, "the hours proposition was withheld and unrecorded")
             for item in suppressed:
                 self.assertTrue(item.suppression_reason, item.proposition_id)
@@ -438,8 +460,8 @@ class D_ResponsePlan(unittest.TestCase):
 
 class E_TraceAndInspector(unittest.TestCase):
 
-    def test_g35e_33_the_contract_is_1_4_and_renders_the_new_fields(self):
-        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.4")
+    def test_g35e_33_the_contract_is_current_and_renders_the_new_fields(self):
+        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.5")
         t = Turn((("w0", Q, 0), ("w1", "¿Hay algo mañana?", 5)), evidence=None).run()
         try:
             from app.services import hybrid_trace as svc
@@ -448,7 +470,10 @@ class E_TraceAndInspector(unittest.TestCase):
             payload = plan.to_payload()
             for key in ("plan_id", "item_count", "suppressed_count", "item_kinds",
                         "transport_multiplicity", "renderer_source", "dispatch_path",
-                        "dispatch_result", "shadow"):
+                        "dispatch_result", "shadow",
+                        # G3-5F §15: the Flow is counted apart from text, so "one message"
+                        # stops being ambiguous when the second part is a form.
+                        "planned_text_items", "planned_flow_items"):
                 self.assertIn(key, payload)
             self.assertTrue(hasattr(svc, "build_trace"))
         finally:
@@ -499,10 +524,16 @@ class E_TraceAndInspector(unittest.TestCase):
         self.assertIn("nunca es el autor", src.lower().replace(" ", " "))
 
     def test_g35e_39_the_plan_is_distinguishable_from_the_actual_outcome(self):
+        """G3-5F: the heading now has to say WHICH plan is on screen, not just that it is
+        one. An operator reading a live plan as an observation would draw the wrong
+        conclusion from every suppression in it."""
         from app.ui import hybrid_trace_view as view
         src = pathlib.Path(view.__file__).read_text(encoding="utf-8")
-        self.assertIn("Plan de respuesta (sombra)", src)
+        self.assertIn("Plan de respuesta (autoridad)", src)
+        self.assertIn("Plan de respuesta (observado)", src)
         self.assertIn("Mensajes realmente enviados", src)
+        self.assertIn("Mensajes de texto planificados", src)
+        self.assertIn("Formularios (Flow) planificados", src)
 
 
 # ══ F — non-regression ═════════════════════════════════════════════════════

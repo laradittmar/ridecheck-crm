@@ -341,8 +341,17 @@ class MN_ModelCallAccounting(unittest.TestCase):
                 self.assertNotIn(forbidden, new)
 
     def test_m02_the_number_of_provider_call_sites_is_unchanged(self):
-        """Two call sites existed before this milestone: the AI path and the FAQ AI path."""
-        self.assertEqual(len(re.findall(r"self\._call_openai\(", self.source())), 2)
+        """The guarantee is "no provider call was added", and it got STRONGER.
+
+        Two call sites existed when this was written: the AI path and the FAQ AI path.
+        G3-5F §4.3 put both behind one boundary, `_reply_decision`, so there is now exactly
+        one place that calls the provider and exactly two consumers that ask it for a
+        decision. The count asserted here is the count that matters — how many places can
+        issue a reply request — and it fell from two to one. A third would fail this.
+        """
+        src = self.source()
+        self.assertEqual(len(re.findall(r"self\._call_openai\(", src)), 1)
+        self.assertEqual(len(re.findall(r"self\._reply_decision\(", src)), 2)
 
     def test_n01_a_provider_call_is_marked_in_exactly_one_place(self):
         """`ai_invoked` means an OpenAI request was actually issued — nothing else."""

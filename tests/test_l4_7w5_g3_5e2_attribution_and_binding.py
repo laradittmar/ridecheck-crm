@@ -20,6 +20,7 @@ exists to catch, and read attribution off real production paths rather than hand
 """
 from __future__ import annotations
 
+import inspect
 import json
 import pathlib
 import sys
@@ -38,11 +39,29 @@ from test_l4_7w5_g3_5b_unified_evidence_boundary import (                # noqa:
 import app.services.conversation_engine as ce                            # noqa: E402
 from app.services.conversation_engine import (                            # noqa: E402
     ConversationEngine, ReplyAdmission, ReplyRole, _ANSWER_SOURCE_ATTRIBUTION,
+    _canonical_burst_from_texts,
 )
+from unittest import mock                                                 # noqa: E402
 from app.schemas.hybrid_trace import (                                    # noqa: E402
     DecisionAuthority, DispatchPath, DispatchResult, FactSource, RendererSource,
     ReplyModelRecord, TRACE_VERSION, TRACE_VERSION_1_3,
 )
+
+class _NullDb:
+    def commit(self): pass
+    def rollback(self): pass
+
+
+class _StubGate:
+    """Stands in for the outbound gate: records nothing, sends nothing, allows nothing."""
+    def __init__(self, db): self.db = db
+    def attempt(self, **kw): return SimpleNamespace(outcome=None, message_id=None)
+
+
+class _StubCtx:
+    contact = SimpleNamespace(wa_id="549110000000")
+    thread = SimpleNamespace(id=1)
+
 
 Q = HOURS_Q
 #: A burst that reaches the reply model: no deterministic gate owns it.
@@ -253,16 +272,70 @@ class B_BindingEnforcement(unittest.TestCase):
         self.assertNotIn(ReplyAdmission.NOT_DISPATCHED, ReplyAdmission.REJECTED)
 
     def test_g35e2_13_no_production_reply_call_happens_without_a_canonical_burst(self):
-        """Both call sites live in `_process_text`, which builds the burst before any gate."""
+        """Both consumers live in `_process_text`, which builds the burst before any gate.
+
+        G3-5F §4.3 rewrote what "the call site" means: the consumers no longer call the
+        provider, they ask `_reply_decision` for a decision. The property under test is
+        unchanged — no reply may be obtained before the turn's burst exists — so it is
+        asserted against the route that now exists.
+        """
         import inspect
         src = inspect.getsource(ConversationEngine._process_text)
         self.assertIn("self._canonical_turn_burst = _canonical_burst(", src)
         burst_at = src.index("self._canonical_turn_burst = _canonical_burst(")
-        call_at = src.index("self._call_openai(")
+        call_at = src.index("self._reply_decision(")
         self.assertLess(burst_at, call_at,
                         "a reply call would precede the canonical burst")
         general = inspect.getsource(ConversationEngine._handle_general_information_ai)
-        self.assertIn("self._call_openai(", general)
+        self.assertIn("self._reply_decision(", general)
+
+    def test_g35f_13a_only_the_boundary_obtains_a_reply_decision(self):
+        """§4.3. The `NOT_DISPATCHED` loophole, closed structurally rather than by audit.
+
+        `_reply_admission` is safe only while every reply decision comes from the engine's
+        own provider boundary. That held by inspection; it now holds by construction, and
+        this is the assertion that keeps it holding: exactly one function calls the
+        provider and parses its result, and no consumer does either.
+        """
+        import inspect
+        src = inspect.getsource(ce)
+        callers = [name for name, fn in vars(ConversationEngine).items()
+                   if inspect.isfunction(fn) and "self._call_openai(" in
+                   inspect.getsource(fn)]
+        self.assertEqual(sorted(callers), ["_reply_decision"],
+                         f"a reply call outside the boundary: {sorted(callers)}")
+        # `_call_openai_inner` is the transport itself: it parses the HTTP envelope and
+        # returns the message content, and never sees a decision. Every OTHER function
+        # that parses reply JSON would have to have obtained it from the boundary — which
+        # the assertion above has just shown is impossible.
+        for name in ("_process_text", "_handle_general_information_ai"):
+            with self.subTest(consumer=name):
+                body = inspect.getsource(getattr(ConversationEngine, name))
+                self.assertNotIn("json.loads(", body,
+                                 "a consumer still parses a provider result itself")
+        boundary = inspect.getsource(ConversationEngine._reply_decision)
+        self.assertIn("self._reply_admission()", boundary)
+        self.assertIn("self._refuse_reply(", boundary)
+        self.assertIn("self._reply_admission_state = admission", boundary)
+
+    def test_g35f_13b_a_substituted_provider_cannot_present_as_bound(self):
+        """Test substitution stays possible — and stays distinguishable.
+
+        The counter is read before and after the call, so a substituted `_call_openai`
+        (which never increments it) reports NOT_DISPATCHED however the engine's binding
+        fields happen to be set, and a real call can never report NOT_DISPATCHED.
+        """
+        e = ConversationEngine.__new__(ConversationEngine)
+        e._reply_calls = 0
+        # A stale binding from an earlier turn must not make a substituted call look bound.
+        e._reply_burst = "stale-fingerprint"
+        e._canonical_turn_burst = _canonical_burst_from_texts(
+            thread_id=1, texts=["hola"], turn_anchor_id="wamid.A")
+        e._call_openai = lambda messages, role=None: '{"reply": "x"}'
+        decision, admission = e._reply_decision([], role="COMMERCIAL_TURN", ctx=None)
+        self.assertEqual(admission, ReplyAdmission.NOT_DISPATCHED)
+        self.assertEqual(decision["reply"], "x")
+        self.assertEqual(e._reply_admission_state, ReplyAdmission.NOT_DISPATCHED)
 
     def test_g35e2_14_the_binding_is_taken_at_the_provider_boundary(self):
         import inspect
@@ -360,12 +433,58 @@ class D_KillSwitchDispatch(unittest.TestCase):
     """G5E-03. The seven early exits now record what the gate did."""
 
     def test_g35e2_23_every_early_exit_records_the_dispatch(self):
+        """G5E2-01/G5E2-04. Not "seven calls happened" — WHAT each one recorded.
+
+        The count-only form of this test is the reason three exits recorded META_FLOW next
+        to a CE_TEXT gate attempt and the suite stayed green. Each exit now names the
+        authorized path it is blocking, and the transport is derived from that path, so
+        this asserts the pairing that actually has to be true.
+        """
         import inspect, re
         src = inspect.getsource(ce)
-        exits = re.findall(r'if os\.environ\.get\("OUTBOUND_ENABLED"\) != "true":\n(\s*)'
-                           r'self\._record_blocked_dispatch\(', src)
+        exits = re.findall(
+            r'if not self\._outbound_armed\(\):\n\s*'
+            r'return self\._blocked_outbound\([^,]+,\s*[^,]+,\s*'
+            r'OutboundPathId\.(\w+)\.value\)', src)
         self.assertEqual(len(exits), 7,
-                         "an early kill-switch exit records no dispatch attribution")
+                         "an early kill-switch exit does not use the one blocked exit")
+        # The three text exits the G3-5E2 review found mislabelled as Meta Flows.
+        self.assertEqual(sorted(exits),
+                         ["CE_FLOW", "CE_FLOW", "CE_FLOW", "CE_FLOW",
+                          "CE_TEXT", "CE_TEXT", "CE_TEXT"],
+                         f"the blocked paths are not the ones the sites dispatch: {exits}")
+        for path in set(exits):
+            with self.subTest(path=path):
+                expected = (DispatchPath.META_FLOW if path.endswith("FLOW")
+                            else DispatchPath.TEXT)
+                self.assertEqual(
+                    ConversationEngine._transport_for_path_id(path), expected)
+        self.assertNotIn("_record_blocked_dispatch(DispatchPath", src,
+                         "a site states a transport literal again — it must be derived")
+
+    def test_g35f_23a_a_blocked_text_path_is_never_recorded_as_a_flow(self):
+        """The defect itself, as a behavioural assertion over the real exit."""
+        calls = {}
+        e = ConversationEngine.__new__(ConversationEngine)
+        e._record_blocked_dispatch = lambda p: calls.setdefault("path", p)
+        e.db = _NullDb()
+        ctx = _StubCtx()
+        with mock.patch.object(ce, "OutboundSafetyGate", _StubGate):
+            e._blocked_outbound(ctx, "texto", ce.OutboundPathId.CE_TEXT.value)
+        self.assertEqual(calls["path"], DispatchPath.TEXT)
+        calls.clear()
+        with mock.patch.object(ce, "OutboundSafetyGate", _StubGate):
+            e._blocked_outbound(ctx, "texto", ce.OutboundPathId.CE_FLOW.value)
+        self.assertEqual(calls["path"], DispatchPath.META_FLOW)
+
+    def test_g35f_23b_an_unknown_path_names_no_transport(self):
+        """An unmapped path is the case the outbound invariants block. Guessing a
+        transport for it would be the same falsehood this correction removes."""
+        self.assertEqual(ConversationEngine._transport_for_path_id("NOT_A_PATH"),
+                         DispatchPath.NONE)
+        self.assertEqual(
+            ConversationEngine._transport_for_path_id(
+                ce.OutboundPathId.LEGACY_N8N_AI_PIPELINE.value), DispatchPath.NONE)
 
     def test_g35e2_24_the_recorder_touches_only_the_dispatch_fields(self):
         e = ConversationEngine.__new__(ConversationEngine)
@@ -456,9 +575,19 @@ class E_TraceAndPlan(unittest.TestCase):
         self.assertEqual(payload["admission"], "ADMITTED")
         self.assertEqual(payload["prompt_version"], "reply/1.0")
 
-    def test_g35e2_31_the_contract_stays_at_1_4(self):
-        """1.4 was never deployed, so completing its promised field beats inventing 1.5."""
-        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.4")
+    def test_g35e2_31_the_contract_moved_to_1_5_and_1_4_stays_readable(self):
+        """G3-5E2 completed 1.4 in place because no row had ever claimed it.
+
+        G3-5F could not do the same. It changed what `shadow` MEANS — a 1.4 plan only ever
+        described a turn, a 1.5 plan may have decided it — so a reader must be able to tell
+        the two apart. That is a semantic change, and it gets a version.
+        """
+        from app.schemas.hybrid_trace import (READABLE_VERSIONS, TRACE_VERSION_1_4,
+                                              VERSIONS_WITH_SHADOW_ONLY_PLAN)
+        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.5")
+        self.assertIn(TRACE_VERSION_1_4, READABLE_VERSIONS)
+        self.assertIn(TRACE_VERSION_1_4, VERSIONS_WITH_SHADOW_ONLY_PLAN)
+        self.assertNotIn(TRACE_VERSION, VERSIONS_WITH_SHADOW_ONLY_PLAN)
 
     def test_g35e2_32_a_pre_1_4_row_shows_the_role_as_unavailable(self):
         from app.ui.hybrid_trace_view import (UNAVAILABLE_BEFORE_1_4,
@@ -487,17 +616,49 @@ class F_NonRegression(unittest.TestCase):
             after = (state_row(t), len(t.sent), t.engine._turn_semantic_calls,
                      t.engine._reply_calls)
             self.assertEqual(before, after)
-            self.assertTrue(t.engine._turn_response_plan.shadow)
+            # G3-5F: the plan is now the LIVE authority for a turn that composed, so it
+            # reports `shadow=False`. The property this test exists for is unchanged and
+            # is asserted above: PROJECTING the plan — however many times — dispatches
+            # nothing, interprets nothing, renders nothing and mutates nothing.
+            self.assertFalse(t.engine._turn_response_plan.shadow,
+                             "a turn that composed must not report a shadow plan")
+            for _ in range(3):
+                projected = t.engine._turn_plan(t.out)
+            self.assertEqual(
+                (state_row(t), len(t.sent), t.engine._turn_semantic_calls,
+                 t.engine._reply_calls), before, "projecting the live plan acted")
+            self.assertEqual(projected.plan_id, t.engine._turn_response_plan.plan_id)
         finally:
             t.close()
 
-    def test_g35e2_35_the_flow_acknowledgement_is_still_inactive(self):
+    def test_g35e2_35_the_flow_acknowledgement_is_never_unconditional(self):
+        """G3-5F §12 activates the acknowledgement. What may never return is a FREE one.
+
+        The G3-5E form of this test asserted the copy was absent. That guard has done its
+        job — the wording is live now — and the guarantee that replaces it is the one that
+        matters from here on: the sentence exists in exactly ONE place, it is reachable
+        only through the authorizer, and the authorizer is driven by the pinned condition
+        list rather than by a list written at the call site.
+        """
+        src = pathlib.Path(ce.__file__).read_text(encoding="utf-8")
+        self.assertEqual(src.count("Gracias por completarlo"), 1,
+                         "the acknowledgement copy exists in more than one place")
         import app.services.booking_flow_service as bfs
-        for mod in (ce, bfs):
-            src = pathlib.Path(mod.__file__).read_text(encoding="utf-8")
-            for needle in ("FLOW_COMPLETION_ACK", "Gracias por completarlo",
-                           "se va a comunicar", "se estará comunicando"):
-                self.assertNotIn(needle, src, f"{needle!r} became live in {mod.__name__}")
+        self.assertNotIn("Gracias por completarlo",
+                         pathlib.Path(bfs.__file__).read_text(encoding="utf-8"),
+                         "the two booking paths hold competing acknowledgement copy")
+        authorizer = inspect.getsource(ce.ConversationEngine._plan_flow_completion_ack)
+        self.assertIn("flow_completion_ack_authorized(evidence)", authorizer)
+        # Every pinned condition is evidenced by name; none is assumed.
+        for condition in ce.FLOW_COMPLETION_ACK_CONDITIONS:
+            with self.subTest(condition=condition):
+                self.assertIn(f'"{condition}"', authorizer)
+        emitters = [n for n, fn in vars(ce.ConversationEngine).items()
+                    if inspect.isfunction(fn)
+                    and "_FLOW_COMPLETION_ACK" in inspect.getsource(fn)]
+        self.assertEqual(sorted(emitters), ["_flow_ack_already_sent",
+                                            "_plan_flow_completion_ack"],
+                         f"the acknowledgement is reachable elsewhere: {sorted(emitters)}")
 
     def test_g35e2_36_f01_and_f02_remain_closed(self):
         for texts in ([Q, "¿Hay algo mañana?"], [Q, "¿Y el martes?"]):

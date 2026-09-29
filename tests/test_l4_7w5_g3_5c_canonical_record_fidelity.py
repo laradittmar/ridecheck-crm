@@ -521,7 +521,7 @@ class F_Freeze(unittest.TestCase):
         self.assertIn('or "gpt-4o-mini"', interp)
         self.assertIn('PROMPT_VERSION = "understand/1.19"', interp)
         self.assertEqual(te.SCHEMA_VERSION, "turn-evidence/1.3")
-        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.4")
+        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.5")
 
     def test_g35c_40_the_matching_normalization_is_the_projects_own(self):
         from app.schemas.hybrid_trace import normalize_burst

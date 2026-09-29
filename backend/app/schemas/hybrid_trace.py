@@ -60,20 +60,35 @@ import unicodedata
 from dataclasses import dataclass, field, asdict
 from typing import Any, Optional
 
-TRACE_VERSION = "hybrid-decision-trace/1.4"
+TRACE_VERSION = "hybrid-decision-trace/1.5"
 #: G3-5E. 1.4 splits `response_plan_source` — which was `answer_source`, and therefore
 #: answered three questions at once — into decision authority, fact sources, renderer source
 #: and dispatch result, and adds the reply-generation role and the shadow response plan. A
 #: 1.3 row carries none of those fields, so a reader must render them as UNAVAILABLE rather
 #: than as empty 1.4 fields; `response_plan_source` on a 1.3 row keeps its old meaning.
+#: G3-5F. 1.4 described a plan that watched; 1.5 describes a plan that decides. The bump is
+#: a SEMANTIC one, not a convenience: `shadow` used to be constant-true and now distinguishes
+#: a live composition from a post-hoc description, and the payload gained the counts §15
+#: requires — planned text items, actual text messages, the Flow item counted apart from
+#: text. A consumer reading a 1.4 row must not interpret its `shadow` flag as the 1.5 one,
+#: so the version has to say which contract it is.
+#:
+#: Checked against the live table before choosing: no persisted row has ever claimed 1.4, so
+#: completing 1.4 in place was truthful for G3-5E2. Rows DO exist at 1.0 and 1.3, and 1.5
+#: changes what a reader must conclude, so this one is a new version rather than an edit.
+TRACE_VERSION_1_4 = "hybrid-decision-trace/1.4"
 TRACE_VERSION_1_3 = "hybrid-decision-trace/1.3"
 TRACE_VERSION_1_2 = "hybrid-decision-trace/1.2"
 TRACE_VERSION_1_1 = "hybrid-decision-trace/1.1"
 #: The first contract. Its reconciliation rows carry no producer provenance, so a
 #: reader must never treat their absent 1.1 fields as empty 1.1 fields.
 TRACE_VERSION_1_0 = "hybrid-decision-trace/1.0"
-READABLE_VERSIONS = (TRACE_VERSION, TRACE_VERSION_1_3, TRACE_VERSION_1_2,
-                     TRACE_VERSION_1_1, TRACE_VERSION_1_0)
+READABLE_VERSIONS = (TRACE_VERSION, TRACE_VERSION_1_4, TRACE_VERSION_1_3,
+                     TRACE_VERSION_1_2, TRACE_VERSION_1_1, TRACE_VERSION_1_0)
+#: Contracts whose `response_plan`, where present, only ever DESCRIBED a turn. A reader must
+#: not take their `shadow` flag, item counts or suppression reasons as decisions.
+VERSIONS_WITH_SHADOW_ONLY_PLAN = (TRACE_VERSION_1_4, TRACE_VERSION_1_3, TRACE_VERSION_1_2,
+                                  TRACE_VERSION_1_1, TRACE_VERSION_1_0)
 #: Contracts predating the G3-5E attribution split. A reader must not infer the new fields.
 VERSIONS_WITHOUT_ATTRIBUTION_SPLIT = (TRACE_VERSION_1_3, TRACE_VERSION_1_2,
                                       TRACE_VERSION_1_1, TRACE_VERSION_1_0)
@@ -566,6 +581,21 @@ class ResponsePlan:
     def suppressed_items(self) -> tuple:
         return tuple(i for i in self.items if not i.included)
 
+    #: Everything that occupies a TEXT message. `NO_RESPONSE` and `SUPPRESSED` occupy none,
+    #: and `META_FLOW` is a Flow — counting it as text is what made "one message" ambiguous.
+    _TEXT_KINDS = (ResponseItemKind.TEXT, ResponseItemKind.CLARIFICATION,
+                   ResponseItemKind.FAQ_ANSWER, ResponseItemKind.HANDOFF_ACK,
+                   ResponseItemKind.FLOW_INTRO_TEXT, ResponseItemKind.FLOW_COMPLETION_ACK)
+
+    @property
+    def planned_text_items(self) -> tuple:
+        return tuple(i for i in self.included_items if i.kind in self._TEXT_KINDS)
+
+    @property
+    def planned_flow_items(self) -> tuple:
+        return tuple(i for i in self.included_items
+                     if i.kind == ResponseItemKind.META_FLOW)
+
     def to_payload(self) -> dict:
         return {
             "plan_id": self.plan_id, "turn_id": self.turn_id,
@@ -578,10 +608,23 @@ class ResponsePlan:
             "item_count": len(self.included_items),
             "suppressed_count": len(self.suppressed_items),
             "item_kinds": [i.kind for i in self.included_items],
+            # §15. The Flow is counted APART from text, because "two messages" means
+            # something different when the second one is a form. `planned_text_items` is
+            # what the plan authorized; the trace carries what was actually sent beside it,
+            # so a divergence is visible instead of averaged away.
+            "planned_text_items": len(self.planned_text_items),
+            "planned_flow_items": len(self.planned_flow_items),
             "items": [
                 {"kind": i.kind, "claim_family": i.claim_family,
                  "proposition_id": i.proposition_id,
-                 "evidence_ids": list(i.evidence_ids),
+                 # G3-5F §15. `evidence_ids` are WAMIDs. The plan needs to prove WHICH
+                 # messages a proposition rests on and HOW MANY — it never needs the
+                 # identifiers themselves, and a trace row is read by operators. Each is
+                 # reduced to a short digest: still comparable between items and against
+                 # the burst, no longer a reversible identifier.
+                 "evidence_ids": [hashlib.sha256(str(x).encode("utf-8")).hexdigest()[:12]
+                                  for x in i.evidence_ids],
+                 "evidence_count": len(i.evidence_ids),
                  "classification": i.classification,
                  "decision_authority": i.decision_authority,
                  "fact_sources": list(i.fact_sources),

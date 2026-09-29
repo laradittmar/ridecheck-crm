@@ -738,6 +738,10 @@ def _no_response_produced(trace: dict) -> tuple:
 #: be confused with "the field is empty".
 UNAVAILABLE_BEFORE_1_4 = "no disponible en este contrato"
 
+#: Rendered where a contract older than 1.5 cannot say whether its plan decided or merely
+#: described. It must never be confused with "the plan decided nothing".
+UNAVAILABLE_BEFORE_1_5 = "no disponible en este contrato"
+
 DISPATCH_NOTE = ("La compuerta de salida decide si el mensaje se envía. Nunca es el autor "
                  "del razonamiento ni del texto.")
 
@@ -755,23 +759,53 @@ def _unavailable_before_1_4(trace: dict):
 
 
 def _response_plan_card(trace: dict) -> str:
-    """The shadow response plan. Observational in G3-5E: it dispatched nothing."""
+    """The response plan: what the turn decided to tell the customer, and what it withheld.
+
+    G3-5F §15. Until 1.5 this card described a plan that only watched, so its heading said
+    "(sombra)" and the operator could ignore it. From 1.5 a turn that composed carries the
+    plan that actually decided, and the heading has to say which of the two is on screen —
+    an operator reading a live plan as an observation would draw the wrong conclusion from
+    every suppression in it.
+    """
+    from ..schemas.hybrid_trace import VERSIONS_WITH_SHADOW_ONLY_PLAN
     plan = trace.get("response_plan")
     if not isinstance(plan, dict):
         return ""
+    old_contract = str(trace.get("trace_version") or "") in VERSIONS_WITH_SHADOW_ONLY_PLAN
+    shadow = bool(plan.get("shadow")) or old_contract
+    heading = ("Plan de respuesta (observado)" if shadow
+               else "Plan de respuesta (autoridad)")
+    if old_contract:
+        modo = f'<span class="note">{html.escape(UNAVAILABLE_BEFORE_1_5)}</span>'
+    elif shadow:
+        modo = _e("descripción — el turno no llegó a componer")
+    else:
+        modo = _e("autoridad — este plan decidió la respuesta")
+    items = [i for i in (plan.get("items") or []) if i.get("included")]
     rows = [
         ("Plan", _e(plan.get("plan_id"))),
-        ("Modo", "sombra (no despacha)" if plan.get("shadow") else _e("activo")),
+        ("Modo", modo),
         ("Ítems planificados", _e(plan.get("item_count"))),
         ("Tipos", _e(", ".join(plan.get("item_kinds") or []) or None)),
+        ("Mensajes de texto planificados", _e(plan.get("planned_text_items"))),
+        ("Formularios (Flow) planificados", _e(plan.get("planned_flow_items"))),
+        ("Mensajes realmente enviados", _e(trace.get("final_message_count"))),
         ("Ítems suprimidos", _e(plan.get("suppressed_count"))),
         ("Multiplicidad de transporte", _e(plan.get("transport_multiplicity"))),
-        ("Mensajes realmente enviados", _e(trace.get("final_message_count"))),
+        ("Transporte previsto", _e(plan.get("dispatch_path"))),
+        ("Resultado del envío", _e(plan.get("dispatch_result"))),
     ]
+    body = f'<div class="card"><h2>{heading}</h2>' + _kv(rows)
+    if items:
+        body += "<h3>Proposiciones</h3><ul>" + "".join(
+            f'<li>{_e(i.get("kind"))} · {_e(i.get("proposition_id"))}'
+            f' — decidió {_e(i.get("decision_authority"))}'
+            f' · redactó {_e(i.get("renderer_source"))}'
+            + (f' · política {_e(i.get("policy"))}' if i.get("policy") else "")
+            + "</li>" for i in items) + "</ul>"
     suppressed = [i for i in (plan.get("items") or []) if not i.get("included")]
-    body = '<div class="card"><h2>Plan de respuesta (sombra)</h2>' + _kv(rows)
     if suppressed:
-        body += "<ul>" + "".join(
+        body += "<h3>Suprimidas</h3><ul>" + "".join(
             f'<li>{_e(i.get("kind"))} · {_e(i.get("proposition_id"))} — '
             f'{_e(i.get("suppression_reason"))}</li>' for i in suppressed) + "</ul>"
     return body + "</div>"

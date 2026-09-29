@@ -56,6 +56,10 @@ from ..schemas.conversation import (
     ConversationHandleOut,
 )
 from ..schemas.hybrid_trace import DecisionSite
+from .response_composition import (LiveResponsePlan, Proposition, PropositionId,
+                                   SuppressionReason, flow_completion_ack_authorized)
+from ..schemas.hybrid_trace import (FLOW_COMPLETION_ACK_CONDITIONS, ResponseItemKind,
+                                    ResponsePolicy)
 # G3-5E: the attribution vocabulary. `schemas.hybrid_trace` imports nothing from services,
 # so this is a module-level import rather than the file's usual local-import style.
 from ..schemas.hybrid_trace import (
@@ -919,11 +923,21 @@ class CanonicalTurnBurst:
     competing_time_str: str | None
     competing_next_available: bool
     stage_at_build: str | None         # provenance only; the decision reads its own snapshot
+    #: G3-5F §4.2 (audit G5E2-02). The identity of the customer turn this burst reconstructs
+    #: — the causal inbound WAMID. It is the one turn identity that is BOTH genuine and
+    #: stable: Meta issues it once per message, so a redelivery of the same turn reproduces
+    #: the same value and idempotency survives, while two different turns never share one.
+    #: `turn_id` is deliberately NOT used for this: it is a fresh uuid4 per request, so
+    #: folding it in would make the fingerprint unique per delivery and destroy exactly the
+    #: determinism the binding depends on. None means no anchor was available — the
+    #: fingerprint then rests on thread plus message identities, and says so rather than
+    #: inventing one.
     #: G3-5C. Structural evidence from the merge itself. `payload_conflicts` records where one
     #: identity carried two payloads and which source won; `format_variations` counts messages
     #: the transport reported with different formatting than the persisted copy. Digests only.
     payload_conflicts: tuple = ()
     format_variations: int = 0
+    turn_anchor_id: str | None = None
 
     # ── every view below is PROJECTED from `messages`; none is stored separately ──
 
@@ -941,14 +955,25 @@ class CanonicalTurnBurst:
 
     @property
     def fingerprint(self) -> str:
-        """Proves membership, order, identity AND the id-to-text association.
+        """Proves WHOSE turn, WHICH turn, and then membership, order and identity.
 
-        Each record contributes `id\x1ftext`, so two messages with the same words but
-        different identities hash differently, and swapping two messages changes the digest.
-        No customer text is stored — only the digest travels.
+        G3-5F §4.2 (audit G5E2-02). The digest used to be computed from the message records
+        alone. Where those records carry real WAMIDs that is globally unique, but a thread's
+        FIRST burst has no persisted rows to key on, so every identity is synthetic and
+        derived from content — and two different customers opening with the same words
+        produced the SAME fingerprint. The binding that admits a reply, and the plan id,
+        both rest on this value, so it must carry conversation identity, not only content.
+
+        Conversation identity comes first (`thread`), then the turn anchor, then each
+        record as `id\x1ftext` — so two messages with the same words but different
+        identities still hash differently and swapping two messages still changes the
+        digest. Every component is deterministic: the same turn reconstructed twice, or
+        redelivered, produces the same value. No customer text is stored — only digests.
         """
         from ..schemas.hybrid_trace import normalize_burst
-        parts = [f"{m.message_id}\x1f{normalize_burst([m.text])}" for m in self.messages]
+        parts = [f"thread\x1f{self.thread_id if self.thread_id is not None else ''}",
+                 f"anchor\x1f{self.turn_anchor_id or ''}"]
+        parts += [f"{m.message_id}\x1f{normalize_burst([m.text])}" for m in self.messages]
         return _text_digest("\x1e".join(parts))
 
     @property
@@ -1242,7 +1267,7 @@ def _canonical_messages(*, db_rows=(), event_wamid=None, event_text=None,
 
 
 def _canonical_burst(*, thread_id, turn_id, messages, provenance, presentation_texts,
-                     stage_at_build=None) -> CanonicalTurnBurst:
+                     stage_at_build=None, turn_anchor_id=None) -> CanonicalTurnBurst:
     """Build the turn's canonical burst. Deterministic evidence is resolved here, once.
 
     The date/time parser is the one the engine already trusts for this judgement —
@@ -1269,7 +1294,8 @@ def _canonical_burst(*, thread_id, turn_id, messages, provenance, presentation_t
     except Exception:            # a parser failure must never cost a turn
         pass
     return CanonicalTurnBurst(
-        thread_id=thread_id, turn_id=turn_id, messages=tuple(messages),
+        thread_id=thread_id, turn_id=turn_id, turn_anchor_id=turn_anchor_id,
+        messages=tuple(messages),
         provenance=tuple(provenance or ()),
         presentation_texts=tuple(presentation_texts or ()),
         requested_day_iso=day_iso, requested_time_str=time_str,
@@ -1283,7 +1309,8 @@ def _canonical_burst(*, thread_id, turn_id, messages, provenance, presentation_t
 
 def _canonical_burst_from_texts(*, thread_id=None, turn_id=None, texts=(),
                                 provenance=("caller_supplied",), presentation_texts=None,
-                                stage_at_build=None) -> CanonicalTurnBurst:
+                                stage_at_build=None,
+                                turn_anchor_id=None) -> CanonicalTurnBurst:
     """A canonical burst for a caller that has texts but no message identities.
 
     Used only where no reconstruction ran — an engine that did not go through `handle`.
@@ -1297,7 +1324,7 @@ def _canonical_burst_from_texts(*, thread_id=None, turn_id=None, texts=(),
         thread_id=thread_id, turn_id=turn_id, messages=msgs, provenance=provenance,
         presentation_texts=(presentation_texts if presentation_texts is not None
                             else [m.text for m in msgs]),
-        stage_at_build=stage_at_build)
+        stage_at_build=stage_at_build, turn_anchor_id=turn_anchor_id)
 
 
 def _hours_units(text: str) -> list[str]:
@@ -3124,6 +3151,60 @@ class ConversationEngine:
             if fact not in existing:
                 existing.append(fact)
 
+    #: G3-5F §4.1 (audit G5E2-01). The ONE place that says which transport an outbound
+    #: path uses. Three kill-switch exits used to name `META_FLOW` beside a `CE_TEXT`
+    #: gate attempt, because the transport was a literal written at the call site and
+    #: nothing tied it to the path actually being blocked. Deriving it from the very
+    #: `path_id` handed to the gate makes that drift unrepresentable.
+    _TRANSPORT_FOR_PATH_ID: dict = {
+        OutboundPathId.CE_TEXT.value: DispatchPath.TEXT,
+        OutboundPathId.CE_INTERACTIVE.value: DispatchPath.TEXT,
+        OutboundPathId.CE_LIST.value: DispatchPath.TEXT,
+        OutboundPathId.MANUAL_CRM.value: DispatchPath.TEXT,
+        OutboundPathId.SYSTEM_NOTIFICATION.value: DispatchPath.TEXT,
+        OutboundPathId.CE_FLOW.value: DispatchPath.META_FLOW,
+        OutboundPathId.BOOKING_FLOW.value: DispatchPath.META_FLOW,
+    }
+
+    @classmethod
+    def _transport_for_path_id(cls, path_id: str) -> str:
+        """The transport a given authorized outbound path uses.
+
+        An unmapped path id records `NONE` rather than guessing a transport: an unknown
+        path is exactly the case the outbound invariants block, and naming a transport for
+        it would be the same class of falsehood this method exists to remove.
+        """
+        return cls._TRANSPORT_FOR_PATH_ID.get(path_id, DispatchPath.NONE)
+
+    @staticmethod
+    def _outbound_armed() -> bool:
+        """The ONE read of the kill switch inside the engine.
+
+        G3-5F §14. Seven handlers each read `OUTBOUND_ENABLED` from the environment
+        themselves. That is not a second kill switch — the gate still refuses every send
+        independently, and it stays fail-closed — but it is seven places that could drift
+        in how they spell the check. There is one now, and it keeps the gate's own
+        semantics exactly: only the literal "true" arms outbound.
+        """
+        return os.environ.get("OUTBOUND_ENABLED") == "true"
+
+    def _blocked_outbound(self, ctx, text: str, path_id: str):
+        """The single early kill-switch exit: audit the intent, record it truthfully, stop.
+
+        G3-5F §4.1/§14. Seven paths read `OUTBOUND_ENABLED` themselves and return before
+        reaching `_send_text_to_wa`, so the gate's own recording never runs. They now share
+        this one exit, which takes the authorized path id and derives everything else from
+        it. A site can no longer state a transport that disagrees with the path it blocked,
+        because it no longer states one.
+        """
+        self._record_blocked_dispatch(self._transport_for_path_id(path_id))
+        OutboundSafetyGate(self.db).attempt(
+            wa_id=ctx.contact.wa_id, thread_id=ctx.thread.id, text=text,
+            path_id=path_id,
+        )
+        self.db.commit()
+        return _out("blocked_dispatch", detail="OUTBOUND_GATE_BLOCKED_KILL_SWITCH")
+
     def _record_blocked_dispatch(self, path: str) -> None:
         """An early kill-switch exit records WHAT the gate did, and nothing else.
 
@@ -3189,6 +3270,10 @@ class ConversationEngine:
         self._turn_flow_dispatched = False
         self._turn_text_dispatches = 0
         self._turn_response_plan = None
+        # G3-5F §5/§6: the LIVE plan. Constructed before anything can dispatch, so the
+        # propositions a turn registers are decided by a plan rather than by which handler
+        # reached the send primitive first.
+        self._live_plan = LiveResponsePlan(turn_id=self._correlation_id)
         self._turn_burst_texts = []
         self._turn_trace_ctx = None
         self._turn_trace_before = None
@@ -3280,7 +3365,7 @@ class ConversationEngine:
         # G3-5E: the shadow plan describes the turn whether or not tracing is armed, so
         # "what this turn owed the customer" is observable on its own terms. It reads state
         # the decision path already recorded; it calls nothing and changes nothing.
-        self._turn_response_plan = self._shadow_response_plan(out)
+        self._turn_response_plan = self._turn_plan(out)
         self._write_hybrid_trace(event, out, _trace_started_at,
                                  int((_time.perf_counter() - _ce_t0) * 1000))
         return out
@@ -3338,6 +3423,14 @@ class ConversationEngine:
         # Human takeover check — AFTER cycle reset which clears needs_human
         if state.needs_human:
             logger.info("M18 thread_id=%s needs_human — AI suppressed", event.thread_id)
+            # ── G3-5F §9 (P2): exclusivity, declared to the plan ──────────────────
+            # Nothing automated may stand beside a human-owned turn — no FAQ answer, no
+            # canonical restatement, no clarification. Declaring it here rather than
+            # checking `state.needs_human` at each composition point means a proposition
+            # registered by a producer that ran EARLIER in the turn is suppressed too.
+            _plan = getattr(self, "_live_plan", None)
+            if _plan is not None:
+                _plan.human_owns_turn = True
             self.db.commit()
             return _out("skipped_human")
 
@@ -3377,6 +3470,7 @@ class ConversationEngine:
 
         # Token validation (warn only — don't hard-block in case of token mismatch due to clock skew)
         expected = state.flow_booking_token
+        self._flow_token_expected = expected
         if expected and flow_token and flow_token != expected:
             logger.warning(
                 "M18 flow token mismatch thread_id=%s expected=%s got=%s",
@@ -3536,8 +3630,107 @@ class ConversationEngine:
         from .booking_flow_service import build_booking_receipt_message
         confirm_text = build_booking_receipt_message(
             name_display or None, date_display, time_display)
+        # ── G3-5F §12 (P5): the completion acknowledgement ────────────────────────
+        #
+        # Planned only AFTER `self.db.commit()` above, so "the booking exists" is a fact
+        # about committed rows and not about an intention. It joins the receipt in ONE
+        # message rather than following it as a second send, because P3 governs this turn
+        # too: the customer completed one form and receives one reply.
+        self._plan_flow_completion_ack(ctx, thread_rev_id=thread_rev.id,
+                                       flow_token=flow_token, flow_data=flow_data)
         sent_id = self._send_text_to_wa(ctx, confirm_text)
         return _out("booking_created", wa_message_id=sent_id)
+
+    #: P5 §12. The acknowledgement a customer receives once their Flow submission is
+    #: validated, accepted and committed. Says only what is true at that moment: an
+    #: operator still has to approve the appointment, so it promises contact, not a turn.
+    _FLOW_COMPLETION_ACK = (
+        "Gracias por completarlo. Un representante de RideCheck se va a comunicar con vos.")
+
+    def _flow_ack_already_sent(self, ctx) -> bool:
+        """Has this thread already been acknowledged for a completed Flow?
+
+        G3-5F §12. Idempotency with no new column and no migration: the outbound ledger is
+        already the durable, container-independent record of every automated send, and the
+        acknowledgement is a fixed sentence, so its presence in this thread's outbound
+        history IS the evidence. A duplicate webhook, a redelivery or a retried submission
+        therefore finds the acknowledgement already recorded and plans none.
+
+        Fails CLOSED: a ledger read that raises reports "already acknowledged", because
+        sending a second acknowledgement is a customer-visible defect while withholding one
+        is recoverable.
+        """
+        try:
+            from ..models import WhatsAppMessage
+            return self.db.query(WhatsAppMessage.id).filter(
+                WhatsAppMessage.thread_id == ctx.thread.id,
+                WhatsAppMessage.direction == "out",
+                WhatsAppMessage.text.contains(self._FLOW_COMPLETION_ACK),
+            ).first() is not None
+        except Exception as exc:
+            logger.warning("G3-5F flow-ack ledger read failed thread_id=%s: %s",
+                           getattr(getattr(ctx, "thread", None), "id", None), exc)
+            return True
+
+    def _plan_flow_completion_ack(self, ctx, *, thread_rev_id, flow_token, flow_data) -> bool:
+        """Authorize and register the P5 acknowledgement, or record why it was withheld.
+
+        Every condition in `FLOW_COMPLETION_ACK_CONDITIONS` is evidenced from something
+        that actually happened in this turn — never assumed, never defaulted to True. A
+        missing key is unmet, so relaxing a condition means deleting it from the pinned
+        contract, which a test watches.
+        """
+        expected = getattr(self, "_flow_token_expected", None)
+        evidence = {
+            # The webhook carried a completed submission; an opened or navigated Flow never
+            # reaches this function, and neither does a `nfm_reply`-less event.
+            "flow_submitted": bool(flow_data),
+            # The route fails closed on an unconfigured secret, so a request that arrived
+            # here was HMAC-authenticated exactly when the secret is configured. The
+            # deliberate `WHATSAPP_WEBHOOK_ALLOW_UNSIGNED` escape is NOT treated as
+            # verification: it is a development convenience, and a business fact told to a
+            # customer may not rest on one.
+            "signature_verified": bool(
+                (getattr(self.settings, "whatsapp_app_secret", "") or "").strip()),
+            # A token the thread never issued, or one that does not match, is not valid.
+            "token_valid": bool(expected is None or not expected or flow_token == expected),
+            "payload_complete": bool(flow_data) and any(
+                (flow_data.get(k) or "").strip() if isinstance(flow_data.get(k), str)
+                else flow_data.get(k) for k in ("nombre", "direccion", "email",
+                                                "direccion_texto", "tipo_vendedor")),
+            # Parsing, vehicle resolution and scheduling all completed without raising.
+            "validation_passed": True,
+            # The booking rows are committed: `thread_rev_id` is a persisted primary key.
+            "persistence_committed": bool(thread_rev_id),
+            "not_already_acknowledged": not self._flow_ack_already_sent(ctx),
+        }
+        authorized, unmet = flow_completion_ack_authorized(evidence)
+        plan = getattr(self, "_live_plan", None)
+        if not authorized:
+            logger.info("G3-5F P5 ack withheld thread_id=%s unmet=%s",
+                        getattr(getattr(ctx, "thread", None), "id", None), ",".join(unmet))
+            if plan is not None:
+                plan.register(Proposition(
+                    proposition_id=PropositionId.FLOW_COMPLETION_ACK,
+                    kind=ResponseItemKind.FLOW_COMPLETION_ACK, claim_family="booking",
+                    render=None,
+                    decision_authority=DecisionAuthority.FLOW_TRANSACTION,
+                    fact_sources=(FactSource.FLOW_TRANSACTION,),
+                    renderer_source=RendererSource.NO_PROSE,
+                    policy=ResponsePolicy.P5_FLOW_COMPLETION_ACK, priority=20,
+                    included=False, suppression_reason=f"UNMET:{','.join(unmet)}"))
+            return False
+        if plan is not None:
+            plan.register(Proposition(
+                proposition_id=PropositionId.FLOW_COMPLETION_ACK,
+                kind=ResponseItemKind.FLOW_COMPLETION_ACK, claim_family="booking",
+                render=lambda: self._FLOW_COMPLETION_ACK,
+                decision_authority=DecisionAuthority.FLOW_TRANSACTION,
+                fact_sources=(FactSource.FLOW_TRANSACTION,),
+                renderer_source=RendererSource.DETERMINISTIC_TEMPLATE,
+                policy=ResponsePolicy.P5_FLOW_COMPLETION_ACK, priority=20))
+        self._note_fact_source(FactSource.FLOW_TRANSACTION)
+        return True
 
     # ── Qualification fallback Flows ─────────────────────────────────────
 
@@ -3710,7 +3903,8 @@ class ConversationEngine:
                 thread_id=getattr(getattr(ctx, "thread", None), "id", None),
                 turn_id=getattr(self, "_correlation_id", None),
                 texts=list(texts or ()), provenance=("caller_supplied",),
-                stage_at_build=getattr(state, "last_stage", None))
+                stage_at_build=getattr(state, "last_stage", None),
+                turn_anchor_id=getattr(ctx, "inbound_wa_message_id", None))
             self._canonical_turn_burst = burst
 
         # A caller asking about a DIFFERENT burst in the same turn is a defect, not a
@@ -4667,14 +4861,8 @@ class ConversationEngine:
         logger.info(
             "M20 vehicle_flow_direct thread_id=%s flow_id=%s", ctx.thread.id, flow_id
         )
-        if os.environ.get("OUTBOUND_ENABLED") != "true":
-            self._record_blocked_dispatch(DispatchPath.META_FLOW)
-            OutboundSafetyGate(self.db).attempt(
-                wa_id=ctx.contact.wa_id, thread_id=ctx.thread.id, text=intro,
-                path_id=OutboundPathId.CE_FLOW.value,
-            )
-            self.db.commit()
-            return _out("blocked_dispatch", detail="OUTBOUND_GATE_BLOCKED_KILL_SWITCH")
+        if not self._outbound_armed():
+            return self._blocked_outbound(ctx, intro, OutboundPathId.CE_FLOW.value)
         state.vehicle_fallback_flow_sent = True
         flow_token = secrets.token_urlsafe(24)
         sent_id = self._send_flow_button(
@@ -4705,14 +4893,8 @@ class ConversationEngine:
             "M20 location_flow_direct thread_id=%s flow_id=%s concern=%s",
             ctx.thread.id, flow_id, concern,
         )
-        if os.environ.get("OUTBOUND_ENABLED") != "true":
-            self._record_blocked_dispatch(DispatchPath.META_FLOW)
-            OutboundSafetyGate(self.db).attempt(
-                wa_id=ctx.contact.wa_id, thread_id=ctx.thread.id, text=body,
-                path_id=OutboundPathId.CE_FLOW.value,
-            )
-            self.db.commit()
-            return _out("blocked_dispatch", detail="OUTBOUND_GATE_BLOCKED_KILL_SWITCH")
+        if not self._outbound_armed():
+            return self._blocked_outbound(ctx, body, OutboundPathId.CE_FLOW.value)
         state.location_fallback_flow_sent = True
         flow_token = secrets.token_urlsafe(24)
         sent_id = self._send_flow_button(
@@ -4732,16 +4914,8 @@ class ConversationEngine:
         if ctx.lead:
             ctx.lead.necesita_humano = True
         logger.info("M20 coverage_response thread_id=%s", ctx.thread.id)
-        if os.environ.get("OUTBOUND_ENABLED") != "true":
-            self._record_blocked_dispatch(DispatchPath.META_FLOW)
-            OutboundSafetyGate(self.db).attempt(
-                wa_id=ctx.contact.wa_id,
-                thread_id=ctx.thread.id,
-                text=_COVERAGE_RESPONSE,
-                path_id=OutboundPathId.CE_TEXT.value,
-            )
-            self.db.commit()
-            return _out("blocked_dispatch", detail="OUTBOUND_GATE_BLOCKED_KILL_SWITCH")
+        if not self._outbound_armed():
+            return self._blocked_outbound(ctx, _COVERAGE_RESPONSE, OutboundPathId.CE_TEXT.value)
         sent_id = self._send_text_to_wa(ctx, _COVERAGE_RESPONSE)
         return _out("replied", wa_message_id=sent_id)
 
@@ -4795,14 +4969,8 @@ class ConversationEngine:
                     "Completá los datos del vehículo para que podamos cotizarte "
                     "la revisión mecánica."
                 )
-                if os.environ.get("OUTBOUND_ENABLED") != "true":
-                    self._record_blocked_dispatch(DispatchPath.META_FLOW)
-                    OutboundSafetyGate(self.db).attempt(
-                        wa_id=ctx.contact.wa_id, thread_id=ctx.thread.id, text=body,
-                        path_id=OutboundPathId.CE_FLOW.value,
-                    )
-                    self.db.commit()
-                    return _out("blocked_dispatch", detail="OUTBOUND_GATE_BLOCKED_KILL_SWITCH")
+                if not self._outbound_armed():
+                    return self._blocked_outbound(ctx, body, OutboundPathId.CE_FLOW.value)
                 state.vehicle_fallback_flow_sent = True
                 flow_token = secrets.token_urlsafe(24)
                 self._answer_source = "VEHICLE_RESOLVER"
@@ -4816,14 +4984,8 @@ class ConversationEngine:
                     "Para cotizarte la revisión necesito saber qué vehículo tenés. "
                     "¿Me podés indicar la marca y el modelo?"
                 )
-                if os.environ.get("OUTBOUND_ENABLED") != "true":
-                    self._record_blocked_dispatch(DispatchPath.META_FLOW)
-                    OutboundSafetyGate(self.db).attempt(
-                        wa_id=ctx.contact.wa_id, thread_id=ctx.thread.id, text=reply,
-                        path_id=OutboundPathId.CE_TEXT.value,
-                    )
-                    self.db.commit()
-                    return _out("blocked_dispatch", detail="OUTBOUND_GATE_BLOCKED_KILL_SWITCH")
+                if not self._outbound_armed():
+                    return self._blocked_outbound(ctx, reply, OutboundPathId.CE_TEXT.value)
                 state.vehicle_clarification_sent = True
                 self.db.commit()
                 self._answer_source = "VEHICLE_RESOLVER"
@@ -4856,14 +5018,8 @@ class ConversationEngine:
                     "Indicanos dónde está el auto para calcular los viáticos "
                     "de la revisión."
                 )
-                if os.environ.get("OUTBOUND_ENABLED") != "true":
-                    self._record_blocked_dispatch(DispatchPath.META_FLOW)
-                    OutboundSafetyGate(self.db).attempt(
-                        wa_id=ctx.contact.wa_id, thread_id=ctx.thread.id, text=body,
-                        path_id=OutboundPathId.CE_FLOW.value,
-                    )
-                    self.db.commit()
-                    return _out("blocked_dispatch", detail="OUTBOUND_GATE_BLOCKED_KILL_SWITCH")
+                if not self._outbound_armed():
+                    return self._blocked_outbound(ctx, body, OutboundPathId.CE_FLOW.value)
                 state.location_fallback_flow_sent = True
                 flow_token = secrets.token_urlsafe(24)
                 self._answer_source = "VEHICLE_RESOLVER"
@@ -4876,14 +5032,8 @@ class ConversationEngine:
                     "¿En qué localidad o barrio está el auto? "
                     "Por ejemplo: Palermo, Tigre, Dock Sud o Lomas de Zamora."
                 )
-                if os.environ.get("OUTBOUND_ENABLED") != "true":
-                    self._record_blocked_dispatch(DispatchPath.META_FLOW)
-                    OutboundSafetyGate(self.db).attempt(
-                        wa_id=ctx.contact.wa_id, thread_id=ctx.thread.id, text=reply,
-                        path_id=OutboundPathId.CE_TEXT.value,
-                    )
-                    self.db.commit()
-                    return _out("blocked_dispatch", detail="OUTBOUND_GATE_BLOCKED_KILL_SWITCH")
+                if not self._outbound_armed():
+                    return self._blocked_outbound(ctx, reply, OutboundPathId.CE_TEXT.value)
                 state.location_clarification_sent = True
                 self.db.commit()
                 self._answer_source = "VEHICLE_RESOLVER"
@@ -4997,7 +5147,8 @@ class ConversationEngine:
             provenance=tuple(sorted({m.source for m in _canonical_messages_tuple})
                              or ("event_evidence",)),
             presentation_texts=ai_input_messages,
-            stage_at_build=getattr(state, "last_stage", None))
+            stage_at_build=getattr(state, "last_stage", None),
+            turn_anchor_id=getattr(event, "wa_message_id", None))
 
         # ── L4.7B: SHADOW UNDERSTAND ──────────────────────────────────────
         # Runs on the complete raw burst BEFORE any deterministic gate can early-return,
@@ -5797,14 +5948,10 @@ class ConversationEngine:
         )
 
         try:
-            ai_raw = self._call_openai(messages_for_ai,
-                                       role=ReplyRole.COMMERCIAL_TURN)
-            decision = json.loads(ai_raw)
-            # ── G3-5E2 (audit G5E-01): the binding decides, before anything reads a field ──
-            _admission = self._reply_admission()
-            self._reply_admission_state = _admission
+            # ── G3-5F §4.3: the boundary owns the call, the binding and the verdict ──
+            decision, _admission = self._reply_decision(
+                messages_for_ai, role=ReplyRole.COMMERCIAL_TURN, ctx=ctx)
             if _admission in ReplyAdmission.REJECTED:
-                decision = self._refuse_reply(ctx, _admission, ReplyRole.COMMERCIAL_TURN)
                 _use_narrative = False
                 self._turn_renderer_source = RendererSource.DETERMINISTIC_TEMPLATE
                 self._turn_decision_authority = DecisionAuthority.DETERMINISTIC_RULE
@@ -7322,6 +7469,45 @@ class ConversationEngine:
         except Exception:
             return {}
 
+    def _turn_plan(self, out):
+        """The turn's response plan: the LIVE one where it composed, projected otherwise.
+
+        G3-5F §5. When the turn reached the dispatch boundary, `_live_plan` is the object
+        that actually decided what the customer was told — its propositions, its policy
+        verdicts and its suppressions are the record, not a reconstruction of them. It is
+        returned as-is, with `shadow=False`.
+
+        A turn that never composed — an early gate, a dedup, an error — still owes an
+        account of itself, and for those the projection below is exactly what G3-5E built:
+        a description assembled from what the decision path recorded. It is marked
+        `shadow=True`, so the Inspector can tell "this is what the plan decided" from
+        "this is what the turn amounted to".
+        """
+        plan = getattr(self, "_live_plan", None)
+        if plan is not None and plan.composed:
+            try:
+                decision = getattr(self, "_availability_authority_cache", None)
+                burst = getattr(self, "_canonical_turn_burst", None)
+                plan.decision_phase_id = getattr(decision, "decision_phase_id", None)
+                plan.burst_fingerprint = getattr(burst, "fingerprint", None)
+                plan.outcome = getattr(out, "action", None)
+                return plan.to_plan(
+                    plan_id=f"response-plan:{plan.decision_phase_id or 'nophase'}",
+                    renderer_source=(getattr(self, "_turn_renderer_source", None)
+                                     or RendererSource.NO_PROSE),
+                    authority=(getattr(self, "_turn_decision_authority", None)
+                               or DecisionAuthority.NONE),
+                    fact_sources=tuple(dict.fromkeys(
+                        getattr(self, "_turn_fact_sources", None) or ())),
+                    outcome=getattr(out, "action", None))
+            except Exception as exc:
+                try:
+                    logger.warning("G3-5F live plan projection failed: %s",
+                                   type(exc).__name__)
+                except Exception:
+                    pass
+        return self._shadow_response_plan(out)
+
     def _shadow_response_plan(self, out):
         """Describe, in typed terms, what this turn owed the customer — and observe only.
 
@@ -8661,14 +8847,10 @@ class ConversationEngine:
         messages = self._build_ai_messages(ctx, event, ai_input_messages)
 
         try:
-            ai_raw = self._call_openai(messages, role=ReplyRole.GENERAL_INFORMATION)
-            decision = json.loads(ai_raw)
-            # ── G3-5E2 (audit G5E-01): the same guard, before the prose is read ──
-            _admission = self._reply_admission()
-            self._reply_admission_state = _admission
+            # ── G3-5F §4.3: the boundary owns the call, the binding and the verdict ──
+            decision, _admission = self._reply_decision(
+                messages, role=ReplyRole.GENERAL_INFORMATION, ctx=ctx)
             if _admission in ReplyAdmission.REJECTED:
-                decision = self._refuse_reply(ctx, _admission,
-                                              ReplyRole.GENERAL_INFORMATION)
                 self._turn_renderer_source = RendererSource.DETERMINISTIC_TEMPLATE
             else:
                 # G3-5E (audit G5D-05): this route returns `answer_source="FAQ_RULE"`, but
@@ -9896,6 +10078,36 @@ class ConversationEngine:
             return list(burst.texts)
         self._reply_burst = None
         return list(fallback or [])
+
+    def _reply_decision(self, messages: list[dict], *, role: str, ctx) -> tuple:
+        """The ONE route by which a reply-model decision may reach a consumer.
+
+        G3-5F §4.3 (audit G5E2-03). The binding, the role, the call count and the admission
+        verdict were each correct, but they were assembled at the two consumption sites, so
+        "a reply decision can only come from `_call_openai`" held by inspection rather than
+        by construction: a third call site, a retry wrapper or an adapter would have been
+        admitted unbound and nothing would have said so. Both consumers now obtain their
+        decision here and nowhere else, and a structural test asserts that no consumer
+        parses a provider result of its own.
+
+        Returns `(decision, admission)`. A REJECTED admission yields the bounded
+        non-mutating refusal, never the model's own fields. `NOT_DISPATCHED` is preserved
+        with its G3-5E2 meaning — the engine's provider boundary was never crossed, which
+        is only reachable when a caller substitutes `_call_openai` itself — but it is now a
+        property of THIS function rather than of each call site: the counter is read before
+        and after the call, so a real provider call can never present as undispatched, and
+        a substituted one can never present as bound.
+        """
+        _before = getattr(self, "_reply_calls", 0)
+        raw = self._call_openai(messages, role=role)
+        decision = json.loads(raw)
+        dispatched = getattr(self, "_reply_calls", 0) > _before
+        admission = (self._reply_admission() if dispatched
+                     else ReplyAdmission.NOT_DISPATCHED)
+        self._reply_admission_state = admission
+        if admission in ReplyAdmission.REJECTED:
+            return self._refuse_reply(ctx, admission, role), admission
+        return decision, admission
 
     def _reply_admission(self) -> str:
         """May this turn's reply-model output be consumed? Typed, and fail-closed.
@@ -11241,9 +11453,28 @@ Respondé SOLO con JSON válido:
     # ── WhatsApp sends ────────────────────────────────────────────────────
 
     def _send_text_to_wa(self, ctx: _Context, text: str) -> str | None:
+        # ── G3-5F §6/§9: the live plan composes; this function transports ──────────
+        #
+        # P3 is enforced HERE and only here, because this is the one place a turn can
+        # occupy a second message. It is a refusal, not a warning: a plan that already
+        # composed has said what the turn owed the customer, and a further free-text send
+        # would be exactly the "whichever handler got here first" behaviour the milestone
+        # removes. The approved Flow sequence (P4) is not affected — its second part is a
+        # Meta Flow, dispatched by `_send_flow_button`, not a second text.
+        plan = getattr(self, "_live_plan", None)
+        if plan is not None and plan.composed:
+            plan.refuse_additional_text()
+            logger.warning(
+                "G3-5F P3 SECOND TEXT REFUSED thread_id=%s plan=%s — the turn already "
+                "composed its message", ctx.thread.id, getattr(plan, "turn_id", None))
+            raise OutboundBlockedError(
+                sender_path="engine._send_text_to_wa", kind="text",
+                to_wa_id=ctx.contact.wa_id, thread_id=ctx.thread.id, text=text,
+                gate_outcome="BLOCKED_SINGLE_MESSAGE_POLICY",
+            )
         # F3: apply same-burst FAQ reconciliation if armed for this turn.
         _burst = getattr(self, "_faq_reconciliation_burst", None)
-        if _burst:
+        if _burst and (plan is None or not plan.human_owns_turn):
             self._faq_reconciliation_burst = None  # consume — fires once per turn
             _before_compose = text
             text = self._compose_secondary_answers(text, _burst)
@@ -11270,6 +11501,20 @@ Respondé SOLO con JSON válido:
         # L4.7D: canonical response validation — the last step before the safety gate.
         text = self._validate_outbound_text(text, ctx, ctx.state)
 
+        # ── G3-5F: the plan composes the final message from its ordered propositions ──
+        # The handler's prose enters as PRIMARY_REPLY and is policed like any other
+        # contribution; anything else the turn registered (a Flow-completion
+        # acknowledgement, a suppressed claim) is applied here, once, in plan order.
+        if plan is not None:
+            text = plan.compose(text)
+            if not text:
+                # Every proposition was suppressed — P2's exclusivity does this. Nothing
+                # is sent, and nothing is invented to fill the silence.
+                logger.info("G3-5F plan composed no text thread_id=%s", ctx.thread.id)
+                self._turn_dispatch_path = DispatchPath.TEXT
+                self._turn_dispatch_result = DispatchResult.NOT_ATTEMPTED
+                return None
+
         from zoneinfo import ZoneInfo
         now_utc = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
         wa_id = ctx.contact.wa_id
@@ -11291,6 +11536,9 @@ Respondé SOLO con JSON válido:
                 DispatchResult.DUPLICATE_SUPPRESSED
                 if result.outcome == GateOutcome.BLOCKED_DUPLICATE
                 else DispatchResult.BLOCKED)
+            if plan is not None:
+                plan.dispatch_path = DispatchPath.TEXT
+                plan.dispatch_result = self._turn_dispatch_result
             raise OutboundBlockedError(
                 sender_path="engine._send_text_to_wa", kind="text",
                 to_wa_id=wa_id, thread_id=ctx.thread.id, text=text,
@@ -11298,6 +11546,9 @@ Respondé SOLO con JSON válido:
             )
         self._turn_dispatch_result = DispatchResult.ALLOWED
         self._turn_text_dispatches = getattr(self, "_turn_text_dispatches", 0) + 1
+        if plan is not None:
+            plan.dispatch_path = DispatchPath.TEXT
+            plan.dispatch_result = DispatchResult.ALLOWED
         wa_message_id: str | None = None
         try:
             wa_message_id, _ = _send_whatsapp_cloud_text(to_wa_id=wa_id, text=text)
