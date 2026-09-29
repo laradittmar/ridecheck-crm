@@ -80,6 +80,26 @@ class PropositionId:
         return f"clarification.{field}"
 
 
+class RequiredPropositionUnavailable(Exception):
+    """A producer that owns a REQUIRED proposition failed.
+
+    G3-7 (audit BC36-A03). The producer wrapper used to swallow every exception from every
+    producer, so a broken price or FAQ producer silently dropped its proposition and the
+    customer received a message that was quietly missing the thing they asked for — logged,
+    but not visible to them and not represented anywhere in the plan.
+
+    Optional producers still degrade quietly (and traceably). A REQUIRED one raises this,
+    and the composition boundary fails CLOSED: it sends a bounded deterministic line
+    instead of a partial answer that would read as complete. The customer is never shown an
+    internal error.
+    """
+
+    def __init__(self, producer: str, cause: str):
+        super().__init__(f"{producer}: {cause}")
+        self.producer = producer
+        self.cause = cause
+
+
 class SuppressionReason:
     """Why an authorized proposition did not reach the customer."""
     HUMAN_OWNS_TURN = "HUMAN_OWNS_TURN"
@@ -93,6 +113,8 @@ class SuppressionReason:
     CONFLICTS_WITH_CANONICAL = "CONFLICTS_WITH_CANONICAL"
     #: The producer registered it and the turn had nothing to say for it.
     NOTHING_TO_RENDER = "NOTHING_TO_RENDER"
+    #: G3-7 (audit BC36-A03). An optional producer failed; its claim is absent and says so.
+    PRODUCER_FAILED = "PRODUCER_FAILED"
 
 
 @dataclass
@@ -134,6 +156,12 @@ class Proposition:
     #: `(field, safe_token)` pairs naming the canonical values this item is answerable for.
     #: Never customer data — a field name and a value the business owns.
     locked_values: tuple = ()
+    #: G3-7 (audit BC36-A01). A canonical value this proposition exists to deliver. When set,
+    #: redundancy is DERIVED rather than asserted: the plan includes the item unless the
+    #: composed message already carries this exact canonical token. The token is a value the
+    #: business owns (a formatted amount), so this is canonical-value equality — not a
+    #: substring search for a phrase, and not an assumption about what the primary said.
+    delivers_value: Optional[str] = None
     included: bool = True
     suppression_reason: Optional[str] = None
 
@@ -168,6 +196,16 @@ class LiveResponsePlan:
     dispatch_path: str = DispatchPath.NONE
     dispatch_result: str = DispatchResult.NOT_ATTEMPTED
     outcome: Optional[str] = None
+    #: G3-7 (audit BC36-A03). `(producer, exception type)` for every producer that raised.
+    #: Optional failures are recorded and the turn continues; a required failure also sets
+    #: `degraded`, and the boundary then refuses to send a partial answer.
+    producer_failures: list = field(default_factory=list)
+    degraded: bool = False
+    #: The bounded deterministic line a degraded turn sends instead of a partial answer.
+    #: Supplied by the engine so the copy stays with the rest of the engine's wording, and
+    #: consumed INSIDE `compose()` so the boundary never rebinds the composed text — the
+    #: "nothing is added after composition" invariant stays absolute.
+    degraded_fallback: Optional[str] = None
 
     # ── registration ──────────────────────────────────────────────────────────
 
@@ -229,6 +267,21 @@ class LiveResponsePlan:
                 # the customer not get this?" is answered by the rule that said no.
                 p.policy = ResponsePolicy.P2_HUMAN_HANDOFF_EXCLUSIVE
         # ── P6: a fact the producer already established as redundant ──────────
+        #
+        # G3-7 (audit BC36-A01). A proposition that DELIVERS a canonical value no longer
+        # takes the producer's word for whether it was already said. The producer used to
+        # assert `redundant=True` on the strength of the turn having declared a
+        # PRICING_SERVICE answer — true at every site today, but unenforced, and when it
+        # was wrong the customer received no price at all while the trace claimed the
+        # price had already been stated.
+        #
+        # Redundancy is now DERIVED: the item is redundant only if a proposition that IS
+        # going out already carries the exact canonical token. That is value equality on a
+        # value the business owns, not a phrase search, and it cannot silently swallow the
+        # only copy of an authorized fact.
+        for p in self.propositions:
+            if p.included and p.delivers_value is not None:
+                p.redundant = self._value_already_delivered(p)
         for p in self.propositions:
             if p.included and p.redundant:
                 p.included = False
@@ -242,6 +295,24 @@ class LiveResponsePlan:
             for p in self.propositions:
                 if p.included and p.kind == ResponseItemKind.CLARIFICATION:
                     p.policy = p.policy or ResponsePolicy.P1_HOLD_PLUS_SAFE_FAQ
+
+    def _value_already_delivered(self, prop: "Proposition") -> bool:
+        """Is `prop.delivers_value` already carried by another INCLUDED proposition?
+
+        Only propositions that are actually going out count: a claim withheld for conflict
+        or exclusivity delivers nothing, so it cannot make this one redundant. The
+        comparison is on the canonical token itself, which the business owns and this plan
+        rendered — never on the customer's or the model's phrasing.
+        """
+        token = prop.delivers_value
+        if not token:
+            return False
+        for other in self.propositions:
+            if other is prop or not other.included:
+                continue
+            if token in other.text():
+                return True
+        return False
 
     def _ordered_included(self) -> list:
         return sorted((p for p in self.propositions if p.included),
@@ -270,6 +341,13 @@ class LiveResponsePlan:
         else:
             primary.render = lambda: primary_text
         self._apply_policies()
+        if self.degraded:
+            # BC36-A03: a REQUIRED proposition could not be produced, so whatever survived
+            # would read as a complete answer while quietly missing what the customer asked
+            # for. Fail closed to the bounded line, here, so nothing downstream has to
+            # rebind the composed text.
+            self.composed = True
+            return (self.degraded_fallback or "").strip()
         # A rejected primary must not leave the turn silent when the plan still holds
         # authorized propositions: composition continues from those below. If it holds
         # none, the turn genuinely has nothing it may truthfully say, and says nothing.

@@ -865,7 +865,14 @@ class DomainVerdictGuard(unittest.TestCase):
         # G3-4-R2 collapsed the G3-4 reader into `_semantic_reading`, the turn's single
         # read, so the count returns to the five pre-existing consumers plus that one. The
         # guard's subject — no PROVIDER CALL was added — is untouched.
-        self.assertEqual(calls, 6, "five pre-existing consumers plus the R2 single reader")
+        # G3-7 added ONE more authorised reader — `_reconciled_reply_proposals`, the
+        # deriver that replaces the reply model's mutation fields with typed evidence.
+        # Like the G3-4 addition above it reads the evidence the single interpretation
+        # already produced and makes no provider call, which is what the assertions
+        # above this one actually guard. The per-turn provider count is pinned
+        # separately by the semantic-call-count tests.
+        self.assertEqual(calls, 7,
+                         "five pre-existing consumers, the R2 reader, and the G3-7 deriver")
         readers = {n.name for n in ast.walk(tree)
                    if isinstance(n, ast.FunctionDef)
                    and "_semantic_turn_evidence()" in ast.unparse(n)}

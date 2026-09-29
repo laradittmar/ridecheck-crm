@@ -1028,6 +1028,21 @@ REPLY_PROMPT_VERSION = "reply/1.0"
 #: to `WhatsAppMessage.correlation_id` on the acknowledgement's own outbound row, so "was
 #: this transaction acknowledged?" is an exact ledger lookup rather than a search for words.
 _FLOW_TXN_KEY_PREFIX = "flow-txn:"
+
+
+#: G3-7 (audit BC36-A03). What a customer receives when a REQUIRED proposition could not be
+#: produced. It promises follow-up and claims nothing: no price, no availability, no vehicle,
+#: no booking. It must never read as an answer, and it must never expose an internal error.
+_DEGRADED_RESPONSE_FALLBACK = (
+    "Disculpá, se me complicó armar la respuesta completa. "
+    "Un asesor de RideCheck te sigue en un momento.")
+
+
+def _format_price_ars(total: int) -> str:
+    """The one way this engine writes an amount. Used by the quote copy and by the plan's
+    canonical-value equality check, so the two can never disagree about what "the price"
+    looks like in a message."""
+    return f"${total:,.0f}".replace(",", ".")
 REPLY_PROMPT_ID = "conversation_engine._build_ai_messages"
 
 
@@ -1053,6 +1068,22 @@ _ANSWER_SOURCE_ATTRIBUTION: dict = {
     # the mapping refuses it rather than leaving it to a lookup miss.
     "ERROR_FALLBACK":     (None, ()),
 }
+
+
+class ReplyContract:
+    """Which output contract the reply model answered under, for this turn.
+
+    G3-7. `LEGACY_WITH_MUTATIONS` is the pre-demotion contract: the decision carries
+    `extracted`, `candidate`, `lead_flag` and `needs_human`, and the engine applies them.
+    `RENDERER_ONLY` is the demoted contract: those fields are stripped at the provider
+    boundary and typed evidence supplies them instead. The trace records which one ran, so
+    a turn's attribution says whether the model still held mutation authority.
+    """
+    LEGACY_WITH_MUTATIONS = "LEGACY_WITH_MUTATIONS"
+    RENDERER_ONLY = "RENDERER_ONLY"
+    NOT_INVOKED = "NOT_INVOKED"
+
+    ALL = (LEGACY_WITH_MUTATIONS, RENDERER_ONLY, NOT_INVOKED)
 
 
 class ReplyAdmission:
@@ -3242,6 +3273,7 @@ class ConversationEngine:
         self._reply_role = None
         self._reply_burst = None
         self._reply_admission_state = None
+        self._reply_contract = ReplyContract.NOT_INVOKED
         self._turn_decision_authority = None
         self._turn_fact_sources = []
         self._turn_renderer_source = None
@@ -3770,7 +3802,7 @@ class ConversationEngine:
         Genial! La cotización para la revisión del {vehicle} en {location}
         es de ${price}. Si te parece bien, podemos avanzar.
         """
-        total = f"${precio_total:,.0f}".replace(",", ".")
+        total = _format_price_ars(precio_total)
         vehicle = " ".join(
             p for p in [
                 (marca or "").strip(),
@@ -3799,6 +3831,111 @@ class ConversationEngine:
         )
 
     # ── G3-4: semantic availability enquiry — read, never re-derived ─────────
+
+    # ── G3-7 — the reply model's former mutation authority, moved to typed evidence ──
+
+    def _reply_renderer_demotion_on(self) -> bool:
+        """Is the reply model demoted to a renderer on this deployment?
+
+        Default OFF. The cutover is gated because the replacement's INPUT is the semantic
+        interpreter's output, and proving it covers the durable corpus — the messy quote
+        request, the vehicle replacement, the Wild reproductions — needs a live
+        interpretation this milestone is not authorized to make. The plumbing is here and
+        tested against injected evidence; arming it is a separate, evidenced decision.
+        """
+        return getattr(getattr(self, "settings", None),
+                       "reply_renderer_demotion_enabled", False) is True
+
+    #: The four fields the reply model used to supply. Named once so the boundary that
+    #: strips them and the deriver that replaces them cannot drift.
+    _REPLY_MUTATION_FIELDS: tuple = ("extracted", "candidate", "lead_flag", "needs_human")
+
+    def _reconciled_reply_proposals(self, ctx, state) -> dict:
+        """The four former reply-model fields, derived from typed evidence.
+
+        G3-7 (audit G5D-01/G5D-02). These are PROPOSALS, exactly as the model's were: every
+        one still passes the canonical writer and the authorizer that already guarded it —
+        `_apply_extracted`'s fill-if-absent discipline, `_apply_candidate`'s dedup and
+        demotion rules, `_authorize_acceptance` for ACEPTADO, the human-handoff policy for
+        `needs_human`. What changes is the SOURCE: typed evidence the reconciler admitted,
+        instead of prose a model wrote.
+
+        Nothing here interprets language. The interpretation already happened in
+        `understand/1.19`, which exists for exactly this: turning fuzzy, misspelled,
+        conversational Spanish into typed evidence. This function reads that evidence.
+        """
+        proposals: dict = {"extracted": {}, "candidate": {"action": "none"},
+                           "lead_flag": None, "needs_human": False}
+        reading = self._semantic_reading()
+        if getattr(reading, "status", None) != "OK":
+            return proposals                 # ABSENT or UNAVAILABLE: propose nothing
+        try:
+            evidence = self._semantic_turn_evidence()
+        except Exception:
+            return proposals
+        if evidence is None:
+            return proposals
+        from ..schemas.turn_evidence import EvidenceStatus, UNRESOLVED_STATUSES
+
+        def _admitted(item) -> bool:
+            """Evidence the reconciler would admit: named, and not corrected away."""
+            if item is None or getattr(item, "is_superseded", False):
+                return False
+            return getattr(getattr(item, "status", None), "value",
+                           getattr(item, "status", None)) not in UNRESOLVED_STATUSES
+
+        # ── extracted: identity, locality and a requested day/time ────────────────
+        extracted: dict = {}
+        for ident in getattr(evidence, "identity_mentions", ()) or ():
+            if _admitted(ident) and getattr(ident, "normalized_value", None):
+                extracted["customer_name"] = str(ident.normalized_value)
+                break
+        for loc in getattr(evidence, "location_mentions", ()) or ():
+            if _admitted(loc) and getattr(loc, "locality", None):
+                # P7: semantic-only locality may not WRITE locality. `_apply_extracted`
+                # already refuses it when a DB-validated zone_group exists, and the
+                # reconciled location authority owns the thread-level write.
+                extracted["zone_detail"] = str(loc.locality)
+                break
+        for req in getattr(evidence, "scheduling_requests", ()) or ():
+            if not _admitted(req):
+                continue
+            if getattr(req, "resolved_date", None) and "preferred_day_iso" not in extracted:
+                extracted["preferred_day_iso"] = str(req.resolved_date)
+            if getattr(req, "time", None) and "preferred_time_str" not in extracted:
+                extracted["preferred_time_str"] = str(req.time)
+        proposals["extracted"] = extracted
+
+        # ── candidate: the vehicle the interpreter named for THIS turn ────────────
+        vehicle = next((v for v in (getattr(evidence, "vehicle_mentions", ()) or ())
+                        if _admitted(v)), None)
+        if vehicle is not None:
+            cand: dict = {"action": "update" if ctx.candidates else "create"}
+            if getattr(vehicle, "make", None):
+                cand["marca"] = str(vehicle.make)
+            if getattr(vehicle, "model", None):
+                cand["modelo"] = str(vehicle.model)
+            if getattr(vehicle, "year", None):
+                cand["anio"] = int(vehicle.year)
+            if getattr(vehicle, "category_suggestion", None):
+                # A SUGGESTION, and it stays one: `_enforce_catalog_vehicle` overrides it
+                # whenever the catalogue resolved the vehicle, exactly as before.
+                cand["tipo_vehiculo"] = str(vehicle.category_suggestion)
+            proposals["candidate"] = cand
+
+        # ── lead_flag: acceptance PROPOSES; the C3B authorizer still grants ──────
+        acceptance = getattr(evidence, "acceptance", None)
+        if _admitted(acceptance):
+            signal = getattr(getattr(acceptance, "signal", None), "value",
+                             getattr(acceptance, "signal", None))
+            if signal == "ACCEPT":
+                proposals["lead_flag"] = "ACEPTADO"
+
+        # ── needs_human: P7's one approved semantic-only escalation ──────────────
+        handoff = getattr(evidence, "handoff", None)
+        if _admitted(handoff) and getattr(handoff, "requested", False):
+            proposals["needs_human"] = True
+        return proposals
 
     def _semantic_reading(self):
         """Everything this decision needs, from ONE read of the burst's interpretation.
@@ -5885,8 +6022,15 @@ class ConversationEngine:
         if _narr is not None and _narr.is_effectively_deferred():
             return self._handle_deferred_interest(ctx, state), True
 
+        # ── G3-7: where the mutation proposals come from ─────────────────────────
+        # Demoted: typed evidence the reconciler admitted. Legacy: the reply model, exactly
+        # as before. The WRITERS below are unchanged either way — `_apply_extracted`'s
+        # fill-if-absent rule, `_apply_candidate`'s dedup and demotion, the flag guards and
+        # `_authorize_acceptance` all still run. Only the source moves.
+        _proposals = (self._reconciled_reply_proposals(ctx, state)
+                      if self._reply_renderer_demotion_on() else decision)
         # Apply extracted data to thread state
-        extracted = decision.get("extracted") or {}
+        extracted = _proposals.get("extracted") or {}
         _state_zone_before_ai = (state.home_zone_group, state.home_zone_detail)
         self._apply_extracted(ctx, state, extracted)
         _ai_set_zone = (state.home_zone_group, state.home_zone_detail) != _state_zone_before_ai
@@ -5897,7 +6041,7 @@ class ConversationEngine:
         # Candidate updates
         _focus_before = self._focus_candidate(ctx)
         _focus_before_tipo = _focus_before.tipo_vehiculo if _focus_before else None
-        _cand_data = decision.get("candidate") or {}
+        _cand_data = _proposals.get("candidate") or {}
         if (
             (_cand_data.get("tipo_vehiculo") or "").upper() == "MOTO"
             and _cand_data.get("action") in ("create", "update")
@@ -6044,7 +6188,7 @@ class ConversationEngine:
         real_price_quote = self._compute_price_quote(ctx, state)
 
         # Lead flag — only allowed values, engine validates
-        new_flag = decision.get("lead_flag")
+        new_flag = _proposals.get("lead_flag")
         flag_accepted = new_flag and new_flag in _ALLOWED_FLAGS
         # ── L4.7W1-F3: the AI may PROPOSE acceptance; it may not GRANT it ─────
         # PRESUPUESTO_ENVIADO already required a deterministic price below. ACEPTADO
@@ -6152,7 +6296,7 @@ class ConversationEngine:
                 state.last_stage = STAGE_SCHEDULING
 
         # Human escalation
-        if decision.get("needs_human"):
+        if _proposals.get("needs_human"):
             lead.necesita_humano = True
             state.needs_human = True
             state.last_stage = STAGE_HUMAN
@@ -9962,6 +10106,17 @@ class ConversationEngine:
         self._reply_admission_state = admission
         if admission in ReplyAdmission.REJECTED:
             return self._refuse_reply(ctx, admission, role), admission
+        # ── G3-7: the renderer's output contract ─────────────────────────────────
+        # When demoted, the mutation fields are removed HERE, at the one boundary every
+        # reply decision crosses. A consumer cannot opt back in, and a future consumer
+        # cannot find them by accident: past this point the decision carries renderer
+        # material only. `_reconciled_reply_proposals` supplies what they used to.
+        if self._reply_renderer_demotion_on():
+            for field in self._REPLY_MUTATION_FIELDS:
+                decision.pop(field, None)
+            self._reply_contract = ReplyContract.RENDERER_ONLY
+        else:
+            self._reply_contract = ReplyContract.LEGACY_WITH_MUTATIONS
         return decision, admission
 
     def _reply_admission(self) -> str:
@@ -11332,25 +11487,55 @@ Respondé SOLO con JSON válido:
         """
         return bool(getattr(self, "_turn_faq_burst", None))
 
+    #: G3-7 (audit BC36-A03). Which producers own a REQUIRED proposition.
+    #:
+    #: The distinction is about what the customer asked for. A canonical FAQ answer and an
+    #: authorized price are things they will read the message expecting to find; a message
+    #: that quietly lacks one reads as a complete answer and is not. The vehicle
+    #: reconciliation is required for the opposite reason: without it the reply may speak of
+    #: a vehicle canonical state does not hold. The clarification is OPTIONAL — losing it
+    #: costs a round trip, not a falsehood.
+    _RESPONSE_PRODUCERS: tuple = (
+        ("price", "_register_price_proposition", True),
+        ("faq", "_register_faq_propositions", True),
+        ("vehicle", "_register_canonical_vehicle_proposition", True),
+        ("clarification", "_register_clarification_proposition", False),
+    )
+
     def _register_response_propositions(self, ctx, text: str) -> None:
         """Register every proposition this turn owes the customer beside the primary reply.
 
         Called once, at the dispatch boundary, before composition. It reads canonical state
         and the burst; it writes only to the plan — with one deliberate exception, the
-        pending-vehicle arming below, which is a canonical decision the L4.6 gate has always
-        made and which belongs to the PRODUCER, never to a renderer.
+        pending-vehicle arming in the vehicle producer, which is a canonical decision the
+        L4.6 gate has always made and which belongs to the PRODUCER, never to a renderer.
+
+        G3-7 (audit BC36-A03). Every producer used to share one `except Exception`, so a
+        broken producer silently dropped its proposition and the customer received a message
+        that looked complete and was not. Failures are now recorded on the plan, and a
+        REQUIRED producer's failure marks the turn degraded — the composition boundary then
+        refuses to send a partial answer. One producer's defect still cannot take down the
+        others, and no internal error reaches the customer.
         """
         plan = getattr(self, "_live_plan", None)
         if plan is None:
             return
-        try:
-            self._register_price_proposition(ctx, text)
-            self._register_faq_propositions(ctx, text)
-            self._register_clarification_proposition(ctx, text)
-            self._register_canonical_vehicle_proposition(ctx, text)
-        except Exception as exc:          # a producer defect must never cost a turn
-            logger.warning("G3-6 proposition producer failed: %s: %s",
-                           type(exc).__name__, exc, exc_info=True)
+        for name, method, required in self._RESPONSE_PRODUCERS:
+            try:
+                getattr(self, method)(ctx, text)
+            except Exception as exc:
+                plan.producer_failures.append((name, type(exc).__name__))
+                if required:
+                    plan.degraded = True
+                    logger.error(
+                        "G3-7 REQUIRED PRODUCER FAILED thread_id=%s producer=%s %s: %s",
+                        getattr(getattr(ctx, "thread", None), "id", None), name,
+                        type(exc).__name__, exc, exc_info=True)
+                else:
+                    logger.warning(
+                        "G3-7 optional producer failed thread_id=%s producer=%s %s: %s",
+                        getattr(getattr(ctx, "thread", None), "id", None), name,
+                        type(exc).__name__, exc, exc_info=True)
 
     # ── 0. canonical price ───────────────────────────────────────────────────────
 
@@ -11418,7 +11603,13 @@ Respondé SOLO con JSON válido:
             fact_sources=(FactSource.PRICING_SERVICE, FactSource.CANONICAL_STATE),
             renderer_source=RendererSource.DETERMINISTIC_TEMPLATE,
             policy=ResponsePolicy.P6_NO_ROUTINE_FACT_REPETITION, priority=30,
-            redundant=True,
+            # G3-7 (audit BC36-A01). The producer no longer ASSERTS that the primary
+            # already said the price — it declares the canonical value it exists to
+            # deliver, and the plan decides. On an ordinary quote turn the primary carries
+            # the amount and the item is withheld ALREADY_STATED; on a turn whose primary
+            # is empty, is a clarification, or was rejected for conflict, the amount is not
+            # going out and the item is INCLUDED. The customer cannot lose the only copy.
+            delivers_value=_format_price_ars(int(total)),
             locked_values=(("pricing.precio_total", str(int(total))),)))
         self._note_fact_source(FactSource.PRICING_SERVICE)
 
@@ -11647,9 +11838,19 @@ Respondé SOLO con JSON válido:
         # and suppressible by policy — and nothing appends a fact after composition.
         self._turn_clarification_burst = getattr(self, "_turn_faq_burst", None)
         if plan is not None:
+            plan.degraded_fallback = _DEGRADED_RESPONSE_FALLBACK
             self._register_response_propositions(ctx, text)
             text = plan.compose(text)
-            if plan.mixed_renderers:
+            if plan.degraded:
+                # BC36-A03: `compose()` has already replaced the partial answer with the
+                # bounded line. All that is left here is to say so — loudly, and in the
+                # attribution, so a degraded turn is never mistaken for a normal one.
+                logger.error(
+                    "G3-7 DEGRADED RESPONSE thread_id=%s failures=%s — the bounded "
+                    "fallback was sent instead of a partial answer",
+                    ctx.thread.id, plan.producer_failures)
+                self._turn_renderer_source = RendererSource.DETERMINISTIC_TEMPLATE
+            elif plan.mixed_renderers:
                 self._turn_renderer_source = RendererSource.COMPOSED_MIXED
             if not text:
                 # Every proposition was suppressed — P2's exclusivity does this. Nothing

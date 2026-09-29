@@ -40,6 +40,11 @@ class Settings:
     reconciler_location_authority_enabled: bool = False
     # L4.7C.3B — acceptance / commercial-progression authority. Default OFF everywhere.
     reconciler_acceptance_authority_enabled: bool = False
+    # G3-7 — the reply model stops supplying `extracted`, `candidate`, `lead_flag` and
+    # `needs_human`; typed evidence supplies them instead. Default OFF: the cutover waits on
+    # a semantic-coverage proof that only a corpus/live evaluation can give, and turning the
+    # flag off restores the legacy source exactly. See the G3-7 closeout §5.
+    reply_renderer_demotion_enabled: bool = False
     # L4.7C.4 — scheduling-language interpretation. Default OFF everywhere.
     reconciler_scheduling_authority_enabled: bool = False
     # L4.7C.4A — same-turn semantic evidence. When false the interpretation stays behind the
@@ -145,6 +150,8 @@ def get_settings() -> Settings:
             _getenv("RECONCILER_LOCATION_AUTHORITY_ENABLED", "false").lower() == "true"),
         reconciler_acceptance_authority_enabled=(
             _getenv("RECONCILER_ACCEPTANCE_AUTHORITY_ENABLED", "false").lower() == "true"),
+        reply_renderer_demotion_enabled=(
+            _getenv("REPLY_RENDERER_DEMOTION_ENABLED", "false").lower() == "true"),
         reconciler_scheduling_authority_enabled=(
             _getenv("RECONCILER_SCHEDULING_AUTHORITY_ENABLED", "false").lower() == "true"),
         internal_api_auth_enabled=(
