@@ -511,7 +511,7 @@ class D_FlowCompletionAck(unittest.TestCase):
         e._live_plan = LiveResponsePlan(turn_id="t")
         e._turn_fact_sources = []
         e._flow_token_expected = expected_token
-        e._flow_ack_already_sent = lambda ctx: already
+        e._flow_ack_already_sent = lambda ctx, txn_key: already
         return e
 
     FLOW_DATA = {"nombre": "Ana", "direccion": "Av. Siempreviva 742",
@@ -568,11 +568,17 @@ class D_FlowCompletionAck(unittest.TestCase):
         self.assertIn("not_already_acknowledged", ack.suppression_reason)
 
     def test_g35f_45_idempotency_reads_the_durable_outbound_ledger(self):
-        """No new column and no migration: the ledger already records every send."""
+        """No new column and no migration: the ledger already records every send.
+
+        G3-5F-BOUNDED-CORRECTION (audit G5F-A01): the lookup keys on the transaction, not
+        on the acknowledgement's words. The phrase-matching form is asserted gone.
+        """
         body = inspect.getsource(ConversationEngine._flow_ack_already_sent)
         self.assertIn("WhatsAppMessage", body)
         self.assertIn('direction == "out"', body)
-        self.assertIn("_FLOW_COMPLETION_ACK", body)
+        self.assertIn("correlation_id == txn_key", body)
+        self.assertNotIn("_FLOW_COMPLETION_ACK", body)
+        self.assertNotIn(".contains(", body)
 
     def test_g35f_46_a_ledger_read_that_fails_withholds_the_acknowledgement(self):
         """Fail closed: a second acknowledgement is customer-visible, a missing one is
@@ -580,7 +586,7 @@ class D_FlowCompletionAck(unittest.TestCase):
         e = ConversationEngine.__new__(ConversationEngine)
         e.db = SimpleNamespace(query=lambda *a, **k: (_ for _ in ()).throw(RuntimeError()))
         self.assertTrue(e._flow_ack_already_sent(
-            SimpleNamespace(thread=SimpleNamespace(id=1))))
+            SimpleNamespace(thread=SimpleNamespace(id=1)), "flow-txn:1"))
 
     def test_g35f_47_it_rides_in_the_same_message_as_the_receipt(self):
         """P3 governs this turn too: one completed form, one reply."""
@@ -629,7 +635,7 @@ class E_TraceAndInspector(unittest.TestCase):
         self.assertIn(UNAVAILABLE_BEFORE_1_5, old)
         self.assertIn("observado", old)
 
-    def test_g35f_52_a_live_plan_is_labelled_as_the_authority(self):
+    def test_g35f_52_a_live_plan_is_labelled_by_the_scope_it_actually_governs(self):
         from app.ui.hybrid_trace_view import _response_plan_card
         card = _response_plan_card({
             "trace_version": TRACE_VERSION, "final_message_count": 1,
@@ -640,7 +646,13 @@ class E_TraceAndInspector(unittest.TestCase):
                                          "included": True,
                                          "decision_authority": "DETERMINISTIC_RULE",
                                          "renderer_source": "REPLY_MODEL"}]}})
-        self.assertIn("autoridad", card)
+        # G3-5F-BOUNDED-CORRECTION (audit G5F-A02). The card used to read "(autoridad)",
+        # which claimed more than the plan holds: it governs the propositions REGISTERED
+        # with it, not the principal action, the canonical mutations, the transport or the
+        # transaction — and content added downstream reaches the customer uncounted.
+        self.assertIn("composición", card)
+        self.assertNotIn("autoridad", card)
+        self.assertIn("Alcance actual", card)
         self.assertIn("turn.primary_reply", card)
         self.assertIn("DETERMINISTIC_RULE", card)
 

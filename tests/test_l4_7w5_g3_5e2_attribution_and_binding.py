@@ -656,8 +656,10 @@ class F_NonRegression(unittest.TestCase):
         emitters = [n for n, fn in vars(ce.ConversationEngine).items()
                     if inspect.isfunction(fn)
                     and "_FLOW_COMPLETION_ACK" in inspect.getsource(fn)]
-        self.assertEqual(sorted(emitters), ["_flow_ack_already_sent",
-                                            "_plan_flow_completion_ack"],
+        # G3-5F-BOUNDED-CORRECTION: `_flow_ack_already_sent` no longer names the sentence
+        # at all — it keys on the transaction — so the authorizer is now the only place
+        # that touches the copy. That is a strictly tighter result for this assertion.
+        self.assertEqual(sorted(emitters), ["_plan_flow_completion_ack"],
                          f"the acknowledgement is reachable elsewhere: {sorted(emitters)}")
 
     def test_g35e2_36_f01_and_f02_remain_closed(self):

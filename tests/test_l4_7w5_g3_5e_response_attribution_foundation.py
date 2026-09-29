@@ -529,11 +529,17 @@ class E_TraceAndInspector(unittest.TestCase):
         conclusion from every suppression in it."""
         from app.ui import hybrid_trace_view as view
         src = pathlib.Path(view.__file__).read_text(encoding="utf-8")
-        self.assertIn("Plan de respuesta (autoridad)", src)
+        # G3-5F-BOUNDED-CORRECTION (audit G5F-A02): the live heading no longer claims
+        # authority it does not hold. The property this test protects — the plan is
+        # distinguishable from what actually happened — is unchanged and now stronger,
+        # because the card also states what it does NOT cover.
+        self.assertIn("Plan de respuesta (composición)", src)
         self.assertIn("Plan de respuesta (observado)", src)
-        self.assertIn("Mensajes realmente enviados", src)
-        self.assertIn("Mensajes de texto planificados", src)
-        self.assertIn("Formularios (Flow) planificados", src)
+        self.assertNotIn("Plan de respuesta (autoridad)", src)
+        self.assertIn("Mensajes enviados", src)
+        self.assertIn("Textos planificados", src)
+        self.assertIn("Flows planificados", src)
+        self.assertIn("PARTIAL_PRODUCER_COVERAGE_NOTE", src)
 
 
 # ══ F — non-regression ═════════════════════════════════════════════════════

@@ -1023,6 +1023,11 @@ class CanonicalTurnBurst:
 # `_build_ai_messages` is the ONE prompt builder for both reply call sites, so one version
 # covers both; the ROLE is recorded separately per call site.
 REPLY_PROMPT_VERSION = "reply/1.0"
+
+#: G3-5F-BOUNDED-CORRECTION. Prefix of the Flow-transaction idempotency key. It is written
+#: to `WhatsAppMessage.correlation_id` on the acknowledgement's own outbound row, so "was
+#: this transaction acknowledged?" is an exact ledger lookup rather than a search for words.
+_FLOW_TXN_KEY_PREFIX = "flow-txn:"
 REPLY_PROMPT_ID = "conversation_engine._build_ai_messages"
 
 
@@ -3636,6 +3641,17 @@ class ConversationEngine:
         # about committed rows and not about an intention. It joins the receipt in ONE
         # message rather than following it as a second send, because P3 governs this turn
         # too: the customer completed one form and receives one reply.
+        # ── G3-5F-BOUNDED-CORRECTION (audit G5F-A01) ─────────────────────────────
+        # This turn's outbound row must be findable by the transaction it acknowledges, so
+        # the turn's correlation id BECOMES that transaction's key before the send. It is
+        # safe to reassign here: `_process_flow_response` performs exactly one WhatsApp
+        # send (the email notification above writes no ledger row), and every reader of the
+        # correlation — `_trace_outbound_for_turn` included — reads this same attribute, so
+        # writer and reader still agree. What changes is that the identity is now durable
+        # and specific instead of a per-request uuid that no later turn could reproduce.
+        _txn_key = self._flow_transaction_key(thread_rev.id)
+        if _txn_key:
+            self._correlation_id = _txn_key
         self._plan_flow_completion_ack(ctx, thread_rev_id=thread_rev.id,
                                        flow_token=flow_token, flow_data=flow_data)
         sent_id = self._send_text_to_wa(ctx, confirm_text)
@@ -3647,25 +3663,56 @@ class ConversationEngine:
     _FLOW_COMPLETION_ACK = (
         "Gracias por completarlo. Un representante de RideCheck se va a comunicar con vos.")
 
-    def _flow_ack_already_sent(self, ctx) -> bool:
-        """Has this thread already been acknowledged for a completed Flow?
+    @staticmethod
+    def _flow_transaction_key(thread_rev_id) -> "str | None":
+        """The idempotency identity of ONE successfully committed Flow transaction.
 
-        G3-5F §12. Idempotency with no new column and no migration: the outbound ledger is
-        already the durable, container-independent record of every automated send, and the
-        acknowledgement is a fixed sentence, so its presence in this thread's outbound
-        history IS the evidence. A duplicate webhook, a redelivery or a retried submission
-        therefore finds the acknowledgement already recorded and plans none.
+        G3-5F-BOUNDED-CORRECTION (audit G5F-A01). The key is derived from the committed
+        `ThreadRevision` primary key, which is the only thing that is true of exactly this
+        transaction and of nothing else: it exists only after the insert, it is identical
+        however often the same committed revision is examined, and two legitimate bookings
+        on one thread have two of them.
 
-        Fails CLOSED: a ledger read that raises reports "already acknowledged", because
-        sending a second acknowledgement is a customer-visible defect while withholding one
-        is recoverable.
+        It carries no customer text, no phone number and no WAMID — a row id and a fixed
+        prefix — and it fits `WhatsAppMessage.correlation_id` (String(36)) with room to
+        spare, so no migration is required.
+
+        Returns None when there is no committed revision, which the caller treats as
+        "not acknowledgeable" rather than as a key.
         """
+        try:
+            rev_id = int(thread_rev_id)
+        except (TypeError, ValueError):
+            return None
+        return f"{_FLOW_TXN_KEY_PREFIX}{rev_id}" if rev_id else None
+
+    def _flow_ack_already_sent(self, ctx, txn_key: "str | None") -> bool:
+        """Has THIS committed Flow transaction already been acknowledged?
+
+        G3-5F-BOUNDED-CORRECTION (audit G5F-A01). The first implementation searched the
+        thread's outbound history for the acknowledgement SENTENCE, which made the key
+        "this thread, ever" rather than "this transaction". A returning customer who books
+        a second inspection on the same WhatsApp thread was therefore silenced permanently:
+        the second revision is a different, legitimate transaction and it is owed its own
+        acknowledgement.
+
+        The lookup is now an exact match on the transaction key the acknowledgement's own
+        outbound row carries in `correlation_id`. No phrase matching remains, so an older
+        message that happens to contain the same sentence cannot suppress a later
+        transaction, and a customer quoting it back cannot either.
+
+        Fails CLOSED in both directions that matter: a missing key and a ledger read that
+        raises both report "already acknowledged", because a second acknowledgement is a
+        customer-visible defect while a withheld one is recoverable and logged.
+        """
+        if not txn_key:
+            return True
         try:
             from ..models import WhatsAppMessage
             return self.db.query(WhatsAppMessage.id).filter(
                 WhatsAppMessage.thread_id == ctx.thread.id,
                 WhatsAppMessage.direction == "out",
-                WhatsAppMessage.text.contains(self._FLOW_COMPLETION_ACK),
+                WhatsAppMessage.correlation_id == txn_key,
             ).first() is not None
         except Exception as exc:
             logger.warning("G3-5F flow-ack ledger read failed thread_id=%s: %s",
@@ -3681,6 +3728,7 @@ class ConversationEngine:
         contract, which a test watches.
         """
         expected = getattr(self, "_flow_token_expected", None)
+        txn_key = self._flow_transaction_key(thread_rev_id)
         evidence = {
             # The webhook carried a completed submission; an opened or navigated Flow never
             # reaches this function, and neither does a `nfm_reply`-less event.
@@ -3701,8 +3749,8 @@ class ConversationEngine:
             # Parsing, vehicle resolution and scheduling all completed without raising.
             "validation_passed": True,
             # The booking rows are committed: `thread_rev_id` is a persisted primary key.
-            "persistence_committed": bool(thread_rev_id),
-            "not_already_acknowledged": not self._flow_ack_already_sent(ctx),
+            "persistence_committed": bool(thread_rev_id) and bool(txn_key),
+            "not_already_acknowledged": not self._flow_ack_already_sent(ctx, txn_key),
         }
         authorized, unmet = flow_completion_ack_authorized(evidence)
         plan = getattr(self, "_live_plan", None)

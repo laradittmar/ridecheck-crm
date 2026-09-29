@@ -742,6 +742,21 @@ UNAVAILABLE_BEFORE_1_4 = "no disponible en este contrato"
 #: described. It must never be confused with "the plan decided nothing".
 UNAVAILABLE_BEFORE_1_5 = "no disponible en este contrato"
 
+#: G3-5F-BOUNDED-CORRECTION (audit G5F-A02). The card used to be headed "(autoridad)" and to
+#: report its item count as though it were the number of propositions the customer received.
+#: At this contract stage that is false: only some producers register propositions, and
+#: content added downstream of the plan — the same-burst FAQ answer, the required-next-info
+#: question, the canonical vehicle guard — reaches the customer inside the primary text
+#: without ever being counted here. The plan governs what it was given, and the card now
+#: says so, so an operator does not read a count of 1 as "the customer was told one thing".
+PARTIAL_PRODUCER_COVERAGE_NOTE = (
+    "Alcance actual: el plan ordena y compone las proposiciones REGISTRADAS. En esta etapa "
+    "del contrato no todos los productores registran proposiciones, y puede haber contenido "
+    "heredado agregado después del plan (FAQ de la misma ráfaga, pregunta de dato faltante, "
+    "validación canónica) que viaja dentro del texto principal y no está contado acá. El "
+    "plan no decide la acción principal, ni las mutaciones canónicas, ni el transporte, ni "
+    "el resultado transaccional.")
+
 DISPATCH_NOTE = ("La compuerta de salida decide si el mensaje se envía. Nunca es el autor "
                  "del razonamiento ni del texto.")
 
@@ -774,28 +789,31 @@ def _response_plan_card(trace: dict) -> str:
     old_contract = str(trace.get("trace_version") or "") in VERSIONS_WITH_SHADOW_ONLY_PLAN
     shadow = bool(plan.get("shadow")) or old_contract
     heading = ("Plan de respuesta (observado)" if shadow
-               else "Plan de respuesta (autoridad)")
+               else "Plan de respuesta (composición)")
     if old_contract:
         modo = f'<span class="note">{html.escape(UNAVAILABLE_BEFORE_1_5)}</span>'
     elif shadow:
         modo = _e("descripción — el turno no llegó a componer")
     else:
-        modo = _e("autoridad — este plan decidió la respuesta")
+        modo = _e("composición — este plan ordenó y compuso las proposiciones registradas")
     items = [i for i in (plan.get("items") or []) if i.get("included")]
     rows = [
         ("Plan", _e(plan.get("plan_id"))),
         ("Modo", modo),
-        ("Ítems planificados", _e(plan.get("item_count"))),
+        ("Ítems registrados en el plan", _e(plan.get("item_count"))),
         ("Tipos", _e(", ".join(plan.get("item_kinds") or []) or None)),
-        ("Mensajes de texto planificados", _e(plan.get("planned_text_items"))),
-        ("Formularios (Flow) planificados", _e(plan.get("planned_flow_items"))),
-        ("Mensajes realmente enviados", _e(trace.get("final_message_count"))),
+        ("Textos planificados", _e(plan.get("planned_text_items"))),
+        ("Flows planificados", _e(plan.get("planned_flow_items"))),
+        ("Mensajes enviados", _e(trace.get("final_message_count"))),
         ("Ítems suprimidos", _e(plan.get("suppressed_count"))),
         ("Multiplicidad de transporte", _e(plan.get("transport_multiplicity"))),
         ("Transporte previsto", _e(plan.get("dispatch_path"))),
         ("Resultado del envío", _e(plan.get("dispatch_result"))),
     ]
-    body = f'<div class="card"><h2>{heading}</h2>' + _kv(rows)
+    body = f'<div class="card"><h2>{heading}</h2>'
+    if not shadow:
+        body += f'<p class="note">{html.escape(PARTIAL_PRODUCER_COVERAGE_NOTE)}</p>'
+    body += _kv(rows)
     if items:
         body += "<h3>Proposiciones</h3><ul>" + "".join(
             f'<li>{_e(i.get("kind"))} · {_e(i.get("proposition_id"))}'
