@@ -276,10 +276,31 @@ class C_ReplacementAuthority(unittest.TestCase):
         self.assertEqual(p["candidate"]["modelo"], "208")
         self.assertEqual(p["candidate"]["anio"], 2022)
 
-    def test_g37_19_an_existing_candidate_makes_it_an_update(self):
+    def test_g37_19_an_existing_candidate_is_reused_only_when_it_MATCHES(self):
+        """G3-7-R2 supersedes this test's original claim, and correctly.
+
+        It asserted "candidates exist → update", which was the first cut's naive mapping and
+        is wrong: whether a mention reuses a candidate depends on whether it IS that
+        candidate, not on whether any candidate exists. The reconciler decides that, and
+        this now asserts the real rule in both directions.
+        """
+        from app.schemas.hybrid_trace import CandidateAction
         ev = te.TurnEvidence(vehicle_mentions=(te.VehicleEvidence(
             value="Focus", make="Ford", model="Focus", status=CONFIRMED),))
-        self.assertEqual(self.derive(ev)["candidate"]["action"], "update")
+        matching = SimpleNamespace(id=1, marca="Ford", modelo="Focus",
+                                   tipo_vehiculo="AUTO", status="current_focus",
+                                   anio=None, zone_group=None, zone_detail=None)
+        p = self.derive(ev, candidates=(matching,))
+        self.assertEqual(p["candidate"]["action"], "update")
+        self.assertEqual(p["candidate"]["id"], 1)
+        self.assertEqual(p["candidate_resolution"].action, CandidateAction.REUSE_FOCUS)
+        # a DIFFERENT existing vehicle is not this one
+        other = SimpleNamespace(id=2, marca="Peugeot", modelo="208",
+                                tipo_vehiculo="AUTO", status="current_focus",
+                                anio=None, zone_group=None, zone_detail=None)
+        q = self.derive(ev, candidates=(other,))
+        self.assertEqual(q["candidate"]["action"], "create")
+        self.assertEqual(q["candidate_resolution"].action, CandidateAction.CREATE)
 
     def test_g37_20_a_superseded_vehicle_is_not_proposed(self):
         """Named, then corrected away — the reconciler would not admit it."""

@@ -651,6 +651,91 @@ class ResponsePlan:
         }
 
 
+class CandidateAction:
+    """What the candidate reconciler decided to do with the turn's admitted evidence.
+
+    G3-7-R2. These are the actions the certified writer already implements; the reconciler
+    names them so the decision is inspectable BEFORE it is applied, instead of being an
+    emergent property of a dict the reply model happened to produce.
+    """
+    NONE = "NONE"                       # no admitted vehicle evidence — noise
+    REUSE_FOCUS = "REUSE_FOCUS"         # the mention is the candidate already in focus
+    REUSE_EXISTING = "REUSE_EXISTING"   # exactly one non-focused candidate matches
+    CREATE = "CREATE"                   # a distinct vehicle, not seen on this thread
+    HOLD = "HOLD"                       # more than one candidate is equally compatible
+
+    ALL = (NONE, REUSE_FOCUS, REUSE_EXISTING, CREATE, HOLD)
+
+
+class CandidateHoldReason:
+    AMBIGUOUS_MATCH = "AMBIGUOUS_MATCH"
+    EVIDENCE_UNAVAILABLE = "EVIDENCE_UNAVAILABLE"
+
+
+#: The reconciler's rule set, versioned so a decision can be replayed against the rules that
+#: made it. Bump when the SELECTION rules change, never for wording.
+CANDIDATE_RULE_ID = "reconcile.candidate_selection"
+CANDIDATE_RULE_VERSION = "v1"
+
+
+@dataclass(frozen=True)
+class CandidateResolution:
+    """Which candidate the turn's admitted evidence affects, and what may change.
+
+    G3-7-R2 (cutover audit G37-A01). The reply model used to answer this by emitting a
+    `candidate` dict carrying a database id and a CRM status — reconciliation work dressed
+    as interpretation. `VehicleEvidence` correctly describes only what the customer
+    MENTIONED; this is the deterministic step that turns a mention plus the thread's current
+    candidates into a canonical decision.
+
+    It carries no customer prose: evidence is referenced by ref, never quoted.
+    """
+    thread_id: object = None
+    turn_id: Optional[str] = None
+    action: str = CandidateAction.NONE
+    target_candidate_id: Optional[int] = None
+    created_candidate_id: Optional[int] = None
+    previous_focus_id: Optional[int] = None
+    resulting_focus_id: Optional[int] = None
+    focus_transition_required: bool = False
+    locality_binding_permitted: bool = False
+    zone_group: Optional[str] = None
+    zone_detail: Optional[str] = None
+    vehicle_evidence_ref: Optional[str] = None
+    location_evidence_ref: Optional[str] = None
+    hold_reason: Optional[str] = None
+    rule_id: str = CANDIDATE_RULE_ID
+    rule_version: str = CANDIDATE_RULE_VERSION
+    mutation_applied: bool = False
+    correlation_id: Optional[str] = None
+    #: How many existing candidates the evidence was compatible with. 2+ is why HOLD.
+    compatible_candidate_count: int = 0
+
+    @property
+    def mutates(self) -> bool:
+        return self.action in (CandidateAction.REUSE_FOCUS, CandidateAction.REUSE_EXISTING,
+                               CandidateAction.CREATE)
+
+    def to_payload(self) -> dict:
+        return {
+            "action": self.action,
+            "target_candidate_id": self.target_candidate_id,
+            "created_candidate_id": self.created_candidate_id,
+            "previous_focus_id": self.previous_focus_id,
+            "resulting_focus_id": self.resulting_focus_id,
+            "focus_transition_required": self.focus_transition_required,
+            "locality_binding_permitted": self.locality_binding_permitted,
+            "zone_group": self.zone_group, "zone_detail": self.zone_detail,
+            "vehicle_evidence_ref": self.vehicle_evidence_ref,
+            "location_evidence_ref": self.location_evidence_ref,
+            "hold_reason": self.hold_reason,
+            "compatible_candidate_count": self.compatible_candidate_count,
+            "rule_id": self.rule_id, "rule_version": self.rule_version,
+            "mutation_applied": self.mutation_applied,
+            "correlation_id": self.correlation_id,
+        }
+
+
 @dataclass
 class ReplyModelRecord:
     """The reply-generation role, recorded separately from the semantic role.

@@ -3274,6 +3274,7 @@ class ConversationEngine:
         self._reply_burst = None
         self._reply_admission_state = None
         self._reply_contract = ReplyContract.NOT_INVOKED
+        self._turn_candidate_resolution = None
         self._turn_decision_authority = None
         self._turn_fact_sources = []
         self._turn_renderer_source = None
@@ -3850,6 +3851,206 @@ class ConversationEngine:
     #: strips them and the deriver that replaces them cannot drift.
     _REPLY_MUTATION_FIELDS: tuple = ("extracted", "candidate", "lead_flag", "needs_human")
 
+    # ── G3-7-R2 — the candidate reconciler ───────────────────────────────────────
+    #
+    # The cutover audit found that the reply model had never been only interpreting: it was
+    # choosing which CRM candidate a mention referred to, which one became the focus, which
+    # one was demoted, and which one a locality attached to. `VehicleEvidence` correctly
+    # describes what the customer SAID and must never carry a database id or a mutable CRM
+    # status. This is the deterministic step between them.
+    #
+    # It decides; `_apply_candidate` still writes. Every selection rule below is read off
+    # the writer's own certified behaviour and the tests that pin it — nothing here is new
+    # product policy, and nothing here matches a phrase.
+
+    @staticmethod
+    def _evidence_admitted(item) -> bool:
+        """Named, and not corrected away. The reconciler's admission test, in one place."""
+        from ..schemas.turn_evidence import UNRESOLVED_STATUSES
+        if item is None or getattr(item, "is_superseded", False):
+            return False
+        status = getattr(getattr(item, "status", None), "value",
+                         getattr(item, "status", None))
+        return status not in UNRESOLVED_STATUSES
+
+    @classmethod
+    def _admitted_vehicle_evidence(cls, evidence):
+        """The vehicle the customer named this turn, if the reconciler may admit it.
+
+        The LAST admitted mention wins: within one burst "el 208... no, el Focus" supersedes,
+        and the corpus records exactly that rule ("the last stated value supersedes the
+        earlier one"). `mention_index` orders them.
+        """
+        mentions = [v for v in (getattr(evidence, "vehicle_mentions", ()) or ())
+                    if cls._evidence_admitted(v)]
+        if not mentions:
+            return None
+        return sorted(mentions, key=lambda v: getattr(v, "mention_index", 0))[-1]
+
+    @classmethod
+    def _admitted_location_evidence(cls, evidence):
+        """The locality the customer named, when it is the INSPECTION location.
+
+        A customer-origin statement ("yo estoy en Pilar pero el auto está en Palermo") is a
+        different role and must not bind to the vehicle — the role is already typed.
+        """
+        from ..schemas.turn_evidence import LocationRole
+        for loc in (getattr(evidence, "location_mentions", ()) or ()):
+            if not cls._evidence_admitted(loc) or not getattr(loc, "locality", None):
+                continue
+            role = getattr(getattr(loc, "role", None), "value", getattr(loc, "role", None))
+            if role == LocationRole.CUSTOMER_ORIGIN.value:
+                continue
+            return loc
+        return None
+
+    @staticmethod
+    def _evidence_identity(item) -> tuple:
+        """(marca, modelo) from a vehicle mention, normalized the way the writer compares."""
+        return ((getattr(item, "make", None) or "").strip().lower(),
+                (getattr(item, "model", None) or "").strip().lower())
+
+    @staticmethod
+    def _candidate_identity(cand) -> tuple:
+        return ((getattr(cand, "marca", None) or "").strip().lower(),
+                (getattr(cand, "modelo", None) or "").strip().lower())
+
+    @classmethod
+    def _candidate_matches_evidence(cls, cand, marca: str, modelo: str, tipo) -> bool:
+        """Is this existing candidate the vehicle the customer just mentioned?
+
+        Matching is on the identity the customer gave. A mention that names only the make
+        ("volvamos con el Peugeot") matches on make alone — which is exactly the M10 case
+        the writer's own create-dedup cannot reach, because that dedup requires make AND
+        model. A mention naming both must match both. Type compatibility is the writer's
+        `_tipo_compatible`, so a MOTO candidate is never repurposed for an AUTO mention.
+        """
+        c_marca, c_modelo = cls._candidate_identity(cand)
+        if marca and c_marca != marca:
+            return False
+        if modelo and c_modelo and c_modelo != modelo:
+            return False
+        if modelo and not c_modelo:
+            return False
+        if not marca and not modelo:
+            return False
+        return _tipo_compatible(getattr(cand, "tipo_vehiculo", None), tipo)
+
+    def _resolve_candidate(self, ctx, state, evidence) -> "CandidateResolution":
+        """Which candidate this turn's admitted evidence affects, and what may change.
+
+        Deterministic and side-effect free: it reads evidence and canonical state and
+        returns a decision. Nothing is written here — `_apply_resolved_candidate` does that
+        through the existing writer, so every guard the writer already enforces still runs.
+        """
+        from ..schemas.hybrid_trace import (CandidateAction, CandidateHoldReason,
+                                            CandidateResolution)
+        focus = self._focus_candidate(ctx)
+        base = dict(
+            thread_id=getattr(getattr(ctx, "thread", None), "id", None),
+            turn_id=getattr(self, "_correlation_id", None),
+            previous_focus_id=getattr(focus, "id", None),
+            correlation_id=getattr(self, "_correlation_id", None))
+
+        vehicle = self._admitted_vehicle_evidence(evidence)
+        if vehicle is None:
+            # Noise, or a turn that named no vehicle. Neither creates nor switches anything.
+            return CandidateResolution(action=CandidateAction.NONE, **base)
+
+        marca, modelo = self._evidence_identity(vehicle)
+        tipo = getattr(vehicle, "category_suggestion", None)
+        compatible = [c for c in (getattr(ctx, "candidates", None) or [])
+                      if self._candidate_matches_evidence(c, marca, modelo, tipo)]
+        location = self._admitted_location_evidence(evidence)
+        loc_ref = getattr(location, "ref", None) if location else None
+        veh_ref = getattr(vehicle, "ref", None)
+        # ── the zone GROUP is canonical, never interpreted ───────────────────────
+        # The interpreter says what locality the customer named; the zone table says
+        # which operating group that locality belongs to. Resolving the group here — by
+        # the same DB lookup every other location path uses — is what keeps a CRM
+        # grouping out of `LocationEvidence`, where it would be an invented business fact.
+        zone_detail = (getattr(location, "locality", None) or None) if location else None
+        zone_group = None
+        if zone_detail:
+            try:
+                _z = self._extract_zone_from_text(str(zone_detail))
+            except Exception:
+                _z = None
+            if _z is not None:
+                zone_group = _z.zone_group
+                zone_detail = _z.zone_detail or zone_detail
+
+        if len(compatible) > 1:
+            # More than one existing candidate is equally compatible and the customer did
+            # not say which. Guessing here is how a quote ends up against the wrong car.
+            return CandidateResolution(
+                action=CandidateAction.HOLD,
+                hold_reason=CandidateHoldReason.AMBIGUOUS_MATCH,
+                compatible_candidate_count=len(compatible),
+                vehicle_evidence_ref=veh_ref, location_evidence_ref=loc_ref, **base)
+
+        if len(compatible) == 1:
+            target = compatible[0]
+            is_focus = focus is not None and target.id == getattr(focus, "id", None)
+            return CandidateResolution(
+                action=(CandidateAction.REUSE_FOCUS if is_focus
+                        else CandidateAction.REUSE_EXISTING),
+                target_candidate_id=target.id,
+                resulting_focus_id=target.id,
+                focus_transition_required=not is_focus,
+                locality_binding_permitted=bool(zone_detail),
+                zone_detail=zone_detail, zone_group=zone_group,
+                compatible_candidate_count=1,
+                vehicle_evidence_ref=veh_ref, location_evidence_ref=loc_ref, **base)
+
+        return CandidateResolution(
+            action=CandidateAction.CREATE,
+            focus_transition_required=focus is not None,
+            locality_binding_permitted=bool(zone_detail),
+            zone_detail=zone_detail, zone_group=zone_group,
+            compatible_candidate_count=0,
+            vehicle_evidence_ref=veh_ref, location_evidence_ref=loc_ref, **base)
+
+    def _resolution_to_candidate_data(self, resolution, evidence) -> dict:
+        """The writer's input, built from the decision — never from prose.
+
+        `status="current_focus"` is the certified behaviour for both a new distinct vehicle
+        and a re-focused existing one: the writer then demotes the previous focus itself.
+        A mention of the candidate already in focus carries no status, so nothing moves.
+        """
+        from ..schemas.hybrid_trace import CandidateAction
+        if not resolution.mutates:
+            return {"action": "none"}
+        vehicle = self._admitted_vehicle_evidence(evidence)
+        data: dict = {}
+        if resolution.action == CandidateAction.CREATE:
+            data["action"] = "create"
+            data["status"] = "current_focus"
+        else:
+            data["action"] = "update"
+            data["id"] = resolution.target_candidate_id
+            if resolution.focus_transition_required:
+                data["status"] = "current_focus"
+        if vehicle is not None:
+            if getattr(vehicle, "make", None):
+                data["marca"] = str(vehicle.make)
+            if getattr(vehicle, "model", None):
+                data["modelo"] = str(vehicle.model)
+            if getattr(vehicle, "year", None):
+                data["anio"] = int(vehicle.year)
+            if getattr(vehicle, "category_suggestion", None):
+                # A SUGGESTION: the writer's catalogue guard overrides it whenever the
+                # catalogue knows the vehicle, exactly as it did for the model's proposal.
+                data["tipo_vehiculo"] = str(vehicle.category_suggestion)
+        if resolution.locality_binding_permitted and resolution.zone_detail:
+            # The locality binds to the RESOLVED candidate and only to it. The thread-level
+            # write stays behind the reconciled location authority; this is the
+            # candidate-level association the audit found had no owner.
+            data["zone_detail"] = resolution.zone_detail
+            if resolution.zone_group:
+                data["zone_group"] = resolution.zone_group
+        return data
+
     def _reconciled_reply_proposals(self, ctx, state) -> dict:
         """The four former reply-model fields, derived from typed evidence.
 
@@ -3906,22 +4107,15 @@ class ConversationEngine:
                 extracted["preferred_time_str"] = str(req.time)
         proposals["extracted"] = extracted
 
-        # ── candidate: the vehicle the interpreter named for THIS turn ────────────
-        vehicle = next((v for v in (getattr(evidence, "vehicle_mentions", ()) or ())
-                        if _admitted(v)), None)
-        if vehicle is not None:
-            cand: dict = {"action": "update" if ctx.candidates else "create"}
-            if getattr(vehicle, "make", None):
-                cand["marca"] = str(vehicle.make)
-            if getattr(vehicle, "model", None):
-                cand["modelo"] = str(vehicle.model)
-            if getattr(vehicle, "year", None):
-                cand["anio"] = int(vehicle.year)
-            if getattr(vehicle, "category_suggestion", None):
-                # A SUGGESTION, and it stays one: `_enforce_catalog_vehicle` overrides it
-                # whenever the catalogue resolved the vehicle, exactly as before.
-                cand["tipo_vehiculo"] = str(vehicle.category_suggestion)
-            proposals["candidate"] = cand
+        # ── candidate: the RECONCILER decides, not the mention ───────────────────
+        # G3-7-R2. The first cut mapped a mention straight to create/update and lost every
+        # canonical decision the reply model had been making by accident: which existing
+        # candidate, which becomes focus, which is demoted, where the locality binds. That
+        # is what `_resolve_candidate` answers, deterministically, from evidence plus state.
+        resolution = self._resolve_candidate(ctx, state, evidence)
+        self._turn_candidate_resolution = resolution
+        proposals["candidate"] = self._resolution_to_candidate_data(resolution, evidence)
+        proposals["candidate_resolution"] = resolution
 
         # ── lead_flag: acceptance PROPOSES; the C3B authorizer still grants ──────
         acceptance = getattr(evidence, "acceptance", None)
