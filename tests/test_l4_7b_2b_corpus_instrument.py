@@ -55,8 +55,12 @@ MIX = [c for cid, c in CORPUS.items() if cid.startswith("SYN-MIX")]
 # The interpreter as shipped by the CURRENT milestone. L4.7B.2B pinned understand/1.4 to
 # prove the ruler was repaired without touching the interpreter; L4.7B.3 then changed the
 # interpreter on purpose, so the pin moved with it — deliberately, and only in a milestone
-# whose stated job is to change the interpreter.
-INTERPRETER_SHA256 = "7fc31f5571d26d93c07104bdf89e52bd77be77efc4b0d6eef7bfff2a621aacc5"
+# whose stated job is to change the interpreter. L4.7W5-GATE3-G3-7B moved it again, for one
+# authorized line: `CorrectionEvidence.target_ref` was read while parsing and then dropped,
+# which left the only in-burst correction target inert. The PROMPT version did not move —
+# `test_fixture_11_prompt_version_unchanged` still pins understand/1.19 — because the prompt
+# already specified the meaning the reconciler needed.
+INTERPRETER_SHA256 = "e92d647d5994fa8f6b4355dc1022fedf0ca285552c7f19665a0d51985b589a48"
 INTERPRETER_PATH = ROOT / "backend" / "app" / "services" / "semantic_interpreter.py"
 
 

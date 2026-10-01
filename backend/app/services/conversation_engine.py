@@ -592,6 +592,19 @@ _LOCATION_CONTRADICTION_CLARIFICATION = (
 # for the locality text (1–4 words). The 7th pattern captures alternative-location
 # continuations ("o puede ser X") which, combined with uncertainty markers, signals
 # a same-turn contradiction (SC17).
+def _coerce_candidate_year(value) -> "int | None":
+    """A plausible model year, or None. Never raises, never guesses.
+
+    G3-7B. Used to read a corrected year off `CorrectionEvidence.to_value`, which the
+    interpreter may deliver as an int or as prose-free text ("2018").
+    """
+    try:
+        year = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return year if 1900 <= year <= date.today().year + 1 else None
+
+
 _VEHICLE_LOCATION_CLAUSE_PATTERNS: list[re.Pattern[str]] = [
     re.compile(
         r'\bel\s+(?:auto|veh[ií]culo|coche|m[oó]vil)\s+(?:ahora\s+)?'
@@ -3865,13 +3878,107 @@ class ConversationEngine:
 
     @staticmethod
     def _evidence_admitted(item) -> bool:
-        """Named, and not corrected away. The reconciler's admission test, in one place."""
+        """Named, RESOLVED, and not corrected away. The admission test, in one place.
+
+        G3-7B. The test used to check only status and supersession, which is weaker than
+        the schema's own `EvidenceItem.resolved` (`status not in UNRESOLVED and value is not
+        None`). That gap had a live consequence: for a corrected year the interpreter emits
+        `VehicleEvidence(value=None, year=2018, reason="corrected year carried by a
+        correction")`, and admitting that row as a vehicle IDENTITY is what let a correction
+        fall through to CREATE and become a phantom candidate.
+
+        A valid relation-only `CorrectionEvidence` is unaffected: the parser sets
+        `value=True` whenever a relation, a from/to value or a target_ref is present, so
+        "he replaced the car" survives even when the discarded car was never named.
+        """
         from ..schemas.turn_evidence import UNRESOLVED_STATUSES
         if item is None or getattr(item, "is_superseded", False):
             return False
         status = getattr(getattr(item, "status", None), "value",
                          getattr(item, "status", None))
-        return status not in UNRESOLVED_STATUSES
+        if status in UNRESOLVED_STATUSES:
+            return False
+        resolved = getattr(item, "resolved", None)
+        if resolved is None:                      # duck-typed stub: apply the same rule
+            resolved = getattr(item, "value", None) is not None
+        return bool(resolved)
+
+    @classmethod
+    def _admitted_correction_evidence(cls, evidence):
+        """The correction this turn states, if the reconciler may admit it."""
+        for corr in (getattr(evidence, "corrections", ()) or ()):
+            if cls._evidence_admitted(corr):
+                return corr
+        return None
+
+    @staticmethod
+    def _identity_complete(item) -> bool:
+        """Make AND model: where the certified writer itself treats a vehicle as identified."""
+        return bool((getattr(item, "make", None) or "").strip()) and \
+               bool((getattr(item, "model", None) or "").strip())
+
+    @classmethod
+    def _creation_permitted(cls, vehicle) -> bool:
+        """May this turn's evidence bring a NEW candidate into existence?
+
+        One guard, at the one decision site. The threshold is make AND model because that is
+        where `_apply_candidate` already draws it: its create-dedup engages only
+        `if _new_marca and _new_modelo`, and its catalogue authority resolves a tipo only
+        when both are present. Below that threshold the writer has itself documented that it
+        cannot tell a duplicate from a new car — so nothing below it may create one. A year,
+        a locality, a category suggestion, a correction relation and noise all fail here.
+        """
+        return (vehicle is not None
+                and cls._evidence_admitted(vehicle)
+                and cls._identity_complete(vehicle))
+
+    @classmethod
+    def _correction_focus(cls, ctx):
+        """`(candidate, hold_reason)` — the ONE row a subjectless correction may target.
+
+        Deliberately stricter than `_focus_candidate`, and deliberately separate from it.
+        `_focus_candidate` carries a certified single-row fallback (CL-05) that many
+        selection paths rely on; selecting a car the customer just named is a different risk
+        from writing attributes onto a row they did not name. So this predicate requires the
+        pointer and the status to agree, and never infers focus from a row count.
+
+        Pure: it reads and returns, and unlike `_focus_candidate` it repairs nothing.
+        """
+        from ..schemas.hybrid_trace import CandidateHoldReason as _H
+        state = getattr(ctx, "state", None)
+        candidates = list(getattr(ctx, "candidates", None) or ())
+        pointer = getattr(state, "current_focus_candidate_id", None) if state else None
+        marked = [c for c in candidates
+                  if getattr(c, "status", None) == "current_focus"]
+        if pointer is None:
+            return None, (_H.FOCUS_POINTER_MISSING if marked
+                          else _H.FOCUS_NOT_ESTABLISHED)
+        row = next((c for c in candidates if getattr(c, "id", None) == pointer), None)
+        if row is None:
+            return None, _H.FOCUS_POINTER_INVALID
+        if len(marked) > 1:
+            return None, _H.FOCUS_NOT_UNIQUE
+        if getattr(row, "status", None) != "current_focus":
+            return None, _H.FOCUS_INCONSISTENT
+        return row, None
+
+    def _canonical_zone(self, location) -> tuple:
+        """`(zone_group, zone_detail, hit)` for an admitted locality, from the zone table.
+
+        The interpreter says WHICH locality was named; the canonical table says which
+        operating group it belongs to. Resolving the group here is what keeps a CRM grouping
+        out of `LocationEvidence`, where it would be an invented business fact.
+        """
+        detail = (getattr(location, "locality", None) or None) if location else None
+        if not detail:
+            return None, None, None
+        try:
+            zone = self._extract_zone_from_text(str(detail))
+        except Exception:
+            zone = None
+        if zone is None:
+            return None, str(detail), False
+        return zone.zone_group, (zone.zone_detail or str(detail)), True
 
     @classmethod
     def _admitted_vehicle_evidence(cls, evidence):
@@ -3940,12 +4047,28 @@ class ConversationEngine:
         """Which candidate this turn's admitted evidence affects, and what may change.
 
         Deterministic and side-effect free: it reads evidence and canonical state and
-        returns a decision. Nothing is written here — `_apply_resolved_candidate` does that
-        through the existing writer, so every guard the writer already enforces still runs.
+        returns a decision. Nothing is written here — `_apply_candidate` does that through
+        the existing writer, so every guard the writer already enforces still runs.
+
+        G3-7B implements the authorized precedence ladder. Its ordering is the safety
+        property: an explicit COMPLETE identity (rungs 1-3) always outranks any inference
+        from a correction relation, so "no, es un Corolla" can never be misapplied as an
+        attribute correction to the car currently in focus. Below that, a correction may
+        target an in-burst reference (rung 4) or the strictly-validated canonical focus
+        (rung 5), and anything that identifies no vehicle well enough to act on holds
+        (rungs 6, 7, 9) or does nothing (rung 10) — it never creates.
         """
         from ..schemas.hybrid_trace import (CandidateAction, CandidateHoldReason,
-                                            CandidateResolution)
-        focus = self._focus_candidate(ctx)
+                                            CandidateResolution, CandidateSelectionBasis)
+        from ..schemas.turn_evidence import CorrectionRelation
+
+        try:
+            focus = self._focus_candidate(ctx, repair=False)
+        except TypeError:
+            # A suite may substitute this helper with a positional-only stub to control
+            # focus. Fall back to the plain call: the CL-05 repair has already run in the
+            # proposal step above, so there is nothing stale left for it to write.
+            focus = self._focus_candidate(ctx)
         base = dict(
             thread_id=getattr(getattr(ctx, "thread", None), "id", None),
             turn_id=getattr(self, "_correlation_id", None),
@@ -3953,63 +4076,201 @@ class ConversationEngine:
             correlation_id=getattr(self, "_correlation_id", None))
 
         vehicle = self._admitted_vehicle_evidence(evidence)
-        if vehicle is None:
-            # Noise, or a turn that named no vehicle. Neither creates nor switches anything.
-            return CandidateResolution(action=CandidateAction.NONE, **base)
-
-        marca, modelo = self._evidence_identity(vehicle)
-        tipo = getattr(vehicle, "category_suggestion", None)
-        compatible = [c for c in (getattr(ctx, "candidates", None) or [])
-                      if self._candidate_matches_evidence(c, marca, modelo, tipo)]
+        correction = self._admitted_correction_evidence(evidence)
         location = self._admitted_location_evidence(evidence)
-        loc_ref = getattr(location, "ref", None) if location else None
-        veh_ref = getattr(vehicle, "ref", None)
-        # ── the zone GROUP is canonical, never interpreted ───────────────────────
-        # The interpreter says what locality the customer named; the zone table says
-        # which operating group that locality belongs to. Resolving the group here — by
-        # the same DB lookup every other location path uses — is what keeps a CRM
-        # grouping out of `LocationEvidence`, where it would be an invented business fact.
-        zone_detail = (getattr(location, "locality", None) or None) if location else None
-        zone_group = None
-        if zone_detail:
-            try:
-                _z = self._extract_zone_from_text(str(zone_detail))
-            except Exception:
-                _z = None
-            if _z is not None:
-                zone_group = _z.zone_group
-                zone_detail = _z.zone_detail or zone_detail
+        # G3-7B: evidence items carry no `.ref` of their own — only `TurnEvidence` can
+        # address them — so the previous `getattr(item, "ref", None)` was always None and
+        # the resolution recorded no provenance at all. Addressing goes through the owner.
+        loc_ref = self._evidence_ref_of(evidence, location)
+        veh_ref = self._evidence_ref_of(evidence, vehicle)
+        corr_ref = self._evidence_ref_of(evidence, correction)
+        relation = (getattr(getattr(correction, "relation", None), "value",
+                            getattr(correction, "relation", None))
+                    if correction is not None else None)
+        zone_group, zone_detail, zone_hit = self._canonical_zone(location)
+        candidates = list(getattr(ctx, "candidates", None) or ())
 
-        if len(compatible) > 1:
-            # More than one existing candidate is equally compatible and the customer did
-            # not say which. Guessing here is how a quote ends up against the wrong car.
-            return CandidateResolution(
-                action=CandidateAction.HOLD,
-                hold_reason=CandidateHoldReason.AMBIGUOUS_MATCH,
-                compatible_candidate_count=len(compatible),
-                vehicle_evidence_ref=veh_ref, location_evidence_ref=loc_ref, **base)
+        common = dict(vehicle_evidence_ref=veh_ref, location_evidence_ref=loc_ref,
+                      correction_evidence_ref=corr_ref, target_relation=relation,
+                      zone_lookup_hit=zone_hit, **base)
 
-        if len(compatible) == 1:
-            target = compatible[0]
+        def _hold(reason, count=0):
+            return CandidateResolution(action=CandidateAction.HOLD, hold_reason=reason,
+                                       compatible_candidate_count=count, **common)
+
+        def _select(target, basis):
+            """Rungs 1-3 and 8: the customer identified a car; select it (focus may move)."""
             is_focus = focus is not None and target.id == getattr(focus, "id", None)
             return CandidateResolution(
                 action=(CandidateAction.REUSE_FOCUS if is_focus
                         else CandidateAction.REUSE_EXISTING),
-                target_candidate_id=target.id,
-                resulting_focus_id=target.id,
+                target_candidate_id=target.id, resulting_focus_id=target.id,
                 focus_transition_required=not is_focus,
                 locality_binding_permitted=bool(zone_detail),
-                zone_detail=zone_detail, zone_group=zone_group,
-                compatible_candidate_count=1,
-                vehicle_evidence_ref=veh_ref, location_evidence_ref=loc_ref, **base)
+                zone_group=zone_group, zone_detail=zone_detail,
+                compatible_candidate_count=1, selection_basis=basis, **common)
 
-        return CandidateResolution(
-            action=CandidateAction.CREATE,
-            focus_transition_required=focus is not None,
-            locality_binding_permitted=bool(zone_detail),
-            zone_detail=zone_detail, zone_group=zone_group,
-            compatible_candidate_count=0,
-            vehicle_evidence_ref=veh_ref, location_evidence_ref=loc_ref, **base)
+        def _correct(target, basis):
+            """Rungs 4-5: correct an existing row's ATTRIBUTES. Focus never moves."""
+            fields = self._corrected_attributes(
+                target, vehicle, correction,
+                zone_group if zone_hit else None, zone_detail if zone_hit else None)
+            return CandidateResolution(
+                action=CandidateAction.CORRECT_EXISTING,
+                target_candidate_id=target.id,
+                resulting_focus_id=getattr(focus, "id", None),
+                focus_transition_required=False,
+                locality_binding_permitted=bool(zone_hit and zone_detail),
+                zone_group=(zone_group if zone_hit else None),
+                zone_detail=(zone_detail if zone_hit else None),
+                compatible_candidate_count=1, selection_basis=basis,
+                corrected_fields=fields, **common)
+
+        def _compatible_for(item):
+            marca, modelo = self._evidence_identity(item)
+            tipo = getattr(item, "category_suggestion", None)
+            return [c for c in candidates
+                    if self._candidate_matches_evidence(c, marca, modelo, tipo)]
+
+        # ── rungs 1-3: an explicit COMPLETE identity outranks every inference ──────
+        if vehicle is not None and self._identity_complete(vehicle):
+            compatible = _compatible_for(vehicle)
+            if len(compatible) > 1:
+                return _hold(CandidateHoldReason.AMBIGUOUS_MATCH, len(compatible))
+            if len(compatible) == 1:
+                return _select(compatible[0], CandidateSelectionBasis.EVIDENCE_IDENTITY)
+            if not self._creation_permitted(vehicle):      # unreachable by construction
+                return _hold(CandidateHoldReason.INCOMPLETE_IDENTITY)
+            return CandidateResolution(
+                action=CandidateAction.CREATE,
+                focus_transition_required=focus is not None,
+                locality_binding_permitted=bool(zone_detail),
+                zone_group=zone_group, zone_detail=zone_detail,
+                compatible_candidate_count=0,
+                selection_basis=CandidateSelectionBasis.EVIDENCE_IDENTITY, **common)
+
+        # ── rung 4: the correction points at a vehicle mentioned in THIS burst ─────
+        if correction is not None and getattr(correction, "target_ref", None):
+            item = None
+            try:
+                item = evidence.item_at(str(correction.target_ref))
+            except Exception:
+                item = None
+            if item is None or getattr(item, "field", None) != "vehicle":
+                return _hold(CandidateHoldReason.TARGET_UNRESOLVED)
+            compatible = _compatible_for(item)
+            if len(compatible) > 1:
+                return _hold(CandidateHoldReason.AMBIGUOUS_MATCH, len(compatible))
+            if len(compatible) == 1:
+                return _correct(compatible[0], CandidateSelectionBasis.EXPLICIT_REFERENCE)
+            # Told to correct a vehicle this thread does not have.
+            return _hold(CandidateHoldReason.TARGET_CONFLICT)
+
+        # ── rungs 5-7: an UNNAMED correction of the car under discussion ───────────
+        if relation == CorrectionRelation.CORRECT_EXISTING.value:
+            target, reason = self._correction_focus(ctx)
+            if target is None:
+                return _hold(reason)
+            return _correct(target, CandidateSelectionBasis.FOCUS_POINTER)
+
+        # ── rungs 8-9: a partial IDENTITY the customer did give (make or model only) ──
+        # A mention carrying no identity token at all — a bare year, a bare category — is
+        # rung 10, not a reference: asking "which vehicle?" because a number appeared would
+        # be noise. A make-only or model-only reference IS a reference, so failing to place
+        # it holds rather than silently creating a second car.
+        if vehicle is not None and any(self._evidence_identity(vehicle)):
+            compatible = _compatible_for(vehicle)
+            if len(compatible) > 1:
+                return _hold(CandidateHoldReason.AMBIGUOUS_MATCH, len(compatible))
+            if len(compatible) == 1:
+                return _select(compatible[0], CandidateSelectionBasis.EVIDENCE_IDENTITY)
+            return _hold(CandidateHoldReason.INCOMPLETE_IDENTITY)
+
+        # ── "el otro": a switch with no identity at all ────────────────────────────
+        if relation == CorrectionRelation.SWITCH_TO_PRIOR_CANDIDATE.value:
+            others = [c for c in candidates
+                      if focus is None or c.id != getattr(focus, "id", None)]
+            if len(others) == 1:
+                return _select(others[0], CandidateSelectionBasis.SOLE_NON_FOCUS)
+            return _hold(CandidateHoldReason.TARGET_UNRESOLVED, len(others))
+
+        # ── a stated correction we cannot place at all ─────────────────────────────
+        if correction is not None:
+            return _hold(CandidateHoldReason.TARGET_UNRESOLVED)
+
+        # ── rung 10: year / locality / category with no correction semantics ───────
+        return CandidateResolution(action=CandidateAction.NONE, **common)
+
+    def _record_candidate_mutation(self, outcome) -> None:
+        """Fold the writer's real outcome into this turn's stored resolution.
+
+        `CandidateResolution` is frozen, so this replaces it rather than mutating it. A
+        correction never carries a created id; only a real insert does.
+
+        `outcome` is the `(applied, created_id)` pair `_apply_candidate` reports. Anything
+        else — a test double standing in for the writer, most often — is treated as "the
+        writer reported nothing", and the decision then claims no mutation. The field must
+        never assert a write that was not observed.
+        """
+        import dataclasses
+        resolution = getattr(self, "_turn_candidate_resolution", None)
+        if resolution is None:
+            return
+        applied, created_id = False, None
+        if isinstance(outcome, tuple) and len(outcome) == 2:
+            _applied, _created = outcome
+            if isinstance(_applied, bool):
+                applied = _applied
+                created_id = _created if isinstance(_created, int) else None
+        self._turn_candidate_resolution = dataclasses.replace(
+            resolution, mutation_applied=applied, created_candidate_id=created_id)
+
+    def _record_quote_consequence(self, invalidated: bool, recomputed: bool) -> None:
+        """Record whether the correction invalidated and re-derived the price."""
+        import dataclasses
+        resolution = getattr(self, "_turn_candidate_resolution", None)
+        if resolution is None:
+            return
+        self._turn_candidate_resolution = dataclasses.replace(
+            resolution, quote_invalidated=bool(invalidated),
+            quote_recomputed=bool(recomputed))
+
+    @staticmethod
+    def _evidence_ref_of(evidence, item) -> "str | None":
+        """The evidence-local ref of `item` — a burst address, never a database id."""
+        if item is None or evidence is None:
+            return None
+        try:
+            for ref, candidate in evidence.iter_items():
+                if candidate is item:
+                    return ref
+        except Exception:
+            return None
+        return None
+
+    @classmethod
+    def _corrected_attributes(cls, target, vehicle, correction,
+                              zone_group, zone_detail) -> tuple:
+        """`((field, before, after), ...)` the correction authorizes on `target`.
+
+        Canonical VALUES only, never customer text. The corrected YEAR is read from the
+        correction's own `to_value` when no admitted mention carries one, so the year's
+        provenance is the correction that stated it rather than the identity-less row the
+        interpreter synthesizes alongside it.
+        """
+        out = []
+        year = None
+        if vehicle is not None and getattr(vehicle, "year", None):
+            year = _coerce_candidate_year(getattr(vehicle, "year", None))
+        if year is None and correction is not None:
+            year = _coerce_candidate_year(getattr(correction, "to_value", None))
+        if year is not None and getattr(target, "anio", None) != year:
+            out.append(("anio", getattr(target, "anio", None), year))
+        if zone_detail and getattr(target, "zone_detail", None) != zone_detail:
+            out.append(("zone_detail", getattr(target, "zone_detail", None), zone_detail))
+            if zone_group and getattr(target, "zone_group", None) != zone_group:
+                out.append(("zone_group", getattr(target, "zone_group", None), zone_group))
+        return tuple(out)
 
     def _resolution_to_candidate_data(self, resolution, evidence) -> dict:
         """The writer's input, built from the decision — never from prose.
@@ -4023,6 +4284,17 @@ class ConversationEngine:
             return {"action": "none"}
         vehicle = self._admitted_vehicle_evidence(evidence)
         data: dict = {}
+        # ── G3-7B: a correction patches the resolved row and NOTHING else ──────────
+        # No `status` key, so `_apply_candidate`'s demotion loop and its assignment to
+        # `state.current_focus_candidate_id` are both structurally unreachable: a
+        # subjectless correction cannot move focus even by accident. The fields come from
+        # the decision's `corrected_fields`, never from a re-read of the mention.
+        if resolution.action == CandidateAction.CORRECT_EXISTING:
+            data["action"] = "update"
+            data["id"] = resolution.target_candidate_id
+            for field, _before, after in resolution.corrected_fields:
+                data[field] = after
+            return data
         if resolution.action == CandidateAction.CREATE:
             data["action"] = "create"
             data["status"] = "current_focus"
@@ -4112,6 +4384,9 @@ class ConversationEngine:
         # canonical decision the reply model had been making by accident: which existing
         # candidate, which becomes focus, which is demoted, where the locality binds. That
         # is what `_resolve_candidate` answers, deterministically, from evidence plus state.
+        # G3-7B: run the CL-05 stale-pointer repair here, once, so the resolver below can
+        # read canonical focus without writing anything. Same repair, earlier step.
+        self._focus_candidate(ctx)
         resolution = self._resolve_candidate(ctx, state, evidence)
         self._turn_candidate_resolution = resolution
         proposals["candidate"] = self._resolution_to_candidate_data(resolution, evidence)
@@ -6242,7 +6517,10 @@ class ConversationEngine:
         ):
             return self._motorcycle_human_handoff(ctx, state)  # AI path: no source_text
         # FIX 2 (CL-07): pass zone_protected so AI cannot overwrite LR-3-written zone.
-        self._apply_candidate(ctx, _cand_data, zone_protected=_vehicle_location_written)
+        _outcome = self._apply_candidate(
+            ctx, _cand_data, zone_protected=_vehicle_location_written)
+        # G3-7B: the decision records what the WRITER did, not what the resolver expected.
+        self._record_candidate_mutation(_outcome)
 
         # ── Catalog enforcement (post-AI) ─────────────────────────────────
         # If catalog found a vehicle, override the candidate's tipo_vehiculo
@@ -6276,6 +6554,8 @@ class ConversationEngine:
             )
             lead.flag = "PRESUPUESTANDO"
             state.last_stage = STAGE_QUALIFYING
+            # G3-7B: the trace must show the CONSEQUENCE of a correction, not only its intent.
+            self._record_quote_consequence(invalidated=True, recomputed=True)
         # F3-T2: Zone correction re-quote guard — mirrors the vehicle-change guard above.
         # When the customer corrects location after a quote was sent (QUOTED/SCHEDULING),
         # the old viatico may be stale. Reset to QUALIFYING so the deterministic override
@@ -6309,6 +6589,8 @@ class ConversationEngine:
             )
             lead.flag = "PRESUPUESTANDO"
             state.last_stage = STAGE_QUALIFYING
+            # G3-7B: same record for the zone path — this is the Wild Case B re-quote.
+            self._record_quote_consequence(invalidated=True, recomputed=True)
         # Sync thread state → candidate only when zone was set THIS turn (by the
         # pre-AI bare-locality path or by AI extraction). Never copy stale thread
         # zone that was set in a prior turn (LR-6/LR-7).
@@ -7961,6 +8243,8 @@ class ConversationEngine:
                 decision_phase_id=getattr(
                     getattr(self, "_availability_authority_cache", None),
                     "decision_phase_id", None),
+                # ── G3-7B contract 1.6 ──
+                candidate_resolution=getattr(self, "_turn_candidate_resolution", None),
             )
             persist(self.db, trace)
         except Exception as exc:
@@ -10976,7 +11260,16 @@ Respondé SOLO con JSON válido:
             state.current_cycle_started_at,
         )
 
-    def _focus_candidate(self, ctx: _Context) -> WhatsAppThreadCandidate | None:
+    def _focus_candidate(self, ctx: _Context, *,
+                         repair: bool = True) -> WhatsAppThreadCandidate | None:
+        """The candidate in focus, or None when focus is ambiguous.
+
+        `repair=False` makes the call read-only. G3-7B added it because the CL-05 branch
+        below WRITES — it clears a stale pointer — and the candidate resolver, documented as
+        side-effect free, reached that write through this helper. The repair itself is
+        unchanged and still runs once per turn; it simply runs in the proposal step now
+        (`_reconciled_reply_proposals`) rather than inside the resolution step.
+        """
         # FIX 5 (CL-05): explicit, non-arbitrary focus resolution.
         state = ctx.state
         if state and state.current_focus_candidate_id:
@@ -10984,6 +11277,8 @@ Respondé SOLO con JSON válido:
                 if c.id == state.current_focus_candidate_id:
                     return c
             # Stored ID not in active-cycle candidates — stale cross-cycle reference; clear it.
+            if not repair:
+                return None
             logger.warning(
                 "L1 CL-05 stale current_focus_candidate_id=%s thread_id=%s — clearing",
                 state.current_focus_candidate_id,
@@ -11090,10 +11385,18 @@ Respondé SOLO con JSON válido:
                     raw_time, ctx.thread.id,
                 )
 
-    def _apply_candidate(self, ctx: _Context, candidate_data: dict, *, zone_protected: bool = False) -> None:
+    def _apply_candidate(self, ctx: _Context, candidate_data: dict, *,
+                         zone_protected: bool = False) -> tuple:
+        """Apply a candidate mutation. Returns `(applied, created_candidate_id)`.
+
+        G3-7B: the return value is new; every existing caller ignores it, so behaviour is
+        unchanged. It exists so `CandidateResolution.mutation_applied` can record what the
+        writer ACTUALLY did instead of what the resolver predicted — the G3-7-R2 review
+        found that field hard-wired to False and `created_candidate_id` hard-wired to None.
+        """
         action = candidate_data.get("action", "none")
         if action == "none" or not candidate_data:
-            return
+            return (False, None)
         state = ctx.state
 
         if action == "create":
@@ -11117,13 +11420,12 @@ Respondé SOLO con JSON válido:
                             "F3 candidate dedup: redirecting create→update id=%s %s %s",
                             _ex.id, _new_marca, _new_modelo,
                         )
-                        self._apply_candidate(ctx, {
+                        return self._apply_candidate(ctx, {
                             **candidate_data,
                             "action": "update",
                             "id": _ex.id,
                             "status": candidate_data.get("status") or "current_focus",
                         })
-                        return
             fields = {
                 k: candidate_data[k]
                 for k in ("marca", "modelo", "version_text", "anio", "tipo_vehiculo",
@@ -11161,6 +11463,7 @@ Respondé SOLO con JSON válido:
                         c.status = "mentioned"
                 state.current_focus_candidate_id = candidate.id
             ctx.candidates.insert(0, candidate)
+            return (True, candidate.id)
 
         elif action == "update":
             raw_id = candidate_data.get("id")
@@ -11176,16 +11479,15 @@ Respondé SOLO con JSON válido:
                         "L1 RISK-05 AI update missing candidate id, focus ambiguous thread_id=%s — skipping",
                         ctx.thread.id if ctx.thread else "?",
                     )
-                    return
+                    return (False, None)
                 target_id = target.id
             # Type-safety: if the resolved candidate has an established tipo_vehiculo
             # that is incompatible with the new one (e.g. MOTO vs AUTO), redirect to
             # create rather than corrupting the existing candidate's identity.
             if target is not None and not _tipo_compatible(target.tipo_vehiculo, new_tipo):
-                self._apply_candidate(ctx, {**candidate_data, "action": "create"})
-                return
+                return self._apply_candidate(ctx, {**candidate_data, "action": "create"})
             if target is None:
-                return
+                return (False, None)
             # WILD-04R-F6 guard: catalog is authoritative for tipo_vehiculo.
             # Before applying any AI-proposed tipo, resolve the effective marca+modelo
             # (possibly updated in this same turn) against the catalog. If the catalog
@@ -11227,6 +11529,7 @@ Respondé SOLO con JSON válido:
                             c.status = "mentioned"
                     state.current_focus_candidate_id = target_id
                 target.status = new_status
+            return (True, None)
 
     def _enforce_catalog_vehicle(self, ctx: _Context, match: VehicleMatch) -> None:
         """Override candidate tipo_vehiculo with the catalog result (post-AI).

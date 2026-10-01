@@ -970,6 +970,10 @@ class SemanticTurnInterpreter:
                        else None),
                 relation=relation, from_value=from_value,
                 to_value=to_value, status=_status(raw.get("status")),
+                # G3-7B: the ref was read a line above to decide `value` and then dropped,
+                # which left the only in-burst target pointer inert. It addresses an item in
+                # THIS turn's evidence (`vehicle_mentions[1]`), never a database row.
+                target_ref=(str(raw["target_ref"]) if raw.get("target_ref") else None),
                 reason=raw.get("reason"), provenance=prov))
 
         identities: list[IdentityEvidence] = []

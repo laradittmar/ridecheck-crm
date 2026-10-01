@@ -261,8 +261,12 @@ class C_LocalityBinding(unittest.TestCase):
                        zone_lookup=lambda t: None)
         self.assertIsNone(r.zone_group, "a group was invented without a DB match")
         self.assertEqual(r.zone_detail, "Palermo")
-        body = inspect.getsource(E._resolve_candidate)
-        self.assertIn("self._extract_zone_from_text", body)
+        # G3-7B moved the lookup into `_canonical_zone`, which the resolver calls. The
+        # invariant is unchanged and the assertion is now a two-link chain: the resolver
+        # must reach the canonical table, and the table must be the thing it reaches.
+        self.assertIn("self._canonical_zone", inspect.getsource(E._resolve_candidate))
+        self.assertIn("self._extract_zone_from_text",
+                      inspect.getsource(E._canonical_zone))
 
     def test_r2_22_a_customer_origin_locality_does_not_bind_to_the_vehicle(self):
         r, d = resolve([cand(1, "Ford", "Focus", status="current_focus")],

@@ -60,7 +60,7 @@ import unicodedata
 from dataclasses import dataclass, field, asdict
 from typing import Any, Optional
 
-TRACE_VERSION = "hybrid-decision-trace/1.5"
+TRACE_VERSION = "hybrid-decision-trace/1.6"
 #: G3-5E. 1.4 splits `response_plan_source` — which was `answer_source`, and therefore
 #: answered three questions at once — into decision authority, fact sources, renderer source
 #: and dispatch result, and adds the reply-generation role and the shadow response plan. A
@@ -663,13 +663,50 @@ class CandidateAction:
     REUSE_EXISTING = "REUSE_EXISTING"   # exactly one non-focused candidate matches
     CREATE = "CREATE"                   # a distinct vehicle, not seen on this thread
     HOLD = "HOLD"                       # more than one candidate is equally compatible
+    #: G3-7B. An existing candidate's ATTRIBUTES are corrected. Distinct from REUSE_FOCUS
+    #: because the authority differs: a re-mention names the car, a correction does not.
+    #: Focus never moves on this action — the writer receives no `status` key.
+    CORRECT_EXISTING = "CORRECT_EXISTING"
 
-    ALL = (NONE, REUSE_FOCUS, REUSE_EXISTING, CREATE, HOLD)
+    ALL = (NONE, REUSE_FOCUS, REUSE_EXISTING, CREATE, HOLD, CORRECT_EXISTING)
 
 
 class CandidateHoldReason:
     AMBIGUOUS_MATCH = "AMBIGUOUS_MATCH"
     EVIDENCE_UNAVAILABLE = "EVIDENCE_UNAVAILABLE"
+    # ── G3-7B: every way a correction can fail to find one safe target ──────────
+    #: Evidence identifies no vehicle well enough to create one, and no target to correct.
+    INCOMPLETE_IDENTITY = "INCOMPLETE_IDENTITY"
+    #: A correction was stated but its target could not be resolved at all.
+    TARGET_UNRESOLVED = "TARGET_UNRESOLVED"
+    #: The correction names a vehicle this thread does not have.
+    TARGET_CONFLICT = "TARGET_CONFLICT"
+    FOCUS_POINTER_MISSING = "FOCUS_POINTER_MISSING"
+    FOCUS_POINTER_INVALID = "FOCUS_POINTER_INVALID"
+    FOCUS_NOT_UNIQUE = "FOCUS_NOT_UNIQUE"
+    FOCUS_INCONSISTENT = "FOCUS_INCONSISTENT"
+    FOCUS_NOT_ESTABLISHED = "FOCUS_NOT_ESTABLISHED"
+
+
+class CandidateSelectionBasis:
+    """WHY the reconciler chose the candidate it chose.
+
+    G3-7B. Two decisions can share an action and a target and still rest on different
+    authority — a re-mention of the focused car and a subjectless correction of it both
+    update the same row. The Inspector has to be able to tell them apart, which means the
+    basis is recorded rather than inferred from the action.
+    """
+    NONE = "NONE"
+    #: The customer's own words identified the vehicle.
+    EVIDENCE_IDENTITY = "EVIDENCE_IDENTITY"
+    #: The canonical focus pointer, under the strict four-condition predicate.
+    FOCUS_POINTER = "FOCUS_POINTER"
+    #: A correction's `target_ref` pointed at a vehicle mentioned in this same burst.
+    EXPLICIT_REFERENCE = "EXPLICIT_REFERENCE"
+    #: "el otro" — the one candidate that is not the current focus.
+    SOLE_NON_FOCUS = "SOLE_NON_FOCUS"
+
+    ALL = (NONE, EVIDENCE_IDENTITY, FOCUS_POINTER, EXPLICIT_REFERENCE, SOLE_NON_FOCUS)
 
 
 #: The reconciler's rule set, versioned so a decision can be replayed against the rules that
@@ -710,11 +747,26 @@ class CandidateResolution:
     correlation_id: Optional[str] = None
     #: How many existing candidates the evidence was compatible with. 2+ is why HOLD.
     compatible_candidate_count: int = 0
+    # ── G3-7B: correction-target authority ─────────────────────────────────────
+    #: Why this candidate — see `CandidateSelectionBasis`.
+    selection_basis: str = CandidateSelectionBasis.NONE
+    #: Evidence-local ref of the correction that licensed the decision. Never prose.
+    correction_evidence_ref: Optional[str] = None
+    #: The linguistic relation the interpreter reported (`CorrectionRelation` value).
+    target_relation: Optional[str] = None
+    #: `((field, before, after), ...)` — canonical VALUES only, never customer text.
+    corrected_fields: tuple = ()
+    #: Did the canonical zone table recognise the corrected locality?
+    zone_lookup_hit: Optional[bool] = None
+    #: Set by the turn once the re-quote guards have run, so the trace shows the
+    #: consequence of the correction and not merely its intent.
+    quote_invalidated: Optional[bool] = None
+    quote_recomputed: Optional[bool] = None
 
     @property
     def mutates(self) -> bool:
         return self.action in (CandidateAction.REUSE_FOCUS, CandidateAction.REUSE_EXISTING,
-                               CandidateAction.CREATE)
+                               CandidateAction.CREATE, CandidateAction.CORRECT_EXISTING)
 
     def to_payload(self) -> dict:
         return {
@@ -733,6 +785,15 @@ class CandidateResolution:
             "rule_id": self.rule_id, "rule_version": self.rule_version,
             "mutation_applied": self.mutation_applied,
             "correlation_id": self.correlation_id,
+            "selection_basis": self.selection_basis,
+            "correction_evidence_ref": self.correction_evidence_ref,
+            "target_relation": self.target_relation,
+            "corrected_fields": [
+                {"field": f, "before": b, "after": a} for f, b, a in self.corrected_fields],
+            "zone_lookup": {"locality": self.zone_detail, "hit": self.zone_lookup_hit,
+                            "zone_group": self.zone_group},
+            "quote_invalidated": self.quote_invalidated,
+            "quote_recomputed": self.quote_recomputed,
         }
 
 
@@ -1082,6 +1143,10 @@ class HybridDecisionTrace:
     reply: Optional[Any] = None                   # ReplyModelRecord payload
     response_plan: Optional[Any] = None           # shadow ResponsePlan payload
     response_plan_id: Optional[str] = None
+    #: G3-7B, contract 1.6. The candidate decision for this turn — which row the reconciler
+    #: selected, why, what it corrected, and what the writer actually did. Absent on 1.5 and
+    #: earlier rows, which therefore remain readable without a migration.
+    candidate_resolution: Optional[Any] = None
     response_item_count: Optional[int] = None
     response_item_kinds: tuple = ()
     suppressed_item_count: Optional[int] = None

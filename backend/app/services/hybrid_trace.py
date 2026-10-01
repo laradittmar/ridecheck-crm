@@ -933,7 +933,8 @@ def build_trace(*, turn_id, thread_id, lead_id, deployment_sha, started_at, comp
                 decision_authority=None, fact_sources=(), renderer_source=None,
                 dispatch_path=None, dispatch_result=None, reply=None, response_plan=None,
                 final_message_count=None, flow_participation=None,
-                burst_fingerprint=None, decision_phase_id=None) -> HybridDecisionTrace:
+                burst_fingerprint=None, decision_phase_id=None,
+                candidate_resolution=None) -> HybridDecisionTrace:
     kind = result_kind_for(action, before, after, answer_source, ce_rules)
     # Rows are captured while the turn runs, when the interpreter may not have answered
     # yet. Settle the one question that needs the whole turn before anything reads them.
@@ -979,6 +980,9 @@ def build_trace(*, turn_id, thread_id, lead_id, deployment_sha, started_at, comp
         final_message_count=final_message_count,
         flow_participation=flow_participation,
         burst_fingerprint=burst_fingerprint, decision_phase_id=decision_phase_id,
+        candidate_resolution=(candidate_resolution.to_payload()
+                              if hasattr(candidate_resolution, "to_payload")
+                              else candidate_resolution),
     )
     trace.badges = badges_for(trace, classify(semantic, ce_rules, reconciliations))
     return trace

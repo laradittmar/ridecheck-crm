@@ -755,6 +755,13 @@ UNAVAILABLE_BEFORE_1_5 = "no disponible en este contrato"
 #: with their suppressions) and what is NOT (claims inside the opaque primary, and the
 #: validator's own edits). It must not be broadened into "the plan implements nothing", which
 #: would be just as untrue in the other direction.
+CANDIDATE_SCOPE_NOTE = (
+    "La decisión la toma el reconciliador y la escribe `_apply_candidate`: el modelo de "
+    "respuesta no elige candidato ni localidad. «Mutación aplicada» es lo que informó el "
+    "escritor después de escribir, no lo que el reconciliador esperaba. Una corrección "
+    "nunca mueve el foco y nunca crea un candidato."
+)
+
 PLAN_SCOPE_NOTE = (
     "Alcance: se cuentan las proposiciones REGISTRADAS en el plan — las respuestas canónicas "
     "de FAQ, la pregunta de dato faltante, el vehículo canónico y el precio canónico — con "
@@ -779,6 +786,91 @@ def _unavailable_before_1_4(trace: dict):
             return f'<span class="note">{html.escape(UNAVAILABLE_BEFORE_1_4)}</span>'
         return _e(value)
     return render
+
+
+def _candidate_resolution_card(trace: dict) -> str:
+    """Which vehicle the turn acted on, WHY, and what actually changed.
+
+    G3-7B, contract 1.6. The G3-7-R2 review found the candidate decision invisible: the type
+    existed and serialized, nothing persisted it, and `mutation_applied` was hard-wired
+    False. An operator could not tell whether a correction had been applied to the right car,
+    or why a HOLD fired. This card answers both, and distinguishes the two cases that share
+    an action — a car the customer named, and a correction to the car under discussion.
+
+    Values only: evidence is referenced by burst address, never quoted.
+    """
+    res = trace.get("candidate_resolution")
+    if not isinstance(res, dict):
+        if str(trace.get("trace_version") or "") in ("hybrid-decision-trace/1.6",):
+            return ('<div class="card"><h2>Candidato — decisión</h2>'
+                    f'<p class="note">{_e("sin decisión de candidato en este turno")}</p>'
+                    "</div>")
+        return ""
+    _BASIS = {
+        "EVIDENCE_IDENTITY": "el cliente nombró el vehículo",
+        "FOCUS_POINTER": "corrección sobre el vehículo en foco (puntero canónico válido)",
+        "EXPLICIT_REFERENCE": "la corrección apuntó a un vehículo mencionado en este turno",
+        "SOLE_NON_FOCUS": "el único candidato que no estaba en foco",
+        "NONE": "sin selección",
+    }
+    _HOLD = {
+        "AMBIGUOUS_MATCH": "más de un candidato compatible — no se adivina",
+        "INCOMPLETE_IDENTITY": "la evidencia no identifica un vehículo (sin marca y modelo)",
+        "TARGET_UNRESOLVED": "se corrigió algo pero no se pudo ubicar qué vehículo",
+        "TARGET_CONFLICT": "la corrección nombra un vehículo que este hilo no tiene",
+        "FOCUS_POINTER_MISSING": "no hay puntero de foco canónico",
+        "FOCUS_POINTER_INVALID": "el puntero apunta a un candidato fuera del ciclo",
+        "FOCUS_NOT_UNIQUE": "más de un candidato marcado como foco",
+        "FOCUS_INCONSISTENT": "el puntero y el estado del candidato no coinciden",
+        "FOCUS_NOT_ESTABLISHED": "todavía no hay un vehículo establecido",
+        "EVIDENCE_UNAVAILABLE": "sin evidencia utilizable",
+    }
+    action = str(res.get("action") or "")
+    hold = res.get("hold_reason")
+    rows = [
+        ("Decisión", _e(action)),
+        ("Regla", _e(f'{res.get("rule_id")} {res.get("rule_version")}'
+                     if res.get("rule_id") else None)),
+        ("Candidato objetivo", _e(res.get("target_candidate_id"))),
+        ("Por qué", _e(_BASIS.get(str(res.get("selection_basis")),
+                                  res.get("selection_basis")))),
+        ("Relación semántica", _e(res.get("target_relation"))),
+        ("Foco anterior → resultante", _e(
+            f'{res.get("previous_focus_id")} → {res.get("resulting_focus_id")}'
+            if res.get("previous_focus_id") is not None
+            or res.get("resulting_focus_id") is not None else None)),
+        ("Cambio de foco requerido", _e(res.get("focus_transition_required"))),
+        ("Candidatos compatibles", _e(res.get("compatible_candidate_count"))),
+    ]
+    if hold:
+        rows.append(("Motivo de HOLD", _e(_HOLD.get(str(hold), hold))))
+    changed = res.get("corrected_fields") or []
+    if isinstance(changed, list) and changed:
+        detalle = "; ".join(
+            f'{c.get("field")}: {c.get("before")} → {c.get("after")}'
+            for c in changed if isinstance(c, dict))
+        rows.append(("Valores corregidos", _e(detalle)))
+    zone = res.get("zone_lookup") if isinstance(res.get("zone_lookup"), dict) else {}
+    if zone.get("locality") is not None or zone.get("hit") is not None:
+        hit = zone.get("hit")
+        rows.append(("Zona canónica", _e(
+            f'{zone.get("locality")} → {zone.get("zone_group")}' if hit
+            else f'{zone.get("locality")} — sin coincidencia en la tabla de zonas'
+                 if hit is False else None)))
+    rows += [
+        ("Localidad vinculada", _e(res.get("locality_binding_permitted"))),
+        ("Cotización invalidada", _e(res.get("quote_invalidated"))),
+        ("Cotización recalculada", _e(res.get("quote_recomputed"))),
+        ("Mutación aplicada por el escritor", _e(res.get("mutation_applied"))),
+        ("Candidato creado", _e(res.get("created_candidate_id"))),
+        ("Evidencia (corrección / vehículo / ubicación)", _e(
+            " · ".join(str(r) for r in (res.get("correction_evidence_ref"),
+                                        res.get("vehicle_evidence_ref"),
+                                        res.get("location_evidence_ref")) if r) or None)),
+    ]
+    return ('<div class="card"><h2>Candidato — decisión</h2>'
+            f'<p class="note">{html.escape(CANDIDATE_SCOPE_NOTE)}</p>'
+            f"{_kv(rows)}</div>")
 
 
 def _response_plan_card(trace: dict) -> str:
@@ -969,6 +1061,7 @@ def render_turn_trace_page(record: Optional[dict], turn_id: str = "") -> str:
         + _ce_card(trace.get("ce_evidence") or [])
         + _reconciliation_card(*_rows_and_counts(record, trace),
                                semantic=trace.get("semantic") or {})
+        + _candidate_resolution_card(trace)
         + _state_card(trace.get("canonical_before") or {}, trace.get("canonical_after") or {})
         + _outcome_card(trace)
         + _reply_model_card(trace)
