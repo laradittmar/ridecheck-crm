@@ -131,6 +131,37 @@ def _ai_qualifying_reply(reply: str = "¿En qué zona está el auto?") -> str:
     })
 
 
+# ── typed semantic evidence for the G3-7 cutover (G3-7B) ─────────────────────
+# What the CUSTOMER said. No candidate id, no CRM status, no zone group — the reconciler
+# derives those. See tests/_g37b_evidence.py.
+
+def _ev_replacement(make, model, year, *, discarded, discarded_model=None):
+    """"Al final ese auto se cayó. Tengo un <make> <model> <year>." """
+    from _g37b_evidence import turn, vehicle, fix, R
+    return turn(
+        vehicles=[vehicle(make=discarded, model=discarded_model, superseded=True, index=0),
+                  vehicle(make=make, model=model, year=year, index=1)],
+        fixes=[fix(R.REPLACE_CANDIDATE, was=discarded, now=f"{make} {model}")])
+
+
+def _ev_return_to_make(make):
+    """"Al final volvamos con el <make>." — a make-only reference to a car already seen."""
+    from _g37b_evidence import turn, vehicle, fix, R
+    return turn(vehicles=[vehicle(make=make, value=f"el {make}")],
+                fixes=[fix(R.SWITCH_TO_PRIOR_CANDIDATE, now=make)])
+
+
+def _ev_acceptance_plus_faq(*topics):
+    """"Dale, avancemos." plus an FAQ in the same burst.
+
+    The FAQ topic is deliberately NOT asserted here: the deterministic FAQ path already
+    reads it from the burst text, and stating it twice made the reconciliation append the
+    answer a second time. The semantic contribution this turn needs is the STANCE.
+    """
+    from _g37b_evidence import turn, accepts
+    return turn(acceptance=accepts("ACCEPT"))
+
+
 def _ai_acceptance_reply() -> str:
     return json.dumps({
         "intent": "SCHEDULING",
@@ -464,7 +495,9 @@ def _run_ce(
     base_msg_id: str,
     texts: list[str],
     ai_reply: Optional[str] = None,
+    evidence: object = None,
 ) -> tuple[object, list[str]]:
+    """`evidence` migrates the setup for the G3-7 cutover — see tests/_g37b_evidence.py."""
     ev = ConversationHandleIn(
         thread_id=thread_id,
         wa_message_id=f"{base_msg_id}-{len(texts)-1}",
@@ -482,7 +515,9 @@ def _run_ce(
         _counter[0] += 1
         return (f"fake-wa-{_counter[0]}", {})
 
-    with patch("urllib.request.urlopen") as mock_url:
+    from _g37b_evidence import armed_evidence
+    with armed_evidence(eng, evidence), \
+         patch("urllib.request.urlopen") as mock_url:
         mock_url.return_value.__enter__ = lambda s: s
         mock_url.return_value.__exit__ = MagicMock()
         mock_url.return_value.read = lambda: json.dumps({
@@ -561,6 +596,8 @@ class TestM1VehicleReplacementAfterQuote(unittest.TestCase):
             self.db, self.eng, self.thread.id, self.WA_ID, "m1",
             ["Al final ese auto se cayó. Tengo un Ford Focus 2019."],
             ai_reply=_ai_create_vehicle("Ford", "Focus", "AUTO", 2019),
+            evidence=_ev_replacement("Ford", "Focus", 2019,
+                                     discarded="Peugeot", discarded_model="2008"),
         )
 
     def test_m1_two_candidates_in_db(self):
@@ -877,6 +914,8 @@ class TestM4VehicleReplacementPlusFAQ(unittest.TestCase):
             self.db, self.eng, self.thread.id, self.WA_ID, "m4",
             self.burst,
             ai_reply=_ai_create_vehicle("Toyota", "Corolla", "AUTO", 2020),
+            evidence=_ev_replacement("Toyota", "Corolla", 2020,
+                                     discarded="Ford", discarded_model="Focus"),
         )
 
     def test_m4_two_candidates(self):
@@ -945,6 +984,7 @@ class TestM5AcceptancePlusFAQRegression(unittest.TestCase):
             self.db, self.eng, self.thread.id, self.WA_ID, "m5",
             self.burst,
             ai_reply=_ai_acceptance_reply(),
+            evidence=_ev_acceptance_plus_faq("payment"),
         )
         self.db.expire_all()
         lead = _refresh_lead(self.db, self.thread.id)
@@ -955,6 +995,7 @@ class TestM5AcceptancePlusFAQRegression(unittest.TestCase):
             self.db, self.eng, self.thread.id, self.WA_ID, "m5",
             self.burst,
             ai_reply=_ai_acceptance_reply(),
+            evidence=_ev_acceptance_plus_faq("payment"),
         )
         combined = " ".join(sent)
         self.assertIn("efectivo", combined.lower(),
@@ -997,6 +1038,7 @@ class TestM6AcceptancePlusSchedulingPlusPayment(unittest.TestCase):
             self.db, self.eng, self.thread.id, self.WA_ID, "m6",
             self.burst,
             ai_reply=_ai_acceptance_reply(),
+            evidence=_ev_acceptance_plus_faq("payment"),
         )
 
     def test_m6_acceptance_detected(self):
@@ -1336,6 +1378,7 @@ class TestM10ReturnToPreviousCandidate(unittest.TestCase):
             self.db, self.eng, self.thread.id, self.WA_ID, "m10",
             ["Al final volvamos con el Peugeot."],
             ai_reply=_ai_refocus_candidate(self.peugeot_id),
+            evidence=_ev_return_to_make("Peugeot"),
         )
 
     def test_m10_no_new_candidate_created(self):
@@ -1419,6 +1462,8 @@ class TestM1SameTypeReplacement(unittest.TestCase):
             self.db, self.eng, self.thread.id, self.WA_ID, "m1b",
             ["Dejá el 208, tengo un Focus 2020."],
             ai_reply=_ai_create_vehicle("Ford", "Focus", "AUTO", 2020),
+            evidence=_ev_replacement("Ford", "Focus", 2020,
+                                     discarded="Peugeot", discarded_model="208"),
         )
         self.db.expire_all()
         cands = _candidates(self.db, self.thread.id)
@@ -1429,6 +1474,8 @@ class TestM1SameTypeReplacement(unittest.TestCase):
             self.db, self.eng, self.thread.id, self.WA_ID, "m1b",
             ["Dejá el 208, tengo un Focus 2020."],
             ai_reply=_ai_create_vehicle("Ford", "Focus", "AUTO", 2020),
+            evidence=_ev_replacement("Ford", "Focus", 2020,
+                                     discarded="Peugeot", discarded_model="208"),
         )
         self.db.expire_all()
         cands = _candidates(self.db, self.thread.id)

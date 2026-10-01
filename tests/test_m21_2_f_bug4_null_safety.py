@@ -282,11 +282,24 @@ class TestBUG405NullCandidate(unittest.TestCase):
         self.eng._motorcycle_human_handoff.assert_not_called()
 
     def test_apply_candidate_called_with_empty_dict(self):
-        """null candidate coerced to {}; _apply_candidate called (it guards action=none)."""
+        """A null candidate reaches the writer as a NO-OP, and the writer guards it.
+
+        G3-7B corrected the shape of this assertion, not its subject. It pinned the literal
+        `{}` the legacy coercion happened to produce; the reconciled path expresses the same
+        decision as `{"action": "none"}`. Both are "nothing to write", and `_apply_candidate`
+        returns immediately for either. Pinning one spelling made a representation change
+        look like a behaviour change, so the invariant is now stated as the behaviour: the
+        writer is called, and what it receives authorizes no mutation.
+        """
         _run_turn(self.eng, self.ctx, "Quiero revisar el auto.")
         self.eng._apply_candidate.assert_called_once()
         call_arg = self.eng._apply_candidate.call_args[0][1]
-        self.assertEqual(call_arg, {})
+        self.assertIn(call_arg.get("action", "none"), (None, "none"),
+                      f"a null candidate must authorize no mutation, got {call_arg!r}")
+        for mutating in ("marca", "modelo", "anio", "tipo_vehiculo", "status",
+                         "zone_group", "zone_detail", "id"):
+            with self.subTest(field=mutating):
+                self.assertNotIn(mutating, call_arg)
 
 
 # ── BUG4-06: LIVE04 crash reproduction ───────────────────────────────────────

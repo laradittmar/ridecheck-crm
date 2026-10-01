@@ -127,6 +127,12 @@ _NOW = datetime.now(timezone.utc)
 
 # ── Standard AI mocks ─────────────────────────────────────────────────────────
 
+def _ev_acceptance():
+    """The customer agreed to go ahead. G3-7B cutover migration."""
+    from _g37b_evidence import turn, accepts
+    return turn(acceptance=accepts("ACCEPT"))
+
+
 def _ai_acceptance_reply():
     """AI detects acceptance, advances to SCHEDULING, returns scheduling question."""
     return json.dumps({
@@ -387,8 +393,13 @@ def _run_ce(
     base_msg_id: str,
     texts: list[str],
     ai_reply: Optional[str] = None,
+    evidence: object = None,
 ) -> tuple[object, list[str]]:
     """Fire CE for a burst, return (result, sent_texts).
+
+    `evidence` migrates the setup for the G3-7 cutover — see tests/_g37b_evidence.py. The
+    FAQ topic is never asserted there: the deterministic FAQ path reads it from the burst
+    text, and the semantic contribution these turns need is the acceptance STANCE.
 
     texts is the full burst, passed as unanswered_recent_user_messages.
     The triggering message is texts[-1].
@@ -412,7 +423,9 @@ def _run_ce(
         _counter[0] += 1
         return (f"fake-wa-{_counter[0]}", {})
 
-    with patch("urllib.request.urlopen") as mock_url:
+    from _g37b_evidence import armed_evidence
+    with armed_evidence(eng, evidence), \
+         patch("urllib.request.urlopen") as mock_url:
         mock_url.return_value.__enter__ = lambda s: s
         mock_url.return_value.__exit__ = MagicMock()
         mock_url.return_value.read = lambda: json.dumps({
@@ -461,7 +474,7 @@ class TestF301AcceptancePlusHours(unittest.TestCase):
     def _run(self):
         return _run_ce(
             self.db, self.eng, self.thread.id, self.WA_ID, "f3-01", self.burst,
-            ai_reply=_ai_acceptance_reply(),
+            ai_reply=_ai_acceptance_reply(), evidence=_ev_acceptance(),
         )
 
     def test_f3_01_replied(self):
@@ -586,7 +599,7 @@ class TestF303AcceptancePlusPayment(unittest.TestCase):
     def _run(self):
         return _run_ce(
             self.db, self.eng, self.thread.id, self.WA_ID, "f3-03", self.burst,
-            ai_reply=_ai_acceptance_reply(),
+            ai_reply=_ai_acceptance_reply(), evidence=_ev_acceptance(),
         )
 
     def test_f3_03_payment_answer_present(self):
@@ -640,7 +653,7 @@ class TestF304AcceptancePlusReport(unittest.TestCase):
     def _run(self):
         return _run_ce(
             self.db, self.eng, self.thread.id, self.WA_ID, "f3-04", self.burst,
-            ai_reply=_ai_acceptance_reply(),
+            ai_reply=_ai_acceptance_reply(), evidence=_ev_acceptance(),
         )
 
     def test_f3_04_report_answer_present(self):
@@ -690,7 +703,7 @@ class TestF305AcceptancePlusPresence(unittest.TestCase):
     def _run(self):
         return _run_ce(
             self.db, self.eng, self.thread.id, self.WA_ID, "f3-05", self.burst,
-            ai_reply=_ai_acceptance_reply(),
+            ai_reply=_ai_acceptance_reply(), evidence=_ev_acceptance(),
         )
 
     def test_f3_05_presence_answer_present(self):
@@ -743,7 +756,7 @@ class TestF306AcceptancePlusThreeFAQs(unittest.TestCase):
     def _run(self):
         return _run_ce(
             self.db, self.eng, self.thread.id, self.WA_ID, "f3-06", self.burst,
-            ai_reply=_ai_acceptance_reply(),
+            ai_reply=_ai_acceptance_reply(), evidence=_ev_acceptance(),
         )
 
     def test_f3_06_hours_present(self):

@@ -182,7 +182,9 @@ def _run_ce(
     base_msg_id: str,
     texts: list[str],
     ai_reply: Optional[str] = None,
+    evidence: object = None,
 ) -> tuple[object, list[str]]:
+    """`evidence` migrates the setup for the G3-7 cutover — see tests/_g37b_evidence.py."""
     ev = ConversationHandleIn(
         thread_id=thread_id,
         wa_message_id=f"{base_msg_id}-{len(texts) - 1}",
@@ -204,7 +206,8 @@ def _run_ce(
         _counter[0] += 1
         return (f"fake-wa-{_counter[0]}", {})
 
-    with patch("urllib.request.urlopen") as mock_url:
+    from _g37b_evidence import armed_evidence
+    with armed_evidence(eng, evidence), patch("urllib.request.urlopen") as mock_url:
         mock_url.return_value.__enter__ = lambda s: s
         mock_url.return_value.__exit__ = MagicMock()
         mock_url.return_value.read = lambda: json.dumps({
@@ -501,6 +504,26 @@ class TestCaseB_FocusPilarDisplay(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# ── typed semantic evidence for the G3-7 cutover (G3-7B) ─────────────────────
+def _ev_case_c():
+    """"No, perdón, está en San Miguel." — a locality correction naming no vehicle.
+
+    This is the turn the pre-G3-7B reconciler could not represent at all: it returned NONE
+    because no vehicle identity was admitted, and the correction was silently lost.
+    """
+    from _g37b_evidence import turn, place, fix
+    return turn(places=[place("San Miguel")], fixes=[fix(was="Palermo", now="San Miguel")])
+
+
+def _ev_case_d():
+    """"Al final el Peugeot 2008 en San Miguel." — the customer names the car again."""
+    from _g37b_evidence import turn, vehicle, place, fix, R
+    return turn(vehicles=[vehicle(make="Peugeot", model="2008", year=2014,
+                                  value="el Peugeot 2008")],
+                places=[place("San Miguel")],
+                fixes=[fix(R.SWITCH_TO_PRIOR_CANDIDATE, now="Peugeot 2008")])
+
+
 # Case C — Location-only correction: "No, perdón, está en San Miguel."
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -557,7 +580,7 @@ class TestCaseC_LocationOnlyCorrection(unittest.TestCase):
             thread_id=self.thread_id, wa_id=self.WA_ID,
             base_msg_id="caseC-01",
             texts=["No, perdón, está en San Miguel."],
-            ai_reply=ai_payload,
+            ai_reply=ai_payload, evidence=_ev_case_c(),
         )
 
     def test_c_reply_contains_san_miguel(self):
@@ -674,7 +697,7 @@ class TestCaseD_SwitchToOldCandidate(unittest.TestCase):
             thread_id=self.thread_id, wa_id=self.WA_ID,
             base_msg_id="caseD-01",
             texts=["Al final el Peugeot 2008 en San Miguel."],
-            ai_reply=ai_payload,
+            ai_reply=ai_payload, evidence=_ev_case_d(),
         )
         return sent
 

@@ -307,15 +307,21 @@ def _ai_acceptance_reply(candidate_id: int, tipo: str = "AUTO") -> str:
     })
 
 
-def _run_turn(eng: ConversationEngine, event: ConversationHandleIn, ai_json: str) -> str:
-    """Run one CE handle() turn with mocked AI + intercepted outbound. Returns captured text."""
+def _run_turn(eng: ConversationEngine, event: ConversationHandleIn, ai_json: str,
+              evidence: object = None) -> str:
+    """Run one CE handle() turn with mocked AI + intercepted outbound. Returns captured text.
+
+    `evidence` migrates the setup for the G3-7 cutover — see tests/_g37b_evidence.py.
+    """
     captured: list[str] = []
 
     def _fake_send(self_eng, ctx, text):
         captured.append(text)
         return "wamid.FAKEOUT001"
 
-    with patch.object(eng, "_call_openai", return_value=ai_json), \
+    from _g37b_evidence import armed_evidence
+    with armed_evidence(eng, evidence), \
+         patch.object(eng, "_call_openai", return_value=ai_json), \
          patch.object(ConversationEngine, "_send_text_to_wa", _fake_send):
         eng.handle(event)
 
@@ -508,7 +514,10 @@ class TestF6RealVehicleReplacement(unittest.TestCase):
                 "status": "current_focus",
             },
         })
-        _run_turn(eng, event, ai_json)
+        from _g37b_evidence import turn, vehicle, fix, R
+        _run_turn(eng, event, ai_json, evidence=turn(
+            vehicles=[vehicle(make="Ford", model="Focus", value="un Ford Focus")],
+            fixes=[fix(R.REPLACE_CANDIDATE, now="Ford Focus")]))
 
         from sqlalchemy import select as _sel
         candidates = self.db.execute(
@@ -616,7 +625,10 @@ class TestF6UnknownVehicleFallback(unittest.TestCase):
                 "tipo_vehiculo": "CLASICO",
             },
         })
-        _run_turn(eng, event, ai_json)
+        from _g37b_evidence import turn, vehicle, fix
+        _run_turn(eng, event, ai_json, evidence=turn(
+            vehicles=[vehicle(value="un clásico de los 70s", tipo="CLASICO")],
+            fixes=[fix(now="CLASICO")]))
 
         cand = self.db.get(WhatsAppThreadCandidate, self.cand_id)
         # No catalog hit → AI tipo accepted

@@ -437,9 +437,20 @@ class D_BoundaryContract(unittest.TestCase):
             with self.subTest(writer=writer):
                 self.assertTrue(hasattr(ConversationEngine, writer))
 
-    def test_g37_34_the_cutover_is_off_by_default(self):
-        from app.settings import Settings
-        self.assertIs(Settings().reply_renderer_demotion_enabled, False)
+    def test_g37_34_the_cutover_is_on_by_default_and_still_reversible(self):
+        """G3-7B flipped the default. The reversibility this suite certifies is unchanged:
+        the env var still turns it off, and only the literal "true" turns it on."""
+        import os
+        from app.settings import Settings, get_settings
+        self.assertIs(Settings().reply_renderer_demotion_enabled, True)
+        for raw, expected in (("false", False), ("FALSE", False), ("0", False),
+                              ("", False), ("true", True), ("  true  ", True)):
+            with self.subTest(env=raw):
+                os.environ["REPLY_RENDERER_DEMOTION_ENABLED"] = raw
+                get_settings.cache_clear()
+                self.assertIs(get_settings().reply_renderer_demotion_enabled, expected)
+        os.environ.pop("REPLY_RENDERER_DEMOTION_ENABLED", None)
+        get_settings.cache_clear()
 
     def test_g37_35_the_model_receives_no_narrower_boundary_than_the_authority(self):
         """G5D-02. The reply call sits inside `_process_text`, after the canonical burst is

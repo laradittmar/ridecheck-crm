@@ -128,6 +128,49 @@ def _make_engine(db: Session) -> ConversationEngine:
     return eng
 
 
+# ── typed semantic evidence (G3-7B cutover migration) ────────────────────────
+# What the CUSTOMER said, in the shape `understand/1.19` is specified to produce. No
+# candidate id, no CRM status, no zone group: the reconciler derives those.
+from app.schemas import turn_evidence as _te
+
+_C = _te.EvidenceStatus.CONFIRMED
+_INSP = _te.LocationRole.INSPECTION_LOCATION.value
+
+
+def _ev_case_a():
+    """"Al final ese auto se cayó. Encontré un Focus 2019 en Palermo." """
+    return _te.TurnEvidence(
+        service_intents=(_te.ServiceIntentEvidence(
+            value="PREPURCHASE_INSPECTION", status=_C),),
+        vehicle_mentions=(
+            _te.VehicleEvidence(value="ese auto", make="Peugeot", model="2008",
+                                status=_C, is_superseded=True, mention_index=0),
+            _te.VehicleEvidence(value="Focus 2019", make="Ford", model="Focus",
+                                year=2019, status=_C, mention_index=1)),
+        location_mentions=(_te.LocationEvidence(value="Palermo", locality="Palermo",
+                                                status=_C, role=_INSP),),
+        corrections=(_te.CorrectionEvidence(
+            value=True, relation=_te.CorrectionRelation.REPLACE_CANDIDATE,
+            from_value="Peugeot 2008", to_value="Ford Focus", status=_C),))
+
+
+def _ev_case_b():
+    """"Perdón, es 2018 y está en Pilar, no Palermo." — names no vehicle.
+
+    The bare-year mention is what the interpreter itself synthesizes for a corrected year
+    (C4); it is included so the migrated setup matches real parser output exactly.
+    """
+    return _te.TurnEvidence(
+        corrections=(_te.CorrectionEvidence(
+            value=True, relation=_te.CorrectionRelation.CORRECT_EXISTING,
+            from_value=2019, to_value=2018, status=_C),),
+        vehicle_mentions=(_te.VehicleEvidence(
+            value=None, year=2018, year_status=_C, status=_C, mention_index=0,
+            reason="corrected year carried by a correction"),),
+        location_mentions=(_te.LocationEvidence(value="Pilar", locality="Pilar",
+                                                status=_C, role=_INSP),))
+
+
 # ── DB helpers ────────────────────────────────────────────────────────────────
 
 def _new_session() -> Session:
@@ -174,7 +217,19 @@ def _run_ce(
     base_msg_id: str,
     texts: list[str],
     ai_reply: Optional[str] = None,
+    evidence: object = None,
 ) -> tuple[object, list[str]]:
+    """Run one turn. `evidence` migrates the setup for the G3-7 cutover.
+
+    L4.7W5-GATE3-G3-7B. These cases used to state the canonical answer — a `candidate`
+    dict carrying a database action and a CRM status — through the reply model, which is
+    exactly the authority the cutover removes. `evidence` instead states what the CUSTOMER
+    said, as typed `TurnEvidence`, and lets the reconciler decide.
+
+    It is supplied only when the demotion is armed. With the flag off the legacy channel is
+    still the authority and must stay exercised, so the same test certifies both sides of
+    the cutover and the business assertions below never move.
+    """
     ev = ConversationHandleIn(
         thread_id=thread_id,
         wa_message_id=f"{base_msg_id}-{len(texts) - 1}",
@@ -196,23 +251,32 @@ def _run_ce(
         _counter[0] += 1
         return (f"fake-wa-{_counter[0]}", {})
 
-    with patch("urllib.request.urlopen") as mock_url:
-        mock_url.return_value.__enter__ = lambda s: s
-        mock_url.return_value.__exit__ = MagicMock()
-        mock_url.return_value.read = lambda: json.dumps({
-            "choices": [{"message": {"content": _ai_payload}}]
-        }).encode()
-        with patch("app.services.conversation_engine.OutboundSafetyGate") as _MockGate:
-            _gate_inst = MagicMock()
-            _gate_result = MagicMock()
-            _gate_result.outcome = "allowed"
-            _gate_result.message_id = 1
-            _gate_inst.attempt.return_value = _gate_result
-            _MockGate.return_value = _gate_inst
-            with patch("app.services.conversation_engine._send_whatsapp_cloud_text",
-                       side_effect=_fake_send_wa):
-                with patch("app.services.conversation_engine.reset_unanswered_alert"):
-                    result = eng.handle(ev)
+    _armed = evidence is not None and eng._reply_renderer_demotion_on()
+    _orig_sem = ConversationEngine._semantic_turn_evidence
+    if _armed:
+        ConversationEngine._semantic_turn_evidence = lambda self: evidence
+        eng.settings.semantic_same_turn_enabled = True
+        eng.settings.shadow_understand_enabled = True
+    try:
+      with patch("urllib.request.urlopen") as mock_url:
+          mock_url.return_value.__enter__ = lambda s: s
+          mock_url.return_value.__exit__ = MagicMock()
+          mock_url.return_value.read = lambda: json.dumps({
+              "choices": [{"message": {"content": _ai_payload}}]
+          }).encode()
+          with patch("app.services.conversation_engine.OutboundSafetyGate") as _MockGate:
+              _gate_inst = MagicMock()
+              _gate_result = MagicMock()
+              _gate_result.outcome = "allowed"
+              _gate_result.message_id = 1
+              _gate_inst.attempt.return_value = _gate_result
+              _MockGate.return_value = _gate_inst
+              with patch("app.services.conversation_engine._send_whatsapp_cloud_text",
+                         side_effect=_fake_send_wa):
+                  with patch("app.services.conversation_engine.reset_unanswered_alert"):
+                      result = eng.handle(ev)
+    finally:
+        ConversationEngine._semantic_turn_evidence = _orig_sem
     return result, sent_texts
 
 
@@ -322,7 +386,7 @@ class TestExactCaseA(unittest.TestCase):
         return _run_ce(
             self.db, self.eng, self.thread.id, self.WA_ID, "caseA",
             ["Al final ese auto se cayó. Encontré un Focus 2019 en Palermo."],
-            ai_reply=_ai,
+            ai_reply=_ai, evidence=_ev_case_a(),
         )
 
     # ── Candidate assertions ──────────────────────────────────────────────────
@@ -542,7 +606,7 @@ class TestExactCaseB(unittest.TestCase):
         return _run_ce(
             self.db, self.eng, self.thread.id, self.WA_ID, "caseB",
             ["Perdón, es 2018 y está en Pilar, no Palermo."],
-            ai_reply=_ai,
+            ai_reply=_ai, evidence=_ev_case_b(),
         )
 
     # ── Candidate assertions ──────────────────────────────────────────────────

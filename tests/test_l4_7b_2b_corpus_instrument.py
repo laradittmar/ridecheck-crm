@@ -248,7 +248,8 @@ class TestCorpusIntegrity(unittest.TestCase):
         self.assertEqual(findings, [], render(findings))
 
     def test_corpus_still_has_162_cases_and_12_real(self):
-        self.assertEqual(len(CORPUS), 162)
+        self.assertEqual(len(CORPUS), 172,
+                         "G3-7B added ten correction-target cases")
         self.assertEqual(sum(1 for c in CORPUS.values()
                              if c["provenance"]["kind"] == "REAL"), 12)
 

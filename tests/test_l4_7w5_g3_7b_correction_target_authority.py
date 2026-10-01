@@ -738,6 +738,46 @@ class H_NegativeControls(unittest.TestCase):
         self.assertIn("sin decisión de candidato", rendered)
         self.assertNotIn("CORRECT_EXISTING", rendered)
 
+    def test_g37b_69b_the_rendered_page_actually_includes_the_card(self):
+        """Mutation control. `test_g37b_59` proves the card renders; it does NOT prove the
+        PAGE calls it. Dropping the call from the assembly left every card test green, so
+        the assembled page is asserted here directly."""
+        from app.ui.hybrid_trace_view import render_turn_trace_page
+        r, _ = resolve(FOCUS_ONLY, parsed_case_b(), zone=NORTE)
+        page = render_turn_trace_page(
+            {"captured": True, "turn_id": "t1",
+             "trace": {"trace_version": TRACE_VERSION, "turn_id": "t1",
+                       "candidate_resolution": r.to_payload()}}, "t1")
+        self.assertIn("Candidato — decisión", page,
+                      "the Inspector page must carry the candidate decision")
+        self.assertIn("CORRECT_EXISTING", page)
+        self.assertIn("vehículo en foco", page)
+
+    def test_g37b_69c_the_engine_passes_the_resolution_to_the_trace(self):
+        """Mutation control for the other half: a trace built without the resolution would
+        leave every `build_trace` test green, because they pass it explicitly."""
+        import inspect
+        src = inspect.getsource(ce.ConversationEngine._trace_turn) if hasattr(
+            ce.ConversationEngine, "_trace_turn") else inspect.getsource(ce)
+        self.assertIn(
+            'candidate_resolution=getattr(self, "_turn_candidate_resolution", None)', src,
+            "the turn must hand its real decision to the trace, not a literal None")
+
+    def test_g37b_69d_a_stale_quote_cannot_be_accepted(self):
+        """Mutation control for acceptance ordering: if `quote_inputs_unchanged` stopped
+        noticing a corrected zone, a customer could accept a price that no longer holds."""
+        from app.services.acceptance_authorizer import CommercialState
+        import inspect
+        body = inspect.getsource(CommercialState.quote_inputs_unchanged)
+        for required in ("quote_zone_group", "quote_zone_detail", "quote_tipo_vehiculo",
+                         "quote_candidate_id"):
+            with self.subTest(input=required):
+                self.assertIn(required, body,
+                              "every pricing input must be compared")
+        self.assertNotIn("anio", body,
+                         "the YEAR is not a pricing input: a year correction must not "
+                         "invalidate a delivered quote")
+
     def test_g37b_70_every_hold_reason_is_a_named_constant(self):
         reasons = {v for k, v in vars(CandidateHoldReason).items()
                    if k.isupper() and isinstance(v, str)}
@@ -748,13 +788,148 @@ class H_NegativeControls(unittest.TestCase):
             with self.subTest(reason=required):
                 self.assertIn(required, reasons)
 
-    def test_g37b_71_the_cutover_is_still_off_by_default(self):
-        import dataclasses
-        from app.settings import Settings
+    def test_g37b_71_the_cutover_is_on_by_default_and_rollback_still_works(self):
+        """Commit 1 left the default false; Commit 2 flipped it after certification. Both
+        directions must keep working, and a missing setting must still fail safe."""
+        import dataclasses, os
+        from app.settings import Settings, get_settings
         field = next(f for f in dataclasses.fields(Settings)
                      if f.name == "reply_renderer_demotion_enabled")
-        self.assertIs(field.default, False,
-                      "Commit 1 must not change the cutover default")
+        self.assertIs(field.default, True)
+        os.environ["REPLY_RENDERER_DEMOTION_ENABLED"] = "false"
+        get_settings.cache_clear()
+        try:
+            self.assertIs(get_settings().reply_renderer_demotion_enabled, False)
+        finally:
+            os.environ.pop("REPLY_RENDERER_DEMOTION_ENABLED", None)
+            get_settings.cache_clear()
+        bare = E.__new__(E)
+        bare.settings = SimpleNamespace()
+        self.assertFalse(bare._reply_renderer_demotion_on())
+
+
+# ══ I — the durable corpus ═════════════════════════════════════════════════
+
+class I_Corpus(unittest.TestCase):
+    """The corpus is where the relation this architecture depends on is asserted.
+
+    Before G3-7B every group-I case recorded a correction as a bare boolean, so the five
+    `CorrectionRelation` values were emitted by `understand/1.19`, preserved by the schema,
+    and checked nowhere. These cases close that, and pin the must-not-create rule in the
+    same place the language lives.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import json
+        path = (ROOT / "tests" / "semantic_corpus" / "real_world_turns.jsonl")
+        cls.cases = {}
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                row = json.loads(line)
+                cls.cases[row["id"]] = row
+
+    def _correction(self, cid):
+        return next((e for e in self.cases[cid]["expected_turn_evidence"]
+                     if e["field"] == "correction"), None)
+
+    def test_g37b_72_every_correction_case_states_its_relation(self):
+        bare = []
+        for cid, case in self.cases.items():
+            for item in case["expected_turn_evidence"]:
+                if item["field"] == "correction" and "relation" not in item:
+                    bare.append(cid)
+        self.assertEqual(bare, [],
+                         "a correction without a relation cannot be placed on a candidate")
+
+    def test_g37b_73_the_ten_correction_target_families_are_present(self):
+        for n in range(1, 11):
+            with self.subTest(case=f"SYN-CT-{n:02d}"):
+                self.assertIn(f"SYN-CT-{n:02d}", self.cases)
+
+    def test_g37b_74_the_owner_case_is_labelled_honestly(self):
+        """It is NOT a transcript turn. The real Wild B transcript records the 2008/2014
+        and Berazategui/Tigre turns; this correction turn is an owner-specified exact case,
+        so it is SYNTHETIC and says where it came from."""
+        case = self.cases["SYN-CT-01"]
+        self.assertEqual(case["provenance"]["kind"], "SYNTHETIC")
+        self.assertIn("WILD-04R-F3 Case B", case["provenance"]["source"])
+        self.assertIn("NOT a transcript turn", case["provenance"]["source"])
+
+    def test_g37b_75_authored_cases_never_claim_real_provenance(self):
+        for cid, case in self.cases.items():
+            if cid.startswith("SYN-CT-"):
+                with self.subTest(case=cid):
+                    self.assertEqual(case["provenance"]["kind"], "SYNTHETIC")
+                    self.assertRegex(case["provenance"]["source"],
+                                     r"authored (capability|regression) case")
+
+    def test_g37b_76_the_subjectless_families_must_not_create(self):
+        for cid in ("SYN-CT-01", "SYN-CT-02", "SYN-CT-03", "SYN-CT-05",
+                    "SYN-CT-06", "SYN-CT-07", "SYN-CT-09", "SYN-CT-10"):
+            with self.subTest(case=cid):
+                self.assertTrue(self.cases[cid].get("must_not_create_candidate"),
+                                "incomplete identity must never create a candidate")
+
+    def test_g37b_77_the_target_relations_match_the_ladder(self):
+        expected = {
+            "SYN-CT-01": ("CORRECT_EXISTING", "CURRENT_FOCUSED_CANDIDATE"),
+            "SYN-CT-02": ("CORRECT_EXISTING", "CURRENT_FOCUSED_CANDIDATE"),
+            "SYN-CT-03": ("CORRECT_EXISTING", "CURRENT_FOCUSED_CANDIDATE"),
+            "SYN-CT-04": ("CORRECT_EXISTING", "EXPLICIT_VEHICLE_MENTION"),
+            "SYN-CT-05": ("CORRECT_EXISTING", "UNKNOWN_OR_AMBIGUOUS"),
+            "SYN-CT-06": ("CORRECT_EXISTING", "CURRENT_FOCUSED_CANDIDATE"),
+            "SYN-CT-07": ("SWITCH_TO_PRIOR_CANDIDATE", "OTHER_VEHICLE"),
+        }
+        for cid, (relation, target) in expected.items():
+            with self.subTest(case=cid):
+                self.assertEqual(self._correction(cid)["relation"], relation)
+                self.assertEqual(self.cases[cid]["expected_correction_target"], target)
+
+    def test_g37b_78_the_negative_controls_forbid_a_correction(self):
+        for cid in ("SYN-CT-08", "SYN-CT-09"):
+            with self.subTest(case=cid):
+                self.assertIsNone(self._correction(cid),
+                                  "a negative control must assert no correction item")
+                forbidden = [m for m in self.cases[cid]["must_not_infer"]
+                             if m["field"] == "correction"]
+                self.assertTrue(forbidden, "and must say so explicitly")
+
+    def test_g37b_79_the_eight_original_group_i_cases_kept_their_language(self):
+        """Their relations were added; their customer text is untouched."""
+        verbatim = {
+            "SYN-CORR-01": "Es un Ford Ka... no, perdón, es un Ford Kuga",
+            "SYN-CORR-03": "Dije Palermo pero es en Belgrano",
+            "SYN-CORR-07": "Es del 2015 no del 2014",
+            "SYN-CORR-08": "Al final volvemos con el Peugeot",
+        }
+        for cid, text in verbatim.items():
+            with self.subTest(case=cid):
+                self.assertEqual(self.cases[cid]["raw"]["messages"][0], text)
+                self.assertIn("relation", self._correction(cid))
+
+    def test_g37b_80_the_evidence_never_expresses_a_database_identity(self):
+        """The semantic layer may say WHAT was corrected; never which row.
+
+        Scoped to `expected_turn_evidence`, which is what the interpreter produces. A
+        case's `expected_canonical_state` legitimately describes the CRM state the case
+        assumes — that is the reconciler's input, not the interpreter's output.
+        """
+        import json
+        evidence = json.dumps([e for case in self.cases.values()
+                               for e in case["expected_turn_evidence"]],
+                              ensure_ascii=False)
+        for forbidden in ("candidate_id", "current_focus", "zone_group",
+                          "target_candidate_id", "mutation"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, evidence)
+
+    def test_g37b_81_canonical_state_is_a_precondition_not_an_answer(self):
+        """Where a case does name canonical state, it is the state the turn STARTS from."""
+        case = self.cases["SYN-CT-06"]
+        self.assertEqual(case["expected_canonical_state"], {"candidate_id": None})
+        self.assertEqual(case["expected_candidate_action"], "HOLD",
+                         "with nothing established the correction must hold")
 
 
 if __name__ == "__main__":        # pragma: no cover

@@ -416,9 +416,25 @@ class E_Boundaries(unittest.TestCase):
                  for t in n.targets if isinstance(t, ast.Attribute)}
         self.assertIn("_turn_candidate_resolution", reset)
 
-    def test_r2_34_the_cutover_is_still_off_by_default(self):
-        from app.settings import Settings
-        self.assertIs(Settings().reply_renderer_demotion_enabled, False)
+    def test_r2_34_the_cutover_is_on_by_default_and_still_reversible(self):
+        """G3-7B flipped the default once the correction-target authority closed the gap
+        this assertion was guarding. What must stay true is that the switch still works in
+        both directions and that an engine with no setting at all fails safe."""
+        import os
+        from app.settings import Settings, get_settings
+        self.assertIs(Settings().reply_renderer_demotion_enabled, True)
+        os.environ["REPLY_RENDERER_DEMOTION_ENABLED"] = "false"
+        get_settings.cache_clear()
+        try:
+            self.assertIs(get_settings().reply_renderer_demotion_enabled, False,
+                          "the rollback switch must still turn the cutover off")
+        finally:
+            os.environ.pop("REPLY_RENDERER_DEMOTION_ENABLED", None)
+            get_settings.cache_clear()
+        bare = E.__new__(E)
+        bare.settings = SimpleNamespace()
+        self.assertFalse(bare._reply_renderer_demotion_on(),
+                         "a missing setting must still read as off")
 
 
 if __name__ == "__main__":       # pragma: no cover

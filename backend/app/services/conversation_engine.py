@@ -4266,6 +4266,18 @@ class ConversationEngine:
             year = _coerce_candidate_year(getattr(correction, "to_value", None))
         if year is not None and getattr(target, "anio", None) != year:
             out.append(("anio", getattr(target, "anio", None), year))
+        # Identity and category arms of the G3-7A attribute matrix. They arise when the
+        # correction points at a mention that carries them (rung 4), or when the customer
+        # corrects the CATEGORY of the car under discussion without renaming it
+        # ("es un clásico de los 70s"). The writer's catalogue guard still outranks a
+        # category suggestion whenever the catalogue knows the vehicle.
+        for field, attr in (("marca", "make"), ("modelo", "model")):
+            proposed = (getattr(vehicle, attr, None) or "").strip() if vehicle else ""
+            if proposed and getattr(target, field, None) != proposed:
+                out.append((field, getattr(target, field, None), proposed))
+        tipo = (getattr(vehicle, "category_suggestion", None) or "").strip() if vehicle else ""
+        if tipo and getattr(target, "tipo_vehiculo", None) != tipo:
+            out.append(("tipo_vehiculo", getattr(target, "tipo_vehiculo", None), tipo))
         if zone_detail and getattr(target, "zone_detail", None) != zone_detail:
             out.append(("zone_detail", getattr(target, "zone_detail", None), zone_detail))
             if zone_group and getattr(target, "zone_group", None) != zone_group:

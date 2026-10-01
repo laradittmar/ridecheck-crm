@@ -197,15 +197,23 @@ def _make_engine(send_raises=False, ai_response=None) -> ConversationEngine:
 
 def _run(text=None, unanswered=None, stage=STAGE_QUALIFYING, needs_human=False,
          last_intent=None, send_raises=False, ai_response=None, lead_kwargs=None,
-         state_kwargs=None):
-    """Run _process_text with mocked engine. Returns (eng, result, state, lead)."""
+         state_kwargs=None, evidence=None, demotion=None):
+    """Run _process_text with mocked engine. Returns (eng, result, state, lead).
+
+    `evidence` and `demotion` migrate setups for the G3-7 cutover — see
+    tests/_g37b_evidence.py.
+    """
     eng = _make_engine(send_raises=send_raises, ai_response=ai_response)
+    if demotion is not None:
+        eng.settings.reply_renderer_demotion_enabled = demotion
     state = _make_state(last_stage=stage, needs_human=needs_human, last_intent=last_intent,
                         **(state_kwargs or {}))
     lead = _make_lead(**(lead_kwargs or {}))
     ctx = _make_ctx(state=state, lead=lead)
     event = _make_event(text=text, unanswered=unanswered)
-    with patch("app.services.conversation_engine.lookup_vehicle", return_value=None):
+    from _g37b_evidence import armed_evidence
+    with armed_evidence(eng, evidence), \
+         patch("app.services.conversation_engine.lookup_vehicle", return_value=None):
         result = eng._process_text(ctx, event)
     return eng, result, state, lead
 
@@ -751,10 +759,40 @@ class TestMotorcycleLayerA(unittest.TestCase):
         eng, result, state, lead = _run(
             text="Quiero revisar el auto antes de comprarlo",  # pre-purchase, no moto in text
             ai_response=ai_moto,
+            # G3-7B: this is the LEGACY vector — the reply model inventing a MOTO candidate
+            # for a turn that never mentioned one. The cutover removes the vector entirely
+            # (the field is stripped at the boundary), so the guard it certifies is pinned
+            # to the channel it belongs to rather than deleted.
+            demotion=False,
         )
         _assert_handled(self, result, "replied")
         self.assertTrue(state.needs_human)
         self.assertEqual(eng._apply_candidate.call_count, 0)
+        self.assertTrue(lead.necesita_humano)
+
+    def test_si22b_a_semantic_motorcycle_still_reaches_manual_handoff(self):
+        """SI-22 under the cutover: the POLICY survives on the channel that replaces it.
+
+        With the reply model demoted there is no hallucinated candidate to catch, so the
+        guard has to be proven from typed evidence instead: a genuine motorcycle mention
+        must reach manual handoff and must never reach the candidate writer.
+        """
+        from _g37b_evidence import turn, vehicle, intent
+        eng, result, state, lead = _run(
+            # Same turn as SI-22, so the only thing that changed is WHERE the motorcycle
+            # claim comes from: the semantic layer rather than the reply model.
+            text="Quiero revisar el auto antes de comprarlo",
+            ai_response=json.dumps({"reply": "Entendido.", "candidate": {"action": "none"},
+                                    "extracted": {}, "lead_flag": None,
+                                    "needs_human": False}),
+            demotion=True,
+            evidence=turn(intents=[intent()],
+                          vehicles=[vehicle(make="Honda", model="Titan", tipo="MOTO",
+                                            value="una Honda Titan")]),
+        )
+        self.assertTrue(state.needs_human, "a motorcycle must still reach a human")
+        self.assertEqual(eng._apply_candidate.call_count, 0,
+                         "the MOTO guard must fire BEFORE the candidate writer")
         self.assertTrue(lead.necesita_humano)
 
     def test_si23_website_form_moto(self):

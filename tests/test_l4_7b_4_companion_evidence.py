@@ -245,7 +245,8 @@ class TestNoRegression(unittest.TestCase):
         from semantic_corpus.corpus_mapping import (corpus_case_to_turn_evidence,
                                                     turn_evidence_to_harness_items)
         corpus = load_corpus()
-        self.assertEqual(len(corpus), 162)
+        self.assertEqual(len(corpus), 172,
+                         "G3-7B added ten correction-target cases")
         for case in corpus:
             items = turn_evidence_to_harness_items(corpus_case_to_turn_evidence(case))
             self.assertIsInstance(items, list, case["id"])

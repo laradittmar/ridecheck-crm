@@ -413,7 +413,8 @@ class TestCorpus(unittest.TestCase):
     def test_corpus_01_all_162_cases_remain_evaluable(self):
         from semantic_corpus.corpus_mapping import (corpus_case_to_turn_evidence,
                                                     turn_evidence_to_harness_items)
-        self.assertEqual(len(CORPUS), 162)
+        self.assertEqual(len(CORPUS), 172,
+                         "G3-7B added ten correction-target cases")
         for case in CORPUS.values():
             evidence = corpus_case_to_turn_evidence(case)
             self.assertTrue(turn_evidence_to_harness_items(evidence) is not None, case["id"])

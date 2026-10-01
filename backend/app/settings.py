@@ -41,10 +41,15 @@ class Settings:
     # L4.7C.3B — acceptance / commercial-progression authority. Default OFF everywhere.
     reconciler_acceptance_authority_enabled: bool = False
     # G3-7 — the reply model stops supplying `extracted`, `candidate`, `lead_flag` and
-    # `needs_human`; typed evidence supplies them instead. Default OFF: the cutover waits on
-    # a semantic-coverage proof that only a corpus/live evaluation can give, and turning the
-    # flag off restores the legacy source exactly. See the G3-7 closeout §5.
-    reply_renderer_demotion_enabled: bool = False
+    # `needs_human`; typed evidence supplies them instead.
+    # G3-7B flipped the default ON. What the G3-7 closeout was waiting for was a
+    # correction-target authority: a customer correcting the car under discussion names no
+    # vehicle, and the reconciler had no way to express that, so the demoted path lost the
+    # correction (and a bare-year mention created a phantom candidate). That is closed, the
+    # 43 cutover-added failures are migrated to typed evidence with every business assertion
+    # unchanged, and `REPLY_RENDERER_DEMOTION_ENABLED=false` still restores the legacy
+    # source exactly — the rollback is verified, not assumed. See the G3-7B closeout.
+    reply_renderer_demotion_enabled: bool = True
     # L4.7C.4 — scheduling-language interpretation. Default OFF everywhere.
     reconciler_scheduling_authority_enabled: bool = False
     # L4.7C.4A — same-turn semantic evidence. When false the interpretation stays behind the
@@ -151,7 +156,7 @@ def get_settings() -> Settings:
         reconciler_acceptance_authority_enabled=(
             _getenv("RECONCILER_ACCEPTANCE_AUTHORITY_ENABLED", "false").lower() == "true"),
         reply_renderer_demotion_enabled=(
-            _getenv("REPLY_RENDERER_DEMOTION_ENABLED", "false").lower() == "true"),
+            _getenv("REPLY_RENDERER_DEMOTION_ENABLED", "true").lower() == "true"),
         reconciler_scheduling_authority_enabled=(
             _getenv("RECONCILER_SCHEDULING_AUTHORITY_ENABLED", "false").lower() == "true"),
         internal_api_auth_enabled=(
