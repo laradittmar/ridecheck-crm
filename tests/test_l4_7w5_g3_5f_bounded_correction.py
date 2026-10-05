@@ -531,7 +531,7 @@ class E_OpeningFixesIntact(unittest.TestCase):
     def test_bc_38_the_trace_contract_is_unchanged_by_this_correction(self):
         """§3: UI wording alone is not a reason to bump a contract. No payload field was
         added and no field's meaning changed, so 1.5 stands."""
-        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.7")
+        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.8")
         from app.schemas.hybrid_trace import ResponsePlan
         payload = ResponsePlan(plan_id="p", turn_id=None, burst_fingerprint=None,
                                decision_phase_id=None).to_payload()

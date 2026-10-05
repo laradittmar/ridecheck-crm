@@ -410,34 +410,59 @@ class D_FiniteRecovery(unittest.TestCase):
             __import__("app.services.pricing", fromlist=["PricingService"])
             .PricingService.quote)))
 
-    def test_r2_27_the_clarification_budget_is_finite(self):
-        """Requirement 11: the loop must terminate."""
-        e, _rows = engine()
-        st = state(flow_booking_token="tok")
-        self.assertTrue(e._spend_correction_clarification(st, "c1"))
-        self.assertFalse(e._spend_correction_clarification(st, "c1"),
-                         "a second clarification in one cycle must be refused")
-        self.assertEqual(pc.clarifications_used(st, "c1"), 1)
+    def test_r2_27_the_free_text_clarification_budget_is_gone(self):
+        """OWNER-RESOLUTION Part D supersedes R2's budget entirely.
 
-    def test_r2_28_a_new_cycle_restores_the_budget(self):
-        e, _rows = engine()
-        st = state()
-        e._spend_correction_clarification(st, "c1")
-        self.assertEqual(pc.clarifications_used(st, "c2"), 0)
-        self.assertTrue(e._spend_correction_clarification(st, "c2"))
+        R2 metered a free-text clarification with a marker stored inside
+        `pending_correction`; the independent review proved the bound was not per-cycle and
+        had no atomic guard. The owner's resolution removes the mechanism rather than
+        repairing it, because the project already owns two structured Flows that are the one
+        clarification attempt. There is no counter left to overwrite.
+        """
+        for gone in ("clarification_marker", "clarifications_used",
+                     "clarification_budget_remains", "CLARIFICATION_BUDGET",
+                     "CLARIFICATION_BUDGET_SPENT"):
+            with self.subTest(symbol=gone):
+                self.assertFalse(hasattr(pc, gone), f"{gone} must not come back")
+        self.assertFalse(hasattr(E, "_spend_correction_clarification"))
 
-    def test_r2_29_the_budget_marker_is_not_a_pending_correction(self):
-        """One column, two record kinds. The strict reader must not confuse them."""
+    def test_r2_28_pending_correction_has_one_typed_meaning_again(self):
+        """The column carries a proposal or nothing — never a second record kind."""
         st = state()
-        st.pending_correction = pc.clarification_marker(1, "c1")
         self.assertIsNone(pc.load(st))
+        st.pending_correction = {"kind": "correction_clarification", "count": 1,
+                                 "cycle_id": "c1"}
+        self.assertIsNone(pc.load(st), "a stale R2 marker still reads as no proposal")
         self.assertEqual(pc.has_blocking_pending_correction(st), (False, None))
+        p = pending()
+        st.pending_correction = p.to_payload()
+        self.assertIsNotNone(pc.load(st))
+
+    def test_r2_29_the_flow_sent_flags_are_what_bounds_clarification(self):
+        """Part F: boundedness is the canonical Flow lifecycle, not a counter."""
+        for family, field, attempted_reason in (
+            ("vehicle", "vehicle_flow_attempted",
+             pc.ClarificationReason.VEHICLE_FLOW_ALREADY_ATTEMPTED),
+            ("location", "location_flow_attempted",
+             pc.ClarificationReason.LOCATION_FLOW_ALREADY_ATTEMPTED),
+        ):
+            with self.subTest(family=family):
+                kw = dict(vehicle_domain_proven=True, vehicle_identity_resolved=False)
+                if family == "location":
+                    kw = dict(location_domain_proven=True, location_resolved=False)
+                first = pc.route_clarification(**kw)
+                second = pc.route_clarification(**{**kw, field: True})
+                self.assertIn(first[0], (pc.ClarificationRoute.VEHICLE_FLOW_REQUIRED,
+                                         pc.ClarificationRoute.LOCATION_FLOW_REQUIRED))
+                self.assertEqual(second,
+                                 (pc.ClarificationRoute.GENERIC_HUMAN_REQUIRED,
+                                  attempted_reason))
 
     def test_r2_30_no_time_based_guess_decides_staleness(self):
         """Part D.7, over the whole recovery path."""
-        for fn in (pc.proposal_disposition, pc.clarifications_used,
-                   pc.clarification_budget_remains, E._withdraw_dependent_proposals,
-                   E._spend_correction_clarification):
+        for fn in (pc.proposal_disposition, pc.route_clarification,
+                   pc.proposal_is_active, E._withdraw_dependent_proposals,
+                   E._route_clarification):
             with self.subTest(fn=fn.__name__):
                 src = inspect.getsource(fn)
                 for token in ("utcnow", "datetime.now", "time.time", "timedelta"):
@@ -883,9 +908,11 @@ class I_Invariants(unittest.TestCase):
     def test_r2_70_no_phrase_or_affirmation_detector_entered_the_new_path(self):
         """Requirement 38 / Part C's last clause."""
         for fn in (E._arm_pending_correction, E._withdraw_dependent_proposals,
-                   E._spend_correction_clarification, E._correction_category,
-                   E._register_correction_propositions, pc.proposal_disposition,
-                   pc.confirmation_admissible, pc.confirmation_dispatch_proven):
+                   E._route_clarification, E._correction_category,
+                   E._register_correction_propositions, E._generic_human_handoff,
+                   E._dispatch_clarification_route, pc.proposal_disposition,
+                   pc.route_clarification, pc.confirmation_admissible,
+                   pc.confirmation_dispatch_proven):
             with self.subTest(fn=fn.__name__):
                 src = _code_only(fn)
                 for token in ("_FUZZY_ACCEPTANCE_RE", "re.search", "re.match", "re.compile",
@@ -965,12 +992,20 @@ class J_MutationControls(unittest.TestCase):
         self.assertEqual(pc.LEGACY_PROPOSAL_FIELDS,
                          tuple(f for f, _fam in pc.LEGACY_PROPOSALS))
 
-    def test_r2_79_mutation_allow_unlimited_clarifications(self):
-        self.assertEqual(pc.CLARIFICATION_BUDGET, 1)
-        e, _rows = engine()
-        st = state()
-        spent = [e._spend_correction_clarification(st, "c1") for _ in range(5)]
-        self.assertEqual(spent, [True, False, False, False, False])
+    def test_r2_79_mutation_restore_the_free_text_clarification_marker(self):
+        """OWNER-RESOLUTION: reintroducing R2's budget marker must be caught.
+
+        The marker was not merely unbounded — it gave `pending_correction` a second meaning.
+        This control fails if any part of it returns, including a renamed counter.
+        """
+        pc_src = pathlib.Path(inspect.getsourcefile(pc)).read_text(encoding="utf-8")
+        code = "\n".join(l for l in pc_src.splitlines()
+                          if not l.lstrip().startswith("#"))
+        for token in ("def clarification_marker", "def clarifications_used",
+                      "def clarification_budget_remains", "CLARIFICATION_BUDGET ="):
+            with self.subTest(token=token):
+                self.assertNotIn(token, code)
+        self.assertNotIn("_spend_correction_clarification", ENGINE_SRC)
 
     def test_r2_80_mutation_provisional_without_grounding(self):
         src = inspect.getsource(E._arm_pending_correction)
@@ -987,7 +1022,11 @@ class J_MutationControls(unittest.TestCase):
         gate = ENGINE_SRC[ENGINE_SRC.index("the category travels WITH the correction"):]
         gate = gate[:gate.index("_outcome = self._apply_candidate(")]
         self.assertIn("self._correction_category(", gate)
-        self.assertIn("return self._motorcycle_human_handoff(ctx, state)", gate)
+        # OWNER-RESOLUTION Parts B and C: the call is gated on the grounding flag, and the
+        # failure routes to the GENERIC handoff — never the motorcycle one.
+        self.assertIn("if self._correction_grounding_on():", gate)
+        self.assertIn("self._generic_human_handoff(", gate)
+        self.assertNotIn("_motorcycle_human_handoff", gate)
 
     def test_r2_83_mutation_allow_phantom_candidate_creation(self):
         src = inspect.getsource(E._apply_candidate)

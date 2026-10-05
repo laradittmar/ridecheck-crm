@@ -32,8 +32,14 @@ _TOTALS = re.compile(r"(\d+)\s+(failed|passed|skipped|errors|error|"
 #: (`tests/Whatsapp Test/Messages/`), and a `(\S+)` capture truncated all four of its
 #: failures to one shared prefix, silently merging them into a single identity. That is the
 #: same class of undercount this module exists to catch.
-_SUMMARY_LINE = re.compile(
-    r"^(FAILED|ERROR|SUBFAILED)\b(\([^)]*\))?\s+(.+?)(?:\s+-\s.*)?$")
+#: The case label may itself contain parentheses, commas, quotes and spaces — pytest prints
+#: `SUBFAILED(outcome='tuple(False, None)') ../tests/a.py::T::t`. A `(\([^)]*\))?` group stops
+#: at the FIRST `)` and the whole line then fails to match, so five such outcomes were
+#: silently discarded (G3-7F-R2 review finding R2R-06). The kind is matched alone and the
+#: remainder is split on the node id instead, which cannot be confused with a label.
+_SUMMARY_LINE = re.compile(r"^(FAILED|ERROR|SUBFAILED)\b(.*)$")
+#: A pytest node id starts at a path and contains `::`; this finds where the label ends.
+_NODE_ID = re.compile(r"(\S*[^\s:]\.py(?:::\S+)?|\S+::\S+)\s*$")
 _COLLECT_ERROR = re.compile(r"errors? during collection|ERROR collecting ")
 
 
@@ -88,7 +94,17 @@ def parse(output: str) -> RegressionAccount:
         m = _SUMMARY_LINE.match(line.strip())
         if not m:
             continue
-        kind, case, ident = m.group(1), (m.group(2) or ""), m.group(3).strip()
+        kind, rest = m.group(1), (m.group(2) or "")
+        rest = rest.split(" - ")[0].strip()
+        node = _NODE_ID.search(rest)
+        if node is None:
+            # A terminal outcome we recognized but could not address. Never discard it:
+            # dropping a recognized outcome is exactly the defect this module exists to
+            # prevent, so it is counted under its raw text.
+            ident, case = rest or "<unparsed>", ""
+        else:
+            ident = node.group(1)
+            case = rest[:node.start(1)].strip()
         if kind == "FAILED":
             failed.add(ident)
         elif kind == "ERROR":

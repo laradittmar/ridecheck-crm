@@ -620,7 +620,7 @@ class D_FlowCompletionAck(unittest.TestCase):
 class E_TraceAndInspector(unittest.TestCase):
 
     def test_g35f_50_the_contract_moved_and_every_older_one_stays_readable(self):
-        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.7")
+        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.8")
         for older in READABLE_VERSIONS[1:]:
             with self.subTest(version=older):
                 self.assertIn(older, READABLE_VERSIONS)

@@ -801,7 +801,7 @@ class FuzzyAdmissibilityRepair(unittest.TestCase):
                              "a raising observer is caught, and acceptance is never assumed")
 
     def test_row_33b_the_contract_version_is_current(self):
-        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.7")
+        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.8")
 
 
 if __name__ == "__main__":       # pragma: no cover

@@ -588,7 +588,7 @@ class E_TraceAndPlan(unittest.TestCase):
         """
         from app.schemas.hybrid_trace import (READABLE_VERSIONS, TRACE_VERSION_1_4,
                                               VERSIONS_WITH_SHADOW_ONLY_PLAN)
-        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.7")
+        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.8")
         self.assertIn(TRACE_VERSION_1_4, READABLE_VERSIONS)
         self.assertIn(TRACE_VERSION_1_4, VERSIONS_WITH_SHADOW_ONLY_PLAN)
         self.assertNotIn(TRACE_VERSION, VERSIONS_WITH_SHADOW_ONLY_PLAN)

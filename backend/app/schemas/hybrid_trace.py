@@ -60,7 +60,7 @@ import unicodedata
 from dataclasses import dataclass, field, asdict
 from typing import Any, Optional
 
-TRACE_VERSION = "hybrid-decision-trace/1.7"
+TRACE_VERSION = "hybrid-decision-trace/1.8"
 #: G3-5E. 1.4 splits `response_plan_source` — which was `answer_source`, and therefore
 #: answered three questions at once — into decision authority, fact sources, renderer source
 #: and dispatch result, and adds the reply-generation role and the shadow response plan. A
@@ -1188,6 +1188,13 @@ class HybridDecisionTrace:
     #: G3-7F, contract 1.7. The provisional patch this turn armed, confirmed, rejected,
     #: superseded or expired — and every commercial action it blocked. Absent on 1.6 rows.
     pending_correction: Optional[Any] = None
+    # ── G3-7F-OWNER-RESOLUTION contract 1.8 ──
+    #: Why this turn did or did not ask the customer anything: the proven domain, the route
+    #: the typed router chose, its reason, which Flow was dispatched and how it went, and
+    #: the generic-handoff reason when a person took over. The owner's Part H makes this
+    #: measurable on purpose — the hybrid architecture is supposed to REDUCE clarification
+    #: Flows, so "resolved without a Flow" has to be countable, not merely absent.
+    clarification: Optional[Any] = None
     response_item_count: Optional[int] = None
     response_item_kinds: tuple = ()
     suppressed_item_count: Optional[int] = None

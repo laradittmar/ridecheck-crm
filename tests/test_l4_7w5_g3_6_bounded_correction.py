@@ -195,7 +195,7 @@ class B_InspectorCoverage(unittest.TestCase):
                 self.assertIn(refused, PLAN_SCOPE_NOTE)
 
     def test_bc36_08_the_contract_was_not_bumped_for_wording(self):
-        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.7")
+        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.8")
 
 
 # ══ C — the canonical price proposition ════════════════════════════════════
@@ -490,7 +490,7 @@ class E_NothingElseMoved(unittest.TestCase):
             encoding="utf-8")
         self.assertIn('REPLY_PROMPT_VERSION = "reply/1.0"', engine_src)
         self.assertIn('PROMPT_VERSION = "understand/1.20"', interp)
-        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.7")
+        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.8")
 
 
 if __name__ == "__main__":       # pragma: no cover

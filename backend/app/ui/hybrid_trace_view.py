@@ -759,7 +759,20 @@ UNAVAILABLE_BEFORE_1_5 = "no disponible en este contrato"
 CONTRACTS_WITH_CANDIDATE_SECTION = frozenset({
     "hybrid-decision-trace/1.6",
     "hybrid-decision-trace/1.7",
+    "hybrid-decision-trace/1.8",
 })
+
+#: G3-7F-OWNER-RESOLUTION. The clarification section needs its own note because the whole
+#: point of the measurement is that a Flow is the FALLBACK: an operator reading a dashboard
+#: full of Flows should understand that as a regression in semantic resolution, not as the
+#: product working as intended.
+CLARIFICATION_SCOPE_NOTE = (
+    "El Flow de aclaración es el recurso de seguridad, no el camino normal. Cuando la "
+    "evidencia semántica y los servicios canónicos resuelven el vehículo y la localidad, "
+    "no se envía ningún formulario: eso es el resultado buscado. Un volumen alto de Flows "
+    "indica que la interpretación semántica está resolviendo menos, no que el producto "
+    "esté funcionando mejor. Nada de esto aplica bloqueo comercial: eso es G3-8."
+)
 
 PENDING_SCOPE_NOTE = (
     "Esto es estado PROPUESTO, no verdad canónica: la fila del candidato no cambió todavía. "
@@ -901,6 +914,61 @@ def _candidate_resolution_card(trace: dict) -> str:
     ]
     return ('<div class="card"><h2>Candidato — decisión</h2>'
             f'<p class="note">{html.escape(CANDIDATE_SCOPE_NOTE)}</p>'
+            f"{_kv(rows)}</div>")
+
+
+def _clarification_card(trace: dict) -> str:
+    """Why the turn did or did not ask the customer anything. Part H.
+
+    Rendered on every 1.8 trace, including the turns that asked nothing — those are the ones
+    the measurement exists to count.
+    """
+    res = trace.get("clarification")
+    if not isinstance(res, dict):
+        return ""
+    _ROUTE = {
+        "NO_CLARIFICATION_REQUIRED": "ninguna — la evidencia alcanzó",
+        "CORRECTION_CONFIRMATION_REQUIRED": "confirmación de corrección (pregunta tipada)",
+        "VEHICLE_FLOW_REQUIRED": "Flow de vehículo",
+        "LOCATION_FLOW_REQUIRED": "Flow de localidad",
+        "GENERIC_HUMAN_REQUIRED": "derivación a un asesor",
+    }
+    _WHY = {
+        "RESOLVED": "se resolvió con la evidencia admitida",
+        "HUMAN_OWNS_TURN": "la conversación ya la lleva una persona",
+        "CORRECTION_VALUES_KNOWN": "el objetivo y los valores corregidos ya se conocen",
+        "VEHICLE_IDENTITY_UNRESOLVED": "se habla de un vehículo pero no se resolvió cuál",
+        "VEHICLE_FLOW_ALREADY_ATTEMPTED": "el Flow de vehículo ya se envió en este ciclo",
+        "VEHICLE_CATEGORY_UNRESOLVED": "identidad conocida, categoría no resoluble",
+        "LOCATION_UNRESOLVED": "se indicó una ubicación pero no se resolvió la zona",
+        "LOCATION_FLOW_ALREADY_ATTEMPTED": "el Flow de localidad ya se envió en este ciclo",
+        "PROPOSAL_WOULD_COEXIST": "había otra propuesta confirmable activa",
+        "DOMAIN_NOT_PROVEN": "no se probó de qué está hablando el cliente",
+    }
+    _BOUND = {
+        "BOUND": "sí — la pregunta estaba en la respuesta entregada",
+        "DEGRADED": "no — la respuesta se degradó y no contenía la pregunta",
+        "NOT_INCLUDED": "no — la proposición no llegó al mensaje compuesto",
+        "NOT_DISPATCHED": "no — el transporte no aceptó nada",
+        "BLOCKED": "no — el kill switch bloqueó la salida",
+    }
+    rows = [
+        ("Aclaración requerida", _e(_ROUTE.get(str(res.get("route")),
+                                               res.get("route") or "—"))),
+        ("Motivo", _e(_WHY.get(str(res.get("reason")), res.get("reason")))),
+        ("Resuelto sin formulario", _e(res.get("resolved_without_flow"))),
+        ("Flow despachado", _e(res.get("flow_dispatched"))),
+        ("Texto explicativo planificado", _e(res.get("explanatory_planned"))),
+        ("Derivación genérica", _e(res.get("generic_handoff"))),
+        ("Motivo de la derivación", _e(res.get("handoff_reason"))),
+        ("Autoridad de confirmación", _e(_BOUND.get(str(res.get("confirmation_bound")),
+                                                    res.get("confirmation_bound")))),
+        ("Categoría re-derivada", _e(res.get("corrected_category"))),
+        ("MOTO probada", _e(res.get("moto_proven"))),
+        ("Aplicado en las compuertas (G3-8)", _e(res.get("g3_8_enforced"))),
+    ]
+    return ('<div class="card"><h2>Aclaración y derivación</h2>'
+            f'<p class="note">{html.escape(CLARIFICATION_SCOPE_NOTE)}</p>'
             f"{_kv(rows)}</div>")
 
 
@@ -1150,6 +1218,7 @@ def render_turn_trace_page(record: Optional[dict], turn_id: str = "") -> str:
                                semantic=trace.get("semantic") or {})
         + _candidate_resolution_card(trace)
         + _pending_correction_card(trace)
+        + _clarification_card(trace)
         + _state_card(trace.get("canonical_before") or {}, trace.get("canonical_after") or {})
         + _outcome_card(trace)
         + _reply_model_card(trace)

@@ -77,6 +77,15 @@ class PropositionId:
     #: is the only thing that makes an unasked mutation visible to the customer; G3-7F
     #: assembled the pairs and never rendered them.
     CORRECTION_APPLIED = "correction.applied"
+    #: G3-7F-OWNER-RESOLUTION. The one short explanatory message that accompanies a
+    #: structured clarification Flow. Owner policy 3: the Flow is the safety fallback, so the
+    #: text exists only to tell the customer what the form is for — it never asks the
+    #: question itself, because an open-ended question is what these Flows replace.
+    VEHICLE_CLARIFICATION_INTRO = "clarification.vehicle_flow_intro"
+    LOCATION_CLARIFICATION_INTRO = "clarification.location_flow_intro"
+    #: The neutral line a generic human handoff says. Separate from the motorcycle reply so
+    #: no non-MOTO situation can borrow motorcycle wording (owner policy 19).
+    GENERIC_HANDOFF_ACK = "handoff.generic_review"
     #: G3-6. Why the principal action is held, when P1 needs it said out loud.
     HOLD_EXPLANATION = "turn.hold_explanation"
 
@@ -229,6 +238,21 @@ class LiveResponsePlan:
             return False
         self.propositions.append(prop)
         return True
+
+    def included(self, proposition_id: str) -> bool:
+        """Did this proposition survive policy and reach the composed message?
+
+        G3-7F-OWNER-RESOLUTION (review finding R2R-01). `registered()` answers only "a
+        producer offered this claim"; a degraded plan, a P2 exclusion or a suppression can
+        still drop it. Confirmation authority must rest on INCLUSION, and the owner's Part A
+        forbids proving it by searching rendered customer prose — so the plan answers
+        structurally, from the same `_ordered_included()` set `compose()` renders.
+
+        False before composition: nothing is included until the plan has composed.
+        """
+        if not self.composed or self.degraded:
+            return False
+        return any(p.proposition_id == proposition_id for p in self._ordered_included())
 
     def registered(self, proposition_id: str) -> bool:
         return any(p.proposition_id == proposition_id for p in self.propositions)

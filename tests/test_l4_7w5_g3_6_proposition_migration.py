@@ -618,7 +618,7 @@ class H_PlanCountIsTruthful(unittest.TestCase):
                 self.assertIn(refused, PLAN_SCOPE_NOTE)
 
     def test_g36_50_the_trace_contract_is_unchanged(self):
-        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.7")
+        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.8")
 
     def test_g36_51_scheduling_meaning_is_preserved(self):
         """§11 — an availability enquiry is still not a business-hours FAQ."""

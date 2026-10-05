@@ -599,7 +599,7 @@ class PrivacyHistoryContract(unittest.TestCase):
         from app.schemas.hybrid_trace import (READABLE_VERSIONS, TRACE_VERSION_1_0,
                                               TRACE_VERSION_1_1, TRACE_VERSION_1_2,
                                               TRACE_VERSION_1_3, TRACE_VERSION_1_4)
-        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.7")
+        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.8")
         for older in (TRACE_VERSION_1_0, TRACE_VERSION_1_1, TRACE_VERSION_1_2,
                       TRACE_VERSION_1_3, TRACE_VERSION_1_4):
             self.assertIn(older, READABLE_VERSIONS)

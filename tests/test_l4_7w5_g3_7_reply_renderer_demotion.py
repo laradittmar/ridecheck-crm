@@ -503,7 +503,7 @@ class E_NothingElseMoved(unittest.TestCase):
         self.assertIn('PROMPT_VERSION = "understand/1.20"', interp)
         self.assertIn('or "gpt-4o-mini"', interp)
         self.assertEqual(te.SCHEMA_VERSION, "turn-evidence/1.4")
-        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.7")
+        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.8")
 
     def test_g37_41_one_provider_call_site_and_one_semantic_interpretation(self):
         engine_src = pathlib.Path(ce.__file__).read_text(encoding="utf-8")

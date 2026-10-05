@@ -96,14 +96,14 @@ class InvalidationReason:
     #: state that proves dispatch was accepted — it is gone, on another thread, still
     #: pending, suppressed, blocked, failed, or carries no WAMID.
     CONFIRMATION_NOT_DISPATCHED = "CONFIRMATION_NOT_DISPATCHED"
-    #: G3-7F-R2 (review G37FRR-04). The clarification budget for this cycle is spent and a
-    #: legacy proposal is still outstanding and still sound. Terminates instead of repeating.
-    CLARIFICATION_BUDGET_SPENT = "CLARIFICATION_BUDGET_SPENT"
+    #: G3-7F-OWNER-RESOLUTION. The correction could not be clarified safely and a person
+    #: owns the turn now. Replaces R2's CLARIFICATION_BUDGET_SPENT, whose budget is gone.
+    GENERIC_HUMAN_OWNERSHIP = "GENERIC_HUMAN_OWNERSHIP"
 
     ALL = (NEWER_CORRECTION, BEFORE_VALUES_MOVED, TARGET_LOST, FOCUS_MOVED, CYCLE_ENDED,
            HUMAN_HANDOFF, CUSTOMER_REJECTED, NOT_LATEST_QUESTION,
            LEGACY_PROPOSAL_ACTIVE, FINGERPRINT_MISMATCH, GROUNDING_NOT_ENABLED,
-           TARGET_NOT_GROUNDED, CONFIRMATION_NOT_DISPATCHED, CLARIFICATION_BUDGET_SPENT)
+           TARGET_NOT_GROUNDED, CONFIRMATION_NOT_DISPATCHED, GENERIC_HUMAN_OWNERSHIP)
 
 
 #: G3-7F-R2 (review G37FRR-08). The canonical outbound lifecycle is
@@ -267,38 +267,148 @@ def proposal_disposition(state, corrected_fields) -> dict:
             "conflicting": tuple(conflicting)}
 
 
-# -- Part D: a FINITE clarification budget, in state that already exists --------------
+# -- DEFERRED TO G3-8 (owner resolution, Part J) ---------------------------------------
 #
-# Review finding G37FRR-04: the "one bounded clarification" wrote no state, so an abandoned
-# `flow_booking_token` refused every future correction and re-sent one identical sentence
-# forever. The budget below lives in the `pending_correction` JSONB column the G3-7F
-# migration already added - no second migration, no new column - and `from_payload` keeps
-# reading a marker as "no pending correction" because a marker carries no `pending_id`.
+# R2R-07, from the G3-7F-R2 independent review, is deliberately NOT closed here.
+#
+#   A correction applied AFTER a booking already exists leaves the booked
+#   `ThreadRevision` and the CRM `Revision` holding the old marca/modelo/anio/
+#   tipo_vehiculo. `booking_flow_service.py:789` and `:803` write those from
+#   `_load_focus_candidate(...)` at booking time, and nothing syncs them afterwards —
+#   this module holds no reference to `current_revision_id` and writes no revision.
+#   The agenda, the appointment record and the CRM therefore show the pre-correction
+#   vehicle.
+#
+# The reverse order is safe: correction-then-booking reads the candidate live, and the
+# booking token carries no snapshot (`make_booking_token` is thread id, timestamp, nonce).
+#
+# G3-8 owns this. Its confirm-then-recompute sequence must either refresh the dependent
+# revision or withdraw it through the existing approval lifecycle, and commercial
+# progression stays blocked until it does. This milestone must not edit booked revisions,
+# and does not.
 
-#: One clarification per cycle. A second unresolved conflict terminates instead of repeating.
-CLARIFICATION_BUDGET = 1
-_MARKER_KIND = "correction_clarification"
+# -- G3-7F-OWNER-RESOLUTION: the typed clarification router ---------------------------
+#
+# R2 answered an unresolvable correction with a free-text question metered by a budget
+# marker stored inside this very column. The independent review found the bound was not
+# per-cycle (a real patch overwrote the marker and the budget returned) and had no atomic
+# guard. The owner's resolution removes that mechanism outright: the project already owns
+# two published, structured clarification Flows, and those are the one clarification
+# attempt. There is no counter to overwrite because there is no counter.
+#
+# This router decides WHICH clarification a turn needs. It is pure, it reads only reconciled
+# and canonical facts, and it matches no phrase: every input below is a boolean another
+# authority already established.
 
 
-def clarification_marker(count: int, cycle_id: Any) -> dict:
-    return {"kind": _MARKER_KIND, "count": int(count), "cycle_id": str(cycle_id or "")}
+class ClarificationRoute:
+    """What this turn needs in order to proceed safely."""
+    #: Nothing: the admitted evidence and the business services resolved what was required.
+    NO_CLARIFICATION_REQUIRED = "NO_CLARIFICATION_REQUIRED"
+    #: Target and corrected values are both known; authority needs the customer's yes.
+    CORRECTION_CONFIRMATION_REQUIRED = "CORRECTION_CONFIRMATION_REQUIRED"
+    #: Vehicle domain proven, canonical identity unresolved -> the Vehicle Flow.
+    VEHICLE_FLOW_REQUIRED = "VEHICLE_FLOW_REQUIRED"
+    #: Inspection-location domain proven, locality/zone unresolved -> the Location Flow.
+    LOCATION_FLOW_REQUIRED = "LOCATION_FLOW_REQUIRED"
+    #: A person takes it. Never motorcycle handling (owner policy 19).
+    GENERIC_HUMAN_REQUIRED = "GENERIC_HUMAN_REQUIRED"
+
+    ALL = (NO_CLARIFICATION_REQUIRED, CORRECTION_CONFIRMATION_REQUIRED,
+           VEHICLE_FLOW_REQUIRED, LOCATION_FLOW_REQUIRED, GENERIC_HUMAN_REQUIRED)
 
 
-def clarifications_used(state, cycle_id: Any) -> int:
-    """How many correction clarifications this cycle has already spent."""
-    raw = getattr(state, "pending_correction", None)
-    if not isinstance(raw, dict) or raw.get("kind") != _MARKER_KIND:
-        return 0
-    if str(raw.get("cycle_id") or "") != str(cycle_id or ""):
-        return 0            # a new cycle is a new budget; the old marker is spent state
-    try:
-        return int(raw.get("count") or 0)
-    except (TypeError, ValueError):
-        return 0
+class ClarificationReason:
+    """Why the router chose what it chose. Enumerated so the trace never says "other"."""
+    RESOLVED = "RESOLVED"
+    HUMAN_OWNS_TURN = "HUMAN_OWNS_TURN"
+    CORRECTION_VALUES_KNOWN = "CORRECTION_VALUES_KNOWN"
+    VEHICLE_IDENTITY_UNRESOLVED = "VEHICLE_IDENTITY_UNRESOLVED"
+    VEHICLE_FLOW_ALREADY_ATTEMPTED = "VEHICLE_FLOW_ALREADY_ATTEMPTED"
+    VEHICLE_CATEGORY_UNRESOLVED = "VEHICLE_CATEGORY_UNRESOLVED"
+    LOCATION_UNRESOLVED = "LOCATION_UNRESOLVED"
+    LOCATION_FLOW_ALREADY_ATTEMPTED = "LOCATION_FLOW_ALREADY_ATTEMPTED"
+    PROPOSAL_WOULD_COEXIST = "PROPOSAL_WOULD_COEXIST"
+    DOMAIN_NOT_PROVEN = "DOMAIN_NOT_PROVEN"
+
+    ALL = (RESOLVED, HUMAN_OWNS_TURN, CORRECTION_VALUES_KNOWN,
+           VEHICLE_IDENTITY_UNRESOLVED, VEHICLE_FLOW_ALREADY_ATTEMPTED,
+           VEHICLE_CATEGORY_UNRESOLVED, LOCATION_UNRESOLVED,
+           LOCATION_FLOW_ALREADY_ATTEMPTED, PROPOSAL_WOULD_COEXIST, DOMAIN_NOT_PROVEN)
 
 
-def clarification_budget_remains(state, cycle_id: Any) -> bool:
-    return clarifications_used(state, cycle_id) < CLARIFICATION_BUDGET
+def route_clarification(*,
+                        human_owns_turn: bool = False,
+                        correction_target_known: bool = False,
+                        correction_values_known: bool = False,
+                        vehicle_domain_proven: bool = False,
+                        vehicle_identity_resolved: bool = True,
+                        vehicle_category_resolved: bool = True,
+                        vehicle_flow_attempted: bool = False,
+                        location_domain_proven: bool = False,
+                        location_resolved: bool = True,
+                        location_flow_attempted: bool = False,
+                        other_confirmable_proposal: bool = False
+                        ) -> tuple[str, str]:
+    """`(route, reason)` for this turn. Pure; every argument is an established fact.
+
+    The order encodes the owner's policy and is the whole of it:
+
+      * human ownership stops autonomous clarification outright (policy 10/11);
+      * a grounded correction whose values are already known asks the ordinary typed
+        confirmation question and never a Flow (policy 17);
+      * vehicle uncertainty outranks location uncertainty, so when both are unresolved only
+        the Vehicle Flow is offered and the Location Flow waits for the next reconciliation
+        (policies 7 and 8);
+      * a known identity whose CATEGORY cannot be resolved does not get the Vehicle Flow,
+        because re-asking an identity we already hold is not a question (policy 18) — it
+        goes to a person;
+      * a family whose Flow was already attempted this cycle escalates rather than repeating
+        (policy 9/10);
+      * a Flow is never dispatched beside another live confirmable proposal (policy 8);
+      * and when neither domain is proven the router infers nothing (Part C).
+
+    Defaults are the safe reading: `*_resolved` default True and `*_domain_proven` default
+    False, so a caller that forgets an argument gets NO_CLARIFICATION_REQUIRED rather than an
+    unasked-for Flow.
+    """
+    if human_owns_turn:
+        return (ClarificationRoute.NO_CLARIFICATION_REQUIRED,
+                ClarificationReason.HUMAN_OWNS_TURN)
+
+    if correction_target_known and correction_values_known:
+        return (ClarificationRoute.CORRECTION_CONFIRMATION_REQUIRED,
+                ClarificationReason.CORRECTION_VALUES_KNOWN)
+
+    if vehicle_domain_proven and not vehicle_identity_resolved:
+        if vehicle_flow_attempted:
+            return (ClarificationRoute.GENERIC_HUMAN_REQUIRED,
+                    ClarificationReason.VEHICLE_FLOW_ALREADY_ATTEMPTED)
+        if other_confirmable_proposal:
+            return (ClarificationRoute.GENERIC_HUMAN_REQUIRED,
+                    ClarificationReason.PROPOSAL_WOULD_COEXIST)
+        return (ClarificationRoute.VEHICLE_FLOW_REQUIRED,
+                ClarificationReason.VEHICLE_IDENTITY_UNRESOLVED)
+
+    # A known vehicle with an unplaceable category: the Flow would ask for what we have.
+    if vehicle_domain_proven and vehicle_identity_resolved and not vehicle_category_resolved:
+        return (ClarificationRoute.GENERIC_HUMAN_REQUIRED,
+                ClarificationReason.VEHICLE_CATEGORY_UNRESOLVED)
+
+    if location_domain_proven and not location_resolved:
+        if location_flow_attempted:
+            return (ClarificationRoute.GENERIC_HUMAN_REQUIRED,
+                    ClarificationReason.LOCATION_FLOW_ALREADY_ATTEMPTED)
+        if other_confirmable_proposal:
+            return (ClarificationRoute.GENERIC_HUMAN_REQUIRED,
+                    ClarificationReason.PROPOSAL_WOULD_COEXIST)
+        return (ClarificationRoute.LOCATION_FLOW_REQUIRED,
+                ClarificationReason.LOCATION_UNRESOLVED)
+
+    if not (vehicle_domain_proven or location_domain_proven):
+        return (ClarificationRoute.NO_CLARIFICATION_REQUIRED,
+                ClarificationReason.DOMAIN_NOT_PROVEN)
+    return (ClarificationRoute.NO_CLARIFICATION_REQUIRED, ClarificationReason.RESOLVED)
 
 
 def classify_field(name: str) -> tuple[str, bool, bool]:

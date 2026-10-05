@@ -688,6 +688,47 @@ _FUZZY_REJECTION_RE = re.compile(
 # L4.7W2-F1: an approximate locality is confirmed, never assumed.
 _LOCALITY_CONFIRMATION_TEMPLATE = "¿El auto está en {zone}?"
 #: G3-7F: asked at most once when a correction cannot be placed on exactly one vehicle.
+# ── G3-7F-OWNER-RESOLUTION: clarification and handoff wording ────────────────────────
+#
+# These sentences live here, beside `_VEH_FLOW_BODY_GENERIC`, `_LOC_FLOW_BODY_STANDARD` and
+# `_MOTORCYCLE_HANDOFF_REPLY`, because G3-5F's architecture is explicit that the response
+# plan "holds no wording of its own" — a static test enforces it — and that every
+# proposition's `render` callable is supplied by the component that owns the fact. They are
+# module constants, not reconciler code: no decision function contains prose (Part E), and
+# the plan still decides whether and where they appear.
+#
+# Owner policy 16: these are conformance examples of intent. Changing the wording is a
+# copy decision, not an architectural one.
+_VEHICLE_CLARIFICATION_INTRO = (
+    "Para asegurarme de cotizar el vehículo correcto, te dejo un formulario breve "
+    "para completar la marca, modelo y año."
+)
+_LOCATION_CLARIFICATION_INTRO = (
+    "Para calcular correctamente el traslado, te dejo un formulario breve para "
+    "indicarnos dónde está el vehículo."
+)
+#: Neutral, professional, and silent about vehicle category. Owner policy 19: an ordinary
+#: car, a catalogue miss, an unknown vehicle and an ambiguous correction must never be told
+#: they are a motorcycle, so this says only that a person is taking over — the one thing
+#: that is true in every case that reaches it.
+_GENERIC_HANDOFF_REPLY = (
+    "Para no equivocarme con tu caso, lo sigue un asesor de RideCheck. "
+    "Te contactamos a la brevedad."
+)
+
+# ── G3-7F-OWNER-RESOLUTION: generic human-handoff reasons ─────────────────────────────
+#
+# Every one of these used to reach `_send_fallback_human_review_notification` as
+# `reason="motorcycle_enquiry"`, so the operator dashboard recorded a motorcycle case for an
+# ordinary car (review finding R2R-02). They are enumerated so a reason can never be
+# borrowed from an unrelated product area again.
+_HANDOFF_CATEGORY_UNRESOLVED = "vehicle_category_unresolved"
+_HANDOFF_CORRECTION_UNRESOLVED = "correction_unresolved_after_flow"
+_HANDOFF_RESPONSE_COMPOSITION_FAILED = "response_composition_failed"
+_HANDOFF_VEHICLE_FLOW_UNAVAILABLE = "vehicle_clarification_flow_unavailable"
+_HANDOFF_LOCATION_FLOW_UNAVAILABLE = "location_clarification_flow_unavailable"
+_HANDOFF_FLOW_DISPATCH_FAILED = "clarification_flow_dispatch_failed"
+
 _CORRECTION_TARGET_CLARIFICATION = (
     "Perdón, para no equivocarme: ¿sobre qué vehículo es la corrección?"
 )
@@ -3295,6 +3336,14 @@ class ConversationEngine:
         self._turn_correction_echo = ()          # G3-7F: Tier 1 must echo what it changed
         self._turn_correction_moto = False       # G3-7F-R2: corrected category is a MOTO
         self._turn_correction_category = None    # G3-7F-R2: the category the correction set
+        # ── G3-7F-OWNER-RESOLUTION observability (Part H) ─────────────────────────
+        self._turn_clarification_route = None    # which clarification the router chose
+        self._turn_clarification_reason = None   # why it chose it
+        self._turn_clarification_flow = None     # "VEHICLE" | "LOCATION", after dispatch
+        self._turn_clarification_intro = None    # (family, composer-rendered sentence)
+        self._turn_handoff_reason = None         # truthful generic-handoff reason
+        self._turn_generic_handoff = False       # a person owns the turn from here
+        self._turn_confirmation_bound = None     # Part A: why authority was or was not bound
         self._turn_correction_proposition = None
         self._turn_decision_authority = None
         self._turn_fact_sources = []
@@ -4078,25 +4127,82 @@ class ConversationEngine:
         except OutboundBlockedError:
             # Fail closed: an unasked question is not a pending proposal.
             self._store_pending_correction(state, None)
+            self._turn_confirmation_bound = "BLOCKED"
             return _out("correction_confirmation_blocked", detail="outbound_disabled")
+
+        # ══ G3-7F-OWNER-RESOLUTION Part A: authority requires the QUESTION, not a send ══
+        #
+        # Review finding R2R-01. R2 treated "transport returned a WAMID" as proof the
+        # question had been asked. It is not: if any REQUIRED producer fails, the plan
+        # degrades, `compose()` replaces the whole message with the bounded human-follow-up
+        # line, and the gate dispatches THAT — returning a perfectly good WAMID for a
+        # message containing no question at all. The patch was then bound to it and a later
+        # ACCEPT was admissible.
+        #
+        # The four structural facts below are checked instead, none of them by reading
+        # rendered customer prose (Part A's explicit prohibition):
+        #
+        #   plan is not None        a plan existed to compose against
+        #   not plan.degraded       no REQUIRED producer failed
+        #   plan.included(...)      the proposition survived policy and reached the message
+        #   dispatch proven         the bound row is an accepted outbound row on this thread
+        #
+        # `plan.included()` reads the same `_ordered_included()` set `compose()` rendered, so
+        # it answers about the actual delivered response rather than about intent.
+        plan = getattr(self, "_live_plan", None)
+        degraded = bool(getattr(plan, "degraded", False)) if plan is not None else True
+        included = bool(
+            plan is not None
+            and plan.included(PropositionId.CORRECTION_CONFIRMATION_REQUIRED))
+
         if not sent:
             # Transport accepted nothing — no WAMID, so nothing proves the question exists.
-            # Authority must not survive it, and neither may the outcome label.
             self._store_pending_correction(state, None)
             self.db.commit()
             logger.warning(
-                "G3-7F-R2 correction confirmation not dispatched thread_id=%s — patch "
-                "discarded", ctx.thread.id)
+                "OWNER-RESOLUTION correction confirmation not dispatched thread_id=%s — "
+                "patch discarded", ctx.thread.id)
+            self._turn_confirmation_bound = "NOT_DISPATCHED"
             return _out("correction_confirmation_blocked", detail="dispatch_failed")
+
+        if degraded or not included:
+            # A message went out, but it was not the question. No authority may exist, and a
+            # person owns the turn — never motorcycle handling (owner policy 19/22).
+            self._store_pending_correction(state, None)
+            logger.error(
+                "OWNER-RESOLUTION confirmation question absent from the delivered response "
+                "thread_id=%s degraded=%s included=%s — authority refused, human ownership",
+                ctx.thread.id, degraded, included)
+            self._turn_confirmation_bound = ("DEGRADED" if degraded else "NOT_INCLUDED")
+            self._generic_human_handoff(
+                ctx, state, reason=_HANDOFF_RESPONSE_COMPOSITION_FAILED, announce=False)
+            return _out("replied", wa_message_id=sent)
+
         row = None
         try:
             row = (self.db.query(WhatsAppMessage)
                    .filter(WhatsAppMessage.wa_message_id == sent).one_or_none())
         except Exception:
             row = None
-        self._store_pending_correction(
-            state, pending.with_confirmation_message(getattr(row, "id", None)))
+
+        # The row we are about to bind must itself satisfy the delivery-truth predicate, so
+        # admission cannot be the first place a bad row is noticed.
+        from . import pending_correction as _pcmod
+        candidate_patch = pending.with_confirmation_message(getattr(row, "id", None))
+        proven, why = _pcmod.confirmation_dispatch_proven(
+            candidate_patch, row, thread_id=getattr(ctx.thread, "id", None))
+        if not proven:
+            self._store_pending_correction(state, None)
+            self.db.commit()
+            logger.error(
+                "OWNER-RESOLUTION confirmation row does not prove dispatch thread_id=%s "
+                "reason=%s — patch discarded", ctx.thread.id, why)
+            self._turn_confirmation_bound = str(why)
+            return _out("correction_confirmation_blocked", detail="dispatch_unproven")
+
+        self._store_pending_correction(state, candidate_patch)
         self.db.commit()
+        self._turn_confirmation_bound = "BOUND"
         return _out("replied", wa_message_id=sent)
 
     def _hold_for_correction_clarification(self, ctx, state, reason):
@@ -4119,6 +4225,31 @@ class ConversationEngine:
         if not sent:
             return _out("correction_hold_blocked", detail="dispatch_failed")
         return _out("replied", wa_message_id=sent)
+
+    def _clarification_for_trace(self):
+        """What the turn decided about asking the customer anything. Part H.
+
+        Always present, including on a turn that asked nothing: the measurement the owner
+        wants is the RATIO of semantic resolution to Flow fallback, and a field that appears
+        only on failures cannot produce it. `g3_8_enforced` is pinned False so no reader can
+        mistake this for commercial gate enforcement, which G3-8 still owns.
+        """
+        route = getattr(self, "_turn_clarification_route", None)
+        intro = getattr(self, "_turn_clarification_intro", None)
+        return {
+            "route": route,
+            "reason": getattr(self, "_turn_clarification_reason", None),
+            "flow_dispatched": getattr(self, "_turn_clarification_flow", None),
+            "explanatory_family": (intro[0] if intro else None),
+            "explanatory_planned": bool(intro),
+            "generic_handoff": bool(getattr(self, "_turn_generic_handoff", False)),
+            "handoff_reason": getattr(self, "_turn_handoff_reason", None),
+            "confirmation_bound": getattr(self, "_turn_confirmation_bound", None),
+            "corrected_category": getattr(self, "_turn_correction_category", None),
+            "moto_proven": bool(getattr(self, "_turn_correction_moto", False)),
+            "resolved_without_flow": route in (None, "NO_CLARIFICATION_REQUIRED"),
+            "g3_8_enforced": False,
+        }
 
     def _pending_correction_for_trace(self, ctx):
         """The thread's proposal as the trace should record it, plus what it blocked."""
@@ -4293,6 +4424,11 @@ class ConversationEngine:
         Fails closed when the catalogue cannot place the corrected vehicle (Part G.7): an
         unknown category is not AUTO, and guessing it would price an unknown car.
         """
+        # Part B: the helper enforces the dependency too, so a direct caller — a test, a
+        # future handler — cannot reach correction-specific category behaviour with the
+        # feature disabled.
+        if not self._correction_grounding_on():
+            return candidate_data
         if resolution is None or candidate_data.get("action") != "update":
             return candidate_data
         from .pending_correction import IDENTITY_FIELDS
@@ -4337,20 +4473,155 @@ class ConversationEngine:
                 getattr(getattr(ctx, "thread", None), "id", None))
         return out
 
-    def _spend_correction_clarification(self, state, cycle_id) -> bool:
-        """Charge one clarification to this cycle's budget. False when it is already spent.
+    # ── G3-7F-OWNER-RESOLUTION: generic human ownership ──────────────────────────
 
-        The budget lives in the `pending_correction` column the G3-7F migration already
-        added, as a marker record that `from_payload` reads as "no pending correction" — so
-        one column carries either a proposal or a spent-budget note, never both, and no
-        second migration is needed.
+    def _generic_human_handoff(self, ctx, state, *, reason: str,
+                               announce: bool = True):
+        """Hand the conversation to a person, saying nothing about vehicle category.
+
+        Owner policy 19 and review finding R2R-02. R2 reused
+        `_motorcycle_human_handoff` for three situations that are not motorcycles — an
+        unresolvable category, an exhausted clarification and a correction conflict — and
+        that helper tells the customer "Las motos las revisamos de forma manual", files the
+        operator alert as `motorcycle_enquiry`, and inserts a `tipo_vehiculo="MOTO"`
+        candidate. A Chery Tiggo owner was being told they own a motorcycle.
+
+        This path does the five things a handoff actually owes and nothing else:
+        establishes human ownership, alerts the operator once, withdraws proposals that are
+        no longer safe to accept, says one neutral sentence through the composer, and leaves
+        every grounded vehicle and location fact exactly as it was. It creates no candidate.
         """
         from . import pending_correction as pc
-        if not pc.clarification_budget_remains(state, cycle_id):
-            return False
-        used = pc.clarifications_used(state, cycle_id)
-        state.pending_correction = pc.clarification_marker(used + 1, cycle_id)
-        return True
+        self._answer_source = "HUMAN_HANDOFF_POLICY"
+        state.needs_human = True
+        if getattr(ctx, "lead", None) is not None:
+            ctx.lead.necesita_humano = True
+
+        # Anything the customer could still say "yes" to is withdrawn: a person is taking
+        # over, and a live proposal would let an affirmation land on a dead conversation.
+        # The canonical field set and values are `_execute_cycle_reset`'s, as in Part D's
+        # withdrawal, and focus/identity/zone are untouched.
+        _withdrawn = []
+        for field, _family in pc.LEGACY_PROPOSALS:
+            if pc.proposal_is_active(state, field):
+                current = getattr(state, field, None)
+                setattr(state, field, False if current is True else None)
+                _withdrawn.append(field)
+        if self._pending_correction(ctx) is not None:
+            self._store_pending_correction(state, None)
+        self.db.commit()
+
+        logger.info("OWNER-RESOLUTION generic human handoff thread_id=%s reason=%s "
+                    "withdrawn=%s", ctx.thread.id, reason, _withdrawn)
+        self._decision_log(ctx, "generic_human_handoff", reason=reason,
+                           withdrawn=_withdrawn)
+        self._turn_handoff_reason = reason
+        try:
+            self._send_fallback_human_review_notification(ctx, state, reason=reason)
+        except Exception as exc:                            # never block the handoff
+            logger.error("OWNER-RESOLUTION handoff notification failed thread_id=%s: %s",
+                         ctx.thread.id, exc)
+        self._turn_generic_handoff = True
+        if not announce:
+            # The turn already occupied its one message — the degraded line, for instance.
+            # Ownership and the alert still transfer; P3 forbids a second text and inventing
+            # one would be the "whichever handler got here first" behaviour G3-5F removed.
+            return None
+        try:
+            sent = self._send_text_to_wa(ctx, "")
+        except OutboundBlockedError:
+            return _out("human_handoff_blocked", detail=reason)
+        if not sent:
+            return _out("human_handoff_blocked", detail=f"{reason}:dispatch_failed")
+        return _out("replied", wa_message_id=sent)
+
+    # ── G3-7F-OWNER-RESOLUTION: the clarification router ─────────────────────────
+
+    def _route_clarification(self, ctx, state, resolution=None, disposition=None):
+        """`(route, reason)` — which clarification this turn needs.
+
+        Collects the canonical facts the pure router consumes. Nothing here reads customer
+        text: each argument is a decision another authority already made.
+        """
+        from . import pending_correction as pc
+        focus = self._focus_candidate(ctx)
+        identity_resolved = bool(
+            (getattr(focus, "marca", None) or "").strip()
+            and (getattr(focus, "modelo", None) or "").strip())
+        category_resolved = bool((getattr(focus, "tipo_vehiculo", None) or "").strip())
+        zone_group, zone_detail = self._get_active_inspection_location(ctx, state)
+        corrected = tuple(getattr(resolution, "corrected_fields", ()) or ())
+        conflicting = tuple((disposition or {}).get("conflicting", ()))
+        return pc.route_clarification(
+            human_owns_turn=bool(getattr(state, "needs_human", False)),
+            correction_target_known=bool(
+                getattr(resolution, "target_candidate_id", None) is not None),
+            correction_values_known=bool(corrected),
+            vehicle_domain_proven=focus is not None,
+            vehicle_identity_resolved=identity_resolved,
+            vehicle_category_resolved=category_resolved,
+            vehicle_flow_attempted=bool(
+                getattr(state, "vehicle_fallback_flow_sent", False)),
+            location_domain_proven=bool(zone_group or zone_detail
+                                        or getattr(focus, "zone_detail", None)),
+            location_resolved=bool(zone_group),
+            location_flow_attempted=bool(
+                getattr(state, "location_fallback_flow_sent", False)),
+            other_confirmable_proposal=bool(conflicting))
+
+    def _dispatch_clarification_route(self, ctx, state, route: str, reason: str):
+        """Carry out a routing decision. The router decides; this only executes.
+
+        `CORRECTION_CONFIRMATION_REQUIRED` is not handled here — the correction gate owns
+        that path and reaches it without consulting the router.
+        """
+        from . import pending_correction as pc
+        self._turn_clarification_route = route
+        self._turn_clarification_reason = reason
+        self._decision_log(ctx, "clarification_routed", route=route, reason=reason)
+        logger.info("OWNER-RESOLUTION clarification route thread_id=%s route=%s reason=%s",
+                    ctx.thread.id, route, reason)
+        if route == pc.ClarificationRoute.VEHICLE_FLOW_REQUIRED:
+            result = self._dispatch_vehicle_clarification_flow(ctx, state)
+            if result is not None:
+                return result
+            # No Flow configured, or dispatch refused: a person takes it rather than the
+            # turn falling through to an open-ended question (owner policy 11).
+            return self._generic_human_handoff(
+                ctx, state, reason=_HANDOFF_VEHICLE_FLOW_UNAVAILABLE)
+        if route == pc.ClarificationRoute.LOCATION_FLOW_REQUIRED:
+            result = self._dispatch_location_clarification_flow(ctx, state)
+            if result is not None:
+                return result
+            return self._generic_human_handoff(
+                ctx, state, reason=_HANDOFF_LOCATION_FLOW_UNAVAILABLE)
+        return self._generic_human_handoff(ctx, state, reason=reason)
+
+    def _dispatch_vehicle_clarification_flow(self, ctx, state):
+        """The Vehicle Clarification Flow, with the composer's explanatory wording.
+
+        Owner policy 4 and 6: when the reconciler has admitted that the customer is talking
+        about a vehicle but the canonical identity is still unresolved, the existing
+        published Flow is the clarification — never another free-text question. Returns
+        `None` when no Flow is configured so the caller can hand off to a person.
+
+        The explanatory sentence IS the Flow body: owner policy 13 requires the text and the
+        Flow to be one response plan with no duplicate, and a Flow button carries its body
+        in the same message. The proposition is registered `redundant=True` so the plan
+        records the claim for the trace without composing a second message.
+        """
+        self._turn_clarification_intro = ("VEHICLE", _VEHICLE_CLARIFICATION_INTRO)
+        return self._dispatch_vehicle_flow_direct(
+            ctx, state, _VEHICLE_CLARIFICATION_INTRO)
+
+    def _dispatch_location_clarification_flow(self, ctx, state):
+        """The Location Clarification Flow, with the composer's explanatory wording.
+
+        Owner policy 5 and 6. Returns `None` when no Flow is configured.
+        """
+        self._turn_clarification_intro = ("LOCATION", _LOCATION_CLARIFICATION_INTRO)
+        return self._dispatch_location_flow_direct(
+            ctx, state, concern=False, body=_LOCATION_CLARIFICATION_INTRO)
 
     def _correction_tier(self, resolution) -> str:
         """Which tier this resolution's patch falls in. Atomic: one Tier 2 entry decides."""
@@ -5964,12 +6235,21 @@ class ConversationEngine:
         )
         if not self._outbound_armed():
             return self._blocked_outbound(ctx, intro, OutboundPathId.CE_FLOW.value)
-        state.vehicle_fallback_flow_sent = True
         flow_token = secrets.token_urlsafe(24)
+        # G3-7F-OWNER-RESOLUTION Part E.5 / F. The flag used to be set BEFORE the dispatch,
+        # so a refused or failed Flow still consumed the thread's one attempt and the
+        # customer was never asked anything. `_send_flow_button` raises on a blocked gate and
+        # on a Meta failure — its own comment says "caller can revert state on flow-send
+        # failure" — so the flag now waits for a real `wa_message_id`.
         sent_id = self._send_flow_button(
             ctx, intro, flow_token,
             flow_id=flow_id, initial_screen="VEHICLE_DETAILS",
         )
+        if not sent_id:
+            return None
+        state.vehicle_fallback_flow_sent = True
+        self.db.commit()
+        self._turn_clarification_flow = "VEHICLE"
         return _out("replied", wa_message_id=sent_id)
 
     def _dispatch_location_flow_direct(
@@ -5978,6 +6258,7 @@ class ConversationEngine:
         state: "WhatsAppThreadState",
         *,
         concern: bool,
+        body: "str | None" = None,
     ) -> "ConversationHandleOut | None":
         """Dispatch the Location Fallback Flow immediately, skipping the text step.
 
@@ -5989,19 +6270,26 @@ class ConversationEngine:
         if not flow_id:
             return None
         self._answer_source = "VEHICLE_RESOLVER"
-        body = _LOC_FLOW_BODY_CONCERN if concern else _LOC_FLOW_BODY_STANDARD
+        # Part E: the composer owns the wording when the router dispatches; the legacy
+        # priority ladder keeps its own certified bodies.
+        body = body or (_LOC_FLOW_BODY_CONCERN if concern else _LOC_FLOW_BODY_STANDARD)
         logger.info(
             "M20 location_flow_direct thread_id=%s flow_id=%s concern=%s",
             ctx.thread.id, flow_id, concern,
         )
         if not self._outbound_armed():
             return self._blocked_outbound(ctx, body, OutboundPathId.CE_FLOW.value)
-        state.location_fallback_flow_sent = True
         flow_token = secrets.token_urlsafe(24)
+        # Part E.5 / F — see the vehicle helper above for why the flag waits.
         sent_id = self._send_flow_button(
             ctx, body, flow_token,
             flow_id=flow_id, initial_screen="LOCATION_DETAILS",
         )
+        if not sent_id:
+            return None
+        state.location_fallback_flow_sent = True
+        self.db.commit()
+        self._turn_clarification_flow = "LOCATION"
         return _out("replied", wa_message_id=sent_id)
 
     def _send_coverage_response(
@@ -7117,10 +7405,15 @@ class ConversationEngine:
                 and _cand_data.get("action") == "create"
                 and not self._category_established(ctx, _cand_data)):
             logger.info("G3-7F category floor: unestablished category thread_id=%s "
-                        "marca=%r modelo=%r — routing to human review",
+                        "marca=%r modelo=%r — routing to generic human review",
                         getattr(ctx.thread, "id", None),
                         _cand_data.get("marca"), _cand_data.get("modelo"))
-            return self._motorcycle_human_handoff(ctx, state)
+            # OWNER-RESOLUTION Part C. G3-7F sent this through the motorcycle helper, so a
+            # vehicle whose category merely could not be established was announced to the
+            # customer as a motorcycle and filed as `motorcycle_enquiry`. Absent is not AUTO
+            # — and it is not MOTO either (owner policy 19).
+            return self._generic_human_handoff(
+                ctx, state, reason=_HANDOFF_CATEGORY_UNRESOLVED)
         # FIX 2 (CL-07): pass zone_protected so AI cannot overwrite LR-3-written zone.
         # ══ G3-7F Commit 3 + G3-7F-R2: provisional correction authority ═══════════
         # A grounded correction is not automatically a safe one. Anything that moves a
@@ -7160,22 +7453,21 @@ class ConversationEngine:
             _disposition = _pcmod.proposal_disposition(
                 state, _pc_resolution.corrected_fields)
             if _disposition["conflicting"]:
-                _cycle = self._reconciler_cycle_id(state)
-                if not self._spend_correction_clarification(state, _cycle):
-                    # The budget is spent and the conflict stands. Terminate under the
-                    # existing policy instead of re-sending one sentence forever.
-                    logger.info(
-                        "G3-7F-R2 correction clarification budget spent thread_id=%s "
-                        "conflicting=%s — routing to human review",
-                        ctx.thread.id, _disposition["conflicting"])
-                    self._decision_log(
-                        ctx, "correction_clarification_exhausted",
-                        conflicting=list(_disposition["conflicting"]))
-                    self._record_candidate_mutation((False, None))
-                    return self._motorcycle_human_handoff(ctx, state)
+                # ── OWNER-RESOLUTION Part D: the typed clarification router ────────
+                # R2 answered this with a free-text question metered by a budget marker
+                # stored in the `pending_correction` column. The review proved the bound was
+                # not per-cycle and had no atomic guard. Both are gone: the router decides
+                # from canonical evidence, and the project's existing structured Flows are
+                # the one clarification attempt. A sound competing proposal means a Flow
+                # would coexist with another confirmable proposal, which owner policy 8
+                # forbids — so this routes to a person rather than asking anything.
+                _route, _reason = self._route_clarification(
+                    ctx, state, _pc_resolution, _disposition)
+                self._decision_log(ctx, "correction_conflict_routed", route=_route,
+                                   reason=_reason,
+                                   conflicting=list(_disposition["conflicting"]))
                 self._record_candidate_mutation((False, None))
-                return self._hold_for_correction_clarification(
-                    ctx, state, _pcmod.InvalidationReason.LEGACY_PROPOSAL_ACTIVE)
+                return self._dispatch_clarification_route(ctx, state, _route, _reason)
             self._withdraw_dependent_proposals(ctx, state, _disposition)
             if _pc_tier == _pcmod.CorrectionTier.PROVISIONAL:
                 _pending, _refusal = self._arm_pending_correction(
@@ -7199,11 +7491,23 @@ class ConversationEngine:
         # Supplying the category here puts the decision back inside the existing catalogue
         # authority (`WILD04R-F6`, which re-resolves and overrides it), and it is NOT added
         # to `corrected_fields`, so it is never echoed or confirmed as a customer statement.
-        _cand_data = self._correction_category(ctx, _cand_data, _pc_resolution)
-        if _cand_data is None:
-            # Category could not be resolved for a corrected identity. Fail closed.
-            self._record_candidate_mutation((False, None))
-            return self._motorcycle_human_handoff(ctx, state)
+        #
+        # OWNER-RESOLUTION Part B (review R2R-02). R2 placed this call OUTSIDE the flag
+        # block and `_correction_category` consulted no flag, so with both features OFF an
+        # identity correction still had its category re-derived, still carried
+        # `correction_in_place` into the writer, and still routed an unplaceable vehicle to a
+        # handoff — flag-off behaviour that never matched the parent. The grounding flag now
+        # gates the call here, and the helper refuses independently, so the dependency holds
+        # at both boundaries.
+        if self._correction_grounding_on():
+            _cand_data = self._correction_category(ctx, _cand_data, _pc_resolution)
+            if _cand_data is None:
+                # A known identity the catalogue cannot place. Owner policy 18: do not send
+                # the Vehicle Flow to re-ask an identity we already hold — hand it to a
+                # person, and never as a motorcycle.
+                self._record_candidate_mutation((False, None))
+                return self._generic_human_handoff(
+                    ctx, state, reason=_HANDOFF_CATEGORY_UNRESOLVED)
 
         _outcome = self._apply_candidate(
             ctx, _cand_data, zone_protected=_vehicle_location_written)
@@ -8977,6 +9281,8 @@ class ConversationEngine:
                 candidate_resolution=getattr(self, "_turn_candidate_resolution", None),
                 # ── G3-7F contract 1.7 ──
                 pending_correction=self._pending_correction_for_trace(ctx),
+                # ── G3-7F-OWNER-RESOLUTION contract 1.8 ──
+                clarification=self._clarification_for_trace(),
             )
             persist(self.db, trace)
         except Exception as exc:
@@ -13046,6 +13352,49 @@ Respondé SOLO con JSON válido:
                 locked_values=tuple((f"correction.{f}", v) for f, v in echo)))
             logger.info("G3-7F-R2 correction echo planned thread_id=%s fields=%s",
                         ctx.thread.id, [f for f, _v in echo])
+
+        # ── OWNER-RESOLUTION: the generic handoff says one neutral sentence ───────
+        # Part C. The wording lives in the composer like every other customer-facing
+        # string, so no handoff can borrow motorcycle prose, and the reason code travels
+        # separately in the trace rather than inside the sentence.
+        if getattr(self, "_turn_generic_handoff", False):
+            rendered_h = _GENERIC_HANDOFF_REPLY
+            if not rendered_h:
+                raise RequiredPropositionUnavailable(
+                    "generic_handoff", "no handoff wording available")
+            plan.register(Proposition(
+                proposition_id=PropositionId.GENERIC_HANDOFF_ACK,
+                kind=ResponseItemKind.HANDOFF_ACK, claim_family="handoff",
+                render=lambda: rendered_h,
+                decision_authority=DecisionAuthority.HUMAN_HANDOFF_POLICY,
+                fact_sources=(FactSource.CANONICAL_STATE,),
+                renderer_source=RendererSource.DETERMINISTIC_TEMPLATE,
+                policy=ResponsePolicy.P2_HUMAN_HANDOFF_EXCLUSIVE, priority=20,
+                locked_values=(("handoff.reason",
+                                getattr(self, "_turn_handoff_reason", None)),)))
+            logger.info("OWNER-RESOLUTION generic handoff planned thread_id=%s reason=%s",
+                        ctx.thread.id, getattr(self, "_turn_handoff_reason", None))
+
+        # ── OWNER-RESOLUTION: the clarification Flow's explanatory sentence ───────
+        # Part E. The Flow button carries this sentence as its body, so registering it
+        # `redundant=True` records the claim in the plan and the trace for correlation
+        # WITHOUT composing a second message — owner policy 13's "no duplicate text or
+        # Flow". It becomes includable only if the Flow body is not what the customer got.
+        _intro = getattr(self, "_turn_clarification_intro", None)
+        if _intro:
+            _family, _sentence = _intro
+            plan.register(Proposition(
+                proposition_id=(PropositionId.VEHICLE_CLARIFICATION_INTRO
+                                if _family == "VEHICLE"
+                                else PropositionId.LOCATION_CLARIFICATION_INTRO),
+                kind=ResponseItemKind.FLOW_INTRO_TEXT, claim_family="clarification",
+                render=lambda: _sentence,
+                decision_authority=DecisionAuthority.RECONCILER,
+                fact_sources=(FactSource.CANONICAL_STATE,),
+                renderer_source=RendererSource.DETERMINISTIC_TEMPLATE,
+                policy=ResponsePolicy.P4_FLOW_INTRO_SEQUENCE, priority=50,
+                redundant=True,
+                locked_values=(("clarification.family", _family),)))
 
         proposition = getattr(self, "_turn_correction_proposition", None)
         if proposition:
