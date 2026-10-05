@@ -3293,6 +3293,8 @@ class ConversationEngine:
         self._reply_contract = ReplyContract.NOT_INVOKED
         self._turn_candidate_resolution = None
         self._turn_correction_echo = ()          # G3-7F: Tier 1 must echo what it changed
+        self._turn_correction_moto = False       # G3-7F-R2: corrected category is a MOTO
+        self._turn_correction_category = None    # G3-7F-R2: the category the correction set
         self._turn_correction_proposition = None
         self._turn_decision_authority = None
         self._turn_fact_sources = []
@@ -4055,22 +4057,41 @@ class ConversationEngine:
         The reconciler authorizes a typed proposition; the composer writes the words. The
         outbound message's id is stored on the patch, which is what later proves the
         correction was the latest thing we said.
+
+        G3-7F-R2 (review G37FRR-02). This method used to word the question itself and hand
+        the finished sentence to transport, which bypassed the response plan entirely: the
+        typed proposition it also built went nowhere, and a FAQ answer in the same turn could
+        not be composed with the question. It now registers nothing but the typed pairs and
+        passes an EMPTY primary to the composition boundary, where
+        `_register_correction_propositions` renders it and `plan.compose()` merges it with
+        whatever else the turn legitimately owes the customer — one message, one question.
+
+        G3-7F-R2 (review G37FRR-10). A send that Meta refused returns no WAMID and must not
+        be reported as `replied`; the patch is also discarded, because an unasked question is
+        not a pending proposal.
         """
         self._answer_source = "CORRECTION_CONFIRMATION"
         self._turn_correction_proposition = self._correction_confirmation_proposition(
             pending)
         try:
-            sent = self._send_text_to_wa(
-                ctx, self._render_correction_confirmation(pending))
+            sent = self._send_text_to_wa(ctx, "")
         except OutboundBlockedError:
             # Fail closed: an unasked question is not a pending proposal.
             self._store_pending_correction(state, None)
             return _out("correction_confirmation_blocked", detail="outbound_disabled")
+        if not sent:
+            # Transport accepted nothing — no WAMID, so nothing proves the question exists.
+            # Authority must not survive it, and neither may the outcome label.
+            self._store_pending_correction(state, None)
+            self.db.commit()
+            logger.warning(
+                "G3-7F-R2 correction confirmation not dispatched thread_id=%s — patch "
+                "discarded", ctx.thread.id)
+            return _out("correction_confirmation_blocked", detail="dispatch_failed")
         row = None
         try:
-            row = ((self.db.query(WhatsAppMessage)
-                    .filter(WhatsAppMessage.wa_message_id == sent).one_or_none())
-                   if sent else None)
+            row = (self.db.query(WhatsAppMessage)
+                   .filter(WhatsAppMessage.wa_message_id == sent).one_or_none())
         except Exception:
             row = None
         self._store_pending_correction(
@@ -4078,32 +4099,26 @@ class ConversationEngine:
         self.db.commit()
         return _out("replied", wa_message_id=sent)
 
-    @staticmethod
-    def _render_correction_confirmation(pending) -> str:
-        """Interim rendering for the typed proposition.
-
-        Commit 3 ships the proposition and one faithful rendering; the composer takes over
-        the wording when the flag is certified. It repeats ONLY the corrected facts — never
-        unrelated known customer information.
-        """
-        _LABEL = {"anio": "el año", "zone_detail": "la localidad", "marca": "la marca",
-                  "modelo": "el modelo", "tipo_vehiculo": "el tipo de vehículo",
-                  "version_text": "la versión"}
-        parts = [f"{_LABEL.get(f, f)} {a}" for f, _b, a in pending.corrected_fields
-                 if f != "zone_group"]
-        if not parts:
-            return "¿Me confirmás el cambio?"
-        return f"Perfecto: {', '.join(parts)}. ¿Es correcto?"
-
     def _hold_for_correction_clarification(self, ctx, state, reason):
-        """One bounded clarification when a correction cannot be safely represented."""
+        """The one clarification this cycle may spend when a correction cannot be applied.
+
+        G3-7F-R2 (review G37FRR-04). The docstring used to say "one bounded clarification"
+        and nothing bounded it: no state was written, so every later turn carrying a grounded
+        correction re-sent the identical sentence while the stale proposal stood. The budget
+        now lives in canonical state and is charged by the caller before this is reached; a
+        spent budget terminates the loop under the existing human-routing policy instead.
+
+        G3-7F-R2 (review G37FRR-10): a refused or failed send is not `replied`.
+        """
         self._answer_source = "CORRECTION_HOLD"
         self._decision_log(ctx, "correction_hold", reason=reason)
         try:
             sent = self._send_text_to_wa(ctx, _CORRECTION_TARGET_CLARIFICATION)
-            return _out("replied", wa_message_id=sent)
         except OutboundBlockedError:
             return _out("correction_hold_blocked", detail="outbound_disabled")
+        if not sent:
+            return _out("correction_hold_blocked", detail="dispatch_failed")
+        return _out("replied", wa_message_id=sent)
 
     def _pending_correction_for_trace(self, ctx):
         """The thread's proposal as the trace should record it, plus what it blocked."""
@@ -4157,14 +4172,34 @@ class ConversationEngine:
     def _arm_pending_correction(self, ctx, state, resolution):
         """Turn a grounded Tier-2 resolution into a pending patch, or refuse.
 
-        Returns `(pending, refusal_reason)`. Refusal is the bounded answer to legacy
-        mutual exclusion: when another confirmable proposal is already outstanding we do not
-        supersede it and we do not coexist with it — we decline to arm and hold, which
-        leaves every legacy workflow exactly as it is.
+        Returns `(pending, refusal_reason)`.
+
+        G3-7F-R2 (review G37FRR-05). The grounding floor is now a PRECONDITION of provisional
+        authority, not an independent feature. G3-7F gated arming on the provisional flag
+        alone, so `provisional ON / grounding OFF` armed a Tier-2 patch on whatever row the
+        v1 resolver picked, carrying `grounding_basis=NONE` — the ungrounded target selection
+        this whole gate exists to replace. Three clauses close that, and they are enforced
+        here rather than only at the call site because this method is reachable from tests,
+        from the trace and from any future caller.
+
+        G3-7F-R2 (review G37FRR-03/04). Legacy mutual exclusion is decided by
+        `proposal_disposition`, not by "is anything set": a proposal the correction ANSWERS
+        or INVALIDATES is withdrawn by the caller in the same turn and is no longer an
+        obstacle. Only a proposal that is outstanding, unanswered and still sound refuses.
         """
         from . import pending_correction as pc
-        legacy = pc.legacy_proposal_active(state)
-        if legacy is not None:
+        if not self._correction_grounding_on():
+            return None, pc.InvalidationReason.GROUNDING_NOT_ENABLED
+        basis = str(getattr(resolution, "grounding_basis", "") or "")
+        if basis in ("", "NONE"):
+            return None, pc.InvalidationReason.TARGET_NOT_GROUNDED
+        target_id = getattr(resolution, "target_candidate_id", None)
+        if target_id is None or not any(
+                getattr(c, "id", None) == target_id
+                for c in (getattr(ctx, "candidates", None) or ())):
+            return None, pc.InvalidationReason.TARGET_LOST
+        disposition = pc.proposal_disposition(state, resolution.corrected_fields)
+        if disposition["conflicting"]:
             return None, pc.InvalidationReason.LEGACY_PROPOSAL_ACTIVE
         pending = pc.PendingCorrection.build(
             thread_id=getattr(getattr(ctx, "thread", None), "id", None),
@@ -4182,6 +4217,140 @@ class ConversationEngine:
                 m for m in (getattr(getattr(self, "_canonical_turn_burst", None),
                                     "ordered_message_ids", None) or ()) if m))
         return pending, None
+
+    def _withdraw_dependent_proposals(self, ctx, state, disposition) -> tuple:
+        """Withdraw every legacy proposal this correction answered or invalidated.
+
+        G3-7F-R2, review finding G37FRR-04. The old path refused to arm whenever ANY legacy
+        field was set and then asked one unbounded question, so an abandoned
+        `flow_booking_token` blocked every future correction forever and re-sent one
+        identical sentence each turn. Nothing cleared the token, because nothing on that path
+        was allowed to decide the token was spent.
+
+        The decision is a DEPENDENCY, never a clock (Part D.7): a quote, a slot offer, a
+        requested date and a live Flow are all computed from the candidate's category and
+        zone, so a correction that moves either makes them unsound. A year moves neither —
+        `quote()` does not read it and `quote_inputs_unchanged()` does not compare it — so a
+        year-only correction leaves a booking proposal standing.
+
+        The field set and the values written are exactly those of `_execute_cycle_reset`,
+        which is this project's canonical withdrawal for the same proposals; this is the
+        bounded subset of it, and it never touches focus, identity, zone or the candidate.
+
+        Returns the `(resolved, invalidated)` field names actually withdrawn.
+        """
+        from . import pending_correction as pc
+        touched = tuple(disposition.get("resolved", ())) + \
+            tuple(disposition.get("invalidated", ()))
+        for field in touched:
+            current = getattr(state, field, None)
+            setattr(state, field, False if current is True else None)
+        if touched:
+            # The fuzzy pair is one proposal in two columns: replaying a stored burst after
+            # its catalogue key is gone would re-ask a question the correction just answered.
+            if "pending_fuzzy_catalog_key" in touched:
+                state.pending_turn_evidence_text = None
+            logger.info(
+                "G3-7F-R2 proposals withdrawn thread_id=%s resolved=%s invalidated=%s",
+                getattr(getattr(ctx, "thread", None), "id", None),
+                disposition.get("resolved", ()), disposition.get("invalidated", ()))
+            self._decision_log(ctx, "legacy_proposals_withdrawn",
+                               resolved=list(disposition.get("resolved", ())),
+                               invalidated=list(disposition.get("invalidated", ())))
+        return tuple(disposition.get("resolved", ())), \
+            tuple(disposition.get("invalidated", ()))
+
+    @staticmethod
+    def _writer_applied(outcome) -> bool:
+        """Did `_apply_candidate` actually report a canonical write?
+
+        G3-7F-R2 (review G37FRR-01). Anything that is not a real `(bool, Optional[int])`
+        pair is "the writer reported nothing" — the same defensive reading
+        `_record_candidate_mutation` already applies, for the same reason: a test double
+        standing in for the writer must never authorize a sentence claiming a mutation.
+        """
+        if isinstance(outcome, tuple) and len(outcome) == 2:
+            applied, _created = outcome
+            if isinstance(applied, bool):
+                return applied
+        return False
+
+    def _correction_category(self, ctx, candidate_data, resolution):
+        """Carry the catalogue's category with an identity correction. `None` to fail closed.
+
+        G3-7F-R2, review finding G37FRR-06. `_apply_candidate`'s catalogue authority is
+        gated on the patch carrying an explicit `tipo_vehiculo`, and a correction patch never
+        carried one, so a confirmed `Honda/Titan -> Ford/Focus` left the row typed MOTO. The
+        category is a pricing input (`PricingService.quote(db, tipo_vehiculo, ...)`), so the
+        corrected vehicle kept being priced as the old one.
+
+        This resolves the category through the SAME authority the rest of the engine uses —
+        `_catalog_tipo_for` — and hands it to the writer, where `WILD04R-F6` re-resolves and
+        overrides it. It is deliberately NOT added to `corrected_fields`: the customer did
+        not state a category, so it is never echoed back or offered for confirmation as
+        though they had.
+
+        Fails closed when the catalogue cannot place the corrected vehicle (Part G.7): an
+        unknown category is not AUTO, and guessing it would price an unknown car.
+        """
+        if resolution is None or candidate_data.get("action") != "update":
+            return candidate_data
+        from .pending_correction import IDENTITY_FIELDS
+        moved = {f for f, _b, _a in (getattr(resolution, "corrected_fields", ()) or ())}
+        if not (moved & IDENTITY_FIELDS):
+            return candidate_data            # identity did not move; category cannot have
+        target = next((c for c in (getattr(ctx, "candidates", None) or ())
+                       if getattr(c, "id", None) == candidate_data.get("id")), None)
+        marca = (candidate_data.get("marca")
+                 or getattr(target, "marca", None) or "").strip()
+        modelo = (candidate_data.get("modelo")
+                  or getattr(target, "modelo", None) or "").strip()
+        if not (marca and modelo):
+            return candidate_data            # a partial identity resolves no category
+        tipo = self._catalog_tipo_for(marca, modelo)
+        if tipo is None:
+            logger.info(
+                "G3-7F-R2 corrected identity not in catalogue thread_id=%s marca=%r "
+                "modelo=%r — failing closed to human review",
+                getattr(getattr(ctx, "thread", None), "id", None), marca, modelo)
+            self._decision_log(ctx, "correction_category_unresolved",
+                               marca=marca, modelo=modelo)
+            return None
+        out = dict(candidate_data)
+        out["tipo_vehiculo"] = tipo
+        # The writer must patch the grounded row IN PLACE. Its tipo-incompatibility guard
+        # redirects update->create, which on a correction turn is the phantom candidate
+        # G37FRR-07 describes: the customer re-identified ONE car, so there is exactly one
+        # row to carry the new identity.
+        out["correction_in_place"] = True
+        self._turn_correction_category = tipo
+        if str(tipo).upper() == "MOTO":
+            # Part G.6. The corrected vehicle is a motorcycle; autonomous quoting and
+            # scheduling stop under the existing policy. The write still happens first, so
+            # canonical state tells the truth about what the customer said.
+            self._turn_correction_moto = True
+        if getattr(target, "tipo_vehiculo", None) != tipo:
+            logger.info(
+                "G3-7F-R2 correction category %r->%r candidate=%s thread_id=%s",
+                getattr(target, "tipo_vehiculo", None), tipo,
+                candidate_data.get("id"),
+                getattr(getattr(ctx, "thread", None), "id", None))
+        return out
+
+    def _spend_correction_clarification(self, state, cycle_id) -> bool:
+        """Charge one clarification to this cycle's budget. False when it is already spent.
+
+        The budget lives in the `pending_correction` column the G3-7F migration already
+        added, as a marker record that `from_payload` reads as "no pending correction" — so
+        one column carries either a proposal or a spent-budget note, never both, and no
+        second migration is needed.
+        """
+        from . import pending_correction as pc
+        if not pc.clarification_budget_remains(state, cycle_id):
+            return False
+        used = pc.clarifications_used(state, cycle_id)
+        state.pending_correction = pc.clarification_marker(used + 1, cycle_id)
+        return True
 
     def _correction_tier(self, resolution) -> str:
         """Which tier this resolution's patch falls in. Atomic: one Tier 2 entry decides."""
@@ -6953,13 +7122,20 @@ class ConversationEngine:
                         _cand_data.get("marca"), _cand_data.get("modelo"))
             return self._motorcycle_human_handoff(ctx, state)
         # FIX 2 (CL-07): pass zone_protected so AI cannot overwrite LR-3-written zone.
-        # ══ G3-7F Commit 3: provisional correction authority ══════════════════════
+        # ══ G3-7F Commit 3 + G3-7F-R2: provisional correction authority ═══════════
         # A grounded correction is not automatically a safe one. Anything that moves a
         # price, an identity or a quote's validity becomes a typed pending patch and waits
         # for the customer; only a price-neutral year applies immediately, and then it must
         # be echoed. Flag off, everything here is skipped and Commit 1 behaviour stands.
+        #
+        # G3-7F-R2 (review G37FRR-05): provisional authority now REQUIRES the grounding
+        # floor. `provisional ON / grounding OFF` used to arm a Tier-2 patch on the v1
+        # resolver's target; it is a refused configuration, here and in
+        # `_arm_pending_correction`, so neither the gate nor a direct caller can reach it.
         _pc_resolution = getattr(self, "_turn_candidate_resolution", None)
+        _pc_tier = None
         if (self._provisional_correction_on()
+                and self._correction_grounding_on()
                 and _pc_resolution is not None
                 and _cand_data.get("action") == "update"
                 and _pc_resolution.action == CandidateAction.CORRECT_EXISTING):
@@ -6975,7 +7151,33 @@ class ConversationEngine:
                     _existing.with_status(_pcmod.PendingStatus.SUPERSEDED,
                                           _pcmod.InvalidationReason.NEWER_CORRECTION))
                 _existing = None
-            if self._correction_tier(_pc_resolution) == _pcmod.CorrectionTier.PROVISIONAL:
+            _pc_tier = self._correction_tier(_pc_resolution)
+            # ── G3-7F-R2 (review G37FRR-04): finite legacy-proposal recovery ───────
+            # Decide what this correction DOES to every outstanding proposal before asking
+            # whether it may coexist with one. A proposal the correction answers or
+            # invalidates is withdrawn canonically now; only a sound, unanswered one
+            # competes for the customer's next word, and that competition is budgeted.
+            _disposition = _pcmod.proposal_disposition(
+                state, _pc_resolution.corrected_fields)
+            if _disposition["conflicting"]:
+                _cycle = self._reconciler_cycle_id(state)
+                if not self._spend_correction_clarification(state, _cycle):
+                    # The budget is spent and the conflict stands. Terminate under the
+                    # existing policy instead of re-sending one sentence forever.
+                    logger.info(
+                        "G3-7F-R2 correction clarification budget spent thread_id=%s "
+                        "conflicting=%s — routing to human review",
+                        ctx.thread.id, _disposition["conflicting"])
+                    self._decision_log(
+                        ctx, "correction_clarification_exhausted",
+                        conflicting=list(_disposition["conflicting"]))
+                    self._record_candidate_mutation((False, None))
+                    return self._motorcycle_human_handoff(ctx, state)
+                self._record_candidate_mutation((False, None))
+                return self._hold_for_correction_clarification(
+                    ctx, state, _pcmod.InvalidationReason.LEGACY_PROPOSAL_ACTIVE)
+            self._withdraw_dependent_proposals(ctx, state, _disposition)
+            if _pc_tier == _pcmod.CorrectionTier.PROVISIONAL:
                 _pending, _refusal = self._arm_pending_correction(
                     ctx, state, _pc_resolution)
                 if _pending is None:
@@ -6989,22 +7191,73 @@ class ConversationEngine:
                                    basis=_pending.grounding_basis)
                 self._record_candidate_mutation((False, None))
                 return self._request_correction_confirmation(ctx, state, _pending)
-            # Tier 1 — immediate, and the echo is a correctness requirement: a year reaches
-            # the quote prose and the booking record even though it moves no price.
-            self._turn_correction_echo = tuple(
-                (f, a) for f, _b, a in _pc_resolution.corrected_fields)
+
+        # ── G3-7F-R2 (review G37FRR-06): the category travels WITH the correction ──
+        # The writer's catalogue authority only runs when the patch carries an explicit
+        # `tipo_vehiculo`, and a correction patch never did, so a confirmed
+        # `Honda/Titan -> Ford/Focus` left the row typed MOTO and priced as a motorcycle.
+        # Supplying the category here puts the decision back inside the existing catalogue
+        # authority (`WILD04R-F6`, which re-resolves and overrides it), and it is NOT added
+        # to `corrected_fields`, so it is never echoed or confirmed as a customer statement.
+        _cand_data = self._correction_category(ctx, _cand_data, _pc_resolution)
+        if _cand_data is None:
+            # Category could not be resolved for a corrected identity. Fail closed.
+            self._record_candidate_mutation((False, None))
+            return self._motorcycle_human_handoff(ctx, state)
 
         _outcome = self._apply_candidate(
             ctx, _cand_data, zone_protected=_vehicle_location_written)
         # G3-7B: the decision records what the WRITER did, not what the resolver expected.
         self._record_candidate_mutation(_outcome)
+        # ── G3-7F-R2 (review G37FRR-01): the echo is authorized by the WRITE ───────
+        # G3-7F assembled the echo before calling the writer and nothing ever read it. The
+        # order is now the other way round and the value is a typed proposition the response
+        # composer renders: a mutation the customer was never told about, or a sentence about
+        # a mutation that did not happen, are both impossible from here.
+        from .pending_correction import CorrectionTier as _CT
+        if (_pc_tier == _CT.IMMEDIATE
+                and self._writer_applied(_outcome)
+                and _pc_resolution is not None):
+            self._turn_correction_echo = tuple(
+                (f, a) for f, _b, a in _pc_resolution.corrected_fields)
+
+        # ── G3-7F-R2 (review G37FRR-07): the correction boundary ──────────────────
+        # `_enforce_catalog_vehicle` operates on FOCUS and, on a category mismatch, CREATES a
+        # candidate rather than repairing one. On a correction turn that is the phantom the
+        # Grounded-Target Invariant exists to prevent, arriving after it through legacy code:
+        # the row was just re-identified in place, so a second row for the same car is wrong
+        # by construction. The category has already been resolved through the same catalogue
+        # authority by `_correction_category`, so nothing is lost by skipping it here. This is
+        # the narrow correction-boundary block the milestone authorizes — the general
+        # catalogue path is untouched for every other turn.
+        _correction_wrote_identity = (
+            _pc_resolution is not None
+            and _cand_data is not None
+            and bool(_cand_data.get("correction_in_place"))
+            and self._writer_applied(_outcome))
 
         # ── Catalog enforcement (post-AI) ─────────────────────────────────
         # If catalog found a vehicle, override the candidate's tipo_vehiculo
         # regardless of what the AI returned.  marca/modelo are only set if
         # not already filled (AI may have added year / version details).
-        if pre_detected_vehicle:
+        if pre_detected_vehicle and not _correction_wrote_identity:
             self._enforce_catalog_vehicle(ctx, pre_detected_vehicle)
+        elif pre_detected_vehicle:
+            logger.info(
+                "G3-7F-R2 catalog enforcement skipped on correction turn thread_id=%s "
+                "candidate=%s — the correction already applied catalogue authority",
+                ctx.thread.id, _cand_data.get("id"))
+
+        # ── G3-7F-R2 (Part G.6): a corrected vehicle that is a motorcycle ──────────
+        # The category moved to MOTO because the customer re-identified the vehicle. Canonical
+        # state has been written, so the record is truthful; autonomous quoting and scheduling
+        # now stop under the existing human-routing policy.
+        if getattr(self, "_turn_correction_moto", False):
+            logger.info(
+                "G3-7F-R2 corrected vehicle is a MOTO thread_id=%s — routing to human review",
+                ctx.thread.id)
+            self._decision_log(ctx, "correction_category_moto", candidate=_cand_data.get("id"))
+            return self._motorcycle_human_handoff(ctx, state)
 
         # M21.1.6 — apply validated narrative facts (NU-9: deterministic gates remain
         # authoritative; narrative only updates state when evidence is active/confirmed).
@@ -11963,7 +12216,17 @@ Respondé SOLO con JSON válido:
             # Type-safety: if the resolved candidate has an established tipo_vehiculo
             # that is incompatible with the new one (e.g. MOTO vs AUTO), redirect to
             # create rather than corrupting the existing candidate's identity.
-            if target is not None and not _tipo_compatible(target.tipo_vehiculo, new_tipo):
+            #
+            # G3-7F-R2 (review G37FRR-06/07). A GROUNDED CORRECTION is the one case where
+            # that redirect is wrong. The customer re-identified the car under discussion:
+            # the Grounded-Target Invariant proved which row they meant, and a category
+            # change is the expected CONSEQUENCE of correcting make and model, not evidence
+            # of a second vehicle. Creating a row here left the thread holding both a MOTO
+            # typed Ford Focus and a phantom AUTO. Only the reconciler sets this key, and
+            # only after the GTI grounded the target.
+            if (target is not None
+                    and not candidate_data.get("correction_in_place")
+                    and not _tipo_compatible(target.tipo_vehiculo, new_tipo)):
                 return self._apply_candidate(ctx, {**candidate_data, "action": "create"})
             if target is None:
                 return (False, None)
@@ -12476,6 +12739,10 @@ Respondé SOLO con JSON válido:
         ("faq", "_register_faq_propositions", True),
         ("vehicle", "_register_canonical_vehicle_proposition", True),
         ("clarification", "_register_clarification_proposition", False),
+        #: G3-7F-R2 (review G37FRR-01/02). REQUIRED: a correction that moved canonical state
+        #: and said nothing, or a confirmation question that was quietly dropped, are both
+        #: worse than a bounded fallback line. Failing here marks the turn degraded.
+        ("correction", "_register_correction_propositions", True),
     )
 
     def _register_response_propositions(self, ctx, text: str) -> None:
@@ -12732,6 +12999,75 @@ Respondé SOLO con JSON válido:
             logger.info("G3-6 clarification planned thread_id=%s field=inspection_location "
                         "candidate=%s", ctx.thread.id, focus.id)
 
+    # ── 3b. corrections (G3-7F-R2) ───────────────────────────────────────────────
+
+    def _register_correction_propositions(self, ctx, text: str) -> None:
+        """The two correction propositions, rendered by the COMPOSER.
+
+        G3-7F-R2, review findings G37FRR-01 and G37FRR-02. G3-7F built both of these as
+        typed values and then never consumed either: `_turn_correction_echo` and
+        `_turn_correction_proposition` were assigned and read by nothing, while the
+        confirmation question was worded by a static method on the engine and handed straight
+        to transport. The authority that decides WHAT changed was also choosing the WORDS,
+        and the typed layer it was supposed to go through was dead scaffolding.
+
+        Here the reconciler's typed field/value pairs are all that crosses the boundary.
+        `render_correction_applied` and `render_correction_confirmation` live in
+        `response_composition` and own every word.
+
+        Both propositions are REQUIRED. If the pairs cannot be rendered — an unknown field,
+        a blank value — this raises `RequiredPropositionUnavailable` and the composition
+        boundary sends the bounded deterministic line. It never drops the claim silently:
+        Tier 1 has already written canonical state, and a confirmation the customer never
+        saw would otherwise become authority for a mutation they never agreed to.
+        """
+        from .response_composition import (RequiredPropositionUnavailable,
+                                           render_correction_applied,
+                                           render_correction_confirmation)
+        plan = getattr(self, "_live_plan", None)
+        if plan is None:
+            return
+
+        echo = tuple(getattr(self, "_turn_correction_echo", ()) or ())
+        if echo:
+            rendered = render_correction_applied(echo)
+            if not rendered:
+                raise RequiredPropositionUnavailable(
+                    "correction_applied",
+                    f"no renderable fragment for {[f for f, _v in echo]}")
+            plan.register(Proposition(
+                proposition_id=PropositionId.CORRECTION_APPLIED,
+                kind=ResponseItemKind.CANONICAL_FACT, claim_family="vehicle",
+                render=lambda: rendered,
+                decision_authority=DecisionAuthority.RECONCILER,
+                fact_sources=(FactSource.DETERMINISTIC_EVIDENCE, FactSource.CANONICAL_STATE),
+                renderer_source=RendererSource.DETERMINISTIC_TEMPLATE,
+                policy=ResponsePolicy.P3_SINGLE_MESSAGE_DEFAULT, priority=55,
+                locked_values=tuple((f"correction.{f}", v) for f, v in echo)))
+            logger.info("G3-7F-R2 correction echo planned thread_id=%s fields=%s",
+                        ctx.thread.id, [f for f, _v in echo])
+
+        proposition = getattr(self, "_turn_correction_proposition", None)
+        if proposition:
+            pairs = tuple((e.get("field"), e.get("proposed"))
+                          for e in (proposition.get("fields") or ()))
+            rendered_q = render_correction_confirmation(pairs)
+            if not rendered_q:
+                raise RequiredPropositionUnavailable(
+                    "correction_confirmation",
+                    f"no renderable fragment for {[f for f, _v in pairs]}")
+            plan.register(Proposition(
+                proposition_id=PropositionId.CORRECTION_CONFIRMATION_REQUIRED,
+                kind=ResponseItemKind.CLARIFICATION, claim_family="correction",
+                render=lambda: rendered_q,
+                decision_authority=DecisionAuthority.RECONCILER,
+                fact_sources=(FactSource.DETERMINISTIC_EVIDENCE, FactSource.CANONICAL_STATE),
+                renderer_source=RendererSource.DETERMINISTIC_TEMPLATE,
+                policy=ResponsePolicy.P3_SINGLE_MESSAGE_DEFAULT, priority=65,
+                locked_values=tuple((f"correction.{f}", v) for f, v in pairs)))
+            logger.info("G3-7F-R2 correction confirmation planned thread_id=%s fields=%s",
+                        ctx.thread.id, [f for f, _v in pairs])
+
     # ── 3. canonical vehicle ─────────────────────────────────────────────────────
 
     def _register_canonical_vehicle_proposition(self, ctx, text: str) -> None:
@@ -12835,6 +13171,17 @@ Respondé SOLO con JSON válido:
                 self._turn_dispatch_path = DispatchPath.TEXT
                 self._turn_dispatch_result = DispatchResult.NOT_ATTEMPTED
                 return None
+
+        if not (text or "").strip():
+            # G3-7F-R2. A producer-only turn passes an EMPTY primary and lets the plan supply
+            # the message (the correction confirmation does exactly this). With no plan to
+            # compose against there is no message, and an empty WhatsApp body must never
+            # reach the gate. `None` is what every correction path already reads as
+            # "not dispatched".
+            logger.info("G3-7F-R2 empty outbound text suppressed thread_id=%s", ctx.thread.id)
+            self._turn_dispatch_path = DispatchPath.TEXT
+            self._turn_dispatch_result = DispatchResult.NOT_ATTEMPTED
+            return None
 
         from zoneinfo import ZoneInfo
         now_utc = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))

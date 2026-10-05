@@ -63,9 +63,23 @@ def row(cid=1, **over):
     return SimpleNamespace(**base)
 
 
+_SENTINEL = object()
+
 YEAR_ONLY = [("anio", 2019, 2018)]
 WILD_B = [("anio", 2019, 2018), ("zone_detail", "Palermo", "Pilar"),
           ("zone_group", "CABA", "Norte")]
+
+
+def out_row(mid=11, *, status="sent", wamid="wamid.CONFIRM1", thread_id=1,
+            direction="out"):
+    """The confirmation question's own outbound record.
+
+    G3-7F-R2: `confirmation_admissible` re-reads this row, so every admission test must now
+    supply it. `status="sent"` is the weakest state in `OUTBOUND_DISPATCH_ACCEPTED` — using
+    the weakest one keeps these tests honest about what the allow-list actually permits.
+    """
+    return SimpleNamespace(id=mid, status=status, wa_message_id=wamid,
+                           thread_id=thread_id, direction=direction)
 
 
 def build(fields=WILD_B, *, cid=1, cycle="c1"):
@@ -231,11 +245,16 @@ class D_Persistence(unittest.TestCase):
 class E_Confirmation(unittest.TestCase):
 
     def _admit(self, pending, *, st=None, candidates=None, cycle="c1", latest=11,
-               newer=False):
+               newer=False, confirmation_row=_SENTINEL, thread_id=1,
+               grounding_enabled=True):
+        if confirmation_row is _SENTINEL:
+            confirmation_row = out_row(pending.confirmation_message_id or latest)
         return pc.confirmation_admissible(
             pending, state=st or state(), candidates=candidates or [row()],
             cycle_id=cycle, latest_outbound_message_id=latest,
-            newer_correction_this_turn=newer)
+            newer_correction_this_turn=newer,
+            confirmation_row=confirmation_row, thread_id=thread_id,
+            grounding_enabled=grounding_enabled)
 
     def test_g37f_93_a_clean_confirmation_is_admissible(self):
         ok, why = self._admit(build().with_confirmation_message(11))
@@ -290,8 +309,11 @@ class F_GenericAffirmation(unittest.TestCase):
     def _admit(self, pending, **kw):
         kw.setdefault("st", state())
         kw.setdefault("candidates", [row()])
+        kw.setdefault("confirmation_row", out_row(
+            pending.confirmation_message_id or kw.get("latest", 11)))
         return pc.confirmation_admissible(
             pending, state=kw["st"], candidates=kw["candidates"],
+            confirmation_row=kw["confirmation_row"], thread_id=1,
             cycle_id=kw.get("cycle", "c1"),
             latest_outbound_message_id=kw.get("latest", 11),
             newer_correction_this_turn=kw.get("newer", False))
@@ -358,13 +380,51 @@ class G_LegacyExclusion(unittest.TestCase):
 
     def test_g37f_108_arming_refuses_rather_than_superseding_or_coexisting(self):
         """The bounded answer: no legacy workflow is rewritten, and two confirmable
-        proposals never coexist."""
+        proposals never coexist.
+
+        G3-7F-R2 replaced the blanket "is anything set" refusal with
+        `proposal_disposition`, which is strictly narrower: a proposal the correction
+        ANSWERS or INVALIDATES is withdrawn canonically, and only a sound, unanswered one
+        refuses. The invariant under test is unchanged — arming never supersedes a legacy
+        proposal and never coexists with one — so this now exercises the behaviour instead
+        of grepping for the old call.
+        """
         import inspect
         from app.services.conversation_engine import ConversationEngine as E
         body = inspect.getsource(E._arm_pending_correction)
-        self.assertIn("legacy_proposal_active", body)
+        self.assertIn("proposal_disposition", body)
         self.assertIn("LEGACY_PROPOSAL_ACTIVE", body)
         self.assertNotIn("_FUZZY_ACCEPTANCE_RE", body)
+
+        e = E.__new__(E)
+        e.settings = SimpleNamespace(correction_target_grounding_enabled=True,
+                                     provisional_correction_enabled=True)
+        e._correlation_id = "t1"
+        e._canonical_turn_burst = SimpleNamespace(ordered_message_ids=("m1",))
+        e._reconciler_cycle_id = lambda _st: "c1"
+        res = SimpleNamespace(
+            target_candidate_id=1, grounding_basis="G2_SINGLETON",
+            target_relation="CORRECT_EXISTING", target_scope_value="CURRENT_REFERENT",
+            corrected_fields=tuple(YEAR_ONLY), correction_evidence_ref="corrections[0]",
+            vehicle_evidence_ref=None, location_evidence_ref=None)
+        ctx = SimpleNamespace(state=None, thread=SimpleNamespace(id=1),
+                              candidates=[row()])
+
+        # a SOUND, unanswered proposal a year correction neither answers nor invalidates
+        st = state(inspectability_clarification_sent=True)
+        ctx.state = st
+        pending, refusal = e._arm_pending_correction(ctx, st, res)
+        self.assertIsNone(pending, "a sound legacy proposal must refuse arming")
+        self.assertEqual(refusal, pc.InvalidationReason.LEGACY_PROPOSAL_ACTIVE)
+        self.assertTrue(st.inspectability_clarification_sent,
+                        "refusing must not quietly consume the legacy proposal")
+
+        # and with nothing outstanding it arms
+        st2 = state()
+        ctx.state = st2
+        pending2, refusal2 = e._arm_pending_correction(ctx, st2, res)
+        self.assertIsNotNone(pending2)
+        self.assertIsNone(refusal2)
 
     def test_g37f_109_the_legacy_phrase_detectors_are_never_used_by_the_new_path(self):
         import inspect
@@ -611,8 +671,17 @@ class L_Flags(unittest.TestCase):
                 self.assertNotIn(word, src.lower())
 
     def test_g37f_132_the_confirmation_question_repeats_only_corrected_facts(self):
+        """G3-7F-R2: the wording moved to the composer, which is the point of G37FRR-02.
+
+        The engine no longer owns a correction sentence at all, so this reads the renderer
+        the response plan actually calls.
+        """
+        from app.services.response_composition import render_correction_confirmation
         from app.services.conversation_engine import ConversationEngine as E
-        text = E._render_correction_confirmation(build(WILD_B))
+        self.assertFalse(hasattr(E, "_render_correction_confirmation"),
+                         "correction prose must not live in the engine")
+        text = render_correction_confirmation(
+            [(f, a) for f, _b, a in build(WILD_B).corrected_fields])
         self.assertIn("2018", text)
         self.assertIn("Pilar", text)
         for unrelated in ("Ford", "Focus", "$", "CABA"):

@@ -187,10 +187,20 @@ class A_PriceDerivedRedundancy(unittest.TestCase):
 class B_ProducerFailure(unittest.TestCase):
 
     def test_g37_10_the_registry_classifies_every_producer(self):
+        """G3-7F-R2 added `correction` as a REQUIRED producer (review G37FRR-01/02).
+
+        A correction that moved canonical state and told the customer nothing, or a
+        confirmation question silently dropped before it was asked, are both worse than the
+        bounded fallback line — so a failure there degrades the turn rather than passing
+        unnoticed. The set is still pinned exactly, in both directions.
+        """
         names = [n for n, _m, _r in ConversationEngine._RESPONSE_PRODUCERS]
-        self.assertEqual(sorted(names), ["clarification", "faq", "price", "vehicle"])
+        self.assertEqual(sorted(names),
+                         ["clarification", "correction", "faq", "price", "vehicle"])
         required = {n for n, _m, r in ConversationEngine._RESPONSE_PRODUCERS if r}
-        self.assertEqual(required, {"price", "faq", "vehicle"})
+        self.assertEqual(required, {"price", "faq", "vehicle", "correction"})
+        optional = {n for n, _m, r in ConversationEngine._RESPONSE_PRODUCERS if not r}
+        self.assertEqual(optional, {"clarification"})
 
     def test_g37_11_an_optional_failure_degrades_quietly_and_traceably(self):
         r = bench("Anotado.", topics=("payment",), quote=None, src=None,

@@ -142,15 +142,34 @@ class A_Types(unittest.TestCase):
 
     def test_g37f_39_a_scope_or_patch_only_correction_survives_sanitation(self):
         """Either is evidence on the same footing as the relation; dropping one loses the
-        only record of what changed, or of which car was meant."""
+        only record of what changed, or of which car was meant.
+
+        G3-7F-R2 (review G37FRR-09). The `patch only` case used to construct a
+        `CorrectedFieldPatch` INSTANCE and nest it. Another suite
+        (`test_l4_7a_turn_evidence_schema.py:498`) reloads `app.schemas.turn_evidence`, so in
+        full-suite order the class this module imported was no longer the class the reloaded
+        `CorrectionEvidence` validates against, and pydantic raised `model_type` — a SUBFAIL
+        that the summary-identity diff could not see.
+
+        The nested entry is built from a DICT instead. That is also the production-faithful
+        boundary: `semantic_interpreter._patch()` builds these from the model's JSON, never
+        from a held class object. Validation is not weakened — pydantic still constructs and
+        validates a real `CorrectedFieldPatch`, as the type assertion below proves.
+        """
         for label, kwargs in (
             ("scope only", {"target_scope": Scope.ALTERNATE_REFERENT}),
-            ("patch only", {"patch": (CorrectedFieldPatch(
-                field=CorrectedField.VEHICLE_YEAR, to_value=2018),)}),
+            ("patch only", {"patch": ({"field": "VEHICLE_YEAR", "to_value": 2018},)}),
         ):
             with self.subTest(case=label):
                 c = te.CorrectionEvidence(**kwargs)
                 self.assertFalse(c.is_semantically_empty())
+                if label == "patch only":
+                    # the dict really did become the schema's own validated model
+                    self.assertEqual(len(c.patch), 1)
+                    self.assertIsInstance(c.patch[0], te.CorrectedFieldPatch)
+                    self.assertEqual(getattr(c.patch[0].field, "value",
+                                             c.patch[0].field), "VEHICLE_YEAR")
+                    self.assertEqual(c.patch[0].to_value, 2018)
                 ev = te.TurnEvidence(corrections=(c,))
                 self.assertEqual(len(ev.without_empty_items().corrections), 1)
 

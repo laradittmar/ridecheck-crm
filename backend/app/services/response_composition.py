@@ -72,6 +72,11 @@ class PropositionId:
     #: corrected field/value pairs: the reconciler authorizes the proposition, the composer
     #: writes the words, and no prose lives in the reconciliation layer.
     CORRECTION_CONFIRMATION_REQUIRED = "correction.confirmation_required"
+    #: G3-7F-R2 (review G37FRR-01). The corrected fact said back, ONCE, after the canonical
+    #: write succeeded. Tier 1 applies a price-neutral year immediately, so this proposition
+    #: is the only thing that makes an unasked mutation visible to the customer; G3-7F
+    #: assembled the pairs and never rendered them.
+    CORRECTION_APPLIED = "correction.applied"
     #: G3-6. Why the principal action is held, when P1 needs it said out loud.
     HOLD_EXPLANATION = "turn.hold_explanation"
 
@@ -443,3 +448,65 @@ def flow_completion_ack_authorized(evidence: dict) -> tuple:
     unmet = tuple(c for c in FLOW_COMPLETION_ACK_CONDITIONS
                   if not bool(evidence.get(c, False)))
     return (not unmet), unmet
+
+
+# ── G3-7F-R2: correction wording lives HERE ───────────────────────────────────────────
+#
+# Review findings G37FRR-01 and G37FRR-02: the reconciler assembled a typed correction
+# proposition and an echo, and then rendered the customer-facing sentence itself in
+# `ConversationEngine._render_correction_confirmation` while the typed values went nowhere.
+# Both halves were wrong in the same way — the authority that decides WHAT changed was also
+# choosing the WORDS. These renderers are the composer's, they take canonical field/value
+# pairs and nothing else, and they are the only place correction prose exists.
+
+#: Canonical field -> the fragment a customer hears for it. `anio` renders as "modelo 2018"
+#: because that is how a model year is spoken in Argentina; the vehicle's model renders the
+#: same way for the same reason, and a turn correcting both reads naturally.
+_CORRECTION_PHRASE: dict = {
+    "anio": "modelo {value}",
+    "marca": "marca {value}",
+    "modelo": "modelo {value}",
+    "version_text": "versión {value}",
+    "tipo_vehiculo": "un {value}",
+    "zone_detail": "la inspección en {value}",
+}
+
+
+def correction_fragments(fields) -> list:
+    """The renderable fragments for `((field, value), ...)`, in the order given.
+
+    `zone_group` is deliberately absent from the phrase table: it is the administrative
+    grouping behind a locality the customer never names, and repeating it would state a fact
+    they did not give us. A field with no fragment contributes nothing.
+    """
+    out = []
+    for entry in (fields or ()):
+        try:
+            field, value = entry[0], entry[1]
+        except (TypeError, IndexError):
+            continue
+        template = _CORRECTION_PHRASE.get(str(field))
+        if template is None or value is None or str(value).strip() == "":
+            continue
+        out.append(template.format(value=str(value).strip()))
+    return out
+
+
+def render_correction_applied(fields) -> str:
+    """Tier 1: the corrected fact, stated back. Empty when nothing is renderable."""
+    parts = correction_fragments(fields)
+    if not parts:
+        return ""
+    return f"Perfecto, entonces es {', '.join(parts)}."
+
+
+def render_correction_confirmation(fields) -> str:
+    """Tier 2: ask once about the corrected fact, and about nothing else.
+
+    No quote, no price, no slot, no unrelated known value — a provisional patch has not been
+    applied, so the only thing this may assert is what the customer just said.
+    """
+    parts = correction_fragments(fields)
+    if not parts:
+        return ""
+    return f"Entonces es {', '.join(parts)}, ¿es correcto?"
