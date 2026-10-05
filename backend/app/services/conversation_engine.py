@@ -4476,6 +4476,39 @@ class ConversationEngine:
         interpreter synthesizes alongside it.
         """
         out = []
+        # ── G3-7F: the typed patch is authoritative when present ──────────────────
+        # Both evaluated models dropped the year from the two-field Wild Case B turn,
+        # because loose (from, to) pairs gave multiplicity nowhere to live. An identified
+        # patch entry per canonical field is what makes "es 2018 Y está en Pilar" two
+        # corrections instead of one. The 1.3-shaped paths below remain the fallback.
+        _patch = list(getattr(correction, "patch", None) or ()) if correction else []
+        if _patch:
+            _FIELD_MAP = {"VEHICLE_YEAR": "anio", "VEHICLE_MAKE": "marca",
+                          "VEHICLE_MODEL": "modelo", "VEHICLE_VERSION": "version_text",
+                          "VEHICLE_CATEGORY": "tipo_vehiculo"}
+            for entry in _patch:
+                name = getattr(entry.field, "value", entry.field)
+                if name == "INSPECTION_LOCALITY":
+                    continue            # bound through the canonical zone table below
+                attr = _FIELD_MAP.get(name)
+                if attr is None:
+                    continue
+                proposed = entry.to_value
+                if attr == "anio":
+                    proposed = _coerce_candidate_year(proposed)
+                elif proposed is not None:
+                    proposed = str(proposed).strip() or None
+                if proposed is None or getattr(target, attr, None) == proposed:
+                    continue
+                out.append((attr, getattr(target, attr, None), proposed))
+            if zone_detail and getattr(target, "zone_detail", None) != zone_detail:
+                out.append(("zone_detail", getattr(target, "zone_detail", None),
+                            zone_detail))
+                if zone_group and getattr(target, "zone_group", None) != zone_group:
+                    out.append(("zone_group", getattr(target, "zone_group", None),
+                                zone_group))
+            return tuple(out)
+
         year = None
         if vehicle is not None and getattr(vehicle, "year", None):
             year = _coerce_candidate_year(getattr(vehicle, "year", None))

@@ -627,8 +627,8 @@ class E_TraceAndFreeze(unittest.TestCase):
         interp = (ROOT / "backend/app/services/semantic_interpreter.py").read_text(
             encoding="utf-8")
         self.assertIn('or "gpt-4o-mini"', interp)
-        self.assertIn('PROMPT_VERSION = "understand/1.19"', interp)
-        self.assertEqual(te.SCHEMA_VERSION, "turn-evidence/1.3")
+        self.assertIn('PROMPT_VERSION = "understand/1.20"', interp)
+        self.assertEqual(te.SCHEMA_VERSION, "turn-evidence/1.4")
 
     def test_g35a_30_the_business_calendar_is_used_for_the_parse(self):
         """The competing-evidence parse resolves dates on the business calendar."""

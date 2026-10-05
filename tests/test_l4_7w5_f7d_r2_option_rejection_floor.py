@@ -317,7 +317,7 @@ class TestGovernance(unittest.TestCase):
         # F7D-R2 itself changed nothing semantic, and still must not. The pin follows the
         # authorized G3-3 move; what this guard protects is `offered_options` never
         # appearing in the interpreter, which is asserted below and unchanged.
-        self.assertIn('PROMPT_VERSION = "understand/1.19"', src)
+        self.assertIn('PROMPT_VERSION = "understand/1.20"', src)
         self.assertNotIn("offered_options", src)
 
     def test_r2_27_vocabulary_lives_in_the_lexicon_not_the_engine(self):

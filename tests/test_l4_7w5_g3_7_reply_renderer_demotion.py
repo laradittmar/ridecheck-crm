@@ -490,9 +490,9 @@ class E_NothingElseMoved(unittest.TestCase):
         interp = (ROOT / "backend/app/services/semantic_interpreter.py").read_text(
             encoding="utf-8")
         self.assertIn('REPLY_PROMPT_VERSION = "reply/1.0"', engine_src)
-        self.assertIn('PROMPT_VERSION = "understand/1.19"', interp)
+        self.assertIn('PROMPT_VERSION = "understand/1.20"', interp)
         self.assertIn('or "gpt-4o-mini"', interp)
-        self.assertEqual(te.SCHEMA_VERSION, "turn-evidence/1.3")
+        self.assertEqual(te.SCHEMA_VERSION, "turn-evidence/1.4")
         self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.7")
 
     def test_g37_41_one_provider_call_site_and_one_semantic_interpretation(self):

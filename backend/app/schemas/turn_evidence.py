@@ -30,7 +30,7 @@ from typing import Any, Iterator, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
-SCHEMA_VERSION = "turn-evidence/1.3"
+SCHEMA_VERSION = "turn-evidence/1.4"
 # 1.1 (L4.7B.2): additive only — AcceptanceSignal.FUTURE_INTENT and the
 # `is_semantically_empty()` helper. No existing field changed meaning, so 1.0 records
 # validate unchanged under the major-version guard.
@@ -90,6 +90,40 @@ class AcceptanceSignal(str, Enum):
     FUTURE_INTENT = "FUTURE_INTENT"   # L4.7B.2: intends to come back later — never ACCEPT
     QUESTION_ONLY = "QUESTION_ONLY"
     UNKNOWN = "UNKNOWN"
+
+
+class CorrectionTargetScope(str, Enum):
+    """WHICH referent a correction is about — orthogonal to `CorrectionRelation`'s KIND.
+
+    G3-7E/G3-7F. One field was carrying both questions, and that is precisely how the
+    wrong-vehicle defect arose: "No, el otro es del 2016." is a CORRECT_EXISTING-kind change
+    (an attribute moves) aimed at an ALTERNATE referent, and with nowhere to put the
+    referent both evaluated models reported the kind correctly and the target wrongly.
+
+    Values name meanings, never wordings. `UNRESOLVED_REFERENT` is the default so silence
+    and `turn-evidence/1.3` payloads both fail closed.
+    """
+    #: The thing currently under discussion.
+    CURRENT_REFERENT = "CURRENT_REFERENT"
+    #: Explicitly NOT the thing under discussion — the exclusion IS the scope.
+    ALTERNATE_REFERENT = "ALTERNATE_REFERENT"
+    #: A referent identified in this burst; pairs with `target_ref`.
+    NAMED_REFERENT = "NAMED_REFERENT"
+    #: The interpreter cannot tell. Never a guess.
+    UNRESOLVED_REFERENT = "UNRESOLVED_REFERENT"
+
+
+class CorrectedField(str, Enum):
+    """The canonical field a correction moves. Enumerated so multiplicity is structural."""
+    VEHICLE_MAKE = "VEHICLE_MAKE"
+    VEHICLE_MODEL = "VEHICLE_MODEL"
+    VEHICLE_YEAR = "VEHICLE_YEAR"
+    VEHICLE_VERSION = "VEHICLE_VERSION"
+    VEHICLE_CATEGORY = "VEHICLE_CATEGORY"
+    INSPECTION_LOCALITY = "INSPECTION_LOCALITY"
+    SCHEDULING_DAY = "SCHEDULING_DAY"
+    SCHEDULING_TIME = "SCHEDULING_TIME"
+    UNKNOWN_FIELD = "UNKNOWN_FIELD"
 
 
 class CorrectionRelation(str, Enum):
@@ -317,13 +351,33 @@ class SchedulingIntentEvidence(EvidenceItem):
     kind: Optional[SchedulingIntentKind] = None
 
 
+class CorrectedFieldPatch(_Frozen):
+    """One canonical field this correction moves.
+
+    G3-7E/G3-7F. `corrections[]` used to be loose `(from, to)` pairs with no field
+    identifier, so a two-field turn collapsed into the one salient change — both evaluated
+    models dropped the year from "Perdón, es 2018 y está en Pilar, no Palermo." A list of
+    identified fields makes enumeration structural instead of hoped-for.
+    """
+    field: CorrectedField = CorrectedField.UNKNOWN_FIELD
+    from_value: Any = None                    # the previous value, when the customer said it
+    to_value: Any = None
+    status: EvidenceStatus = EvidenceStatus.PROPOSED
+    scope: Optional[CorrectionTargetScope] = None   # defaults to the correction's scope
+    evidence_ref: Optional[str] = None        # the family item carrying the same value
+
+
 class CorrectionEvidence(EvidenceItem):
     field: str = "correction"
-    _MEANINGFUL_FIELDS = ("from_value", "to_value", "target_ref")
+    _MEANINGFUL_FIELDS = ("from_value", "to_value", "target_ref", "patch")
     relation: CorrectionRelation = CorrectionRelation.UNKNOWN_RELATION
     from_value: Any = None
     to_value: Any = None
     target_ref: Optional[str] = None          # ref of the item being corrected
+    #: G3-7F. WHICH referent — see `CorrectionTargetScope`. Default fails closed.
+    target_scope: CorrectionTargetScope = CorrectionTargetScope.UNRESOLVED_REFERENT
+    #: G3-7F. Every canonical field this correction moves, identified.
+    patch: tuple[CorrectedFieldPatch, ...] = ()
 
     def is_semantically_empty(self) -> bool:
         # L4.7B.4: the RELATION is evidence on its own. "He replaced the car" is a fact
@@ -333,6 +387,14 @@ class CorrectionEvidence(EvidenceItem):
         # module reload in a test) is still the same relation.
         relation = getattr(self.relation, "value", self.relation)
         if relation != CorrectionRelation.UNKNOWN_RELATION.value:
+            return False
+        # G3-7F: an identified patch, or a scope that commits to a referent, is evidence on
+        # the same footing as the relation. Dropping either loses the only record of what
+        # the customer actually changed, or of which car they meant.
+        if self.patch:
+            return False
+        scope = getattr(self.target_scope, "value", self.target_scope)
+        if scope != CorrectionTargetScope.UNRESOLVED_REFERENT.value:
             return False
         return super().is_semantically_empty()
 

@@ -39,8 +39,11 @@ from ..schemas.turn_evidence import (
     AmbiguityNote,
     BurstReconstruction,
     ConflictNote,
+    CorrectedField,
+    CorrectedFieldPatch,
     CorrectionEvidence,
     CorrectionRelation,
+    CorrectionTargetScope,
     EvidenceStatus,
     FaqIntentEvidence,
     HandoffEvidence,
@@ -63,7 +66,7 @@ from ..schemas.turn_evidence import (
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "understand/1.19"
+PROMPT_VERSION = "understand/1.20"
 INTERPRETER_ID = "semantic:understand"
 
 # Controlled vocabularies. These are the *schema* the interpreter must speak — not phrase
@@ -284,6 +287,25 @@ C4. Toda corrección lleva SIEMPRE su ítem en corrections[], incluso cuando lo 
     año, el año corregido tiene que estar también como evidencia de vehículo.
 C5. Volver a un auto mencionado antes también NOMBRA ese auto: emitilo en vehicles[] además
     de la corrección.
+C6. target_scope es OBLIGATORIO en toda corrección. Describe A QUÉ REFERENTE se aplica, no
+    qué clase de cambio es (eso es relation):
+    CURRENT_REFERENT   = al vehículo del que se está hablando ahora.
+    ALTERNATE_REFERENT = explícitamente a OTRO, no al que se está hablando. Si el mensaje
+                         CONTRAPONE el referente actual —excluye el que estábamos tratando—
+                         es ALTERNATE_REFERENT, aunque no nombre cuál.
+    NAMED_REFERENT     = a un vehículo identificado en ESTE mensaje; acompañalo con
+                         target_ref apuntando a ese ítem de vehicles[].
+    UNRESOLVED_REFERENT = no podés determinarlo. Usalo en vez de adivinar.
+C7. patch[] es OBLIGATORIO y lleva UNA entrada por cada campo canónico que el cliente
+    corrigió, con field, to_value y —si lo dijo— from_value. Si corrige dos cosas en un
+    mensaje, hay dos entradas. Emitir una sola pierde la otra corrección.
+    field ∈ VEHICLE_MAKE | VEHICLE_MODEL | VEHICLE_YEAR | VEHICLE_VERSION |
+            VEHICLE_CATEGORY | INSPECTION_LOCALITY | SCHEDULING_DAY | SCHEDULING_TIME
+C8. Nunca inventes marca, modelo ni identidad que el cliente no dijo. Nunca devuelvas
+    identificadores de base de datos. Nunca elijas el vehículo en foco por tu cuenta: si el
+    referente no es claro, es UNRESOLVED_REFERENT y lo resuelve el reconciliador.
+C9. Si lo corregido convierte el vehículo en una moto, conservá ese significado en
+    vehicles[].category_suggestion; no lo omitas.
 Contraste:
   "es 2015, no 2014"           → correction CORRECT_EXISTING + year 2015
   "no, es un <otro modelo>"    → correction REPLACE_CANDIDATE + vehículo nuevo +
@@ -342,6 +364,13 @@ Vocabulario permitido:
 - acceptance.signal: {" | ".join(ACCEPTANCE_VALUES)}
 - corrections[].relation: CORRECT_EXISTING | REPLACE_CANDIDATE | SWITCH_TO_PRIOR_CANDIDATE
   | ADD_SECOND_CANDIDATE | UNKNOWN_RELATION
+- corrections[].target_scope: CURRENT_REFERENT | ALTERNATE_REFERENT | NAMED_REFERENT
+  | UNRESOLVED_REFERENT
+- corrections[].target_ref: ref de un ítem de vehicles[] de ESTE turno (p. ej.
+  "vehicle_mentions[0]"); nunca un id de base de datos
+- corrections[].patch[].field: VEHICLE_MAKE | VEHICLE_MODEL | VEHICLE_YEAR |
+  VEHICLE_VERSION | VEHICLE_CATEGORY | INSPECTION_LOCALITY | SCHEDULING_DAY |
+  SCHEDULING_TIME
 
 ═══ EJEMPLOS DE SALIDA (forma, no vocabulario de superficie) ═══
 Pregunta por plata:
@@ -567,6 +596,45 @@ def _year_candidates(texts: Sequence[str]) -> list[int]:
     return seen
 
 
+def _scope(raw: Any) -> CorrectionTargetScope:
+    """A target scope, or UNRESOLVED. An unknown value is not a guess — it is unresolved."""
+    try:
+        return CorrectionTargetScope(str(raw))
+    except (ValueError, TypeError):
+        return CorrectionTargetScope.UNRESOLVED_REFERENT
+
+
+def _patch(raw: Any, default_status) -> tuple:
+    """`patch[]` → typed entries. Malformed entries are dropped, never guessed at.
+
+    G3-7F: the field identifier is what makes a two-field correction two entries, so an
+    entry whose field cannot be recognised carries no canonical meaning and is discarded
+    rather than being folded into UNKNOWN_FIELD, where the reconciler could not act on it.
+    """
+    if not isinstance(raw, list):
+        return ()
+    out = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            field = CorrectedField(str(item.get("field")))
+        except (ValueError, TypeError):
+            continue
+        if field is CorrectedField.UNKNOWN_FIELD:
+            continue
+        if item.get("to_value") is None and item.get("from_value") is None:
+            continue
+        scope_raw = item.get("scope")
+        out.append(CorrectedFieldPatch(
+            field=field, from_value=item.get("from_value"),
+            to_value=item.get("to_value"),
+            status=_status(item.get("status"), default_status),
+            scope=(_scope(scope_raw) if scope_raw is not None else None),
+            evidence_ref=(str(item["evidence_ref"]) if item.get("evidence_ref") else None)))
+    return tuple(out)
+
+
 def _said_literally(value: Any, haystack: str) -> bool:
     """True when the customer actually used this token (accent/casing tolerant)."""
     if not isinstance(value, str) or not value.strip():
@@ -740,6 +808,28 @@ class SemanticTurnInterpreter:
                 status=superseded[0].status,
                 reason="derived from a superseded vehicle mention",
                 provenance=prov)]
+
+        # G3-7F: an identified VEHICLE_YEAR patch entry is the authoritative source for a
+        # corrected year; it is mirrored into vehicle evidence so every consumer that reads
+        # `VehicleEvidence.year` keeps working unchanged. The `to_value` fallback below
+        # stays as the 1.3-shaped path.
+        if not any(v.year is not None for v in vehicles):
+            for correction in corrections:
+                for entry in (correction.patch or ()):
+                    if getattr(entry.field, "value", entry.field) != "VEHICLE_YEAR":
+                        continue
+                    year = _coerce_year(entry.to_value)
+                    if year is None:
+                        continue
+                    vehicles = list(vehicles) + [VehicleEvidence(
+                        value=None, year=year, year_status=entry.status,
+                        status=entry.status,
+                        reason="corrected year carried by a correction patch",
+                        mention_index=len(vehicles), provenance=prov)]
+                    break
+                else:
+                    continue
+                break
 
         if not any(v.year is not None for v in vehicles):
             for correction in corrections:
@@ -980,6 +1070,8 @@ class SemanticTurnInterpreter:
                 # which left the only in-burst target pointer inert. It addresses an item in
                 # THIS turn's evidence (`vehicle_mentions[1]`), never a database row.
                 target_ref=(str(raw["target_ref"]) if raw.get("target_ref") else None),
+                target_scope=_scope(raw.get("target_scope")),
+                patch=_patch(raw.get("patch"), _status(raw.get("status"))),
                 reason=raw.get("reason"), provenance=prov))
 
         identities: list[IdentityEvidence] = []

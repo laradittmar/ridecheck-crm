@@ -99,12 +99,19 @@ TWO = [row(1, "Ford", "Focus", status="current_focus"), row(2, "Toyota", "Coroll
 # the exact G3-7C/G3-7D measured output for "No, el otro es del 2016."
 EL_OTRO = ["No, el otro es del 2016."]
 EL_OTRO_4O = {"corrections": [{"relation": "CORRECT_EXISTING", "to_value": 2016,
-                               "status": "PROPOSED"}]}
+                               "status": "PROPOSED",
+                               "target_scope": "CURRENT_REFERENT"}]}
 EL_OTRO_54 = {"corrections": [{"relation": "CORRECT_EXISTING", "to_value": 2016,
-                               "status": "CONFIRMED"}]}
+                               "status": "CONFIRMED",
+                               "target_scope": "CURRENT_REFERENT"}]}
 WILD_B = ["Perdón, es 2018 y está en Pilar, no Palermo."]
+# Commit 2 added `target_scope`, and its default is UNRESOLVED_REFERENT — so from Commit 2
+# onward a correction that does not say which referent it means HOLDS. That is the designed
+# fail-closed behaviour, so the grounding tests state the referent explicitly and
+# `test_g37f_09b` pins the scope-less case to the HOLD it must now produce.
 WILD_B_PAYLOAD = {"corrections": [{"relation": "CORRECT_EXISTING", "from_value": 2019,
-                                   "to_value": 2018, "status": "CONFIRMED"}],
+                                   "to_value": 2018, "status": "CONFIRMED",
+                                   "target_scope": "CURRENT_REFERENT"}],
                   "locations": [{"value": "Pilar", "locality": "Pilar",
                                  "role": "INSPECTION_LOCATION", "status": "CONFIRMED"}]}
 
@@ -195,6 +202,17 @@ class B_Grounds(unittest.TestCase):
         r, _ = resolve(FOCUS, parse(EL_OTRO_4O, EL_OTRO), EL_OTRO)
         self.assertEqual(r.action, CandidateAction.HOLD)
         self.assertEqual(r.hold_reason, H.IMPLICIT_FOCUS_UNCONFIRMED)
+
+    def test_g37f_09b_a_correction_that_names_no_referent_fails_closed(self):
+        """From Commit 2 a scope-less correction — every `turn-evidence/1.3` payload — may
+        not spend implicit focus, even in a singleton thread. Missing is not CURRENT."""
+        texts = ["Perdón, es 2018."]
+        ev = parse({"corrections": [{"relation": "CORRECT_EXISTING", "to_value": 2018,
+                                     "status": "CONFIRMED"}]}, texts)
+        self.assertEqual(ev.corrections[0].target_scope.value, "UNRESOLVED_REFERENT")
+        r, d = resolve(FOCUS, ev, texts)
+        self.assertEqual(r.action, CandidateAction.HOLD)
+        self.assertEqual(d, {"action": "none"})
 
     def test_g37f_10_g3_a_typed_in_burst_reference(self):
         texts = ["El Focus no, el Corolla: ese es del 2017."]

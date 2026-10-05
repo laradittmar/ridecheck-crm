@@ -186,7 +186,7 @@ class ProvenanceAndBurst(unittest.TestCase):
 
     def test_g33_13_provenance_names_the_interpreter_and_its_version(self):
         self.assertEqual(self.item.provenance.interpreter,
-                         "semantic:understand:understand/1.19")
+                         "semantic:understand:understand/1.20")
         self.assertEqual(self.item.provenance.source_kind.value, "SEMANTIC")
         self.assertEqual(self.item.provenance.model_version, "test-model")
 
@@ -210,8 +210,8 @@ class TraceAndInspector(unittest.TestCase):
         from app.services.hybrid_trace import semantic_evidence_from
         evidence = interpret(AVAILABILITY_PAYLOAD).without_empty_items()
         result = type("R", (), {"ok": True, "evidence": evidence, "model": "test-model",
-                                "prompt_version": "understand/1.19",
-                                "schema_version": "turn-evidence/1.3",
+                                "prompt_version": "understand/1.20",
+                                "schema_version": "turn-evidence/1.4",
                                 "latency_ms": 10, "total_tokens": 20})()
         provider = type("P", (), {"ready": True, "get": lambda self, t: result})()
         import dataclasses
@@ -228,7 +228,7 @@ class TraceAndInspector(unittest.TestCase):
         self.assertEqual(item["kind"], "AVAILABILITY_ENQUIRY")
         self.assertEqual(item["provenance"]["source_kind"], "SEMANTIC")
         self.assertEqual(item["provenance"]["interpreter"],
-                         "semantic:understand:understand/1.19")
+                         "semantic:understand:understand/1.20")
 
     def test_g33_18_the_inspector_displays_it_as_semantic_evidence(self):
         from app.ui.hybrid_trace_view import _semantic_card
@@ -342,8 +342,8 @@ class ContractVersioning(unittest.TestCase):
     """17 — additive, and existing consumers are untouched."""
 
     def test_g33_25_the_schema_version_was_bumped(self):
-        self.assertEqual(te.SCHEMA_VERSION, "turn-evidence/1.3")
-        self.assertEqual(si.PROMPT_VERSION, "understand/1.19")
+        self.assertEqual(te.SCHEMA_VERSION, "turn-evidence/1.4")
+        self.assertEqual(si.PROMPT_VERSION, "understand/1.20")
 
     def test_g33_26_scheduling_request_evidence_is_unchanged(self):
         self.assertEqual(SchedulingRequestEvidence()._MEANINGFUL_FIELDS,

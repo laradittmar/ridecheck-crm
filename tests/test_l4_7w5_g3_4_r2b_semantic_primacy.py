@@ -424,8 +424,8 @@ class F_MixedTurnsUnchanged(unittest.TestCase):
     def test_r2b_27_the_model_and_contracts_are_frozen(self):
         interp = (BACKEND / "app/services/semantic_interpreter.py").read_text(encoding="utf-8")
         self.assertIn('or "gpt-4o-mini"', interp)
-        self.assertIn('PROMPT_VERSION = "understand/1.19"', interp)
-        self.assertEqual(te.SCHEMA_VERSION, "turn-evidence/1.3")
+        self.assertIn('PROMPT_VERSION = "understand/1.20"', interp)
+        self.assertEqual(te.SCHEMA_VERSION, "turn-evidence/1.4")
 
 
 if __name__ == "__main__":       # pragma: no cover

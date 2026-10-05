@@ -717,7 +717,7 @@ class F_DegradedAndNonRegression(unittest.TestCase):
         self.assertEqual(len(re.findall(r"self\._call_openai\(", ENGINE_SRC)), 1)
         self.assertEqual(len(re.findall(r"self\._reply_decision\(", ENGINE_SRC)), 2)
         self.assertEqual(len(re.findall(r"self\._ai_invoked = True", ENGINE_SRC)), 1)
-        self.assertIn('PROMPT_VERSION = "understand/1.19"', interp)
+        self.assertIn('PROMPT_VERSION = "understand/1.20"', interp)
         self.assertIn('or "gpt-4o-mini"', interp)
         self.assertIn('REPLY_PROMPT_VERSION = "reply/1.0"', ENGINE_SRC)
 

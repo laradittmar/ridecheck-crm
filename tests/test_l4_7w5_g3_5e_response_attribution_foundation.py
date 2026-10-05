@@ -242,8 +242,8 @@ class C_ModelCalls(unittest.TestCase):
     def test_g35e_18_the_semantic_attribution_is_unchanged(self):
         from app.services import semantic_interpreter as si
         from app.schemas import turn_evidence as te
-        self.assertEqual(si.PROMPT_VERSION, "understand/1.19")
-        self.assertEqual(te.SCHEMA_VERSION, "turn-evidence/1.3")
+        self.assertEqual(si.PROMPT_VERSION, "understand/1.20")
+        self.assertEqual(te.SCHEMA_VERSION, "turn-evidence/1.4")
 
     def test_g35e_19_a_reply_timeout_is_represented_truthfully(self):
         t = Turn((("w0", "¿Cuánto sale?", 0), ("w1", "Estoy en Vicente López.", 5)),

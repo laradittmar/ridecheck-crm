@@ -282,8 +282,8 @@ class TestFutureIntent(unittest.TestCase):
         # fields a decision needs to be replayable). 1.0/1.1 records still load.
         # G3-3 bumped both, additively: SchedulingIntentEvidence and the prompt rule that
         # emits it. The guard keeps its job — an UNAPPROVED move still fails here.
-        self.assertEqual(SCHEMA_VERSION, "turn-evidence/1.3")
-        self.assertEqual(PROMPT_VERSION, "understand/1.19",
+        self.assertEqual(SCHEMA_VERSION, "turn-evidence/1.4")
+        self.assertEqual(PROMPT_VERSION, "understand/1.20",
                          "L4.7W5-GATE3-G3-3 moved the prompt and the schema together")
         old = TurnEvidence.from_json(json.dumps({"schema_version": "turn-evidence/1.0"}))
         self.assertEqual(old.schema_version, "turn-evidence/1.0",
