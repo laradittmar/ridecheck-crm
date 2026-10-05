@@ -42,6 +42,12 @@ HANDLED_ACTIONS = frozenset({
     "blocked_dispatch",
     # L4.7W2-F1: a locality proposal suppressed by the kill switch is still a CE decision.
     "location_proposal_blocked",
+    # G3-7F: the same rule for a correction. Declining to ask for confirmation, or holding
+    # because a correction cannot be placed on exactly one vehicle, are CE DECISIONS. Left
+    # unhandled they would hand the turn to n8n's legacy booking chain — which is how a
+    # kill-switched deployment silently acquired a second booking authority once already.
+    "correction_confirmation_blocked",
+    "correction_hold_blocked",
     # L4.7W5: producing nothing is a CE outcome, not a CE abdication. It MUST be handled,
     # for the same reason `blocked_dispatch` is: the false branch of n8n's
     # `IF - Engine Handled?` runs a legacy booking chain that bypasses the booking

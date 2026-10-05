@@ -623,9 +623,15 @@ class PrivacyHistoryContract(unittest.TestCase):
         headline, _ = svc.effective_from_payload(payload)
         self.assertEqual(headline, Classification.TRACE_INCOMPLETE)
 
-    def test_site_41_no_migration_was_introduced(self):
-        self.assertEqual(
-            len(list((ROOT / "backend" / "migrations" / "versions").glob("*.py"))), 45)
+    def test_site_41_this_milestone_introduced_no_migration(self):
+        """G3-1 introduced none, and that is what this guards. The count moved when G3-7F
+        Commit 3 added exactly one — an additive nullable `pending_correction` column — so
+        the assertion now names its own scope instead of freezing a global total."""
+        versions = sorted(p.name for p in
+                          (ROOT / "backend" / "migrations" / "versions").glob("*.py"))
+        self.assertEqual(len(versions), 46)
+        self.assertIn("20260918_hybrid_decision_traces.py", versions)  # G3-1's table
+        self.assertIn("20261005_pending_correction.py", versions)  # G3-7F Commit 3
 
     def test_site_42_no_pii_in_the_new_row_fields(self):
         h = HandoffSite()

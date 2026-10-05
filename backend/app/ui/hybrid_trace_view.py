@@ -761,6 +761,13 @@ CONTRACTS_WITH_CANDIDATE_SECTION = frozenset({
     "hybrid-decision-trace/1.7",
 })
 
+PENDING_SCOPE_NOTE = (
+    "Esto es estado PROPUESTO, no verdad canónica: la fila del candidato no cambió todavía. "
+    "Una corrección que mueve precio o identidad espera confirmación del cliente; sólo una "
+    "corrección neutra en precio se aplica en el momento, y en ese caso la respuesta la "
+    "repite. El bloqueo comercial lo aplica G3-8 en las compuertas, no esta capa."
+)
+
 CANDIDATE_SCOPE_NOTE = (
     "La decisión la toma el reconciliador y la escribe `_apply_candidate`: el modelo de "
     "respuesta no elige candidato ni localidad. «Mutación aplicada» es lo que informó el "
@@ -894,6 +901,62 @@ def _candidate_resolution_card(trace: dict) -> str:
     ]
     return ('<div class="card"><h2>Candidato — decisión</h2>'
             f'<p class="note">{html.escape(CANDIDATE_SCOPE_NOTE)}</p>'
+            f"{_kv(rows)}</div>")
+
+
+def _pending_correction_card(trace: dict) -> str:
+    """The provisional patch: what was proposed, why it waits, and what it blocked.
+
+    G3-7F. A correction that moves a price or an identity no longer mutates on the strength
+    of a semantic reading — it waits for the customer. An operator has to be able to see the
+    difference between proposed and applied, which is exactly the distinction the trace was
+    missing when a correction could silently land on the wrong vehicle.
+    """
+    res = trace.get("pending_correction")
+    if not isinstance(res, dict):
+        return ""
+    _TIER = {"IMMEDIATE": "inmediata (neutra en precio, con eco en la respuesta)",
+             "PROVISIONAL": "provisional — requiere confirmación del cliente",
+             "HOLD": "no representable como un patch único"}
+    _STATUS = {"PENDING": "esperando confirmación", "CONFIRMED": "confirmada y aplicada",
+               "REJECTED": "rechazada por el cliente", "SUPERSEDED": "reemplazada",
+               "EXPIRED": "vencida"}
+    _WHY = {"NEWER_CORRECTION": "llegó una corrección más nueva",
+            "BEFORE_VALUES_MOVED": "los valores previos cambiaron desde que se propuso",
+            "TARGET_LOST": "el candidato objetivo ya no está",
+            "FOCUS_MOVED": "el foco cambió", "CYCLE_ENDED": "terminó el ciclo",
+            "HUMAN_HANDOFF": "pasó a un humano",
+            "CUSTOMER_REJECTED": "el cliente dijo que no",
+            "NOT_LATEST_QUESTION": "ya no era la última pregunta pendiente",
+            "LEGACY_PROPOSAL_ACTIVE": "había otra propuesta confirmable activa",
+            "FINGERPRINT_MISMATCH": "la huella del patch no coincide"}
+    changes = "; ".join(
+        f'{c.get("field")}: {c.get("before")} → {c.get("proposed")}'
+        for c in (res.get("corrected_fields") or []) if isinstance(c, dict))
+    rows = [
+        ("Clasificación", _e(_TIER.get(str(res.get("tier")), res.get("tier")))),
+        ("Estado", _e(_STATUS.get(str(res.get("status")), res.get("status")))),
+        ("Propuesta", _e(changes or None)),
+        ("Candidato objetivo", _e(res.get("target_candidate_id"))),
+        ("Fundamento del objetivo", _e(res.get("grounding_basis"))),
+        ("Relación / alcance", _e(f'{res.get("relation")} / {res.get("target_scope")}')),
+        ("Impacto en precio", _e(res.get("price_impact"))),
+        ("Afecta la identidad", _e(res.get("identity_impact"))),
+        ("Invalida la cotización", _e(res.get("quote_invalidating"))),
+        ("Bloquea avance comercial", _e(res.get("blocking"))),
+        ("Motivo del bloqueo", _e(res.get("blocking_reason"))),
+        ("Aplicado en las compuertas (G3-8)", _e(res.get("enforced_at_gates"))),
+        ("Mensaje de la pregunta", _e(res.get("confirmation_message_id"))),
+        ("Huella", f'<span class="mono">{_e(res.get("fingerprint"))}</span>'),
+        ("Evidencia", _e(" · ".join(str(r) for r in (res.get("evidence_refs") or []))
+                         or None)),
+    ]
+    if res.get("invalidation_reason"):
+        rows.append(("Por qué dejó de ser confirmable",
+                     _e(_WHY.get(str(res.get("invalidation_reason")),
+                                 res.get("invalidation_reason")))))
+    return ('<div class="card"><h2>Corrección provisional</h2>'
+            f'<p class="note">{html.escape(PENDING_SCOPE_NOTE)}</p>'
             f"{_kv(rows)}</div>")
 
 
@@ -1086,6 +1149,7 @@ def render_turn_trace_page(record: Optional[dict], turn_id: str = "") -> str:
         + _reconciliation_card(*_rows_and_counts(record, trace),
                                semantic=trace.get("semantic") or {})
         + _candidate_resolution_card(trace)
+        + _pending_correction_card(trace)
         + _state_card(trace.get("canonical_before") or {}, trace.get("canonical_after") or {})
         + _outcome_card(trace)
         + _reply_model_card(trace)

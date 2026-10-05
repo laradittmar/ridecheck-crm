@@ -68,6 +68,10 @@ class PropositionId:
     CANONICAL_PRICE = "canonical.price"
     #: G3-6. Appointment times the thread really holds.
     SLOT_OFFER = "scheduling.slot_offer"
+    #: G3-7F. One concise request to confirm a provisional correction. Carries only the
+    #: corrected field/value pairs: the reconciler authorizes the proposition, the composer
+    #: writes the words, and no prose lives in the reconciliation layer.
+    CORRECTION_CONFIRMATION_REQUIRED = "correction.confirmation_required"
     #: G3-6. Why the principal action is held, when P1 needs it said out loud.
     HOLD_EXPLANATION = "turn.hold_explanation"
 

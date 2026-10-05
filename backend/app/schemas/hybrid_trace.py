@@ -1185,6 +1185,9 @@ class HybridDecisionTrace:
     #: selected, why, what it corrected, and what the writer actually did. Absent on 1.5 and
     #: earlier rows, which therefore remain readable without a migration.
     candidate_resolution: Optional[Any] = None
+    #: G3-7F, contract 1.7. The provisional patch this turn armed, confirmed, rejected,
+    #: superseded or expired — and every commercial action it blocked. Absent on 1.6 rows.
+    pending_correction: Optional[Any] = None
     response_item_count: Optional[int] = None
     response_item_kinds: tuple = ()
     suppressed_item_count: Optional[int] = None

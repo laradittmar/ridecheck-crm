@@ -696,8 +696,15 @@ class NothingElseMoved(unittest.TestCase):
         self.assertEqual(touched, [], f"forbidden paths changed: {touched}")
 
     def test_row_29b_no_migration_and_no_schema_change(self):
-        migrations = sorted((ROOT / "backend" / "migrations" / "versions").glob("*.py"))
-        self.assertEqual(len(migrations), 45)
+        """This milestone changed no schema and ran no backfill. The global migration count
+        moved when G3-7F Commit 3 added one additive nullable column, so what is asserted
+        here is the part that is actually this milestone's business: the trace writer still
+        performs no UPDATE, no ALTER and no backfill of its own."""
+        migrations = sorted(p.name for p in
+                            (ROOT / "backend" / "migrations" / "versions").glob("*.py"))
+        self.assertEqual(len(migrations), 46)
+        self.assertNotIn("20261005_pending_correction.py", migrations[:-1],
+                         "the newest migration is the only one added since")
         source = (ROOT / "backend" / "app" / "services"
                   / "hybrid_trace.py").read_text(encoding="utf-8-sig")
         for forbidden in ("UPDATE hybrid_decision_traces", "update(HybridDecisionTraceRow",

@@ -687,6 +687,10 @@ _FUZZY_REJECTION_RE = re.compile(
 )
 # L4.7W2-F1: an approximate locality is confirmed, never assumed.
 _LOCALITY_CONFIRMATION_TEMPLATE = "¿El auto está en {zone}?"
+#: G3-7F: asked at most once when a correction cannot be placed on exactly one vehicle.
+_CORRECTION_TARGET_CLARIFICATION = (
+    "Perdón, para no equivocarme: ¿sobre qué vehículo es la corrección?"
+)
 _LOCALITY_ASK_AGAIN_REPLY = (
     "Perdón, no te entendí bien. ¿En qué localidad está el auto?"
 )
@@ -3288,6 +3292,8 @@ class ConversationEngine:
         self._reply_admission_state = None
         self._reply_contract = ReplyContract.NOT_INVOKED
         self._turn_candidate_resolution = None
+        self._turn_correction_echo = ()          # G3-7F: Tier 1 must echo what it changed
+        self._turn_correction_proposition = None
         self._turn_decision_authority = None
         self._turn_fact_sources = []
         self._turn_renderer_source = None
@@ -4042,6 +4048,161 @@ class ConversationEngine:
         if not marca and not modelo:
             return False
         return _tipo_compatible(getattr(cand, "tipo_vehiculo", None), tipo)
+
+    def _request_correction_confirmation(self, ctx, state, pending):
+        """Ask once, concisely, for confirmation of a provisional patch.
+
+        The reconciler authorizes a typed proposition; the composer writes the words. The
+        outbound message's id is stored on the patch, which is what later proves the
+        correction was the latest thing we said.
+        """
+        self._answer_source = "CORRECTION_CONFIRMATION"
+        self._turn_correction_proposition = self._correction_confirmation_proposition(
+            pending)
+        try:
+            sent = self._send_text_to_wa(
+                ctx, self._render_correction_confirmation(pending))
+        except OutboundBlockedError:
+            # Fail closed: an unasked question is not a pending proposal.
+            self._store_pending_correction(state, None)
+            return _out("correction_confirmation_blocked", detail="outbound_disabled")
+        row = None
+        try:
+            row = ((self.db.query(WhatsAppMessage)
+                    .filter(WhatsAppMessage.wa_message_id == sent).one_or_none())
+                   if sent else None)
+        except Exception:
+            row = None
+        self._store_pending_correction(
+            state, pending.with_confirmation_message(getattr(row, "id", None)))
+        self.db.commit()
+        return _out("replied", wa_message_id=sent)
+
+    @staticmethod
+    def _render_correction_confirmation(pending) -> str:
+        """Interim rendering for the typed proposition.
+
+        Commit 3 ships the proposition and one faithful rendering; the composer takes over
+        the wording when the flag is certified. It repeats ONLY the corrected facts — never
+        unrelated known customer information.
+        """
+        _LABEL = {"anio": "el año", "zone_detail": "la localidad", "marca": "la marca",
+                  "modelo": "el modelo", "tipo_vehiculo": "el tipo de vehículo",
+                  "version_text": "la versión"}
+        parts = [f"{_LABEL.get(f, f)} {a}" for f, _b, a in pending.corrected_fields
+                 if f != "zone_group"]
+        if not parts:
+            return "¿Me confirmás el cambio?"
+        return f"Perfecto: {', '.join(parts)}. ¿Es correcto?"
+
+    def _hold_for_correction_clarification(self, ctx, state, reason):
+        """One bounded clarification when a correction cannot be safely represented."""
+        self._answer_source = "CORRECTION_HOLD"
+        self._decision_log(ctx, "correction_hold", reason=reason)
+        try:
+            sent = self._send_text_to_wa(ctx, _CORRECTION_TARGET_CLARIFICATION)
+            return _out("replied", wa_message_id=sent)
+        except OutboundBlockedError:
+            return _out("correction_hold_blocked", detail="outbound_disabled")
+
+    def _pending_correction_for_trace(self, ctx):
+        """The thread's proposal as the trace should record it, plus what it blocked."""
+        from . import pending_correction as pc
+        pending = pc.load(getattr(ctx, "state", None))
+        if pending is None:
+            return None
+        blocking, reason = pc.has_blocking_pending_correction(getattr(ctx, "state", None))
+        payload = pending.to_payload()
+        payload["blocking"] = blocking
+        payload["blocking_reason"] = reason
+        payload["enforced_at_gates"] = False      # G3-8 owns the gates; see G37BR-02
+        return payload
+
+    def _provisional_correction_on(self) -> bool:
+        """Is provisional correction authority armed? Default OFF.
+
+        G3-7F Commit 3. Flag off, a grounded correction applies as it did in Commit 1: this
+        gates only the confirm-before-mutate behaviour and the blocking it implies.
+        """
+        return getattr(getattr(self, "settings", None),
+                       "provisional_correction_enabled", False) is True
+
+    def _latest_outbound_message_id(self, ctx) -> "int | None":
+        """The id of the last thing WE said on this thread, from the ledger.
+
+        This is how "was the correction the latest unresolved question?" is answered without
+        a word of customer text: if the bot has spoken since the confirmation question, an
+        affirmation has more than one possible referent, and ambiguity there is a wrong-car
+        mutation. A turn that re-attaches the confirmation updates the stored id, so
+        re-asking inside one message keeps it admissible.
+        """
+        latest = None
+        for message in (getattr(ctx, "db_messages", None) or []):
+            if getattr(message, "direction", None) != "out":
+                continue
+            mid = getattr(message, "id", None)
+            if isinstance(mid, int) and (latest is None or mid > latest):
+                latest = mid
+        return latest
+
+    def _pending_correction(self, ctx):
+        """This thread's provisional patch, or None."""
+        from . import pending_correction as pc
+        return pc.load(getattr(ctx, "state", None))
+
+    def _store_pending_correction(self, state, pending) -> None:
+        """Persist (or clear) the proposal. PROPOSED state — never canonical truth."""
+        state.pending_correction = pending.to_payload() if pending is not None else None
+
+    def _arm_pending_correction(self, ctx, state, resolution):
+        """Turn a grounded Tier-2 resolution into a pending patch, or refuse.
+
+        Returns `(pending, refusal_reason)`. Refusal is the bounded answer to legacy
+        mutual exclusion: when another confirmable proposal is already outstanding we do not
+        supersede it and we do not coexist with it — we decline to arm and hold, which
+        leaves every legacy workflow exactly as it is.
+        """
+        from . import pending_correction as pc
+        legacy = pc.legacy_proposal_active(state)
+        if legacy is not None:
+            return None, pc.InvalidationReason.LEGACY_PROPOSAL_ACTIVE
+        pending = pc.PendingCorrection.build(
+            thread_id=getattr(getattr(ctx, "thread", None), "id", None),
+            turn_id=getattr(self, "_correlation_id", None),
+            target_candidate_id=resolution.target_candidate_id,
+            grounding_basis=resolution.grounding_basis,
+            relation=resolution.target_relation,
+            target_scope=getattr(resolution, "target_scope_value", None),
+            corrected_fields=resolution.corrected_fields,
+            evidence_refs=tuple(r for r in (resolution.correction_evidence_ref,
+                                            resolution.vehicle_evidence_ref,
+                                            resolution.location_evidence_ref) if r),
+            cycle_id=self._reconciler_cycle_id(state),
+            origin_message_ids=tuple(
+                m for m in (getattr(getattr(self, "_canonical_turn_burst", None),
+                                    "ordered_message_ids", None) or ()) if m))
+        return pending, None
+
+    def _correction_tier(self, resolution) -> str:
+        """Which tier this resolution's patch falls in. Atomic: one Tier 2 entry decides."""
+        from . import pending_correction as pc
+        tier, _price, _identity, _invalidating = pc.classify_patch(
+            getattr(resolution, "corrected_fields", ()) or ())
+        return tier
+
+    def _correction_confirmation_proposition(self, pending) -> dict:
+        """The typed proposition the composer renders. Field/value pairs, never prose.
+
+        Only the corrected facts travel: §12 of the R2 design forbids restating unrelated
+        known customer information, and the composer owns the wording.
+        """
+        from .response_composition import PropositionId
+        return {
+            "proposition_id": PropositionId.CORRECTION_CONFIRMATION_REQUIRED,
+            "pending_id": pending.pending_id,
+            "fields": [{"field": f, "proposed": a} for f, _b, a in
+                       pending.corrected_fields],
+        }
 
     def _correction_grounding_on(self) -> bool:
         """Is the Grounded-Target Invariant armed on this deployment? Default OFF.
@@ -6792,6 +6953,47 @@ class ConversationEngine:
                         _cand_data.get("marca"), _cand_data.get("modelo"))
             return self._motorcycle_human_handoff(ctx, state)
         # FIX 2 (CL-07): pass zone_protected so AI cannot overwrite LR-3-written zone.
+        # ══ G3-7F Commit 3: provisional correction authority ══════════════════════
+        # A grounded correction is not automatically a safe one. Anything that moves a
+        # price, an identity or a quote's validity becomes a typed pending patch and waits
+        # for the customer; only a price-neutral year applies immediately, and then it must
+        # be echoed. Flag off, everything here is skipped and Commit 1 behaviour stands.
+        _pc_resolution = getattr(self, "_turn_candidate_resolution", None)
+        if (self._provisional_correction_on()
+                and _pc_resolution is not None
+                and _cand_data.get("action") == "update"
+                and _pc_resolution.action == CandidateAction.CORRECT_EXISTING):
+            from . import pending_correction as _pcmod
+            _existing = self._pending_correction(ctx)
+            _newer = bool(_pc_resolution.corrected_fields)
+            if _existing is not None and _newer:
+                # A newer grounded correction supersedes atomically. It may not also be
+                # confirmed in the turn that armed it, or one message would both propose
+                # and accept.
+                self._store_pending_correction(
+                    state,
+                    _existing.with_status(_pcmod.PendingStatus.SUPERSEDED,
+                                          _pcmod.InvalidationReason.NEWER_CORRECTION))
+                _existing = None
+            if self._correction_tier(_pc_resolution) == _pcmod.CorrectionTier.PROVISIONAL:
+                _pending, _refusal = self._arm_pending_correction(
+                    ctx, state, _pc_resolution)
+                if _pending is None:
+                    self._decision_log(ctx, "pending_correction_refused", reason=_refusal)
+                    self._record_candidate_mutation((False, None))
+                    return self._hold_for_correction_clarification(ctx, state, _refusal)
+                self._store_pending_correction(state, _pending)
+                self._decision_log(ctx, "pending_correction_armed",
+                                   tier=_pending.tier,
+                                   fields=len(_pending.corrected_fields),
+                                   basis=_pending.grounding_basis)
+                self._record_candidate_mutation((False, None))
+                return self._request_correction_confirmation(ctx, state, _pending)
+            # Tier 1 — immediate, and the echo is a correctness requirement: a year reaches
+            # the quote prose and the booking record even though it moves no price.
+            self._turn_correction_echo = tuple(
+                (f, a) for f, _b, a in _pc_resolution.corrected_fields)
+
         _outcome = self._apply_candidate(
             ctx, _cand_data, zone_protected=_vehicle_location_written)
         # G3-7B: the decision records what the WRITER did, not what the resolver expected.
@@ -8520,6 +8722,8 @@ class ConversationEngine:
                     "decision_phase_id", None),
                 # ── G3-7B contract 1.6 ──
                 candidate_resolution=getattr(self, "_turn_candidate_resolution", None),
+                # ── G3-7F contract 1.7 ──
+                pending_correction=self._pending_correction_for_trace(ctx),
             )
             persist(self.db, trace)
         except Exception as exc:

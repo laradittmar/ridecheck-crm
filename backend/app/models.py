@@ -356,6 +356,12 @@ class WhatsAppThreadState(Base):
     # customer confirmation. The cycle is embedded so a proposal can never be confirmed in
     # a later cycle; nothing canonical is written until the customer says yes.
     pending_location_proposal: Mapped[Optional[str]] = mapped_column(String(160), nullable=True)  # M21.2: raw current_turn_text from the CONFIRM turn; cleared atomically with pending_fuzzy_catalog_key
+    # G3-7F: the thread's one provisional canonical patch, awaiting customer confirmation.
+    # PROPOSED state only — `whatsapp_thread_candidates` stays the source of truth and
+    # `_apply_candidate` stays its only writer. One column on a one-row-per-thread table is
+    # what enforces "at most one outstanding proposal", which is what makes a typed
+    # affirmation unambiguous instead of a guess.
+    pending_correction: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     unanswered_alert_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     # WILD-04R: cycle boundary fields
     cycle_reset_pending: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")

@@ -57,6 +57,11 @@ class Settings:
     # so a status gate alone is not a safety property. Default OFF: the floor changes which
     # turns mutate, and that needs certification against a model first.
     correction_target_grounding_enabled: bool = False
+    # G3-7F — provisional correction authority. A price-affecting or identity-changing
+    # correction becomes a typed pending patch and waits for the customer to confirm it
+    # before canonical state moves. Default OFF: it changes conversational behaviour, and
+    # the blocking it implies is only enforced at the deterministic gates by G3-8.
+    provisional_correction_enabled: bool = False
     # L4.7C.4 — scheduling-language interpretation. Default OFF everywhere.
     reconciler_scheduling_authority_enabled: bool = False
     # L4.7C.4A — same-turn semantic evidence. When false the interpretation stays behind the
@@ -166,6 +171,8 @@ def get_settings() -> Settings:
             _getenv("REPLY_RENDERER_DEMOTION_ENABLED", "true").lower() == "true"),
         correction_target_grounding_enabled=(
             _getenv("CORRECTION_TARGET_GROUNDING_ENABLED", "false").lower() == "true"),
+        provisional_correction_enabled=(
+            _getenv("PROVISIONAL_CORRECTION_ENABLED", "false").lower() == "true"),
         reconciler_scheduling_authority_enabled=(
             _getenv("RECONCILER_SCHEDULING_AUTHORITY_ENABLED", "false").lower() == "true"),
         internal_api_auth_enabled=(
