@@ -859,8 +859,14 @@ class SemanticTurnInterpreter:
                         if v and not _said_literally(v, haystack)]
             if inferred:
                 status = _cap(status, EvidenceStatus.PROPOSED)
-            catalog_candidate = raw.get("catalog_candidate") or (
-                combined if inferred else None)
+            # G3-7F: the model's value is passed through to a `str` field. A candidate
+            # model returned `{"make": …, "model": …}` here and pydantic rejected the whole
+            # item, discarding every other piece of evidence in the turn (G37DR-03). A
+            # non-string suggestion is not evidence — it is dropped, and the turn survives.
+            _raw_catalog = raw.get("catalog_candidate")
+            if _raw_catalog is not None and not isinstance(_raw_catalog, str):
+                _raw_catalog = None
+            catalog_candidate = _raw_catalog or (combined if inferred else None)
 
             vehicles.append(VehicleEvidence(
                 field=("vehicle_superseded" if raw.get("is_superseded") else "vehicle"),

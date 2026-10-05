@@ -60,7 +60,7 @@ import unicodedata
 from dataclasses import dataclass, field, asdict
 from typing import Any, Optional
 
-TRACE_VERSION = "hybrid-decision-trace/1.6"
+TRACE_VERSION = "hybrid-decision-trace/1.7"
 #: G3-5E. 1.4 splits `response_plan_source` — which was `answer_source`, and therefore
 #: answered three questions at once — into decision authority, fact sources, renderer source
 #: and dispatch result, and adds the reply-generation role and the shadow response plan. A
@@ -686,6 +686,36 @@ class CandidateHoldReason:
     FOCUS_NOT_UNIQUE = "FOCUS_NOT_UNIQUE"
     FOCUS_INCONSISTENT = "FOCUS_INCONSISTENT"
     FOCUS_NOT_ESTABLISHED = "FOCUS_NOT_ESTABLISHED"
+    # ── G3-7F: the Grounded-Target Invariant and the category floor ─────────────
+    #: No admissible ground (G1/G2/G3) established the target.
+    TARGET_NOT_GROUNDED = "TARGET_NOT_GROUNDED"
+    #: The evidence excludes the candidate implicit focus would have chosen.
+    EXCLUDED_REFERENT = "EXCLUDED_REFERENT"
+    #: Only implicit focus was available, and the evidence is not CONFIRMED.
+    IMPLICIT_FOCUS_UNCONFIRMED = "IMPLICIT_FOCUS_UNCONFIRMED"
+    #: Creation needs make AND model said literally by the customer.
+    CREATE_UNCONFIRMED = "CREATE_UNCONFIRMED"
+    #: The vehicle category is established by neither the catalogue nor confirmed evidence.
+    CATEGORY_NOT_ESTABLISHED = "CATEGORY_NOT_ESTABLISHED"
+
+
+class CandidateGroundingBasis:
+    """HOW the reconciler established the target, independently of what the model claimed.
+
+    G3-7F. The G3-7C/G3-7D evaluations showed a model can assert `CONFIRMED` for a referent
+    the customer explicitly excluded. So target selection may not read status or scope as
+    its ground. These three are the only admissible grounds, and each is checked against
+    canonical state and the literal burst — never against the interpreter's confidence.
+    """
+    NONE = "NONE"
+    #: G1 — an admitted mention whose make AND model were said literally, matching one row.
+    G1_IDENTITY = "G1_IDENTITY"
+    #: G2 — exactly one candidate, strict canonical focus, and nothing excluding it.
+    G2_SINGLETON = "G2_SINGLETON"
+    #: G3 — a typed in-burst reference resolving to one row (superseded mentions included).
+    G3_REFERENCE = "G3_REFERENCE"
+
+    ALL = (NONE, G1_IDENTITY, G2_SINGLETON, G3_REFERENCE)
 
 
 class CandidateSelectionBasis:
@@ -712,7 +742,9 @@ class CandidateSelectionBasis:
 #: The reconciler's rule set, versioned so a decision can be replayed against the rules that
 #: made it. Bump when the SELECTION rules change, never for wording.
 CANDIDATE_RULE_ID = "reconcile.candidate_selection"
-CANDIDATE_RULE_VERSION = "v1"
+#: G3-7F. v2 is the Grounded-Target Invariant: the reconciler establishes the target from
+#: a ground it verifies itself, never from the interpreter's own confidence labels.
+CANDIDATE_RULE_VERSION = "v2"
 
 
 @dataclass(frozen=True)
@@ -756,6 +788,10 @@ class CandidateResolution:
     target_relation: Optional[str] = None
     #: `((field, before, after), ...)` — canonical VALUES only, never customer text.
     corrected_fields: tuple = ()
+    #: G3-7F. WHICH ground established the target — see `CandidateGroundingBasis`.
+    grounding_basis: str = CandidateGroundingBasis.NONE
+    #: G3-7F. Was every corrected value present literally in the canonical burst?
+    literally_grounded: Optional[bool] = None
     #: Did the canonical zone table recognise the corrected locality?
     zone_lookup_hit: Optional[bool] = None
     #: Set by the turn once the re-quote guards have run, so the trace shows the
@@ -786,6 +822,8 @@ class CandidateResolution:
             "mutation_applied": self.mutation_applied,
             "correlation_id": self.correlation_id,
             "selection_basis": self.selection_basis,
+            "grounding_basis": self.grounding_basis,
+            "literally_grounded": self.literally_grounded,
             "correction_evidence_ref": self.correction_evidence_ref,
             "target_relation": self.target_relation,
             "corrected_fields": [

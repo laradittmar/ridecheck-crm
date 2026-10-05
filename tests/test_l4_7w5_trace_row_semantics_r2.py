@@ -808,7 +808,7 @@ class RemainingMatrix(unittest.TestCase):
         known = {v for k, v in vars(ClaimType).items() if not k.startswith("_")}
         self.assertTrue(set(CANONICAL_PROPOSITIONS) <= known,
                         "a proposition nothing can produce is a vocabulary nobody earned")
-        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.6")
+        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.7")
 
 
 if __name__ == "__main__":       # pragma: no cover

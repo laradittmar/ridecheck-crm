@@ -50,6 +50,13 @@ class Settings:
     # unchanged, and `REPLY_RENDERER_DEMOTION_ENABLED=false` still restores the legacy
     # source exactly — the rollback is verified, not assumed. See the G3-7B closeout.
     reply_renderer_demotion_enabled: bool = True
+    # G3-7F — the Grounded-Target Invariant. The reconciler establishes a correction's
+    # target from a ground it verifies itself (literal identity, a validated singleton focus,
+    # or a typed in-burst reference) instead of trusting the interpreter's confidence. G3-7C
+    # and G3-7D measured a model asserting CONFIRMED for a referent the customer excluded,
+    # so a status gate alone is not a safety property. Default OFF: the floor changes which
+    # turns mutate, and that needs certification against a model first.
+    correction_target_grounding_enabled: bool = False
     # L4.7C.4 — scheduling-language interpretation. Default OFF everywhere.
     reconciler_scheduling_authority_enabled: bool = False
     # L4.7C.4A — same-turn semantic evidence. When false the interpretation stays behind the
@@ -157,6 +164,8 @@ def get_settings() -> Settings:
             _getenv("RECONCILER_ACCEPTANCE_AUTHORITY_ENABLED", "false").lower() == "true"),
         reply_renderer_demotion_enabled=(
             _getenv("REPLY_RENDERER_DEMOTION_ENABLED", "true").lower() == "true"),
+        correction_target_grounding_enabled=(
+            _getenv("CORRECTION_TARGET_GROUNDING_ENABLED", "false").lower() == "true"),
         reconciler_scheduling_authority_enabled=(
             _getenv("RECONCILER_SCHEDULING_AUTHORITY_ENABLED", "false").lower() == "true"),
         internal_api_auth_enabled=(

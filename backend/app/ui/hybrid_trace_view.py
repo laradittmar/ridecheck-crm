@@ -755,6 +755,12 @@ UNAVAILABLE_BEFORE_1_5 = "no disponible en este contrato"
 #: with their suppressions) and what is NOT (claims inside the opaque primary, and the
 #: validator's own edits). It must not be broadened into "the plan implements nothing", which
 #: would be just as untrue in the other direction.
+#: Trace contracts whose payload carries `candidate_resolution`. Grows with the contract.
+CONTRACTS_WITH_CANDIDATE_SECTION = frozenset({
+    "hybrid-decision-trace/1.6",
+    "hybrid-decision-trace/1.7",
+})
+
 CANDIDATE_SCOPE_NOTE = (
     "La decisión la toma el reconciliador y la escribe `_apply_candidate`: el modelo de "
     "respuesta no elige candidato ni localidad. «Mutación aplicada» es lo que informó el "
@@ -801,7 +807,11 @@ def _candidate_resolution_card(trace: dict) -> str:
     """
     res = trace.get("candidate_resolution")
     if not isinstance(res, dict):
-        if str(trace.get("trace_version") or "") in ("hybrid-decision-trace/1.6",):
+        # The section exists from 1.6 onward. On those contracts an absent decision is a
+        # FACT worth stating ("this turn decided nothing"); on older rows the section never
+        # existed, so saying anything would invent a silence that was never recorded.
+        # G3-7B pinned one literal version here, which inverted the moment 1.7 shipped.
+        if str(trace.get("trace_version") or "") in CONTRACTS_WITH_CANDIDATE_SECTION:
             return ('<div class="card"><h2>Candidato — decisión</h2>'
                     f'<p class="note">{_e("sin decisión de candidato en este turno")}</p>'
                     "</div>")
@@ -823,7 +833,18 @@ def _candidate_resolution_card(trace: dict) -> str:
         "FOCUS_NOT_UNIQUE": "más de un candidato marcado como foco",
         "FOCUS_INCONSISTENT": "el puntero y el estado del candidato no coinciden",
         "FOCUS_NOT_ESTABLISHED": "todavía no hay un vehículo establecido",
+        "TARGET_NOT_GROUNDED": "ningún fundamento verificable identificó el vehículo",
+        "EXCLUDED_REFERENT": "la evidencia excluye el vehículo que el foco habría elegido",
+        "IMPLICIT_FOCUS_UNCONFIRMED": "sólo había foco implícito y la evidencia no es CONFIRMED",
+        "CREATE_UNCONFIRMED": "crear exige marca y modelo dichos textualmente",
+        "CATEGORY_NOT_ESTABLISHED": "la categoría no está establecida: pasa a revisión humana",
         "EVIDENCE_UNAVAILABLE": "sin evidencia utilizable",
+    }
+    _GROUND = {
+        "G1_IDENTITY": "el cliente nombró marca y modelo, textualmente, y coinciden con una fila",
+        "G2_SINGLETON": "un único candidato, con foco canónico válido y nada que lo excluya",
+        "G3_REFERENCE": "una referencia tipada de este turno resolvió a una sola fila",
+        "NONE": "ningún fundamento verificable",
     }
     action = str(res.get("action") or "")
     hold = res.get("hold_reason")
@@ -835,6 +856,9 @@ def _candidate_resolution_card(trace: dict) -> str:
         ("Por qué", _e(_BASIS.get(str(res.get("selection_basis")),
                                   res.get("selection_basis")))),
         ("Relación semántica", _e(res.get("target_relation"))),
+        ("Fundamento del objetivo", _e(_GROUND.get(str(res.get("grounding_basis")),
+                                                   res.get("grounding_basis")))),
+        ("Valores presentes textualmente", _e(res.get("literally_grounded"))),
         ("Foco anterior → resultante", _e(
             f'{res.get("previous_focus_id")} → {res.get("resulting_focus_id")}'
             if res.get("previous_focus_id") is not None

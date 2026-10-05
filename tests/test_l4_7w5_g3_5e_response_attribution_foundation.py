@@ -478,7 +478,7 @@ class D_ResponsePlan(unittest.TestCase):
 class E_TraceAndInspector(unittest.TestCase):
 
     def test_g35e_33_the_contract_is_current_and_renders_the_new_fields(self):
-        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.6")
+        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.7")
         t = Turn((("w0", Q, 0), ("w1", "¿Hay algo mañana?", 5)), evidence=None).run()
         try:
             from app.services import hybrid_trace as svc

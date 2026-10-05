@@ -59,8 +59,12 @@ MIX = [c for cid, c in CORPUS.items() if cid.startswith("SYN-MIX")]
 # authorized line: `CorrectionEvidence.target_ref` was read while parsing and then dropped,
 # which left the only in-burst correction target inert. The PROMPT version did not move —
 # `test_fixture_11_prompt_version_unchanged` still pins understand/1.19 — because the prompt
-# already specified the meaning the reconciler needed.
-INTERPRETER_SHA256 = "e92d647d5994fa8f6b4355dc1022fedf0ca285552c7f19665a0d51985b589a48"
+# already specified the meaning the reconciler needed. L4.7W5-GATE3-G3-7F moved it a
+# third time, for the `catalog_candidate` runtime type guard: a candidate model
+# returned an object there and pydantic rejected the whole item, discarding every
+# other piece of evidence in the turn (G37DR-03). The prompt version is still pinned
+# at understand/1.19 by test_fixture_11 — Commit 1 changes no prompt.
+INTERPRETER_SHA256 = "af5fdb5486a7acf47a21a509e371e88b6e8559cde5ac6b027ce2a7e324e5fa0b"
 INTERPRETER_PATH = ROOT / "backend" / "app" / "services" / "semantic_interpreter.py"
 
 

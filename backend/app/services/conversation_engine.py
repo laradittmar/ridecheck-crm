@@ -4043,6 +4043,145 @@ class ConversationEngine:
             return False
         return _tipo_compatible(getattr(cand, "tipo_vehiculo", None), tipo)
 
+    def _correction_grounding_on(self) -> bool:
+        """Is the Grounded-Target Invariant armed on this deployment? Default OFF.
+
+        G3-7F. The floor changes which turns are allowed to mutate — a multi-candidate
+        thread stops accepting an unnamed correction — so it waits on certification against
+        a real model. Flag off reproduces `reconcile.candidate_selection v1` exactly.
+        """
+        return getattr(getattr(self, "settings", None),
+                       "correction_target_grounding_enabled", False) is True
+
+    def _burst_haystack(self) -> str:
+        """The canonical burst, folded for literal grounding. Empty when unavailable.
+
+        Deliberately the SAME normalisation the interpreter's own `_said_literally` uses, so
+        "did the customer say this token?" has one answer on both sides of the boundary.
+        """
+        burst = getattr(self, "_canonical_turn_burst", None)
+        texts = list(getattr(burst, "messages", None) or ()) if burst is not None else []
+        if not texts:
+            return ""
+        joined = " ".join(str(t) for t in texts if isinstance(t, str))
+        return _strip_accents(joined).lower()
+
+    @staticmethod
+    def _value_said_literally(value, haystack: str) -> bool:
+        """Did this value appear in the burst? Token presence, never meaning."""
+        if value is None or not haystack:
+            return False
+        from .semantic_interpreter import _said_literally
+        return _said_literally(str(value), haystack)
+
+    def _identity_literally_grounded(self, item, haystack: str) -> bool:
+        """Make AND model both said literally — the threshold the writer itself draws."""
+        make, model = (getattr(item, "make", None), getattr(item, "model", None))
+        if not (make or "").strip() or not (model or "").strip():
+            return False
+        return (self._value_said_literally(make, haystack)
+                and self._value_said_literally(model, haystack))
+
+    def _evidence_excludes_current(self, evidence) -> bool:
+        """Does any admitted correction point AWAY from the referent under discussion?
+
+        Reads the typed scope only. G3-7F ships the reader; Commit 2 ships the field, so
+        until then this is False for every real payload — which is correct: with no way to
+        express exclusion, G2 must not pretend one was absent for a reason.
+        """
+        for corr in (getattr(evidence, "corrections", ()) or ()):
+            if not self._evidence_admitted(corr):
+                continue
+            scope = getattr(getattr(corr, "target_scope", None), "value",
+                            getattr(corr, "target_scope", None))
+            if scope in ("ALTERNATE_REFERENT", "UNRESOLVED_REFERENT"):
+                return True
+        return False
+
+    def _grounded_target(self, ctx, evidence, vehicle, correction):
+        """`(candidate, basis, hold_reason)` — the Grounded-Target Invariant.
+
+        The three grounds are checked against canonical state and the literal burst. The
+        interpreter's `status` and `target_scope` may NARROW a decision; neither is ever the
+        ground. That is what makes a mislabelled `CONFIRMED` unable to pick a row.
+        """
+        from ..schemas.hybrid_trace import (CandidateGroundingBasis as _G,
+                                            CandidateHoldReason as _H)
+        from ..schemas.turn_evidence import EvidenceStatus
+        candidates = list(getattr(ctx, "candidates", None) or ())
+        haystack = self._burst_haystack()
+
+        # ── G1: the customer named the car, literally, and it matches exactly one row ──
+        if vehicle is not None and self._identity_literally_grounded(vehicle, haystack):
+            marca, modelo = self._evidence_identity(vehicle)
+            tipo = getattr(vehicle, "category_suggestion", None)
+            matches = [c for c in candidates
+                       if self._candidate_matches_evidence(c, marca, modelo, tipo)]
+            if len(matches) == 1:
+                return matches[0], _G.G1_IDENTITY, None
+
+        # ── G3: a typed in-burst reference, superseded mentions included ───────────────
+        ref = getattr(correction, "target_ref", None) if correction is not None else None
+        if ref:
+            item = None
+            try:
+                item = evidence.item_at(str(ref))
+            except Exception:
+                item = None
+            # G3-7B shipped this gate as `field != "vehicle"`, which rejected the one case
+            # the reference exists for: the parser renames a superseded mention to
+            # `vehicle_superseded`, so "correct the car I just contrasted away" was refused
+            # and the turn fell through to CREATE. Both names are the same kind of item.
+            if item is None or getattr(item, "field", None) not in ("vehicle",
+                                                                    "vehicle_superseded"):
+                return None, _G.NONE, _H.TARGET_UNRESOLVED
+            marca, modelo = self._evidence_identity(item)
+            tipo = getattr(item, "category_suggestion", None)
+            matches = [c for c in candidates
+                       if self._candidate_matches_evidence(c, marca, modelo, tipo)]
+            if len(matches) == 1:
+                return matches[0], _G.G3_REFERENCE, None
+            if len(matches) > 1:
+                return None, _G.NONE, _H.AMBIGUOUS_MATCH
+            return None, _G.NONE, _H.TARGET_CONFLICT
+
+        # ── G2: implicit focus, and ONLY when a singleton makes it unambiguous ─────────
+        if len(candidates) != 1:
+            return None, _G.NONE, _H.TARGET_NOT_GROUNDED
+        if self._evidence_excludes_current(evidence):
+            return None, _G.NONE, _H.EXCLUDED_REFERENT
+        row, reason = self._correction_focus(ctx)
+        if row is None:
+            return None, _G.NONE, reason
+        status = (getattr(getattr(correction, "status", None), "value",
+                          getattr(correction, "status", None))
+                  if correction is not None else None)
+        if correction is not None and status != EvidenceStatus.CONFIRMED.value:
+            # Implicit focus is the one ground with no independent evidence behind it, so
+            # it is the one place a weaker commitment may not be spent.
+            return None, _G.NONE, _H.IMPLICIT_FOCUS_UNCONFIRMED
+        return row, _G.G2_SINGLETON, None
+
+    def _category_established(self, ctx, data: dict) -> bool:
+        """G3-7F MOTO floor: is this candidate's category actually known?
+
+        A complete identity with no category is not an ordinary car. The deterministic
+        catalogue is the primary authority; a semantic suggestion may contribute; neither
+        absent means AUTO. G37DR-04 measured a `Honda/Titan` proposal creating a candidate
+        and continuing commercially because no category reached the guard.
+        """
+        tipo = (data.get("tipo_vehiculo") or "").strip()
+        if tipo:
+            return True
+        marca = (data.get("marca") or "").strip()
+        modelo = (data.get("modelo") or "").strip()
+        if not marca or not modelo:
+            return True          # not a creation-grade identity; other guards own it
+        try:
+            return self._catalog_tipo_for(marca, modelo) is not None
+        except Exception:
+            return False
+
     def _resolve_candidate(self, ctx, state, evidence) -> "CandidateResolution":
         """Which candidate this turn's admitted evidence affects, and what may change.
 
@@ -4131,6 +4270,84 @@ class ConversationEngine:
             tipo = getattr(item, "category_suggestion", None)
             return [c for c in candidates
                     if self._candidate_matches_evidence(c, marca, modelo, tipo)]
+
+        # ══ G3-7F: the Grounded-Target Invariant ═══════════════════════════════════
+        # Flag off, everything below this block is `reconcile.candidate_selection v1`,
+        # byte for byte. Flag on, a correction's target must be established by a ground
+        # the reconciler verifies itself, and a mutation that cannot be grounded holds.
+        if self._correction_grounding_on():
+            from ..schemas.hybrid_trace import CandidateGroundingBasis as _G
+            haystack = self._burst_haystack()
+
+            def _hold_g(reason, basis=_G.NONE, count=0):
+                return CandidateResolution(
+                    action=CandidateAction.HOLD, hold_reason=reason,
+                    compatible_candidate_count=count, grounding_basis=basis,
+                    literally_grounded=False, **common)
+
+            # A correction — stated, or implied by a corrected value with no new identity.
+            if correction is not None:
+                target, basis, reason = self._grounded_target(
+                    ctx, evidence, vehicle, correction)
+                if target is None:
+                    return _hold_g(reason)
+                fields = self._corrected_attributes(
+                    target, vehicle, correction,
+                    zone_group if zone_hit else None, zone_detail if zone_hit else None)
+                return CandidateResolution(
+                    action=CandidateAction.CORRECT_EXISTING,
+                    target_candidate_id=target.id,
+                    resulting_focus_id=getattr(focus, "id", None),
+                    focus_transition_required=False,
+                    locality_binding_permitted=bool(zone_hit and zone_detail),
+                    zone_group=(zone_group if zone_hit else None),
+                    zone_detail=(zone_detail if zone_hit else None),
+                    compatible_candidate_count=1,
+                    selection_basis=(CandidateSelectionBasis.FOCUS_POINTER
+                                     if basis == _G.G2_SINGLETON
+                                     else CandidateSelectionBasis.EVIDENCE_IDENTITY),
+                    grounding_basis=basis, corrected_fields=fields,
+                    literally_grounded=all(
+                        self._value_said_literally(after, haystack)
+                        for _f, _b, after in fields) if fields else False,
+                    **common)
+
+            # No correction stated. A complete identity may select or create; creation now
+            # additionally requires that the customer said make AND model literally.
+            if vehicle is not None and self._identity_complete(vehicle):
+                compatible = _compatible_for(vehicle)
+                if len(compatible) > 1:
+                    return _hold_g(CandidateHoldReason.AMBIGUOUS_MATCH,
+                                   count=len(compatible))
+                if len(compatible) == 1:
+                    sel = _select(compatible[0], CandidateSelectionBasis.EVIDENCE_IDENTITY)
+                    import dataclasses as _dc
+                    return _dc.replace(sel, grounding_basis=_G.G1_IDENTITY,
+                                       literally_grounded=True)
+                if not self._identity_literally_grounded(vehicle, haystack):
+                    return _hold_g(CandidateHoldReason.CREATE_UNCONFIRMED)
+                return CandidateResolution(
+                    action=CandidateAction.CREATE,
+                    focus_transition_required=focus is not None,
+                    locality_binding_permitted=bool(zone_detail),
+                    zone_group=zone_group, zone_detail=zone_detail,
+                    compatible_candidate_count=0,
+                    selection_basis=CandidateSelectionBasis.EVIDENCE_IDENTITY,
+                    grounding_basis=_G.G1_IDENTITY, literally_grounded=True, **common)
+
+            if vehicle is not None and any(self._evidence_identity(vehicle)):
+                compatible = _compatible_for(vehicle)
+                if len(compatible) > 1:
+                    return _hold_g(CandidateHoldReason.AMBIGUOUS_MATCH,
+                                   count=len(compatible))
+                if len(compatible) == 1:
+                    sel = _select(compatible[0], CandidateSelectionBasis.EVIDENCE_IDENTITY)
+                    import dataclasses as _dc
+                    return _dc.replace(sel, grounding_basis=_G.G1_IDENTITY)
+                return _hold_g(CandidateHoldReason.INCOMPLETE_IDENTITY)
+
+            return CandidateResolution(action=CandidateAction.NONE,
+                                       grounding_basis=_G.NONE, **common)
 
         # ── rungs 1-3: an explicit COMPLETE identity outranks every inference ──────
         if vehicle is not None and self._identity_complete(vehicle):
@@ -6528,6 +6745,19 @@ class ConversationEngine:
             and _cand_data.get("action") in ("create", "update")
         ):
             return self._motorcycle_human_handoff(ctx, state)  # AI path: no source_text
+        # ── G3-7F MOTO/category safety floor ──────────────────────────────────────
+        # A complete identity whose category is established by neither the catalogue nor
+        # confirmed evidence is not an ordinary car. G37DR-04 measured a `Honda/Titan`
+        # proposal creating a candidate and continuing commercially because no category
+        # ever reached the guard above. Absent is not AUTO — it is a human's decision.
+        if (self._correction_grounding_on()
+                and _cand_data.get("action") == "create"
+                and not self._category_established(ctx, _cand_data)):
+            logger.info("G3-7F category floor: unestablished category thread_id=%s "
+                        "marca=%r modelo=%r — routing to human review",
+                        getattr(ctx.thread, "id", None),
+                        _cand_data.get("marca"), _cand_data.get("modelo"))
+            return self._motorcycle_human_handoff(ctx, state)
         # FIX 2 (CL-07): pass zone_protected so AI cannot overwrite LR-3-written zone.
         _outcome = self._apply_candidate(
             ctx, _cand_data, zone_protected=_vehicle_location_written)
