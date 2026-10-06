@@ -444,9 +444,19 @@ class TestBlockedDispatchFallbackFlow(unittest.TestCase):
             "wamid.M20.4.3.TEST.3",
         ))
 
-        # Result must be blocked_dispatch (not "error")
-        self.assertEqual(result.action, "blocked_dispatch")
-        self.assertFalse(result.ok)
+        # MIGRATED (G3-7F sequencing §14.5): the retired two-step sent a free-text
+        # location ask, and THAT is what the kill switch blocked. Clarification is now a
+        # single Flow; with no Flow configured, owner policy 11 hands the turn to a person
+        # rather than asking an open-ended question, and that handoff is itself blocked by
+        # the kill switch. The invariant under test is unchanged and still asserted below:
+        # a blocked turn advances no clarification state.
+        # Result must be a blocked CE decision (not "error")
+        self.assertIn(result.action, ("blocked_dispatch", "human_handoff_blocked"))
+        # `ok` is per-action and unchanged by this milestone: `blocked_dispatch` reports
+        # ok=False, `human_handoff_blocked` reports ok=True. The blocked-ness that matters
+        # here is the ACTION, and that nothing was delivered.
+        if result.action == "blocked_dispatch":
+            self.assertFalse(result.ok)
         # L4.7W1-F4 REALIGNMENT: handled now means "CE owns this event", not
         # "a message was delivered". blocked_dispatch is a CE DECISION (the kill
         # switch), and returning handled=False handed Flow submissions to n8n's

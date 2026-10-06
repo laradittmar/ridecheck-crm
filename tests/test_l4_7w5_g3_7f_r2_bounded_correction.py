@@ -40,6 +40,28 @@ from app.services.response_composition import (LiveResponsePlan,         # noqa:
 
 import _r2_regression_accounting as ra                                   # noqa: E402
 
+# ── G3-7F sequencing migration: the clarification authority moved ─────────────────
+# `_route_clarification` + `_dispatch_clarification_route` have been replaced by ONE
+# memoized decision (`_turn_clarification_decision`) placed after the turn's reconciled
+# proposal exists, and ONE executor (`_execute_clarification`) that reserves a durable
+# attempt before transport. These adapters keep every assertion below pointed at the same
+# behavioural claim: the route and reason this turn chose, and what executing it does.
+def _route(eng, ctx, state, resolution=None, disposition=None, **kw):
+    """`(route, reason)` from the current authority. Resets the per-turn memo first."""
+    eng._turn_clarification_decision_obj = None
+    d = eng._turn_clarification_decision(
+        ctx, state, resolution=resolution, disposition=disposition, **kw)
+    return d.route, d.reason
+
+
+def _dispatch(eng, ctx, state, route, reason):
+    """Execute a route through the single reserving authority."""
+    from app.services.clarification_router import TurnClarificationDecision as _TCD
+    fam = ("VEHICLE" if route == "VEHICLE_FLOW_REQUIRED"
+           else "LOCATION" if route == "LOCATION_FLOW_REQUIRED" else None)
+    return eng._execute_clarification(ctx, state, _TCD(route, reason, family=fam))
+
+
 ENGINE_SRC = pathlib.Path(
     inspect.getsourcefile(E)).read_text(encoding="utf-8")                # noqa: E501
 
@@ -462,7 +484,7 @@ class D_FiniteRecovery(unittest.TestCase):
         """Part D.7, over the whole recovery path."""
         for fn in (pc.proposal_disposition, pc.route_clarification,
                    pc.proposal_is_active, E._withdraw_dependent_proposals,
-                   E._route_clarification):
+                   E._turn_clarification_decision):
             with self.subTest(fn=fn.__name__):
                 src = inspect.getsource(fn)
                 for token in ("utcnow", "datetime.now", "time.time", "timedelta"):
@@ -908,9 +930,9 @@ class I_Invariants(unittest.TestCase):
     def test_r2_70_no_phrase_or_affirmation_detector_entered_the_new_path(self):
         """Requirement 38 / Part C's last clause."""
         for fn in (E._arm_pending_correction, E._withdraw_dependent_proposals,
-                   E._route_clarification, E._correction_category,
+                   E._turn_clarification_decision, E._correction_category,
                    E._register_correction_propositions, E._generic_human_handoff,
-                   E._dispatch_clarification_route, pc.proposal_disposition,
+                   E._execute_clarification, pc.proposal_disposition,
                    pc.route_clarification, pc.confirmation_admissible,
                    pc.confirmation_dispatch_proven):
             with self.subTest(fn=fn.__name__):
@@ -962,7 +984,9 @@ class I_Invariants(unittest.TestCase):
         versions = pathlib.Path(
             pathlib.Path(__file__).resolve().parents[1] / "backend/migrations/versions")
         recent = sorted(p.name for p in versions.glob("2026100*.py"))
-        self.assertEqual(recent, ["20261005_pending_correction.py"],
+        # G3-7F sequencing adds exactly ONE additive migration, by design (§4).
+        self.assertEqual(recent, ["20261005_pending_correction.py",
+                                  "20261006_clarification_attempts.py"],
                          f"an unexpected migration appeared: {recent}")
 
 

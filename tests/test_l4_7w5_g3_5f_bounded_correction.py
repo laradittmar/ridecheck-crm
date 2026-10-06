@@ -502,12 +502,19 @@ class D_InspectorTruth(unittest.TestCase):
 class E_OpeningFixesIntact(unittest.TestCase):
 
     def test_bc_35_the_seven_blocked_transports_are_still_truthful(self):
+        """MIGRATED: four of the seven lived in the retired two-step clarification.
+
+        G3-7F sequencing §14.4/§14.5 removed `_check_fallback_flow_triggers`'s branches,
+        and with them their four blocked exits. The invariant this guards is unchanged —
+        every surviving early kill-switch exit still derives its transport from its own
+        authorized path id — only the inventory is smaller.
+        """
         import re
         sites = re.findall(
             r'if not self\._outbound_armed\(\):\n\s*'
             r'return self\._blocked_outbound\([^,]+,\s*[^,]+,\s*'
             r'OutboundPathId\.(\w+)\.value\)', ENGINE_SRC)
-        self.assertEqual(sorted(sites), ["CE_FLOW"] * 4 + ["CE_TEXT"] * 3)
+        self.assertEqual(sorted(sites), ["CE_FLOW"] * 2 + ["CE_TEXT"] * 1)
         self.assertNotIn("_record_blocked_dispatch(DispatchPath", ENGINE_SRC)
         self.assertEqual(ConversationEngine._transport_for_path_id("CE_TEXT"),
                          DispatchPath.TEXT)
@@ -531,7 +538,7 @@ class E_OpeningFixesIntact(unittest.TestCase):
     def test_bc_38_the_trace_contract_is_unchanged_by_this_correction(self):
         """§3: UI wording alone is not a reason to bump a contract. No payload field was
         added and no field's meaning changed, so 1.5 stands."""
-        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.8")
+        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.9")
         from app.schemas.hybrid_trace import ResponsePlan
         payload = ResponsePlan(plan_id="p", turn_id=None, burst_fingerprint=None,
                                decision_phase_id=None).to_payload()

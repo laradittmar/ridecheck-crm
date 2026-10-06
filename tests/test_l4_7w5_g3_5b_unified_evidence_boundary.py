@@ -116,6 +116,13 @@ class Turn:
         engine.settings.shadow_understand_enabled = bool(arm_interpreter)
         engine.settings.shadow_evidence_path = ""
         engine.settings.semantic_same_turn_enabled = True
+        # G3-7F sequencing: production configures both clarification Flows, and owner
+        # policy 11 says an UNCONFIGURED Flow hands the turn to a person rather than
+        # falling through to an open-ended question. A harness that leaves them unset would
+        # therefore exercise the unavailable-Flow handoff on every unresolved turn, which
+        # is a property of the harness and not of the engine under test.
+        engine.settings.whatsapp_vehicle_fallback_flow_id = "veh-test-flow"
+        engine.settings.whatsapp_location_fallback_flow_id = "loc-test-flow"
         engine._schedule = SimpleNamespace(
             find_next_available=lambda **kw: (self.schedule_calls.append(kw), None)[1])
         original_trace = engine._trace_decision
@@ -708,7 +715,7 @@ class E_FreezeAndVocabulary(unittest.TestCase):
         self.assertIn('or "gpt-4o-mini"', interp)
         self.assertIn('PROMPT_VERSION = "understand/1.20"', interp)
         self.assertEqual(te.SCHEMA_VERSION, "turn-evidence/1.4")
-        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.8")
+        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.9")
 
     def test_g35b_37_no_customer_text_reaches_the_trace_metadata(self):
         t = Turn((("w0", HOURS_Q, 0), ("w1", "¿Hay algo mañana?", 5)), evidence=None).run()

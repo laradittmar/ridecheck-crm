@@ -60,7 +60,11 @@ import unicodedata
 from dataclasses import dataclass, field, asdict
 from typing import Any, Optional
 
-TRACE_VERSION = "hybrid-decision-trace/1.8"
+TRACE_VERSION = "hybrid-decision-trace/1.9"
+#: 1.8 added the clarification block; 1.9 adds the ATTEMPT LIFECYCLE inside it, so a
+#: dispatch turn, a completion turn and a prevented-second turn can be joined by
+#: `attempt_id` into one lifecycle. Additive: no 1.8 field changed meaning.
+TRACE_VERSION_1_8 = "hybrid-decision-trace/1.8"
 #: G3-5E. 1.4 splits `response_plan_source` — which was `answer_source`, and therefore
 #: answered three questions at once — into decision authority, fact sources, renderer source
 #: and dispatch result, and adds the reply-generation role and the shadow response plan. A
@@ -83,8 +87,9 @@ TRACE_VERSION_1_1 = "hybrid-decision-trace/1.1"
 #: The first contract. Its reconciliation rows carry no producer provenance, so a
 #: reader must never treat their absent 1.1 fields as empty 1.1 fields.
 TRACE_VERSION_1_0 = "hybrid-decision-trace/1.0"
-READABLE_VERSIONS = (TRACE_VERSION, TRACE_VERSION_1_4, TRACE_VERSION_1_3,
-                     TRACE_VERSION_1_2, TRACE_VERSION_1_1, TRACE_VERSION_1_0)
+READABLE_VERSIONS = (TRACE_VERSION, TRACE_VERSION_1_8, TRACE_VERSION_1_4,
+                     TRACE_VERSION_1_3, TRACE_VERSION_1_2, TRACE_VERSION_1_1,
+                     TRACE_VERSION_1_0)
 #: Contracts whose `response_plan`, where present, only ever DESCRIBED a turn. A reader must
 #: not take their `shadow` flag, item counts or suppression reasons as decisions.
 VERSIONS_WITH_SHADOW_ONLY_PLAN = (TRACE_VERSION_1_4, TRACE_VERSION_1_3, TRACE_VERSION_1_2,

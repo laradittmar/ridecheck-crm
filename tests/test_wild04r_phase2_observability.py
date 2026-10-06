@@ -320,7 +320,11 @@ def _make_engine(db: Session) -> ConversationEngine:
         def find_base_price(self, tipo):
             return BasePriceRow(tipo_vehiculo=tipo, precio_base=130_000)
 
-        def find_zone_by_group_and_detail(self, db, zg, zd):
+        def find_zone_by_group_and_detail(self, db, zone_group=None, zone_detail=None):
+            # The real repository names these `zone_group` / `zone_detail` and callers pass
+            # them by keyword. The stub used `zg` / `zd`, so a keyword call raised TypeError
+            # and masked whatever this test was actually measuring.
+            zg, zd = zone_group, zone_detail
             return None
 
     eng = ConversationEngine.__new__(ConversationEngine)

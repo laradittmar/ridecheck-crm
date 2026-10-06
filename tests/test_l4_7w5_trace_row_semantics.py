@@ -702,9 +702,11 @@ class NothingElseMoved(unittest.TestCase):
         performs no UPDATE, no ALTER and no backfill of its own."""
         migrations = sorted(p.name for p in
                             (ROOT / "backend" / "migrations" / "versions").glob("*.py"))
-        self.assertEqual(len(migrations), 46)
-        self.assertNotIn("20261005_pending_correction.py", migrations[:-1],
-                         "the newest migration is the only one added since")
+        # +1: the single additive clarification-attempt migration (G3-7F sequencing).
+        self.assertEqual(len(migrations), 47)
+        # G3-7F sequencing added one more, so pending_correction is no longer last.
+        self.assertEqual(migrations[-1], "20261006_clarification_attempts.py",
+                         "the clarification attempt table is the newest migration")
         source = (ROOT / "backend" / "app" / "services"
                   / "hybrid_trace.py").read_text(encoding="utf-8-sig")
         for forbidden in ("UPDATE hybrid_decision_traces", "update(HybridDecisionTraceRow",
@@ -801,7 +803,7 @@ class FuzzyAdmissibilityRepair(unittest.TestCase):
                              "a raising observer is caught, and acceptance is never assumed")
 
     def test_row_33b_the_contract_version_is_current(self):
-        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.8")
+        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.9")
 
 
 if __name__ == "__main__":       # pragma: no cover

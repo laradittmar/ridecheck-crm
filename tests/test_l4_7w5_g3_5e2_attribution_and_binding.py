@@ -450,12 +450,15 @@ class D_KillSwitchDispatch(unittest.TestCase):
             r'if not self\._outbound_armed\(\):\n\s*'
             r'return self\._blocked_outbound\([^,]+,\s*[^,]+,\s*'
             r'OutboundPathId\.(\w+)\.value\)', src)
-        self.assertEqual(len(exits), 7,
+        # MIGRATED (G3-7F sequencing §14.5): four of the seven early exits lived in
+        # the retired two-step clarification and no longer exist. The invariant is
+        # unchanged — each surviving exit names its authorized path and derives its
+        # transport from it — only the inventory is smaller.
+        self.assertEqual(len(exits), 3,
                          "an early kill-switch exit does not use the one blocked exit")
         # The three text exits the G3-5E2 review found mislabelled as Meta Flows.
         self.assertEqual(sorted(exits),
-                         ["CE_FLOW", "CE_FLOW", "CE_FLOW", "CE_FLOW",
-                          "CE_TEXT", "CE_TEXT", "CE_TEXT"],
+                         ["CE_FLOW", "CE_FLOW", "CE_TEXT"],
                          f"the blocked paths are not the ones the sites dispatch: {exits}")
         for path in set(exits):
             with self.subTest(path=path):
@@ -588,7 +591,7 @@ class E_TraceAndPlan(unittest.TestCase):
         """
         from app.schemas.hybrid_trace import (READABLE_VERSIONS, TRACE_VERSION_1_4,
                                               VERSIONS_WITH_SHADOW_ONLY_PLAN)
-        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.8")
+        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.9")
         self.assertIn(TRACE_VERSION_1_4, READABLE_VERSIONS)
         self.assertIn(TRACE_VERSION_1_4, VERSIONS_WITH_SHADOW_ONLY_PLAN)
         self.assertNotIn(TRACE_VERSION, VERSIONS_WITH_SHADOW_ONLY_PLAN)

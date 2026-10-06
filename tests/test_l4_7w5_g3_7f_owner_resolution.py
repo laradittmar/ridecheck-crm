@@ -34,6 +34,50 @@ from app.services.response_composition import (LiveResponsePlan,           # noq
                                                PropositionId)
 import _r2_regression_accounting as ra                                     # noqa: E402
 
+# ── G3-7F sequencing migration: the clarification authority moved ─────────────────
+# `_route_clarification` + `_dispatch_clarification_route` have been replaced by ONE
+# memoized decision (`_turn_clarification_decision`) placed after the turn's reconciled
+# proposal exists, and ONE executor (`_execute_clarification`) that reserves a durable
+# attempt before transport. These adapters keep every assertion below pointed at the same
+# behavioural claim: the route and reason this turn chose, and what executing it does.
+def _route(eng, ctx, state, resolution=None, disposition=None, **kw):
+    """`(route, reason)` from the current authority. Resets the per-turn memo first.
+
+    Current-turn relevance is stated explicitly. The retired router proved the domain from
+    STORED state (`vehicle_domain_proven=focus is not None`); the replacement requires the
+    turn itself to be about the family, because owner policy 2.8 forbids an old half-filled
+    candidate turning a payment question into a vehicle form. Every scenario in this file
+    describes a turn that IS about the vehicle and its locality, so that is what is passed.
+    """
+    import types as _t
+    eng._turn_clarification_decision_obj = None
+    kw.setdefault("ce_vehicle", _t.SimpleNamespace(marca="", modelo="", tipo_vehiculo=""))
+    kw.setdefault("ce_location", True)
+    d = eng._turn_clarification_decision(
+        ctx, state, resolution=resolution, disposition=disposition, **kw)
+    return d.route, d.reason
+
+
+def _spend(eng, *families):
+    """Mark a family's one attempt as already made — the ATTEMPT, not the flag.
+
+    The retired design kept "already asked" in `*_fallback_flow_sent`, which completion,
+    handoff and the withdrawal loop could all clear. Availability now lives in
+    `whatsapp_clarification_attempts`, so a test that means "this family has had its turn"
+    says so against the store.
+    """
+    from _clarification_store_double import install
+    return install(eng, spent=list(families))
+
+
+def _dispatch(eng, ctx, state, route, reason):
+    """Execute a route through the single reserving authority."""
+    from app.services.clarification_router import TurnClarificationDecision as _TCD
+    fam = ("VEHICLE" if route == "VEHICLE_FLOW_REQUIRED"
+           else "LOCATION" if route == "LOCATION_FLOW_REQUIRED" else None)
+    return eng._execute_clarification(ctx, state, _TCD(route, reason, family=fam))
+
+
 ENGINE_SRC = pathlib.Path(inspect.getsourcefile(E)).read_text(encoding="utf-8")
 PLAN_SRC = pathlib.Path(
     inspect.getsourcefile(LiveResponsePlan)).read_text(encoding="utf-8")
@@ -186,6 +230,12 @@ def engine(*, grounding=True, provisional=True, rows=None, catalog=None, flow_id
     SENT.clear()
     FLOWS.clear()
     ALERTS.clear()
+    # G3-7F sequencing (§6): an EXPLICIT attempt store, never a mock that happens to
+    # answer. Clarification now depends on durable attempt history, and a harness that let
+    # a MagicMock stand in for it would exercise the fail-closed unavailable path on every
+    # unresolved turn — a property of the harness, not of the engine under test.
+    from _clarification_store_double import install as _install_store
+    _install_store(e)
     return e, rows
 
 
@@ -303,7 +353,7 @@ class B_VehicleFlow(unittest.TestCase):
     def test_or_09_the_intro_is_a_module_constant_not_reconciler_prose(self):
         """Part E: no customer-facing Flow prose in the reconciler, and G3-5F's own
         invariant keeps it out of the response plan too."""
-        for fn in (E._route_clarification, E._dispatch_clarification_route,
+        for fn in (E._turn_clarification_decision, E._execute_clarification,
                    E._arm_pending_correction):
             with self.subTest(fn=fn.__name__):
                 src = inspect.getsource(fn)
@@ -325,12 +375,17 @@ class B_VehicleFlow(unittest.TestCase):
         e, rows = engine(rows=[row(marca="", modelo="")])
         st = state()
         ctx = ctx_for(rows, st)
+        # MIGRATED (G3-7F sequencing): availability lives in the ATTEMPT row now, not
+        # in `*_fallback_flow_sent`. The flag means only "a proposal is outstanding"
+        # and clearing it can never make the attempt available again.
+        _spend(e, "VEHICLE")
         e._dispatch_vehicle_clarification_flow(ctx, st)
         self.assertTrue(st.vehicle_fallback_flow_sent)
-        route, why = e._route_clarification(ctx, st)
+        st.vehicle_fallback_flow_sent = False      # the flag may be cleared freely
+        route, why = _route(e, ctx, st)
         self.assertEqual((route, why),
                          (Route.GENERIC_HUMAN_REQUIRED,
-                          Why.VEHICLE_FLOW_ALREADY_ATTEMPTED))
+                          "VEHICLE_ATTEMPT_SPENT"))
 
     def test_or_12_a_process_restart_does_not_resend_it(self):
         """Requirement 10: the flag is persisted, not in-memory."""
@@ -338,19 +393,27 @@ class B_VehicleFlow(unittest.TestCase):
         self.assertIn("vehicle_fallback_flow_sent", WhatsAppThreadState.__table__.c)
         self.assertIn("location_fallback_flow_sent", WhatsAppThreadState.__table__.c)
         e2, rows2 = engine(rows=[row(marca="", modelo="")])
-        st = state(vehicle_fallback_flow_sent=True)      # as loaded after a restart
-        self.assertEqual(e2._route_clarification(ctx_for(rows2, st), st)[0],
+        # MIGRATED (G3-7F sequencing): availability lives in the ATTEMPT row now, not
+        # in `*_fallback_flow_sent`. The flag means only "a proposal is outstanding"
+        # and clearing it can never make the attempt available again.
+        _spend(e2, "VEHICLE")
+        st = state(vehicle_fallback_flow_sent=False)      # as loaded after a restart
+        self.assertEqual(_route(e2, ctx_for(rows2, st), st)[0],
                          Route.GENERIC_HUMAN_REQUIRED)
 
     def test_or_13_the_next_unresolved_turn_routes_to_a_human(self):
         """Requirement 11 / owner policy 10."""
         e, rows = engine(rows=[row(marca="", modelo="")])
-        st = state(vehicle_fallback_flow_sent=True)
+        # MIGRATED (G3-7F sequencing): availability lives in the ATTEMPT row now, not
+        # in `*_fallback_flow_sent`. The flag means only "a proposal is outstanding"
+        # and clearing it can never make the attempt available again.
+        _spend(e, "VEHICLE")
+        st = state(vehicle_fallback_flow_sent=False)
         ctx = ctx_for(rows, st)
-        route, why = e._route_clarification(ctx, st)
-        out = e._dispatch_clarification_route(ctx, st, route, why)
+        route, why = _route(e, ctx, st)
+        out = _dispatch(e, ctx, st, route, why)
         self.assertTrue(st.needs_human)
-        self.assertEqual(e._turn_handoff_reason, Why.VEHICLE_FLOW_ALREADY_ATTEMPTED)
+        self.assertEqual(e._turn_handoff_reason, "VEHICLE_ATTEMPT_SPENT")
         self.assertEqual(len(FLOWS), 0, "no second Flow")
         self.assertIsNotNone(out)
 
@@ -415,14 +478,22 @@ class C_LocationFlow(unittest.TestCase):
 
     def test_or_20_the_next_unresolved_turn_routes_to_a_human(self):
         """Requirement 21."""
-        e, rows = engine()
+        # The focused candidate carries no zone either — the default fixture has Palermo,
+        # which would make the location RESOLVED and the question moot.
+        e, rows = engine(rows=[row(zone_group=None, zone_detail=None)])
+        # MIGRATED (G3-7F sequencing): the LOCATION attempt is spent — recorded durably —
+        # and the outstanding flag is cleared, proving that clearing it cannot make the
+        # family available again. The vehicle must be resolved or it would outrank location.
+        _spend(e, "LOCATION")
         st = state(home_zone_group=None, home_zone_detail=None,
-                   location_fallback_flow_sent=True)
+                   location_fallback_flow_sent=False)
         ctx = ctx_for(rows, st)
-        route, why = e._route_clarification(ctx, st)
+        route, why = _route(e, ctx, st,
+                            ce_vehicle=SimpleNamespace(marca="Ford", modelo="Ka",
+                                                       tipo_vehiculo="AUTO"))
         self.assertEqual((route, why), (Route.GENERIC_HUMAN_REQUIRED,
-                                        Why.LOCATION_FLOW_ALREADY_ATTEMPTED))
-        e._dispatch_clarification_route(ctx, st, route, why)
+                                        "LOCATION_ATTEMPT_SPENT"))
+        _dispatch(e, ctx, st, route, why)
         self.assertEqual(len(FLOWS), 0)
         self.assertTrue(st.needs_human)
 
@@ -436,7 +507,7 @@ class C_LocationFlow(unittest.TestCase):
         failed when canonical coverage already resolves a safe CABA/GBA location."""
         e, rows = engine()
         st = state(home_zone_group="CABA", home_zone_detail="Palermo")
-        self.assertEqual(e._route_clarification(ctx_for(rows, st), st)[0],
+        self.assertEqual(_route(e, ctx_for(rows, st), st)[0],
                          Route.NO_CLARIFICATION_REQUIRED)
 
     def test_or_23_an_unavailable_location_flow_fails_safely(self):
@@ -444,7 +515,7 @@ class C_LocationFlow(unittest.TestCase):
         e, rows = engine(flow_ids=False)
         st = state(home_zone_group=None, home_zone_detail=None)
         ctx = ctx_for(rows, st)
-        out = e._dispatch_clarification_route(
+        out = _dispatch(e, 
             ctx, st, Route.LOCATION_FLOW_REQUIRED, Why.LOCATION_UNRESOLVED)
         self.assertEqual(len(FLOWS), 0)
         self.assertTrue(st.needs_human)
@@ -489,14 +560,14 @@ class D_Ordering(unittest.TestCase):
         """Requirement 28, structurally: one route is returned, and the executor dispatches
         exactly the one it names."""
         self.assertEqual(len(Route.ALL), 5)
-        src = inspect.getsource(E._dispatch_clarification_route)
+        src = inspect.getsource(E._execute_clarification)
         self.assertEqual(src.count("_dispatch_vehicle_clarification_flow"), 1)
         self.assertEqual(src.count("_dispatch_location_clarification_flow"), 1)
         e, rows = engine(rows=[row(marca="", modelo="")])
         st = state(home_zone_group=None, home_zone_detail=None)
         ctx = ctx_for(rows, st)
-        route, why = e._route_clarification(ctx, st)
-        e._dispatch_clarification_route(ctx, st, route, why)
+        route, why = _route(e, ctx, st)
+        _dispatch(e, ctx, st, route, why)
         self.assertEqual(len(FLOWS), 1, "one Flow in a both-unresolved turn")
         self.assertEqual(FLOWS[0]["screen"], "VEHICLE_DETAILS")
 
@@ -517,7 +588,7 @@ class D_Ordering(unittest.TestCase):
             (Route.NO_CLARIFICATION_REQUIRED, Why.HUMAN_OWNS_TURN))
         e, rows = engine(rows=[row(marca="", modelo="")])
         st = state(needs_human=True)
-        self.assertEqual(e._route_clarification(ctx_for(rows, st), st)[0],
+        self.assertEqual(_route(e, ctx_for(rows, st), st)[0],
                          Route.NO_CLARIFICATION_REQUIRED)
 
 
@@ -664,10 +735,10 @@ class F_NoFalseMoto(unittest.TestCase):
         e, rows = engine()
         st = state(flow_booking_token="tok-abandoned", vehicle_fallback_flow_sent=True)
         ctx = ctx_for(rows, st)
-        route, why = e._route_clarification(
+        route, why = _route(e, 
             ctx, st, resolution([("anio", 2019, 2018)]),
             {"conflicting": ("flow_booking_token",)})
-        e._dispatch_clarification_route(ctx, st, route, why)
+        _dispatch(e, ctx, st, route, why)
         self.assertTrue(st.needs_human)
         self.assertNotIn("moto", (SENT[-1] if SENT else "").lower())
         self.assertEqual(e.created, [])
@@ -857,7 +928,8 @@ class H_State(unittest.TestCase):
         """Part F: the canonical persisted Flow state already exists."""
         versions = pathlib.Path(__file__).resolve().parents[1] / "backend/migrations/versions"
         self.assertEqual(sorted(p.name for p in versions.glob("2026100*.py")),
-                         ["20261005_pending_correction.py"])
+                         ["20261005_pending_correction.py",
+                          "20261006_clarification_attempts.py"])
 
 
 # ══ I — observability (requirements 57-63) ════════════════════════════════════════
@@ -869,8 +941,8 @@ class I_Observability(unittest.TestCase):
         e, rows = engine(rows=[row(marca="", modelo="")])
         st = state()
         ctx = ctx_for(rows, st)
-        route, why = e._route_clarification(ctx, st)
-        e._dispatch_clarification_route(ctx, st, route, why)
+        route, why = _route(e, ctx, st)
+        _dispatch(e, ctx, st, route, why)
         self.assertEqual(e._turn_clarification_route, Route.VEHICLE_FLOW_REQUIRED)
         self.assertEqual(e._turn_clarification_reason, Why.VEHICLE_IDENTITY_UNRESOLVED)
         self.assertEqual(e._turn_clarification_flow, "VEHICLE")
@@ -880,18 +952,22 @@ class I_Observability(unittest.TestCase):
         """Requirement 57: the no-Flow case is observable, not merely silent."""
         e, rows = engine()
         st = state()
-        route, why = e._route_clarification(ctx_for(rows, st), st)
+        route, why = _route(e, ctx_for(rows, st), st)
         self.assertEqual(route, Route.NO_CLARIFICATION_REQUIRED)
         self.assertIn(why, Why.ALL)
 
     def test_or_59_the_unresolved_after_flow_handoff_is_recorded(self):
         """Requirement 60."""
         e, rows = engine(rows=[row(marca="", modelo="")])
-        st = state(vehicle_fallback_flow_sent=True)
+        # MIGRATED (G3-7F sequencing): availability lives in the ATTEMPT row now, not
+        # in `*_fallback_flow_sent`. The flag means only "a proposal is outstanding"
+        # and clearing it can never make the attempt available again.
+        _spend(e, "VEHICLE")
+        st = state(vehicle_fallback_flow_sent=False)
         ctx = ctx_for(rows, st)
-        route, why = e._route_clarification(ctx, st)
-        e._dispatch_clarification_route(ctx, st, route, why)
-        self.assertEqual(e._turn_handoff_reason, Why.VEHICLE_FLOW_ALREADY_ATTEMPTED)
+        route, why = _route(e, ctx, st)
+        _dispatch(e, ctx, st, route, why)
+        self.assertEqual(e._turn_handoff_reason, "VEHICLE_ATTEMPT_SPENT")
         self.assertTrue(e._turn_generic_handoff)
 
     def test_or_60_no_reason_code_can_label_a_car_a_motorcycle(self):
@@ -923,7 +999,7 @@ class I_Observability(unittest.TestCase):
         """Part H: the record exists on every turn, including the ones that asked nothing."""
         e, rows = engine()
         st = state()
-        e._route_clarification(ctx_for(rows, st), st)
+        _route(e, ctx_for(rows, st), st)
         rec = e._clarification_for_trace()
         for key in ("route", "reason", "flow_dispatched", "explanatory_planned",
                     "generic_handoff", "handoff_reason", "confirmation_bound",
@@ -937,7 +1013,7 @@ class I_Observability(unittest.TestCase):
 
     def test_or_62c_the_trace_contract_was_bumped(self):
         from app.schemas.hybrid_trace import TRACE_VERSION
-        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.8")
+        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.9")
 
     def test_or_62d_the_inspector_renders_the_clarification_card(self):
         """Requirements 58-61 at the rendering boundary."""
@@ -946,10 +1022,14 @@ class I_Observability(unittest.TestCase):
         from app.schemas.hybrid_trace import TRACE_VERSION
         self.assertIn(TRACE_VERSION, CONTRACTS_WITH_CANDIDATE_SECTION)
         e, rows = engine(rows=[row(marca="", modelo="")])
-        st = state(vehicle_fallback_flow_sent=True)
+        # MIGRATED (G3-7F sequencing): availability lives in the ATTEMPT row now, not
+        # in `*_fallback_flow_sent`. The flag means only "a proposal is outstanding"
+        # and clearing it can never make the attempt available again.
+        _spend(e, "VEHICLE")
+        st = state(vehicle_fallback_flow_sent=False)
         ctx = ctx_for(rows, st)
-        route, why = e._route_clarification(ctx, st)
-        e._dispatch_clarification_route(ctx, st, route, why)
+        route, why = _route(e, ctx, st)
+        _dispatch(e, ctx, st, route, why)
         html_out = _clarification_card({"trace_version": TRACE_VERSION,
                                         "clarification": e._clarification_for_trace()})
         self.assertIn("Aclaración y derivación", html_out)
@@ -985,8 +1065,8 @@ class I_Observability(unittest.TestCase):
         e, rows = engine(rows=[row(marca="", modelo="")])
         st = state()
         ctx = ctx_for(rows, st)
-        route, why = e._route_clarification(ctx, st)
-        e._dispatch_clarification_route(ctx, st, route, why)
+        route, why = _route(e, ctx, st)
+        _dispatch(e, ctx, st, route, why)
         observable = (e._turn_clarification_route, e._turn_clarification_reason,
                       e._turn_clarification_flow, e._turn_handoff_reason)
         for value in observable:
@@ -1061,8 +1141,8 @@ class J_AccountingAndArchitecture(unittest.TestCase):
              and n.name.startswith("_apply_candidate")],
             ["_apply_candidate"])
         # the new paths write no candidate at all
-        for fn in (E._generic_human_handoff, E._route_clarification,
-                   E._dispatch_clarification_route,
+        for fn in (E._generic_human_handoff, E._turn_clarification_decision,
+                   E._execute_clarification,
                    E._dispatch_vehicle_clarification_flow,
                    E._dispatch_location_clarification_flow):
             with self.subTest(fn=fn.__name__):
@@ -1072,8 +1152,8 @@ class J_AccountingAndArchitecture(unittest.TestCase):
 
     def test_or_69_no_phrase_catalogue_was_added(self):
         """Requirement 69."""
-        for fn in (pc.route_clarification, E._route_clarification,
-                   E._dispatch_clarification_route, E._generic_human_handoff):
+        for fn in (pc.route_clarification, E._turn_clarification_decision,
+                   E._execute_clarification, E._generic_human_handoff):
             with self.subTest(fn=fn.__name__):
                 src = inspect.getsource(fn)
                 for token in ("re.search", "re.match", "re.compile",
@@ -1113,7 +1193,7 @@ class J_AccountingAndArchitecture(unittest.TestCase):
     def test_or_73_no_booking_revision_is_modified(self):
         """Requirement 73 / Part J: R2R-07 is deferred, not touched."""
         for fn in (E._generic_human_handoff, E._withdraw_dependent_proposals,
-                   E._route_clarification, E._dispatch_clarification_route):
+                   E._turn_clarification_decision, E._execute_clarification):
             with self.subTest(fn=fn.__name__):
                 src = inspect.getsource(fn)
                 self.assertNotIn("ThreadRevision", src)
@@ -1165,7 +1245,7 @@ class K_HostileControls(unittest.TestCase):
             location_domain_proven=True, location_resolved=False)
         self.assertEqual(route, Route.VEHICLE_FLOW_REQUIRED)
         self.assertNotIn("and self._dispatch_location", 
-                         inspect.getsource(E._dispatch_clarification_route))
+                         inspect.getsource(E._execute_clarification))
 
     def test_or_79_mutation_resend_a_flow_after_its_sent_flag(self):
         for field, reason in (("vehicle_flow_attempted",

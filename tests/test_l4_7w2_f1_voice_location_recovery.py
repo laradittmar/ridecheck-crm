@@ -203,7 +203,13 @@ class TestStaticGovernance(unittest.TestCase):
 class TestConversationPath(unittest.TestCase):
     """The confirmation lifecycle, read from the engine's own source and state rules."""
 
-    def engine(self, pending=None, cycle="c1"):
+    def engine(self, pending=None, cycle=1):
+        """MIGRATED (G3-7F sequencing §5): the cycle identity is the INTEGER
+        `current_cycle_start_message_db_id`. `_reconciler_cycle_id` no longer falls back to
+        `current_cycle_started_at`, so a string cycle id would silently read as cycle 0 and
+        every cycle would compare equal — which is exactly the dual-identity defect the
+        milestone closed.
+        """
         from app.services.conversation_engine import ConversationEngine
         eng = ConversationEngine.__new__(ConversationEngine)
         eng.db = MagicMock()
@@ -217,9 +223,9 @@ class TestConversationPath(unittest.TestCase):
 
     def test_voiceloc_08_confirmation_is_scoped_to_the_cycle(self):
         """VOICELOC-08/15 — a proposal only exists inside the cycle that armed it."""
-        eng, state = self.engine(pending="Sur||Berazategui||c1", cycle="c1")
+        eng, state = self.engine(pending="Sur||Berazategui||1", cycle=1)
         self.assertEqual(eng._pending_location_proposal(state), ("Sur", "Berazategui"))
-        eng2, stale = self.engine(pending="Sur||Berazategui||c1", cycle="c2")
+        eng2, stale = self.engine(pending="Sur||Berazategui||1", cycle=2)
         self.assertIsNone(eng2._pending_location_proposal(stale),
                           "a prior-cycle proposal cannot be confirmed")
 
@@ -281,8 +287,11 @@ class TestConversationPath(unittest.TestCase):
     def test_voiceloc_18_pricing_still_requires_a_canonical_location(self):
         """VOICELOC-18 — a proposal is not a location, so it cannot price."""
         # Read the raw source, not the unparsed tree: ast.unparse discards comments.
+        # MIGRATED (G3-7F sequencing §14.1): "Priority 2" no longer exists — the gate's
+        # clarification priorities were retired — so the recovery block now ends where the
+        # surviving non-clarification priority begins.
         start = CE_SOURCE.index("L4.7W2-F1: bounded locality recovery")
-        recovery = CE_SOURCE[start:CE_SOURCE.index("Priority 2", start)]
+        recovery = CE_SOURCE[start:CE_SOURCE.index("Priority 3", start)]
         self.assertNotIn("_compute_price_quote", recovery,
                          "recovery must not price on a proposal")
         self.assertNotIn("_apply_inspection_zone", recovery)

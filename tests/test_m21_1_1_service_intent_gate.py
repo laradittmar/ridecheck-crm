@@ -151,6 +151,15 @@ def _make_event(text=None, unanswered=None, recent=None) -> ConversationHandleIn
     )
 
 
+# G3-7F sequencing: "this turn needs no clarification", for harnesses that deliberately
+# silence clarification routing in order to test something else.
+from app.services.clarification_router import (            # noqa: E402
+    ClarificationReason as _CReason, ClarificationRoute as _CRoute,
+    TurnClarificationDecision as _CDecision)
+_NO_CLARIFICATION_DECISION = _CDecision(
+    _CRoute.NO_CLARIFICATION_REQUIRED, _CReason.RESOLVED)
+
+
 def _make_engine(send_raises=False, ai_response=None) -> ConversationEngine:
     """Build CE with all external calls mocked."""
     eng = ConversationEngine.__new__(ConversationEngine)
@@ -180,6 +189,12 @@ def _make_engine(send_raises=False, ai_response=None) -> ConversationEngine:
     eng._extract_zone_from_text = MagicMock(return_value=None)
     eng._normalize_zone_from_db = MagicMock()
     eng._routing_gate = MagicMock(return_value=(None, True))
+    # G3-7F sequencing migration. This harness has always stubbed out clarification routing
+    # so it can test one thing in isolation; the clarification authority moved from
+    # `_routing_gate` to `_turn_clarification_decision`, so the stub follows it. The
+    # assertion under test is unchanged — only the name of the authority being silenced is.
+    eng._turn_clarification_decision = MagicMock(
+        return_value=_NO_CLARIFICATION_DECISION)
     eng._check_fallback_flow_triggers = MagicMock(return_value=None)
     eng._apply_extracted = MagicMock()
     eng._focus_candidate = MagicMock(return_value=None)

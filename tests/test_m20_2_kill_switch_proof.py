@@ -480,11 +480,21 @@ class TestRC47StateFlagsNotFalselyAdvanced(unittest.TestCase):
             thread.id, "Hola, cuánto sale?", "wamid.rc47.b"
         ))
 
-        self.assertEqual(result.action, "blocked_dispatch")
+        # MIGRATED (G3-7F sequencing §14.5): the retired two-step sent a free-text
+        # location ask, and THAT is what the kill switch blocked. Clarification is now a
+        # single Flow; with no Flow configured, owner policy 11 hands the turn to a person
+        # rather than asking an open-ended question, and that handoff is itself blocked by
+        # the kill switch. The invariant under test is unchanged and still asserted below:
+        # a blocked turn advances no clarification state.
+        self.assertIn(result.action, ("blocked_dispatch", "human_handoff_blocked"),
+                      "a blocked turn is still a CE decision, not an abdication")
+        self.assertTrue(result.handled, "CE owns the event even when nothing is sent")
         self.db.expire_all()
         fresh_state = self.db.execute(
             select(WhatsAppThreadState).where(WhatsAppThreadState.thread_id == thread.id)
         ).scalar_one()
+        self.assertFalse(fresh_state.location_fallback_flow_sent,
+                         "a blocked dispatch never marks the Flow outstanding")
         self.assertFalse(
             fresh_state.location_clarification_sent,
             "location_clarification_sent must not be True — "

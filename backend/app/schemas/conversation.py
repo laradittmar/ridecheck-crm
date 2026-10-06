@@ -54,6 +54,15 @@ HANDLED_ACTIONS = frozenset({
     # authority. A truthful action that fell outside this set would fix an alert and open
     # a far worse hole.
     ACTION_NO_REPLY_PRODUCED,
+    # G3-7F SEQUENCING: two more CE DECISIONS that produce no outbound message.
+    # `skipped_clarification_outstanding` — the customer is already holding the Flow we
+    # sent, so saying anything further would give one answer two referents.
+    # `skipped_duplicate_completion` — a replayed Flow submission; the attempt is already
+    # complete and a second mutation would be wrong.
+    # Both are deliberate silence, and silence is ownership. Left unhandled they would hand
+    # the turn to n8n's legacy booking chain, which is the hole `blocked_dispatch` closed.
+    "skipped_clarification_outstanding",
+    "skipped_duplicate_completion",
 })
 # NOT included, deliberately: "no_lead". M21.2.8 certified it as genuine non-ownership
 # (the thread has no lead, so CE could not act), the text-path false branch is empty, and

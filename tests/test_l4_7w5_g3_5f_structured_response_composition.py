@@ -97,7 +97,11 @@ class A_OpeningCorrections(unittest.TestCase):
             r'if not self\._outbound_armed\(\):\n\s*'
             r'return self\._blocked_outbound\([^,]+,\s*[^,]+,\s*'
             r'OutboundPathId\.(\w+)\.value\)', ENGINE_SRC)
-        self.assertEqual(len(sites), 7)
+        # MIGRATED (G3-7F sequencing §14.5): four of the seven early exits lived in
+        # the retired two-step clarification and no longer exist. The invariant is
+        # unchanged — each surviving exit names its authorized path and derives its
+        # transport from it — only the inventory is smaller.
+        self.assertEqual(len(sites), 3)
         self.assertNotIn("_record_blocked_dispatch(DispatchPath", ENGINE_SRC)
         # §14: one read of the kill switch inside the engine, not seven spellings.
         self.assertEqual(ENGINE_SRC.count('os.environ.get("OUTBOUND_ENABLED")'), 1)
@@ -111,16 +115,20 @@ class A_OpeningCorrections(unittest.TestCase):
                         getattr(ce.OutboundPathId, path).value), expected)
 
     def test_g35f_02_the_three_text_exits_no_longer_claim_a_flow(self):
-        """Named, because the review named them: the coverage response and the two
-        `_check_fallback_flow_triggers` chat clarifications all send text."""
-        for fn_name, pid in (("_send_coverage_response", "CE_TEXT"),
-                             ("_check_fallback_flow_triggers", "CE_TEXT")):
-            body = inspect.getsource(getattr(ConversationEngine, fn_name))
-            with self.subTest(fn=fn_name):
-                self.assertIn(f"OutboundPathId.{pid}.value", body)
+        """MIGRATED: two of the three text exits were the retired chat clarifications.
+
+        G3-7F sequencing §14.5 removed `_check_fallback_flow_triggers`'s branches, so its
+        two CE_TEXT exits and two CE_FLOW exits no longer exist — the method dispatches
+        nothing at all now, which is asserted directly. The invariant this guards is
+        unchanged: a text exit must declare a TEXT path, never a Flow one.
+        """
+        body = inspect.getsource(ConversationEngine._send_coverage_response)
+        self.assertIn("OutboundPathId.CE_TEXT.value", body)
         triggers = inspect.getsource(ConversationEngine._check_fallback_flow_triggers)
-        self.assertEqual(triggers.count("OutboundPathId.CE_TEXT.value"), 2)
-        self.assertEqual(triggers.count("OutboundPathId.CE_FLOW.value"), 2)
+        self.assertEqual(triggers.count("OutboundPathId.CE_TEXT.value"), 0)
+        self.assertEqual(triggers.count("OutboundPathId.CE_FLOW.value"), 0)
+        self.assertNotIn("_blocked_outbound", triggers,
+                         "the retired trigger has no outbound exit of any kind")
 
     def test_g35f_03_the_transport_table_covers_every_authorized_path(self):
         """A path the table forgets records NONE, never a guess."""
@@ -620,7 +628,7 @@ class D_FlowCompletionAck(unittest.TestCase):
 class E_TraceAndInspector(unittest.TestCase):
 
     def test_g35f_50_the_contract_moved_and_every_older_one_stays_readable(self):
-        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.8")
+        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.9")
         for older in READABLE_VERSIONS[1:]:
             with self.subTest(version=older):
                 self.assertIn(older, READABLE_VERSIONS)

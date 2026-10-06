@@ -760,6 +760,7 @@ CONTRACTS_WITH_CANDIDATE_SECTION = frozenset({
     "hybrid-decision-trace/1.6",
     "hybrid-decision-trace/1.7",
     "hybrid-decision-trace/1.8",
+    "hybrid-decision-trace/1.9",
 })
 
 #: G3-7F-OWNER-RESOLUTION. The clarification section needs its own note because the whole
@@ -920,7 +921,7 @@ def _candidate_resolution_card(trace: dict) -> str:
 def _clarification_card(trace: dict) -> str:
     """Why the turn did or did not ask the customer anything. Part H.
 
-    Rendered on every 1.8 trace, including the turns that asked nothing — those are the ones
+    Rendered on every 1.8 and 1.9 trace, including the turns that asked nothing — those
     the measurement exists to count.
     """
     res = trace.get("clarification")
@@ -939,11 +940,39 @@ def _clarification_card(trace: dict) -> str:
         "CORRECTION_VALUES_KNOWN": "el objetivo y los valores corregidos ya se conocen",
         "VEHICLE_IDENTITY_UNRESOLVED": "se habla de un vehículo pero no se resolvió cuál",
         "VEHICLE_FLOW_ALREADY_ATTEMPTED": "el Flow de vehículo ya se envió en este ciclo",
+        "VEHICLE_ATTEMPT_SPENT": "el único intento de vehículo de este ciclo ya se usó",
+        "VEHICLE_FLOW_OUTSTANDING": "el Flow de vehículo está pendiente de respuesta",
         "VEHICLE_CATEGORY_UNRESOLVED": "identidad conocida, categoría no resoluble",
         "LOCATION_UNRESOLVED": "se indicó una ubicación pero no se resolvió la zona",
         "LOCATION_FLOW_ALREADY_ATTEMPTED": "el Flow de localidad ya se envió en este ciclo",
+        "LOCATION_ATTEMPT_SPENT": "el único intento de localidad de este ciclo ya se usó",
+        "LOCATION_FLOW_OUTSTANDING": "el Flow de localidad está pendiente de respuesta",
         "PROPOSAL_WOULD_COEXIST": "había otra propuesta confirmable activa",
         "DOMAIN_NOT_PROVEN": "no se probó de qué está hablando el cliente",
+        "DOMAIN_NOT_RELEVANT": "el turno no trataba de ese dato",
+        "clarification_store_unavailable":
+            "no se pudo consultar el registro de intentos — no se preguntó nada",
+        "clarification_attempt_spent": "el intento de este ciclo ya estaba usado",
+    }
+    #: Contract 1.9. Each label names WHO established the fact, so an operator can tell a
+    #: single-producer reading from a genuinely reconciled one. Separate rows on purpose:
+    #: the Inspector must never present one engine's observation as agreement.
+    _RESERVATION = {
+        "WON": "sí — este turno reservó el intento",
+        "ALREADY_ATTEMPTED": "no — ya existía un intento para este ciclo y familia",
+        "STORE_UNAVAILABLE": "no se pudo determinar — el registro no respondió",
+    }
+    _DISPATCH = {
+        "DISPATCHED": "entregado por Meta (con wa_message_id)",
+        "BLOCKED": "bloqueado por el kill switch — nada salió",
+        "FAILED": "el transporte falló o el Flow no está configurado",
+    }
+    _COMPLETION = {
+        "RESOLVED": "el cliente completó el formulario y el dato quedó resuelto",
+        "UNRESOLVED": "el formulario volvió sin resolver el dato",
+        "INVALID_FIELDS": "el formulario volvió con datos no utilizables",
+        "DUPLICATE": "reenvío del mismo formulario — no se mutó nada",
+        "NO_ATTEMPT": "llegó un formulario que no corresponde a ningún intento nuestro",
     }
     _BOUND = {
         "BOUND": "sí — la pregunta estaba en la respuesta entregada",
@@ -967,6 +996,45 @@ def _clarification_card(trace: dict) -> str:
         ("MOTO probada", _e(res.get("moto_proven"))),
         ("Aplicado en las compuertas (G3-8)", _e(res.get("g3_8_enforced"))),
     ]
+    # ── contrato 1.9 only ─────────────────────────────────────────────────────────
+    # A 1.8 trace never carried the attempt lifecycle, so rendering those rows for one
+    # would show an operator a row of em-dashes that reads as "we lost the data" rather
+    # than "this contract predates the field". Older traces render exactly what they have.
+    #
+    # The payload decides, not an outer version string: a 1.9 clarification block contains
+    # these keys and a 1.8 one does not, so the card stays correct for a stored trace whose
+    # envelope is missing or was written by a different writer.
+    _LIFECYCLE_KEYS = ("attempt_id", "reservation", "dispatch_result", "attempt_status",
+                       "store_available", "decision_count", "prevented_second")
+    if any(k in res for k in _LIFECYCLE_KEYS):
+        rows += [
+        # ── contrato 1.9: evidencia por productor, luego reconciliación ───────────
+        ("Evidencia semántica aportó", _e(res.get("semantic_contributed"))),
+        ("Evidencia determinística aportó", _e(res.get("deterministic_contributed"))),
+        ("Reconciliación — vehículo resuelto",
+         _e(res.get("reconciled_identity_resolved"))),
+        ("Reconciliación — localidad resuelta",
+         _e(res.get("reconciled_location_resolved"))),
+        ("Decisiones de aclaración en el turno", _e(res.get("decision_count"))),
+        # ── contrato 1.9: ciclo de vida del intento ──────────────────────────────
+        ("Intento (ID)", _e(res.get("attempt_id"))),
+        ("Ciclo", _e(res.get("cycle_key"))),
+        ("Familia", _e(res.get("family"))),
+        ("Reserva", _e(_RESERVATION.get(str(res.get("reservation")),
+                                        res.get("reservation")))),
+        ("Ya se había intentado", _e(res.get("already_attempted"))),
+        ("Registro de intentos disponible", _e(res.get("store_available"))),
+        ("Falla del registro", _e(res.get("store_fault"))),
+        ("Estado del intento", _e(res.get("attempt_status"))),
+        ("Resultado del envío", _e(_DISPATCH.get(str(res.get("dispatch_result")),
+                                                 res.get("dispatch_result")))),
+        ("Mensaje saliente (ID)", _e(res.get("outbound_message_id"))),
+        ("Resultado de la respuesta del cliente",
+         _e(_COMPLETION.get(str(res.get("completion_result")),
+                            res.get("completion_result")))),
+        ("Familia resuelta por el formulario", _e(res.get("resolved_family"))),
+        ("Se evitó un segundo intento", _e(res.get("prevented_second"))),
+        ]
     return ('<div class="card"><h2>Aclaración y derivación</h2>'
             f'<p class="note">{html.escape(CLARIFICATION_SCOPE_NOTE)}</p>'
             f"{_kv(rows)}</div>")

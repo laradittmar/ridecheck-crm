@@ -655,4 +655,75 @@ Index("ix_whatsapp_messages_wa_message_id", WhatsAppMessage.wa_message_id, uniqu
 Index("ix_ai_events_thread_id", AiEvent.thread_id)
 Index("ix_ai_events_wa_message_id", AiEvent.wa_message_id, unique=True)
 Index("ix_recipient_locks_wa_id", WhatsAppRecipientLock.wa_id, unique=True)
+class WhatsAppClarificationAttempt(Base):
+    """One row per clarification Flow attempt, per thread, per cycle, per family.
+
+    G3-7F clarification lifecycle. The project tried three times to bound clarification in
+    application code and failed three times the same way: the fact "this family already had
+    its attempt" was stored in the same boolean as "a Flow is outstanding", written from four
+    call sites across three authorities, and cleared by completion, by human handoff and by a
+    withdrawal loop. A customer who submitted the Vehicle Flow with a blank make and model
+    was asked again, and again, without bound.
+
+    The invariant is a database constraint here, not a convention:
+
+        UNIQUE (thread_id, cycle_key, family)
+
+    Reservation is an INSERT ... ON CONFLICT DO NOTHING. A conflict is the answer, not an
+    error: this family has already had its one attempt in this cycle. The constraint holds
+    against every caller, including ones not yet written — which is the whole reason the
+    authority moved to the database.
+
+    The row's EXISTENCE is immutable attempt history and is never deleted in normal
+    operation; `status` advances along the lifecycle. A new cycle produces a new `cycle_key`
+    and therefore a new row, leaving the old one as history.
+
+    `whatsapp_thread_states.vehicle_fallback_flow_sent` / `location_fallback_flow_sent` keep
+    exactly one meaning now — a Flow proposal is currently outstanding — and may be cleared
+    freely by completion, withdrawal, handoff, expiry or reset, because availability no
+    longer lives there.
+    """
+
+    __tablename__ = "whatsapp_clarification_attempts"
+    __table_args__ = (
+        UniqueConstraint("thread_id", "cycle_key", "family",
+                         name="uq_clarification_attempt_thread_cycle_family"),
+        UniqueConstraint("idempotency_key",
+                         name="uq_clarification_attempt_idempotency_key"),
+        CheckConstraint("family IN ('VEHICLE', 'LOCATION')",
+                        name="ck_clarification_attempt_family"),
+        CheckConstraint(
+            "status IN ('RESERVED', 'DISPATCHED', 'COMPLETED_RESOLVED', "
+            "'COMPLETED_UNRESOLVED', 'INVALID_COMPLETION', 'DISPATCH_BLOCKED', "
+            "'DISPATCH_FAILED', 'HANDED_OFF')",
+            name="ck_clarification_attempt_status"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    thread_id: Mapped[int] = mapped_column(
+        ForeignKey("whatsapp_threads.id"), nullable=False)
+    #: `COALESCE(state.current_cycle_start_message_db_id, 0)`. An integer message id or 0 for
+    #: the thread's initial, never-reset cycle. Never a timestamp: the identity must be
+    #: stable across bursts, duplicates and restarts, and a clock is none of those.
+    cycle_key: Mapped[int] = mapped_column(Integer, nullable=False)
+    family: Mapped[str] = mapped_column(String(16), nullable=False)
+    #: Deterministic UUIDv5 over (namespace, thread, cycle, family). 36 characters, which is
+    #: exactly what `whatsapp_messages.correlation_id` and `security_events.correlation_id`
+    #: accept, so it can be carried there without truncation if ever needed. The composite
+    #: UNIQUE above is the real authority; this exists for correlation and joining.
+    idempotency_key: Mapped[str] = mapped_column(String(36), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    reserved_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False)
+    outbound_message_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("whatsapp_messages.id"), nullable=True)
+    wa_message_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    dispatch_result: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    completion_result: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    resolved_family: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    terminal_reason: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False)
+
+
 Index("ix_dedup_wa_kind_fp_created", WhatsAppOutboundDedup.wa_id, WhatsAppOutboundDedup.message_kind, WhatsAppOutboundDedup.content_fingerprint, WhatsAppOutboundDedup.created_at)

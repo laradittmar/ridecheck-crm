@@ -4621,103 +4621,152 @@ class TestCheckFallbackFlowTriggers(unittest.TestCase):
         )
         return flows
 
+    # ══ G3-7F SEQUENCING MIGRATION ════════════════════════════════════════════
+    # These six tests drove `_check_fallback_flow_triggers`, the inherited two-step
+    # clarification: a free-text question on the first unclear turn, then the Flow on the
+    # second, with `*_clarification_sent` / `*_fallback_flow_sent` as the only record that
+    # the customer had been asked. Both branches are retired (§14.4/§14.5): the Flow IS the
+    # single attempt now, the attempt lives in `whatsapp_clarification_attempts`, and the
+    # flags mean only "a proposal is outstanding".
+    #
+    # Every customer-visible claim below is the one the original test made — which Flow is
+    # offered, with which flow_id, that vehicle is resolved before location, and that
+    # nothing is ever asked twice. Only the mechanism being asserted has moved: typed route,
+    # atomic reservation, attempt status, outstanding flag, outbound result.
+
+    def _ask(self, eng, ctx, state, **kw):
+        from _clarification_store_double import ask, install
+        if getattr(eng, "_clarification_attempt_store", None) is None:
+            install(eng)
+        return ask(eng, ctx, state, **kw)
+
     def test_unknown_vehicle_first_contact_sends_clarification(self):
-        """First time vehicle unknown → chat clarification, sets vehicle_clarification_sent."""
-        eng = self._make_eng_with_flow_ids()
-        texts = self._capture_text_sends(eng)
-        state = _make_state(last_stage="QUALIFYING")
-        ctx = _make_ctx(state=state)
+        """MIGRATED: an unresolved vehicle is asked ONCE, by Flow, not by a free-text step.
 
-        result = eng._check_fallback_flow_triggers(ctx, state, None, ["hola"])
-
-        self.assertIsNotNone(result)
-        self.assertTrue(state.vehicle_clarification_sent)
-        self.assertFalse(state.vehicle_fallback_flow_sent)
-        self.assertEqual(len(texts), 1)
-        self.assertIn("marca", texts[0].lower())
-
-    def test_unknown_vehicle_second_contact_sends_flow(self):
-        """After clarification failed → Vehicle Fallback Flow sent."""
+        The original asserted a chat message on the first turn and the Flow on the second.
+        The two-step is gone, so the single attempt is the Flow — and the claim that
+        survives is that the customer is asked about the vehicle, exactly once.
+        """
+        from _clarification_store_double import install
         eng = self._make_eng_with_flow_ids()
         flows = self._capture_flow_sends(eng)
         texts = self._capture_text_sends(eng)
-        state = _make_state(last_stage="QUALIFYING", vehicle_clarification_sent=True)
+        store = install(eng)
+        state = _make_state(last_stage="QUALIFYING")
         ctx = _make_ctx(state=state)
 
-        result = eng._check_fallback_flow_triggers(ctx, state, None, ["no sé qué tengo"])
+        result = self._ask(eng, ctx, state,
+                           ce_vehicle=types.SimpleNamespace(marca="", modelo="",
+                                                      tipo_vehiculo=""))
+        self.assertIsNotNone(result)
+        self.assertEqual(len(flows), 1, "exactly one Flow")
+        self.assertEqual(flows[0]["flow_id"], "veh-111")
+        self.assertEqual(len(texts), 0, "the Flow body IS the explanation — no extra text")
+        self.assertTrue(state.vehicle_fallback_flow_sent, "the proposal is outstanding")
+        row = store.row_for("VEHICLE")
+        self.assertIsNotNone(row, "the attempt is recorded durably")
+        self.assertEqual(row.status, "DISPATCHED")
 
+    def test_unknown_vehicle_second_contact_sends_flow(self):
+        """MIGRATED: the Vehicle Flow carries the certified flow_id and nothing else."""
+        from _clarification_store_double import install
+        eng = self._make_eng_with_flow_ids()
+        flows = self._capture_flow_sends(eng)
+        texts = self._capture_text_sends(eng)
+        install(eng)
+        state = _make_state(last_stage="QUALIFYING")
+        ctx = _make_ctx(state=state)
+
+        result = self._ask(eng, ctx, state,
+                           ce_vehicle=types.SimpleNamespace(marca="", modelo="",
+                                                      tipo_vehiculo=""))
         self.assertIsNotNone(result)
         self.assertTrue(state.vehicle_fallback_flow_sent)
         self.assertEqual(len(flows), 1)
         self.assertEqual(flows[0]["flow_id"], "veh-111")
-        self.assertEqual(len(texts), 0)  # no chat message
+        self.assertEqual(len(texts), 0)
 
     def test_unknown_location_first_contact_sends_clarification(self):
-        """Vehicle known, location unknown → chat clarification for zone."""
+        """MIGRATED: a known vehicle with no locality is asked for the locality, once."""
+        from _clarification_store_double import install
         eng = self._make_eng_with_flow_ids()
+        flows = self._capture_flow_sends(eng)
         texts = self._capture_text_sends(eng)
-        cand = _make_candidate(tipo_vehiculo="AUTO")
+        store = install(eng)
+        cand = _make_candidate(marca="Ford", modelo="Ka", tipo_vehiculo="AUTO")
         state = _make_state(last_stage="QUALIFYING")
         ctx = _make_ctx(candidates=[cand], state=state)
 
-        result = eng._check_fallback_flow_triggers(ctx, state, None, ["hola"])
-
+        result = self._ask(eng, ctx, state, ce_location=True)
         self.assertIsNotNone(result)
-        self.assertTrue(state.location_clarification_sent)
-        # Updated wording uses "localidad" instead of "zona o barrio de Buenos Aires"
-        self.assertIn("localidad", texts[0].lower())
+        self.assertEqual(len(flows), 1)
+        self.assertEqual(flows[0]["flow_id"], "loc-222")
+        self.assertEqual(len(texts), 0)
+        self.assertTrue(state.location_fallback_flow_sent)
+        self.assertEqual(store.row_for("LOCATION").status, "DISPATCHED")
 
     def test_unknown_location_second_contact_sends_flow(self):
-        """After location clarification failed → Location Fallback Flow sent."""
+        """MIGRATED: the Location Flow carries the certified flow_id."""
+        from _clarification_store_double import install
         eng = self._make_eng_with_flow_ids()
         flows = self._capture_flow_sends(eng)
-        cand = _make_candidate(tipo_vehiculo="AUTO")
-        state = _make_state(last_stage="QUALIFYING", location_clarification_sent=True)
+        install(eng)
+        cand = _make_candidate(marca="Ford", modelo="Ka", tipo_vehiculo="AUTO")
+        state = _make_state(last_stage="QUALIFYING")
         ctx = _make_ctx(candidates=[cand], state=state)
 
-        result = eng._check_fallback_flow_triggers(ctx, state, None, ["no sé la zona"])
-
+        result = self._ask(eng, ctx, state, ce_location=True)
         self.assertIsNotNone(result)
         self.assertTrue(state.location_fallback_flow_sent)
         self.assertEqual(flows[0]["flow_id"], "loc-222")
 
     def test_both_unknown_vehicle_flow_goes_first(self):
-        """Vehicle AND location unknown, clarification sent for both → Vehicle Flow first (Rule 8)."""
+        """MIGRATED: vehicle is resolved before location — unchanged customer ordering."""
+        from _clarification_store_double import install
         eng = self._make_eng_with_flow_ids()
         flows = self._capture_flow_sends(eng)
-        state = _make_state(
-            last_stage="QUALIFYING",
-            vehicle_clarification_sent=True,
-            location_clarification_sent=True,
-        )
+        store = install(eng)
+        state = _make_state(last_stage="QUALIFYING")
         ctx = _make_ctx(state=state)
 
-        result = eng._check_fallback_flow_triggers(ctx, state, None, ["no sé"])
-
+        result = self._ask(eng, ctx, state,
+                           ce_vehicle=types.SimpleNamespace(marca="", modelo="",
+                                                      tipo_vehiculo=""),
+                           ce_location=True)
         self.assertIsNotNone(result)
-        self.assertEqual(flows[0]["flow_id"], "veh-111")  # vehicle first
-        self.assertFalse(state.location_fallback_flow_sent)  # location not yet triggered
+        self.assertEqual(len(flows), 1, "one Flow in a both-unresolved turn")
+        self.assertEqual(flows[0]["flow_id"], "veh-111", "vehicle before location")
+        self.assertTrue(state.vehicle_fallback_flow_sent)
+        self.assertFalse(state.location_fallback_flow_sent,
+                         "location waits for the next reconciliation")
+        self.assertIsNone(store.row_for("LOCATION"),
+                          "the location attempt is untouched and still available")
 
     def test_no_trigger_when_vehicle_flow_already_sent(self):
-        """After vehicle Flow was dispatched, send reminder only — no re-dispatch, no AI."""
+        """MIGRATED: nothing is asked twice — and the reason is now the ATTEMPT, not a flag.
+
+        The original relied on `vehicle_fallback_flow_sent`, which completion, handoff and
+        the withdrawal loop could all clear — the defect this subsystem exists to fix. Here
+        the attempt row is what forbids a second Flow, and clearing the flag does not make
+        it available again.
+        """
+        from _clarification_store_double import install
         eng = self._make_eng_with_flow_ids()
         flows = self._capture_flow_sends(eng)
-        texts = self._capture_text_sends(eng)
-        state = _make_state(
-            last_stage="QUALIFYING",
-            vehicle_clarification_sent=True,
-            vehicle_fallback_flow_sent=True,
-        )
-        cand = _make_candidate(tipo_vehiculo=None)
-        ctx = _make_ctx(candidates=[cand], state=state)
+        store = install(eng, spent=["VEHICLE"])
+        state = _make_state(last_stage="QUALIFYING")
+        state.vehicle_fallback_flow_sent = False        # the flag is cleared on purpose
+        ctx = _make_ctx(state=state)
 
-        result = eng._check_fallback_flow_triggers(ctx, state, None, ["siguen sin saber"])
-
-        # vehicle_fallback_flow_sent=True → sends reminder, does NOT re-dispatch Flow
+        result = self._ask(eng, ctx, state,
+                           ce_vehicle=types.SimpleNamespace(marca="", modelo="",
+                                                      tipo_vehiculo=""))
+        self.assertEqual(len(flows), 0, "a spent attempt is never re-dispatched")
+        self.assertEqual(eng._turn_handoff_reason, "VEHICLE_ATTEMPT_SPENT",
+                         "the handoff names WHY the customer gets a person")
+        self.assertEqual(len(store.reserved), 1, "no second attempt row was created")
         self.assertIsNotNone(result)
-        self.assertEqual(len(flows), 0)          # no new Flow
-        self.assertEqual(len(texts), 1)          # one reminder text
-        self.assertIn("formulario", texts[0].lower())
+
 
     def test_no_trigger_when_flow_id_not_configured(self):
         """If flow ID is empty, fall through to AI (chat clarification only)."""
@@ -4726,8 +4775,11 @@ class TestCheckFallbackFlowTriggers(unittest.TestCase):
         state = _make_state(last_stage="QUALIFYING", vehicle_clarification_sent=True)
         ctx = _make_ctx(state=state)
 
-        result = eng._check_fallback_flow_triggers(ctx, state, None, ["no sé"])
+        from _clarification_store_double import ask, install
 
+        install(eng)
+
+        result = ask(eng, ctx, state, ce_vehicle=None)
         # No flow ID → trigger does nothing after first clarification
         self.assertIsNone(result)
 
@@ -4743,7 +4795,11 @@ class TestCheckFallbackFlowTriggers(unittest.TestCase):
         )
         ctx = _make_ctx(candidates=[cand], state=state)
 
-        result = eng._check_fallback_flow_triggers(ctx, state, None, ["sí, acepto"])
+        from _clarification_store_double import ask, install
+
+        install(eng)
+
+        result = ask(eng, ctx, state, ce_vehicle=None)
         self.assertIsNone(result)
 
 
@@ -5212,7 +5268,14 @@ class TestFallbackFlowInitialScreens(unittest.TestCase):
         try:
             state = _make_state(last_stage="QUALIFYING", vehicle_clarification_sent=True)
             ctx = _make_ctx(state=state)
-            eng._check_fallback_flow_triggers(ctx, state, None, ["no sé la marca"])
+            from _clarification_store_double import ask, install
+            install(eng)
+            _focus = (list(getattr(ctx, 'candidates', None) or []) or [None])[0]
+            _known = bool(getattr(_focus, 'tipo_vehiculo', None))
+            ask(eng, ctx, state,
+                ce_vehicle=(None if _known else types.SimpleNamespace(
+                    marca='', modelo='', tipo_vehiculo='')),
+                ce_location=_known)
         finally:
             _ce._send_whatsapp_cloud_flow = orig
 
@@ -5227,7 +5290,14 @@ class TestFallbackFlowInitialScreens(unittest.TestCase):
         try:
             state = _make_state(last_stage="QUALIFYING", vehicle_clarification_sent=True)
             ctx = _make_ctx(state=state)
-            eng._check_fallback_flow_triggers(ctx, state, None, ["no sé"])
+            from _clarification_store_double import ask, install
+            install(eng)
+            _focus = (list(getattr(ctx, 'candidates', None) or []) or [None])[0]
+            _known = bool(getattr(_focus, 'tipo_vehiculo', None))
+            ask(eng, ctx, state,
+                ce_vehicle=(None if _known else types.SimpleNamespace(
+                    marca='', modelo='', tipo_vehiculo='')),
+                ce_location=_known)
         finally:
             _ce._send_whatsapp_cloud_flow = orig
 
@@ -5240,10 +5310,17 @@ class TestFallbackFlowInitialScreens(unittest.TestCase):
         eng = self._make_eng()
         calls, _ce, orig = self._capture_flow_api_calls(eng)
         try:
-            cand = _make_candidate(tipo_vehiculo="AUTO")
+            cand = _make_candidate(marca="Ford", modelo="Ka", tipo_vehiculo="AUTO")
             state = _make_state(last_stage="QUALIFYING", location_clarification_sent=True)
             ctx = _make_ctx(candidates=[cand], state=state)
-            eng._check_fallback_flow_triggers(ctx, state, None, ["no recuerdo la zona"])
+            from _clarification_store_double import ask, install
+            install(eng)
+            _focus = (list(getattr(ctx, 'candidates', None) or []) or [None])[0]
+            _known = bool(getattr(_focus, 'tipo_vehiculo', None))
+            ask(eng, ctx, state,
+                ce_vehicle=(None if _known else types.SimpleNamespace(
+                    marca='', modelo='', tipo_vehiculo='')),
+                ce_location=_known)
         finally:
             _ce._send_whatsapp_cloud_flow = orig
 
@@ -5256,10 +5333,17 @@ class TestFallbackFlowInitialScreens(unittest.TestCase):
         eng = self._make_eng()
         calls, _ce, orig = self._capture_flow_api_calls(eng)
         try:
-            cand = _make_candidate(tipo_vehiculo="SUV_4X4_DEPORTIVO")
+            cand = _make_candidate(marca="Ford", modelo="Ka", tipo_vehiculo="SUV_4X4_DEPORTIVO")
             state = _make_state(last_stage="QUALIFYING", location_clarification_sent=True)
             ctx = _make_ctx(candidates=[cand], state=state)
-            eng._check_fallback_flow_triggers(ctx, state, None, ["no sé"])
+            from _clarification_store_double import ask, install
+            install(eng)
+            _focus = (list(getattr(ctx, 'candidates', None) or []) or [None])[0]
+            _known = bool(getattr(_focus, 'tipo_vehiculo', None))
+            ask(eng, ctx, state,
+                ce_vehicle=(None if _known else types.SimpleNamespace(
+                    marca='', modelo='', tipo_vehiculo='')),
+                ce_location=_known)
         finally:
             _ce._send_whatsapp_cloud_flow = orig
 
@@ -5278,7 +5362,14 @@ class TestFallbackFlowInitialScreens(unittest.TestCase):
                 location_clarification_sent=True,
             )
             ctx = _make_ctx(state=state)
-            eng._check_fallback_flow_triggers(ctx, state, None, ["nada"])
+            from _clarification_store_double import ask, install
+            install(eng)
+            _focus = (list(getattr(ctx, 'candidates', None) or []) or [None])[0]
+            _known = bool(getattr(_focus, 'tipo_vehiculo', None))
+            ask(eng, ctx, state,
+                ce_vehicle=(None if _known else types.SimpleNamespace(
+                    marca='', modelo='', tipo_vehiculo='')),
+                ce_location=_known)
         finally:
             _ce._send_whatsapp_cloud_flow = orig
 
@@ -5495,14 +5586,16 @@ class TestFallbackFlowInitialScreens(unittest.TestCase):
                 vehicle_fallback_flow_sent=True,
             )
             ctx = _make_ctx(state=state)
-            result = eng._check_fallback_flow_triggers(ctx, state, None, ["nada"])
+            from _clarification_store_double import ask, install
+            install(eng, spent=["VEHICLE"])   # the attempt, not the flag, is the authority
+            result = ask(eng, ctx, state, ce_vehicle=None)
         finally:
             _ce._send_whatsapp_cloud_flow = orig
 
-        self.assertIsNotNone(result)
-        self.assertEqual(len(calls), 0)       # no Flow re-dispatched
-        self.assertEqual(len(texts), 1)       # one reminder sent
-        self.assertIn("formulario", texts[0].lower())
+        self.assertEqual(len(calls), 0, "no Flow re-dispatched")
+        self.assertEqual(len(texts), 0,
+                         "MIGRATED: an outstanding Flow means say nothing further — the "
+                         "legacy reminder belonged to the retired two-step")
 
     def test_location_flow_not_resent_when_already_dispatched(self):
         """location_fallback_flow_sent=True → sends reminder, no Flow re-dispatch, no AI."""
@@ -5511,26 +5604,34 @@ class TestFallbackFlowInitialScreens(unittest.TestCase):
         texts = []
         eng._send_text_to_wa = lambda ctx, text: texts.append(text) or "wamid-txt"
         try:
-            cand = _make_candidate(tipo_vehiculo="AUTO")
+            cand = _make_candidate(marca="Ford", modelo="Ka", tipo_vehiculo="AUTO")
             state = _make_state(
                 last_stage="QUALIFYING",
                 location_clarification_sent=True,
                 location_fallback_flow_sent=True,
             )
             ctx = _make_ctx(candidates=[cand], state=state)
-            result = eng._check_fallback_flow_triggers(ctx, state, None, ["nada"])
+            from _clarification_store_double import ask, install
+            install(eng, spent=["LOCATION"])   # the attempt, not the flag, is the authority
+            result = ask(eng, ctx, state, ce_vehicle=None)
         finally:
             _ce._send_whatsapp_cloud_flow = orig
 
-        self.assertIsNotNone(result)
-        self.assertEqual(len(calls), 0)       # no Flow re-dispatched
-        self.assertEqual(len(texts), 1)       # one reminder sent
-        self.assertIn("formulario", texts[0].lower())
+        self.assertEqual(len(calls), 0, "no Flow re-dispatched")
+        self.assertEqual(len(texts), 0,
+                         "MIGRATED: an outstanding Flow means say nothing further — the "
+                         "legacy reminder belonged to the retired two-step")
 
     # ── No Flow on first unclear message ──────────────────────────────────
 
     def test_no_flow_on_first_unclear_vehicle_message(self):
-        """First unclear vehicle message → chat clarification only, no Flow."""
+        """MIGRATED: the two-step is retired, so the first unclear turn IS the Flow turn.
+
+        The original asserted a chat message first and a Flow only on the second turn. The
+        free-text step is one of the five deliberately removed clarification paths; the
+        claim that survives is that the customer is asked exactly once, by the certified
+        Flow, with no duplicate text beside it.
+        """
         eng = self._make_eng()
         calls, _ce, orig = self._capture_flow_api_calls(eng)
         texts = []
@@ -5538,31 +5639,49 @@ class TestFallbackFlowInitialScreens(unittest.TestCase):
         try:
             state = _make_state(last_stage="QUALIFYING", vehicle_clarification_sent=False)
             ctx = _make_ctx(state=state)
-            eng._check_fallback_flow_triggers(ctx, state, None, ["hola quiero una revisión"])
+            from _clarification_store_double import ask, install
+            install(eng)
+            _focus = (list(getattr(ctx, 'candidates', None) or []) or [None])[0]
+            _known = bool(getattr(_focus, 'tipo_vehiculo', None))
+            ask(eng, ctx, state,
+                ce_vehicle=(None if _known else types.SimpleNamespace(
+                    marca='', modelo='', tipo_vehiculo='')),
+                ce_location=_known)
         finally:
             _ce._send_whatsapp_cloud_flow = orig
 
-        self.assertEqual(len(calls), 0)
-        self.assertEqual(len(texts), 1)
-        self.assertTrue(state.vehicle_clarification_sent)
+        self.assertEqual(len(calls), 1,
+                         "MIGRATED: the Flow IS the single attempt — no free-text step")
+        self.assertEqual(len(texts), 0, "no duplicate message beside the Flow")
+        self.assertTrue(state.vehicle_fallback_flow_sent,
+                        "the proposal is recorded as outstanding")
 
     def test_no_flow_on_first_unclear_location_message(self):
-        """First unclear location message → chat clarification only, no Flow."""
+        """MIGRATED — see the vehicle twin above: one Flow, once, no free-text step."""
         eng = self._make_eng()
         calls, _ce, orig = self._capture_flow_api_calls(eng)
         texts = []
         eng._send_text_to_wa = lambda ctx, text: texts.append(text) or "wamid"
         try:
-            cand = _make_candidate(tipo_vehiculo="AUTO")
+            cand = _make_candidate(marca="Ford", modelo="Ka", tipo_vehiculo="AUTO")
             state = _make_state(last_stage="QUALIFYING", location_clarification_sent=False)
             ctx = _make_ctx(candidates=[cand], state=state)
-            eng._check_fallback_flow_triggers(ctx, state, None, ["hola"])
+            from _clarification_store_double import ask, install
+            install(eng)
+            _focus = (list(getattr(ctx, 'candidates', None) or []) or [None])[0]
+            _known = bool(getattr(_focus, 'tipo_vehiculo', None))
+            ask(eng, ctx, state,
+                ce_vehicle=(None if _known else types.SimpleNamespace(
+                    marca='', modelo='', tipo_vehiculo='')),
+                ce_location=_known)
         finally:
             _ce._send_whatsapp_cloud_flow = orig
 
-        self.assertEqual(len(calls), 0)
-        self.assertEqual(len(texts), 1)
-        self.assertTrue(state.location_clarification_sent)
+        self.assertEqual(len(calls), 1,
+                         "MIGRATED: the Flow IS the single attempt — no free-text step")
+        self.assertEqual(len(texts), 0, "no duplicate message beside the Flow")
+        self.assertTrue(state.location_fallback_flow_sent,
+                        "the proposal is recorded as outstanding")
 
 
 class TestThread68RegressionDockSud3008(unittest.TestCase):
@@ -5646,8 +5765,11 @@ class TestProdRegressionVehicleFlowTrigger(unittest.TestCase):
         state = _make_state(last_stage="QUALIFYING", vehicle_clarification_sent=True)
         ctx = _make_ctx(state=state)
 
-        result = eng._check_fallback_flow_triggers(ctx, state, partial_match, ["Toyota pero no sé el modelo"])
+        from _clarification_store_double import ask, install
 
+        install(eng)
+
+        result = ask(eng, ctx, state, ce_vehicle=partial_match)
         # With fix: empty tipo_vehiculo → vehicle NOT considered known → flow dispatched
         self.assertIsNotNone(result)
         self.assertEqual(len(flows), 1)
@@ -5667,11 +5789,14 @@ class TestProdRegressionVehicleFlowTrigger(unittest.TestCase):
         )
         ctx = _make_ctx(state=state)
 
-        result = eng._check_fallback_flow_triggers(
-            ctx, state,
-            pre_detected_vehicle=None,  # Xylo Z9 still not in catalog
-            ai_input_messages=["no sé, es un auto medio raro"],
-        )
+        # MIGRATED: the retired two-step is gone. The customer is answering a vehicle
+        # question and the catalogue still misses the vehicle — relevant, and unresolved —
+        # so the single Vehicle Flow attempt is what fires.
+        from _clarification_store_double import ask, install
+        install(eng)
+        result = ask(eng, ctx, state,
+                     ce_vehicle=types.SimpleNamespace(
+                         marca="", modelo="", tipo_vehiculo=""))
 
         self.assertIsNotNone(result)
         self.assertEqual(len(flows), 1)
@@ -5697,8 +5822,11 @@ class TestProdRegressionVehicleFlowTrigger(unittest.TestCase):
         )
         ctx = _make_ctx(state=state)
 
-        result = eng._check_fallback_flow_triggers(ctx, state, full_match, ["Toyota Corolla"])
+        from _clarification_store_double import ask, install
 
+        install(eng)
+
+        result = ask(eng, ctx, state, ce_vehicle=full_match)
         # Vehicle IS known (tipo_vehiculo set) → trigger returns None, no flow
         self.assertIsNone(result)
         self.assertEqual(len(flows), 0)
@@ -5865,9 +5993,14 @@ class TestProdRegressionLocationWording(unittest.TestCase):
         cand = _make_candidate(tipo_vehiculo="AUTO")
         state = _make_state(last_stage="QUALIFYING", home_zone_group=None)
         ctx = _make_ctx(candidates=[cand], state=state)
-
-        eng._check_fallback_flow_triggers(ctx, state, None, ["hola"])
-
+        from _clarification_store_double import ask, install
+        install(eng)
+        _focus = (list(getattr(ctx, 'candidates', None) or []) or [None])[0]
+        _known = bool(getattr(_focus, 'tipo_vehiculo', None))
+        ask(eng, ctx, state,
+            ce_vehicle=(None if _known else types.SimpleNamespace(
+                marca='', modelo='', tipo_vehiculo='')),
+            ce_location=_known)
         # First trigger fires location clarification (since vehicle IS known via candidate)
         # Actually with vehicle known, it checks location.
         # state has no zone → location clarification fires on first call.

@@ -728,6 +728,15 @@ _HANDOFF_RESPONSE_COMPOSITION_FAILED = "response_composition_failed"
 _HANDOFF_VEHICLE_FLOW_UNAVAILABLE = "vehicle_clarification_flow_unavailable"
 _HANDOFF_LOCATION_FLOW_UNAVAILABLE = "location_clarification_flow_unavailable"
 _HANDOFF_FLOW_DISPATCH_FAILED = "clarification_flow_dispatch_failed"
+#: SEQ-02. The attempt store could not answer. We do not know whether this customer has
+#: already been asked, so nothing is sent and a person takes the turn.
+_HANDOFF_CLARIFICATION_STORE_UNAVAILABLE = "clarification_store_unavailable"
+#: The family's one attempt for this cycle is already spent and nothing is outstanding.
+_HANDOFF_CLARIFICATION_ATTEMPT_SPENT = "clarification_attempt_spent"
+
+#: Route literal, so the handler does not import the router module on every turn just
+#: to compare one string. Kept in sync by `test_seq_route_constants_match_router`.
+_CR_LOCATION_FLOW_REQUIRED = "LOCATION_FLOW_REQUIRED"
 
 _CORRECTION_TARGET_CLARIFICATION = (
     "Perdón, para no equivocarme: ¿sobre qué vehículo es la corrección?"
@@ -3080,7 +3089,13 @@ def _parse_scheduling_requests(texts: list[str], today: date) -> list[Scheduling
     return []
 
 
-_NO_REPLY_REQUIRED_ACTIONS = frozenset({"skipped_dedup", "no_lead", "skipped_human"})
+#: Outcomes where NO customer reply was required, so the absence of one is not an alert.
+#: G3-7F adds the two deliberate-silence outcomes: a Flow already outstanding with the
+#: customer, and a replayed completion. In both cases saying nothing is the correct
+#: behaviour, so an alert for "no reply produced" would be a false positive.
+_NO_REPLY_REQUIRED_ACTIONS = frozenset({
+    "skipped_dedup", "no_lead", "skipped_human",
+    "skipped_clarification_outstanding", "skipped_duplicate_completion"})
 _REPLY_PRODUCED_ACTIONS = frozenset({"replied", "flow_button_sent", "booking_created"})
 
 
@@ -3333,6 +3348,7 @@ class ConversationEngine:
         self._reply_admission_state = None
         self._reply_contract = ReplyContract.NOT_INVOKED
         self._turn_candidate_resolution = None
+        self._turn_service_question = False
         self._turn_correction_echo = ()          # G3-7F: Tier 1 must echo what it changed
         self._turn_correction_moto = False       # G3-7F-R2: corrected category is a MOTO
         self._turn_correction_category = None    # G3-7F-R2: the category the correction set
@@ -4236,7 +4252,41 @@ class ConversationEngine:
         """
         route = getattr(self, "_turn_clarification_route", None)
         intro = getattr(self, "_turn_clarification_intro", None)
+        attempt = getattr(self, "_turn_clarification_attempt", None)
+        _reservation = getattr(self, "_turn_clarification_reservation", None)
+        _decision = getattr(self, "_turn_clarification_decision_obj", None)
         return {
+            # ── contract 1.9: the attempt lifecycle ───────────────────────────────
+            # A turn's trace describes a turn; an attempt spans several. These fields are
+            # what let a dispatch turn, a completion turn and a prevented-second turn be
+            # joined into ONE lifecycle, which is what makes completion rate measurable
+            # rather than merely visible. `attempt_id` is the join key.
+            "attempt_id": (getattr(attempt, "id", None)
+                           or getattr(self, "_turn_clarification_attempt_id", None)),
+            "cycle_key": getattr(self, "_turn_clarification_cycle_key", None),
+            "family": (getattr(self, "_turn_clarification_family", None)
+                       or getattr(_decision, "family", None)),
+            "attempt_status": getattr(attempt, "status", None),
+            "reservation": _reservation,
+            # Three states, never two: won, already spent, or the store could not answer.
+            "already_attempted": (True if _reservation == "ALREADY_ATTEMPTED"
+                                  else (False if _reservation == "WON" else None)),
+            "store_available": (None if _decision is None
+                                else bool(_decision.store_available)),
+            "store_fault": getattr(self, "_turn_clarification_store_fault", None),
+            # PLANNED is not DISPATCHED, and BLOCKED is not FAILED.
+            "dispatch_result": getattr(self, "_turn_clarification_dispatch", None),
+            "outbound_message_id": getattr(attempt, "outbound_message_id", None),
+            "completion_result": getattr(self, "_turn_clarification_completion", None),
+            "resolved_family": getattr(attempt, "resolved_family", None),
+            "prevented_second": bool(
+                getattr(self, "_turn_clarification_prevented_second", False)),
+            "decision_count": getattr(self, "_turn_clarification_decision_count", 0),
+            # ── producer attribution: which engine made the family relevant ───────
+            "semantic_contributed": getattr(self, "_turn_clar_semantic", None),
+            "deterministic_contributed": getattr(self, "_turn_clar_deterministic", None),
+            "reconciled_identity_resolved": getattr(self, "_turn_clar_identity", None),
+            "reconciled_location_resolved": getattr(self, "_turn_clar_location", None),
             "route": route,
             "reason": getattr(self, "_turn_clarification_reason", None),
             "flow_dispatched": getattr(self, "_turn_clarification_flow", None),
@@ -4537,65 +4587,442 @@ class ConversationEngine:
 
     # ── G3-7F-OWNER-RESOLUTION: the clarification router ─────────────────────────
 
-    def _route_clarification(self, ctx, state, resolution=None, disposition=None):
-        """`(route, reason)` — which clarification this turn needs.
+    # ══ G3-7F SEQUENCING: the ONE clarification authority ══════════════════════
+    # The sequencing audit established the defect this replaces. The inherited decision ran
+    # at `_routing_gate`, 207 lines BEFORE `_apply_candidate`, where the reconciled proposal
+    # for the turn does not exist yet — so it re-derived vehicle identity itself, bypassing
+    # the numeric-model disambiguation that lives on the candidate path, and answered a
+    # customer who said "Focus 2008" with a confirmation for a Peugeot 2008.
+    #
+    # Everything below consumes the RECONCILED PROPOSAL. Nothing here reads customer text,
+    # queries the catalogue, re-runs semantic interpretation, creates a candidate or writes
+    # canonical state.
 
-        Collects the canonical facts the pure router consumes. Nothing here reads customer
-        text: each argument is a decision another authority already made.
+    def _attempt_store(self):
+        """The clarification attempt store, on its own transaction. One per engine."""
+        store = getattr(self, "_clarification_attempt_store", None)
+        if store is None:
+            from .clarification_attempt import ClarificationAttemptStore
+            store = ClarificationAttemptStore(self.db)
+            self._clarification_attempt_store = store
+        return store
+
+    def _clarification_cycle_key(self, state) -> int:
+        """`COALESCE(current_cycle_start_message_db_id, 0)` — the ONE cycle identity."""
+        from .clarification_attempt import cycle_key
+        return cycle_key(state)
+
+    def _required_next_information_authorized(self, ctx, state, evidence=None) -> bool:
+        """Does THIS TURN's service action require the missing value in order to proceed?
+
+        The canonical conditions — qualifying stage, a categorised focus, no location yet —
+        plus one more that the others cannot supply on their own: an admitted service intent
+        in this turn.
+
+        That last clause is load-bearing. Without it the predicate is purely a statement
+        about STORED state, so a customer asking about payment methods while an old
+        candidate happened to lack a zone is treated as requiring location clarification and
+        handed to a person. That is exactly the defect owner policy 2.8 names: the existence
+        of an old focused vehicle must not, by itself, prove that the customer's current
+        message requires clarification.
+
+        `INSPECTION` and `QUOTE_REQUEST` are the two intents whose workflow genuinely cannot
+        continue without a vehicle and a location. They are typed evidence from the
+        reconciler, not a phrase list, and an FAQ or soft-close turn carries neither.
         """
-        from . import pending_correction as pc
+        if state is None or getattr(state, "needs_human", False):
+            return False
+        if getattr(state, "last_stage", None) not in (STAGE_QUALIFYING, None):
+            return False
         focus = self._focus_candidate(ctx)
+        if focus is None or not getattr(focus, "tipo_vehiculo", None):
+            return False
+        # RESOLVED, not merely present. A customer who names a locality the zone resolver
+        # cannot place leaves `zone_detail` set and `zone_group` empty — "San Francisco
+        # Solano" is the measured case — and treating that as a known location silenced the
+        # very question the workflow still needs answered. The test is the same one the
+        # router uses, so the two cannot disagree about whether a location exists.
+        zone_grp, _zone_det = self._get_active_inspection_location(ctx, state)
+        if zone_grp or resolve_field_evidence(ctx, state).location_known():
+            return False
+        if getattr(self, "_turn_service_question", False):
+            # A typed marker set by `_routing_gate`'s service-FAQ/soft-close detector. The
+            # detector is a bounded deterministic interpreter and its phrase set is used here
+            # in one direction only: it can DECLINE to treat a turn as service progression,
+            # never authorize asking the customer anything. Owner policy 2.8 — a question
+            # about payment methods must not become a location form because an old candidate
+            # happens to lack a zone.
+            return False
+        from ..schemas.turn_evidence import ServiceIntentKind
+        wanted = (ServiceIntentKind.INSPECTION.value, ServiceIntentKind.QUOTE_REQUEST.value)
+        _admitted_any = False
+        for intent in (getattr(evidence, "service_intents", ()) or ()):
+            if not self._evidence_admitted(intent):
+                continue
+            _admitted_any = True
+            kind = getattr(getattr(intent, "kind", None), "value",
+                           getattr(intent, "kind", None))
+            if kind in wanted:
+                return True
+        if _admitted_any:
+            # Semantic evidence spoke about this turn's service intent and did NOT claim an
+            # inspection or a quote. It governs: owner policy 2.8 is exactly the case where a
+            # payment question arrives beside an old zone-less candidate, and the stored
+            # candidate must not turn that into a required-information escalation.
+            return False
+        # Semantic silence is absence, not denial (owner policy 2.1), so the structural
+        # envelope governs rather than the question disappearing: a categorised vehicle with
+        # no inspection locality, mid-qualification, genuinely cannot be quoted or scheduled.
+        # One typed exclusion applies — see `_turn_service_question`.
+        return True
+
+    def _clarification_disposition(self, ctx, state, cand_data):
+        """`(resolution, disposition)` for the clarification decision. Reads; never writes.
+
+        Mirrors the correction gate's own entry conditions so the one decision sees the same
+        competing-proposal picture the correction path would, without arming anything and
+        without mutating state. When the gate's conditions do not hold — the ordinary
+        flags-off turn — both values are None and the decision simply has no correction
+        inputs, which is the correct reading rather than a missing one.
+        """
+        resolution = getattr(self, "_turn_candidate_resolution", None)
+        if resolution is None:
+            return None, None
+        if not (self._provisional_correction_on() and self._correction_grounding_on()):
+            return resolution, None
+        if (cand_data or {}).get("action") != "update":
+            return resolution, None
+        if getattr(resolution, "action", None) != CandidateAction.CORRECT_EXISTING:
+            return resolution, None
+        from . import pending_correction as _pcmod
+        return resolution, _pcmod.proposal_disposition(
+            state, resolution.corrected_fields)
+
+    def _turn_clarification_decision(self, ctx, state, *, reconciled=None,
+                                     resolution=None, disposition=None,
+                                     ce_vehicle=None, ce_location=False,
+                                     current_turn_text: str = ""):
+        """The ONE typed clarification decision for this turn. Evaluated at most once.
+
+        Memoized deliberately. Two call sites exist in the handler — the ordinary
+        conversational path and the correction-conflict branch — and the owner's rule is
+        that one turn produces one decision and one reservation. The second caller reads
+        this cached verdict; it does not produce another, and `_execute_clarification` is
+        the only place that can reserve.
+
+        RESOLUTION SOURCE. Identity, category and locality come from the RECONCILED PROPOSAL
+        and from already-committed canonical state — never from the catalogue, never from
+        raw prose. The reconciler is the authority that distinguishes a Ford Focus of year
+        2008 from a Peugeot whose model is literally "2008", and this method must not form a
+        second opinion about that.
+        """
+        cached = getattr(self, "_turn_clarification_decision_obj", None)
+        if cached is not None:
+            return cached
+
+        from .clarification_router import (clarification_decision, ClarificationRoute,
+                                           TurnClarificationDecision)
+        from .clarification_attempt import ClarificationFamily
+
+        if state is not None and getattr(state, "needs_human", False):
+            evidence = None
+        else:
+            try:
+                evidence = self._semantic_turn_evidence()
+            except Exception:                       # noqa: BLE001 - absence, not denial
+                evidence = None
+
+        # ── domain relevance: current-turn evidence, never stored incompleteness ──
+        vehicle_mention = (self._admitted_vehicle_evidence(evidence)
+                           if evidence is not None else None)
+        location_mention = (self._admitted_location_evidence(evidence)
+                            if evidence is not None else None)
+        _r = reconciled or {}
+        _r_marca = (_r.get("marca") or "").strip()
+        _r_modelo = (_r.get("modelo") or "").strip()
+        _r_tipo = (_r.get("tipo_vehiculo") or "").strip()
+        _r_zone_grp = (_r.get("zone_group") or "").strip()
+        _r_zone_det = (_r.get("zone_detail") or "").strip()
+
+        # Relevance is HYBRID and symmetric. Owner policy 2.1: a deterministic parser's
+        # silence is not a semantic veto, and semantic absence is not a denial of what the
+        # deterministic engine saw. A reconciled proposal that touches the family is itself
+        # current-turn evidence, because the reconciler only proposes from this turn.
+        required_next = self._required_next_information_authorized(ctx, state, evidence)
+        vehicle_relevant = bool(
+            vehicle_mention is not None
+            or ce_vehicle is not None
+            or _r_marca or _r_modelo or _r_tipo)
+        location_relevant = bool(
+            location_mention is not None
+            or ce_location
+            or _r_zone_grp or _r_zone_det)
+
+        # ── resolution: reconciled proposal first, then committed canonical state ──
+        focus = self._focus_candidate(ctx)
+        # `ce_vehicle` is the typed deterministic observation CE already made for this turn
+        # (§11), not a catalogue call made here: the router forms no second opinion about
+        # what the customer named. It contributes only to WHETHER the identity is resolved,
+        # never to what the identity IS — the reconciled proposal remains the sole source of
+        # the values anyone is told about, which is what keeps "Focus 2008" a Ford Focus.
+        _ce_marca = (getattr(ce_vehicle, "marca", None) or "").strip()
+        _ce_modelo = (getattr(ce_vehicle, "modelo", None) or "").strip()
         identity_resolved = bool(
-            (getattr(focus, "marca", None) or "").strip()
-            and (getattr(focus, "modelo", None) or "").strip())
-        category_resolved = bool((getattr(focus, "tipo_vehiculo", None) or "").strip())
-        zone_group, zone_detail = self._get_active_inspection_location(ctx, state)
+            (_r_marca and _r_modelo)
+            or (_ce_marca and _ce_modelo)
+            or ((getattr(focus, "marca", None) or "").strip()
+                and (getattr(focus, "modelo", None) or "").strip()))
+        category_resolved = bool(
+            _r_tipo
+            or (getattr(ce_vehicle, "tipo_vehiculo", None) or "").strip()
+            or (getattr(focus, "tipo_vehiculo", None) or "").strip())
+        _zone_grp, _zone_det = self._get_active_inspection_location(ctx, state)
+        _snap = resolve_field_evidence(ctx, state, current_turn_text)
+        location_resolved = bool(
+            _r_zone_grp or _zone_grp or _snap.location_known())
+
+        # ── immutable attempt history, read ONLY when it can change the answer ──
+        # Attempt history matters exactly when a family is in play AND unresolved, because
+        # that is the only situation in which this turn could ask the customer anything. A
+        # resolved turn, an irrelevant turn and a correction confirmation never consult the
+        # store: reading it would make every ordinary message depend on a second database
+        # round trip whose answer could not alter the route.
+        _vehicle_in_play = vehicle_relevant or required_next
+        _location_in_play = location_relevant or required_next
+        _could_ask = bool(
+            (_vehicle_in_play and not (identity_resolved and category_resolved))
+            or (_location_in_play and not location_resolved))
+        cycle = self._clarification_cycle_key(state)
+        if _could_ask:
+            spent = self._attempt_store().spent_families(
+                thread_id=getattr(ctx.thread, "id", None), cycle=cycle)
+        else:
+            from .clarification_attempt import SpentFamiliesResult
+            spent = SpentFamiliesResult(frozenset())
+        if not spent.available:
+            # SEQ-02 fail-closed. An unreadable store cannot prove an attempt is available,
+            # and dispatching on an unprovable assumption is how a customer gets asked
+            # twice. A person takes the turn; nothing is sent and nothing is claimed.
+            decision = TurnClarificationDecision(
+                ClarificationRoute.GENERIC_HUMAN_REQUIRED,
+                _HANDOFF_CLARIFICATION_STORE_UNAVAILABLE,
+                family=None, store_available=False, store_fault=spent.fault)
+            self._turn_clarification_decision_count = (
+                getattr(self, "_turn_clarification_decision_count", 0) + 1)
+            self._turn_clarification_decision_obj = decision
+            return decision
+
         corrected = tuple(getattr(resolution, "corrected_fields", ()) or ())
-        conflicting = tuple((disposition or {}).get("conflicting", ()))
-        return pc.route_clarification(
+        route, reason = clarification_decision(
             human_owns_turn=bool(getattr(state, "needs_human", False)),
             correction_target_known=bool(
                 getattr(resolution, "target_candidate_id", None) is not None),
             correction_values_known=bool(corrected),
-            vehicle_domain_proven=focus is not None,
+            vehicle_domain_relevant=vehicle_relevant,
             vehicle_identity_resolved=identity_resolved,
             vehicle_category_resolved=category_resolved,
-            vehicle_flow_attempted=bool(
+            vehicle_attempt_spent=ClarificationFamily.VEHICLE in spent,
+            vehicle_flow_outstanding=bool(
                 getattr(state, "vehicle_fallback_flow_sent", False)),
-            location_domain_proven=bool(zone_group or zone_detail
-                                        or getattr(focus, "zone_detail", None)),
-            location_resolved=bool(zone_group),
-            location_flow_attempted=bool(
+            location_domain_relevant=location_relevant,
+            location_resolved=location_resolved,
+            location_attempt_spent=ClarificationFamily.LOCATION in spent,
+            location_flow_outstanding=bool(
                 getattr(state, "location_fallback_flow_sent", False)),
-            other_confirmable_proposal=bool(conflicting))
+            other_confirmable_proposal=bool(
+                tuple((disposition or {}).get("conflicting", ()))),
+            required_next_information_authorized=required_next)
 
-    def _dispatch_clarification_route(self, ctx, state, route: str, reason: str):
-        """Carry out a routing decision. The router decides; this only executes.
+        family = None
+        if route == ClarificationRoute.VEHICLE_FLOW_REQUIRED:
+            family = ClarificationFamily.VEHICLE
+        elif route == ClarificationRoute.LOCATION_FLOW_REQUIRED:
+            family = ClarificationFamily.LOCATION
 
-        `CORRECTION_CONFIRMATION_REQUIRED` is not handled here — the correction gate owns
-        that path and reaches it without consulting the router.
+        # Producer attribution for the trace: WHICH engine made each family relevant, and
+        # what the reconciler concluded. Recorded as booleans, never as customer text.
+        self._turn_clar_semantic = bool(vehicle_mention is not None
+                                        or location_mention is not None)
+        self._turn_clar_deterministic = bool(
+            ce_vehicle is not None or ce_location
+            or _r_marca or _r_modelo or _r_tipo or _r_zone_grp or _r_zone_det)
+        self._turn_clar_identity = bool(identity_resolved and category_resolved)
+        self._turn_clar_location = bool(location_resolved)
+
+        decision = TurnClarificationDecision(route, reason, family=family)
+        self._turn_clarification_decision_count = (
+            getattr(self, "_turn_clarification_decision_count", 0) + 1)
+        self._turn_clarification_decision_obj = decision
+        self._turn_clarification_route = route
+        self._turn_clarification_reason = reason
+        return decision
+
+    def _complete_clarification_attempt(self, ctx, state, family: str, *,
+                                        resolved: bool, result: str):
+        """Bind a Flow completion to its attempt. `(attempt, already_terminal)`.
+
+        Steps 1-4 and 7 of the owner's completion order, in one place so the two handlers
+        cannot drift: derive the integer cycle key, load the attempt for this thread, cycle
+        and family, treat a missing row as unsolicited input, no-op idempotently when the
+        attempt is already terminal, and otherwise record the typed completion outcome.
+
+        Clearing the outstanding flag stays with the caller. That is a different fact from
+        attempt history, and keeping the two apart is the entire point of the subsystem:
+        the flag may be cleared freely and the row may never be.
         """
-        from . import pending_correction as pc
+        from .clarification_attempt import AttemptStatus
+        cycle = self._clarification_cycle_key(state)
+        store = self._attempt_store()
+        attempt = store.load(thread_id=ctx.thread.id, cycle=cycle, family=family)
+        self._turn_clarification_family = family
+        self._turn_clarification_cycle_key = cycle
+        self._turn_clarification_attempt = attempt
+        if attempt is None:
+            # A submission we cannot tie to an attempt we made. Record nothing, invent
+            # nothing, and let the caller proceed defensively.
+            logger.warning(
+                "G3-7F clarification completion with no attempt thread_id=%s cycle=%s "
+                "family=%s — treating as unsolicited", ctx.thread.id, cycle, family)
+            self._turn_clarification_completion = "NO_ATTEMPT"
+            return None, False
+        # `TERMINAL_FOR_AUTOMATION` governs whether this family may be ASKED again. It is
+        # deliberately NOT the duplicate test for a completion: `RESERVED` is terminal for
+        # asking (the process may have died after reserving, so we cannot prove we did not
+        # send) but a customer who just submitted the form plainly did receive it, and
+        # discarding their data because our dispatch record is missing would be the wrong
+        # way round. Only an attempt that has ALREADY been completed or handed to a person
+        # makes a second completion a duplicate.
+        _ALREADY_COMPLETED = (AttemptStatus.COMPLETED_RESOLVED,
+                              AttemptStatus.COMPLETED_UNRESOLVED,
+                              AttemptStatus.INVALID_COMPLETION,
+                              AttemptStatus.HANDED_OFF)
+        if attempt.status in _ALREADY_COMPLETED:
+            logger.info(
+                "G3-7F clarification completion is a duplicate thread_id=%s family=%s "
+                "status=%s — no second mutation", ctx.thread.id, family, attempt.status)
+            self._turn_clarification_completion = "DUPLICATE"
+            return attempt, True
+        if attempt.status in (AttemptStatus.DISPATCH_BLOCKED,
+                              AttemptStatus.DISPATCH_FAILED):
+            # We have no evidence this Flow ever reached the customer, so the submission is
+            # unsolicited. Record nothing against the attempt — rewriting a blocked dispatch
+            # as a completion would falsify the outbound history — but do not discard the
+            # customer's data either: the caller proceeds and a person owns the outcome.
+            logger.warning(
+                "G3-7F clarification completion for a non-dispatched attempt thread_id=%s "
+                "family=%s status=%s — treating as unsolicited",
+                ctx.thread.id, family, attempt.status)
+            self._turn_clarification_completion = "UNSOLICITED"
+            return attempt, False
+        if attempt.status == AttemptStatus.RESERVED:
+            # The customer answering IS the proof of dispatch our record is missing.
+            store.transition(attempt.id, AttemptStatus.DISPATCHED,
+                             dispatch_result="INFERRED_FROM_COMPLETION")
+        status = (AttemptStatus.COMPLETED_RESOLVED if resolved
+                  else (AttemptStatus.COMPLETED_UNRESOLVED
+                        if result == "UNRESOLVED" else AttemptStatus.INVALID_COMPLETION))
+        self._turn_clarification_attempt = store.transition(
+            attempt.id, status, completion_result=result, resolved_family=bool(resolved))
+        self._turn_clarification_completion = result
+        logger.info("G3-7F clarification completion thread_id=%s family=%s -> %s",
+                    ctx.thread.id, family, status)
+        return self._turn_clarification_attempt, False
+
+    def _execute_clarification(self, ctx, state, decision):
+        """Carry out one clarification decision. The ONLY place that reserves an attempt.
+
+        Order is the owner's: reserve atomically, commit the reservation, and only then
+        reach transport. A Flow that may already have reached the customer must never be
+        un-reserved by a later failure, so the reservation lives in its own transaction.
+        """
+        from .clarification_attempt import AttemptStatus
+        from .clarification_router import ClarificationRoute
+
+        route, reason = decision.route, decision.reason
         self._turn_clarification_route = route
         self._turn_clarification_reason = reason
         self._decision_log(ctx, "clarification_routed", route=route, reason=reason)
-        logger.info("OWNER-RESOLUTION clarification route thread_id=%s route=%s reason=%s",
-                    ctx.thread.id, route, reason)
-        if route == pc.ClarificationRoute.VEHICLE_FLOW_REQUIRED:
+        logger.info("G3-7F clarification route thread_id=%s route=%s reason=%s family=%s",
+                    getattr(ctx.thread, "id", None), route, reason, decision.family)
+
+        if route == ClarificationRoute.GENERIC_HUMAN_REQUIRED:
+            return self._generic_human_handoff(ctx, state, reason=reason)
+        if decision.family is None:
+            # NO_CLARIFICATION_REQUIRED and CORRECTION_CONFIRMATION_REQUIRED both reach
+            # here with no family. Neither asks the customer a clarification question, so
+            # there is nothing to execute and nothing to reserve — and handing the turn to
+            # a person because it needed no clarification would be the opposite of correct.
+            # The caller continues the ordinary path.
+            return None
+
+        if not decision.store_available:            # defensive; decided above already
+            return self._generic_human_handoff(
+                ctx, state, reason=_HANDOFF_CLARIFICATION_STORE_UNAVAILABLE)
+
+        cycle = self._clarification_cycle_key(state)
+        store = self._attempt_store()
+        reservation = store.reserve(thread_id=ctx.thread.id, cycle=cycle,
+                                    family=decision.family)
+        self._turn_clarification_reservation = reservation.status
+        self._turn_clarification_cycle_key = cycle
+
+        if not reservation.available:
+            # Fail closed: no Flow, no claim that an attempt succeeded, no outstanding flag,
+            # and no retry inside this turn.
+            self._turn_clarification_store_fault = reservation.fault
+            self._decision_log(ctx, "clarification_store_unavailable",
+                               family=decision.family, fault=reservation.fault)
+            return self._generic_human_handoff(
+                ctx, state, reason=_HANDOFF_CLARIFICATION_STORE_UNAVAILABLE)
+
+        if reservation.already_attempted:
+            attempt = reservation.attempt
+            self._turn_clarification_attempt_id = getattr(attempt, "id", None)
+            self._turn_clarification_prevented_second = True
+            outstanding = bool(getattr(
+                state,
+                "vehicle_fallback_flow_sent" if decision.family == "VEHICLE"
+                else "location_fallback_flow_sent", False))
+            self._decision_log(ctx, "clarification_attempt_already_spent",
+                               family=decision.family,
+                               status=getattr(attempt, "status", None))
+            if outstanding:
+                # The customer is holding the Flow right now. Asking anything further would
+                # give one answer two referents.
+                return None
+            return self._generic_human_handoff(
+                ctx, state, reason=_HANDOFF_CLARIFICATION_ATTEMPT_SPENT)
+
+        attempt = reservation.attempt
+        attempt_id = getattr(attempt, "id", None)
+        self._turn_clarification_attempt_id = attempt_id
+
+        if decision.family == "VEHICLE":
             result = self._dispatch_vehicle_clarification_flow(ctx, state)
-            if result is not None:
-                return result
-            # No Flow configured, or dispatch refused: a person takes it rather than the
-            # turn falling through to an open-ended question (owner policy 11).
-            return self._generic_human_handoff(
-                ctx, state, reason=_HANDOFF_VEHICLE_FLOW_UNAVAILABLE)
-        if route == pc.ClarificationRoute.LOCATION_FLOW_REQUIRED:
+            unavailable_reason = _HANDOFF_VEHICLE_FLOW_UNAVAILABLE
+        else:
             result = self._dispatch_location_clarification_flow(ctx, state)
-            if result is not None:
-                return result
-            return self._generic_human_handoff(
-                ctx, state, reason=_HANDOFF_LOCATION_FLOW_UNAVAILABLE)
-        return self._generic_human_handoff(ctx, state, reason=reason)
+            unavailable_reason = _HANDOFF_LOCATION_FLOW_UNAVAILABLE
+
+        # The dispatchers are the certified ones and set the outstanding flag only after a
+        # real `wa_message_id`, so "delivered" below is proven, not assumed.
+        if result is None:
+            store.transition(attempt_id, AttemptStatus.DISPATCH_FAILED,
+                             dispatch_result="NOT_CONFIGURED_OR_FAILED")
+            self._turn_clarification_dispatch = "FAILED"
+            return self._generic_human_handoff(ctx, state, reason=unavailable_reason)
+
+        if getattr(result, "action", None) == "blocked_dispatch":
+            store.transition(attempt_id, AttemptStatus.DISPATCH_BLOCKED,
+                             dispatch_result="OUTBOUND_GATE_BLOCKED_KILL_SWITCH")
+            self._turn_clarification_dispatch = "BLOCKED"
+            return result
+
+        store.transition(attempt_id, AttemptStatus.DISPATCHED,
+                         wa_message_id=getattr(result, "wa_message_id", None),
+                         dispatch_result="SENT")
+        self._turn_clarification_dispatch = "DISPATCHED"
+        return result
 
     def _dispatch_vehicle_clarification_flow(self, ctx, state):
         """The Vehicle Clarification Flow, with the composer's explanatory wording.
@@ -5950,7 +6377,29 @@ class ConversationEngine:
         except (ValueError, TypeError):
             pass
 
-        state.vehicle_fallback_flow_sent = False  # consumed
+        # G3-7F completion: the attempt row records what happened; the flag records
+        # only that the proposal is no longer outstanding. Validity is decided below,
+        # so the outcome is reported after it is known (see `_vfr_complete`).
+        state.vehicle_fallback_flow_sent = False  # the proposal is no longer outstanding
+
+        # ── G3-7F completion (owner order, steps 1-7) ─────────────────────────────
+        # Validity is known now, so the attempt records a typed outcome rather than merely
+        # "a Flow came back". A submission with no usable category is INVALID_COMPLETION and
+        # an unsolicited one is recorded as such — and in neither case may this family be
+        # asked again in this cycle, which the row, not a flag, guarantees.
+        _vfr_valid = bool(tipo in _FALLBACK_VEHICLE_TYPES and marca and modelo)
+        _vfr_attempt, _vfr_duplicate = self._complete_clarification_attempt(
+            ctx, state, "VEHICLE",
+            resolved=_vfr_valid,
+            result=("RESOLVED" if _vfr_valid
+                    else ("UNRESOLVED" if tipo in _FALLBACK_VEHICLE_TYPES
+                          else "INVALID_FIELDS")))
+        if _vfr_duplicate:
+            # Step 3: a duplicate or replayed submission performs no second mutation.
+            logger.info("G3-7F duplicate vehicle completion thread_id=%s — no mutation",
+                        ctx.thread.id)
+            self.db.commit()
+            return _out("skipped_duplicate_completion")
 
         if tipo not in _FALLBACK_VEHICLE_TYPES:
             logger.info(
@@ -6042,9 +6491,23 @@ class ConversationEngine:
         localidad = (flow_data.get("localidad") or "").strip()
         referencia = (flow_data.get("referencia_ubicacion") or "").strip() or None
 
-        state.location_fallback_flow_sent = False  # consumed
+        # G3-7F completion — see the vehicle handler. The flag means "outstanding", and
+        # clearing it can never make the attempt available again.
+        state.location_fallback_flow_sent = False  # the proposal is no longer outstanding
 
         canonical_group = _FLOW_ZONE_GROUP_MAP.get(zona_general)
+
+        # ── G3-7F completion (owner order, steps 1-7) — see the vehicle handler ───
+        _lfr_valid = bool(canonical_group is not None)
+        _lfr_attempt, _lfr_duplicate = self._complete_clarification_attempt(
+            ctx, state, "LOCATION",
+            resolved=_lfr_valid,
+            result=("RESOLVED" if _lfr_valid else "INVALID_FIELDS"))
+        if _lfr_duplicate:
+            logger.info("G3-7F duplicate location completion thread_id=%s — no mutation",
+                        ctx.thread.id)
+            self.db.commit()
+            return _out("skipped_duplicate_completion")
 
         if canonical_group is None:
             logger.info(
@@ -6123,22 +6586,26 @@ class ConversationEngine:
         pre_detected_vehicle: "VehicleMatch | None",
         ai_input_messages: list[str],
     ) -> "tuple[ConversationHandleOut | None, bool]":
-        """Deterministic routing gate that runs before _check_fallback_flow_triggers.
+        """Deterministic NON-clarification routing. Returns (result, skip_fallback).
 
-        Returns (result, skip_fallback):
-          result is not None   → return it immediately.
-          result is None, skip_fallback=True  → go to AI, skip old fallback trigger.
-          result is None, skip_fallback=False → continue to _check_fallback_flow_triggers.
+        G3-7F sequencing §14.1-§14.3. Priorities 2, 4 and 5 used to dispatch the Location and
+        Vehicle Flows directly from substring predicates over raw customer text — 89 phrases
+        across four frozensets deciding, with no typed intermediate, what a customer would be
+        asked. They are gone. Clarification is decided once, later in the turn, by
+        `_turn_clarification_decision`, from the reconciled proposal.
 
-        Priority order (spec M20.6D.2B.1):
-          1. Clearly outside coverage → deterministic coverage response.
-          2. Vehicle known + concern + zone unknown → concern-aware Location Flow.
-          3. FAQ / soft-close / service-info (not concern, not price) → AI.
-          4. Vehicle known + zone unknown (general) → standard Location Flow.
-             Covers price questions, scheduling, bare vehicle/location messages.
-          5. Vehicle unknown + price intent → Vehicle Flow.
-             Vehicle unknown + no price intent → AI.
-          6. Fall through to existing qualification behavior.
+        What remains here is deliberately NOT clarification:
+
+          * Priority 1 — a message from outside the coverage area gets the deterministic
+            coverage response and a human.
+          * The L4.7W2-F1 locality recovery — an ASR-mangled locality the customer already
+            named becomes a confirmable PROPOSAL, never a Flow and never a canonical write.
+          * Priority 3 — a service FAQ or soft close goes to the reply model.
+
+        Priorities 1 and 3 still read phrase sets. That is deferred technical debt recorded
+        by the sequencing audit (SEQ-09), not an endorsement: neither may dispatch a Vehicle
+        or Location Clarification Flow, and neither decides whether the customer is asked
+        anything.
         """
         if state.last_stage not in (STAGE_QUALIFYING, None):
             return None, False
@@ -6151,68 +6618,37 @@ class ConversationEngine:
         if _is_outside_coverage(combined):
             return self._send_coverage_response(ctx, state), False
 
-        _snap = resolve_field_evidence(ctx, state)
-        # pre_detected_vehicle covers the case where no candidate was created yet (e.g.
-        # direct-call tests). In normal CE flow a candidate already exists at this point
-        # and snap.vehicle_known() picks it up from the focused candidate.
+        _snap = resolve_field_evidence(ctx, state, combined)
         vehicle_known = _snap.vehicle_known() or bool(
             pre_detected_vehicle is not None
             and getattr(pre_detected_vehicle, "tipo_vehiculo", None)
         )
         zone_known = _snap.location_known()
 
-        # ── L4.7W2-F1: bounded locality recovery, BEFORE the generic Location Flow ──
+        # ── L4.7W2-F1: bounded locality recovery ──────────────────────────────────
         # Wild W2: the customer named the locality and ASR mangled it, so the deterministic
         # resolver found nothing and CE asked a question the customer had just answered.
-        # A recovered locality is a PROPOSAL — it is confirmed, never written here.
+        # A recovered locality is a PROPOSAL — it is confirmed, never written here — and it
+        # is not a clarification attempt, so it does not consume one.
         if vehicle_known and not zone_known and not self._pending_location_proposal(state):
             _loc = self._recover_locality(ctx, state, combined)
             if _loc is not None and _loc.needs_confirmation and _loc.best is not None:
                 _proposal = self._propose_locality(ctx, state, _loc)
                 if _proposal is not None:
                     return _proposal, False
-            # NONE / AMBIGUOUS / EXACT-but-unresolved all fall through to the certified
-            # Location Flow. Safety before forced recovery.
 
-        # Priority 2 — vehicle known + concern + zone missing → concern-aware Location Flow.
-        # Concern takes precedence over FAQ/soft-close; cannot be suppressed by the FAQ check.
-        if vehicle_known and not zone_known and not state.location_fallback_flow_sent:
-            if _has_vehicle_concern(combined):
-                result = self._dispatch_location_flow_direct(ctx, state, concern=True)
-                if result is not None:
-                    return result, False
-
-        # Priority 3 — FAQ / soft-close / service-info → AI (regardless of vehicle/zone state).
-        # Only fires when neither concern nor price intent is present.
-        # This carves out service questions and polite exits from the Location/Vehicle Flow paths.
+        # Priority 3 — FAQ / soft-close / service-info → reply model.
         if (
             _is_general_faq_or_soft_close(combined)
             and not _has_vehicle_concern(combined)
             and not _wants_price_quote(combined)
         ):
+            # Typed, one-directional: records that this turn is a service question so the
+            # clarification decision does not treat stored incompleteness as a reason to ask.
+            self._turn_service_question = True
             return None, True
 
-        # Priority 4 — vehicle known + zone missing → standard Location Flow (general case).
-        # Covers: price questions, scheduling queries, bare vehicle mentions, location mentions,
-        # and any other message that is not a FAQ, soft-close, concern, or outside-coverage.
-        # Preserves D.2B direct dispatch for the full "vehicle known + zone unknown" envelope.
-        if vehicle_known and not zone_known and not state.location_fallback_flow_sent:
-            result = self._dispatch_location_flow_direct(ctx, state, concern=False)
-            if result is not None:
-                return result, False
-
-        # Priority 5 — vehicle not resolved
-        if not vehicle_known:
-            if _wants_price_quote(combined) and not state.vehicle_fallback_flow_sent:
-                generic = _is_generic_vehicle_text(combined)
-                intro = _VEH_FLOW_BODY_GENERIC if generic else _VEH_FLOW_BODY_GARBLED
-                result = self._dispatch_vehicle_flow_direct(ctx, state, intro)
-                if result is not None:
-                    return result, False
-            # Unknown vehicle + no price intent → AI (skip old fallback trigger)
-            return None, True
-
-        return None, False
+        return None, True
 
     def _dispatch_vehicle_flow_direct(
         self,
@@ -6315,125 +6751,26 @@ class ConversationEngine:
         pre_detected_vehicle: "VehicleMatch | None",
         ai_input_messages: list[str],
     ) -> "ConversationHandleOut | None":
-        """Check if a qualification fallback Flow should be triggered.
+        """RETIRED (G3-7F sequencing §14.4/§14.5). Always None; dispatches nothing.
 
-        Vehicle is always resolved before location (Rule 8). When vehicle is
-        unresolved in ANY state, location check is skipped entirely so the two
-        paths never interleave. Returns None to continue normal AI processing.
+        This was the inherited two-step clarification: a free-text question on the first
+        unclear turn, then the Flow on the second, for each of the vehicle and location
+        families. It decided from the same substring predicates as `_routing_gate`, it wrote
+        `vehicle_fallback_flow_sent` / `location_fallback_flow_sent` to True BEFORE the
+        dispatch — so a refused or failed Flow still consumed the thread's one attempt — and
+        it held the only copy of "has this family been asked?" in a mutable boolean that
+        completion, handoff and the withdrawal loop could all clear.
+
+        Clarification now has exactly one authority, `_turn_clarification_decision`, which
+        runs after the turn's reconciled proposal exists and before canonical mutation, and
+        exactly one executor, `_execute_clarification`, which reserves a durable attempt row
+        before reaching transport. The body is removed rather than flag-gated so that no
+        configuration can route a customer back through it.
+
+        Kept as a method, returning None, because the call site's contract is part of the
+        certified `_routing_gate` handshake and the retirement is asserted structurally.
         """
-        _snap = resolve_field_evidence(ctx, state)
-        # Require tipo_vehiculo to be explicitly set — a brand-only catalog hit that
-        # resolves marca but leaves tipo_vehiculo empty must NOT block the flow trigger.
-        # pre_detected_vehicle covers the case where no candidate was created yet (e.g.
-        # existing candidates list was non-empty so CE skipped _create_candidate_from_catalog).
-        vehicle_known = _snap.vehicle_known() or bool(
-            pre_detected_vehicle is not None
-            and getattr(pre_detected_vehicle, "tipo_vehiculo", None)
-        )
-        zone_known = _snap.location_known()
-
-        # ── Vehicle fallback (takes priority over location) ───────────────
-        if not vehicle_known:
-            if state.vehicle_fallback_flow_sent:
-                # Flow already dispatched — do NOT call AI, do NOT re-dispatch.
-                # Send a brief reminder so the customer knows to complete the form.
-                reply = (
-                    "Por favor completá el formulario que te enviamos sobre tu vehículo "
-                    "para que podamos cotizarte la revisión."
-                )
-                self.db.commit()
-                self._answer_source = "VEHICLE_RESOLVER"
-                sent_id = self._send_text_to_wa(ctx, reply)
-                return _out("replied", wa_message_id=sent_id)
-            flow_id = (
-                getattr(self.settings, "whatsapp_vehicle_fallback_flow_id", "") or ""
-            ).strip()
-            if state.vehicle_clarification_sent and flow_id:
-                # One chat clarification already failed — send Flow.
-                logger.info(
-                    "M18 vehicle_fallback flow dispatched thread_id=%s flow_id=%s",
-                    ctx.thread.id, flow_id,
-                )
-                body = (
-                    "Completá los datos del vehículo para que podamos cotizarte "
-                    "la revisión mecánica."
-                )
-                if not self._outbound_armed():
-                    return self._blocked_outbound(ctx, body, OutboundPathId.CE_FLOW.value)
-                state.vehicle_fallback_flow_sent = True
-                flow_token = secrets.token_urlsafe(24)
-                self._answer_source = "VEHICLE_RESOLVER"
-                sent_id = self._send_flow_button(
-                    ctx, body, flow_token, flow_id=flow_id, initial_screen="VEHICLE_DETAILS"
-                )
-                return _out("replied", wa_message_id=sent_id)
-            if not state.vehicle_clarification_sent:
-                # First attempt — ask via chat.
-                reply = (
-                    "Para cotizarte la revisión necesito saber qué vehículo tenés. "
-                    "¿Me podés indicar la marca y el modelo?"
-                )
-                if not self._outbound_armed():
-                    return self._blocked_outbound(ctx, reply, OutboundPathId.CE_TEXT.value)
-                state.vehicle_clarification_sent = True
-                self.db.commit()
-                self._answer_source = "VEHICLE_RESOLVER"
-                sent_id = self._send_text_to_wa(ctx, reply)
-                return _out("replied", wa_message_id=sent_id)
-            # Clarification sent but no flow ID configured — fall through to AI.
-            return None
-
-        # ── Location fallback (only when vehicle IS known) ────────────────
-        if not zone_known:
-            if state.location_fallback_flow_sent:
-                # Flow already dispatched — do NOT call AI, do NOT re-dispatch.
-                reply = (
-                    "Por favor completá el formulario que te enviamos sobre la ubicación "
-                    "del auto para que podamos cotizarte la revisión."
-                )
-                self.db.commit()
-                self._answer_source = "VEHICLE_RESOLVER"
-                sent_id = self._send_text_to_wa(ctx, reply)
-                return _out("replied", wa_message_id=sent_id)
-            flow_id = (
-                getattr(self.settings, "whatsapp_location_fallback_flow_id", "") or ""
-            ).strip()
-            if state.location_clarification_sent and flow_id:
-                logger.info(
-                    "M18 location_fallback flow dispatched thread_id=%s flow_id=%s",
-                    ctx.thread.id, flow_id,
-                )
-                body = (
-                    "Indicanos dónde está el auto para calcular los viáticos "
-                    "de la revisión."
-                )
-                if not self._outbound_armed():
-                    return self._blocked_outbound(ctx, body, OutboundPathId.CE_FLOW.value)
-                state.location_fallback_flow_sent = True
-                flow_token = secrets.token_urlsafe(24)
-                self._answer_source = "VEHICLE_RESOLVER"
-                sent_id = self._send_flow_button(
-                    ctx, body, flow_token, flow_id=flow_id, initial_screen="LOCATION_DETAILS"
-                )
-                return _out("replied", wa_message_id=sent_id)
-            if not state.location_clarification_sent:
-                reply = (
-                    "¿En qué localidad o barrio está el auto? "
-                    "Por ejemplo: Palermo, Tigre, Dock Sud o Lomas de Zamora."
-                )
-                if not self._outbound_armed():
-                    return self._blocked_outbound(ctx, reply, OutboundPathId.CE_TEXT.value)
-                state.location_clarification_sent = True
-                self.db.commit()
-                self._answer_source = "VEHICLE_RESOLVER"
-                sent_id = self._send_text_to_wa(ctx, reply)
-                return _out("replied", wa_message_id=sent_id)
-            # Clarification sent but no flow ID configured — fall through to AI.
-            return None
-
         return None
-
-    # ── Text / AI path ────────────────────────────────────────────────────
 
     def _process_text(self, ctx: _Context, event: ConversationHandleIn) -> ConversationHandleOut:
         lead = ctx.lead
@@ -7425,6 +7762,56 @@ class ConversationEngine:
         # floor. `provisional ON / grounding OFF` used to arm a Tier-2 patch on the v1
         # resolver's target; it is a refused configuration, here and in
         # `_arm_pending_correction`, so neither the gate nor a direct caller can reach it.
+        # ══ G3-7F SEQUENCING: the ONE clarification decision for this turn ════════
+        # Placed here, and the placement is the whole milestone. Above this line the turn's
+        # reconciled proposal already exists (`_proposals` / `_cand_data`, from
+        # `_reconciled_reply_proposals`), carrying the numeric-model disambiguation that
+        # keeps "Focus 2008" a Ford Focus of year 2008 rather than a Peugeot 2008. Below
+        # this line `_apply_candidate` performs the canonical mutation. The decision
+        # therefore sees reconciled proposed state AND committed canonical state, and it is
+        # made before anything is written — which is exactly what the inherited decision at
+        # `_routing_gate`, 207 lines earlier, could not do.
+        #
+        # The ordering is structural, not a comment: `_cand_data` is assigned from
+        # `_proposals` above, and `self._apply_candidate(...)` is called below, in this same
+        # method. Neither can be reordered without the other failing.
+        _pc_resolution_d, _disposition_d = self._clarification_disposition(
+            ctx, state, _cand_data)
+        _clar = self._turn_clarification_decision(
+            ctx, state,
+            reconciled=_cand_data,
+            resolution=_pc_resolution_d,
+            disposition=_disposition_d,
+            ce_vehicle=pre_detected_vehicle,
+            ce_location=bool(_vehicle_location_written),
+            current_turn_text=current_turn_text or "")
+        if _clar.requires_clarification:
+            # SAFE PARTIAL MUTATION (§13). A clarification response may coexist with facts
+            # this turn genuinely resolved, but only through the existing canonical writer
+            # and only for the family that is NOT in question.
+            #
+            #   * Location unresolved, vehicle resolved -> the vehicle is written normally,
+            #     then the Location Flow asks for what is actually missing.
+            #   * Vehicle unresolved -> nothing about the vehicle is written. The locality,
+            #     if the customer named one, was already persisted by `_apply_zone_from_text`
+            #     above, through the same canonical path, before this decision ran.
+            #   * Generic human -> nothing is written at all. A person owns the turn.
+            #
+            # There is no second writer here and no field is written that the reconciler did
+            # not resolve.
+            if _clar.route == _CR_LOCATION_FLOW_REQUIRED:
+                _outcome = self._apply_candidate(
+                    ctx, _cand_data, zone_protected=_vehicle_location_written)
+                self._record_candidate_mutation(_outcome)
+            else:
+                self._record_candidate_mutation((False, None))
+            _clar_result = self._execute_clarification(ctx, state, _clar)
+            if _clar_result is not None:
+                return _clar_result
+            # `None` means a Flow is already outstanding with this customer: say nothing
+            # further this turn rather than giving one answer two referents.
+            return _out("skipped_clarification_outstanding")
+
         _pc_resolution = getattr(self, "_turn_candidate_resolution", None)
         _pc_tier = None
         if (self._provisional_correction_on()
@@ -7452,22 +7839,12 @@ class ConversationEngine:
             # competes for the customer's next word, and that competition is budgeted.
             _disposition = _pcmod.proposal_disposition(
                 state, _pc_resolution.corrected_fields)
-            if _disposition["conflicting"]:
-                # ── OWNER-RESOLUTION Part D: the typed clarification router ────────
-                # R2 answered this with a free-text question metered by a budget marker
-                # stored in the `pending_correction` column. The review proved the bound was
-                # not per-cycle and had no atomic guard. Both are gone: the router decides
-                # from canonical evidence, and the project's existing structured Flows are
-                # the one clarification attempt. A sound competing proposal means a Flow
-                # would coexist with another confirmable proposal, which owner policy 8
-                # forbids — so this routes to a person rather than asking anything.
-                _route, _reason = self._route_clarification(
-                    ctx, state, _pc_resolution, _disposition)
-                self._decision_log(ctx, "correction_conflict_routed", route=_route,
-                                   reason=_reason,
-                                   conflicting=list(_disposition["conflicting"]))
-                self._record_candidate_mutation((False, None))
-                return self._dispatch_clarification_route(ctx, state, _route, _reason)
+            # OWNER-RESOLUTION Part D, now folded into the single decision above. A
+            # correction competing with another live confirmable proposal is owner policy 8
+            # — one "sí" with two referents — and the router returns GENERIC_HUMAN_REQUIRED
+            # for it, so this turn has already been handed to a person before reaching here.
+            # There is deliberately no second routing call: one turn, one decision, one
+            # reservation authority.
             self._withdraw_dependent_proposals(ctx, state, _disposition)
             if _pc_tier == _pcmod.CorrectionTier.PROVISIONAL:
                 _pending, _refusal = self._arm_pending_correction(
@@ -8846,9 +9223,16 @@ class ConversationEngine:
         return getattr(self.settings, "reconciler_location_authority_enabled", False) is True
 
     def _reconciler_cycle_id(self, state) -> "str | None":
-        value = (getattr(state, "current_cycle_start_message_db_id", None)
-                 or getattr(state, "current_cycle_started_at", None))
-        return str(value) if value else None
+        """The thread's cycle identity, as a string. ONE definition, shared with the store.
+
+        SEQ-05. This used to fall back to `current_cycle_started_at` and then to `None`,
+        mixing a message id with a timestamp into one string, so the same cycle could be
+        keyed two ways by two subsystems in a single turn. It now derives from exactly the
+        same integer the clarification attempt store uses, so the reconciler and the
+        one-attempt invariant can never disagree about which cycle this is.
+        """
+        from .clarification_attempt import cycle_key
+        return str(cycle_key(state))
 
     def _record_reconciliation(self, ctx, decision, claim_type: str, state=None,
                                claims=(), *, decision_site_id: str = None) -> None:
