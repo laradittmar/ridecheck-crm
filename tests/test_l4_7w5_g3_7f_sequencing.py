@@ -496,9 +496,18 @@ class G_AuthorityRemoval(unittest.TestCase):
         """SEQ-09 debt is bounded: Priority 1 and 3 remain phrase-driven but ask nothing."""
         gate = code_only(E._routing_gate)
         self.assertIn("_is_outside_coverage", gate)
-        self.assertIn("_is_general_faq_or_soft_close", gate)
-        self.assertNotIn("_dispatch_vehicle_flow_direct", gate)
-        self.assertNotIn("_dispatch_location_flow_direct", gate)
+        # The FAQ/soft-close detector now lives behind `_mark_service_question`, which the
+        # gate calls. It is evaluated exactly once per turn and used in ONE direction: it may
+        # decline to treat a turn as service progression, never authorize asking anything.
+        self.assertIn("_mark_service_question", gate)
+        marker = code_only(E._mark_service_question)
+        self.assertIn("_is_general_faq_or_soft_close", marker)
+        for forbidden in ("_dispatch_vehicle_flow_direct", "_dispatch_location_flow_direct",
+                          "_dispatch_vehicle_clarification_flow",
+                          "_dispatch_location_clarification_flow", "_execute_clarification"):
+            self.assertNotIn(forbidden, gate, f"the gate can still ask via {forbidden}")
+            self.assertNotIn(forbidden, marker,
+                             f"the phrase detector can still ask via {forbidden}")
 
     def test_seq_54_the_engine_no_longer_calls_the_superseded_router(self):
         self.assertNotIn("pc.route_clarification", ENGINE_SRC)

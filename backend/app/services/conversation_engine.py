@@ -690,7 +690,7 @@ _LOCALITY_CONFIRMATION_TEMPLATE = "¿El auto está en {zone}?"
 #: G3-7F: asked at most once when a correction cannot be placed on exactly one vehicle.
 # ── G3-7F-OWNER-RESOLUTION: clarification and handoff wording ────────────────────────
 #
-# These sentences live here, beside `_VEH_FLOW_BODY_GENERIC`, `_LOC_FLOW_BODY_STANDARD` and
+# These sentences live here, beside the other outbound bodies and
 # `_MOTORCYCLE_HANDOFF_REPLY`, because G3-5F's architecture is explicit that the response
 # plan "holds no wording of its own" — a static test enforces it — and that every
 # proposition's `render` callable is supplied by the component that owns the fact. They are
@@ -699,13 +699,23 @@ _LOCALITY_CONFIRMATION_TEMPLATE = "¿El auto está en {zone}?"
 #
 # Owner policy 16: these are conformance examples of intent. Changing the wording is a
 # copy decision, not an architectural one.
+#: THE canonical Vehicle Flow introduction. Owner-approved, exact, and the only one.
+#: It IS the customer message: a Flow button carries its body in the same message, so a
+#: separate introductory text would be a duplicate response.
 _VEHICLE_CLARIFICATION_INTRO = (
-    "Para asegurarme de cotizar el vehículo correcto, te dejo un formulario breve "
-    "para completar la marca, modelo y año."
+    "Para identificar correctamente el vehículo y cotizar la revisión, te dejo un "
+    "formulario breve para completar la marca, el modelo y el año."
 )
+#: THE canonical Location Flow introduction. Owner-approved, exact, and the only one.
+#: The closing sentence is a PRODUCT COVERAGE STATEMENT — the service area the customer is
+#: being asked to locate the vehicle within. It is not a lexical routing trigger and nothing
+#: matches on it: coverage routing is `_is_outside_coverage`, which is a separate authority.
+#: The retired two-step carried this signal in a free-text step; it now lives in the body,
+#: so a customer in Greater Buenos Aires is still told they are covered.
 _LOCATION_CLARIFICATION_INTRO = (
-    "Para calcular correctamente el traslado, te dejo un formulario breve para "
-    "indicarnos dónde está el vehículo."
+    "Para calcular correctamente los viáticos de la revisión, te dejo un formulario "
+    "breve para indicarnos dónde se encuentra el vehículo. Realizamos revisiones en "
+    "CABA y GBA."
 )
 #: Neutral, professional, and silent about vehicle category. Owner policy 19: an ordinary
 #: car, a catalogue miss, an unknown vehicle and an ambiguous correction must never be told
@@ -788,23 +798,11 @@ _PRICE_INTENT_WORDS: frozenset[str] = frozenset({
 })
 
 # Location Flow body — concern-aware variant
-_LOC_FLOW_BODY_CONCERN = (
-    "Entiendo. En la revisión podemos revisar ese punto junto con el resto del auto.\n\n"
-    "Para calcular los viáticos, completá dónde está el vehículo."
-)
-# Location Flow body — standard (no concern)
-_LOC_FLOW_BODY_STANDARD = (
-    "Para calcular los viáticos de la revisión, completá dónde está el auto."
-)
-# Vehicle Flow body — generic vehicle or logistics question
-_VEH_FLOW_BODY_GENERIC = (
-    "La revisión se realiza donde está el auto.\n\n"
-    "Para cotizarte bien, completá estos datos del vehículo."
-)
-# Vehicle Flow body — garbled/unrecognised vehicle model
-_VEH_FLOW_BODY_GARBLED = (
-    "Para cotizarte bien, completá estos datos del vehículo."
-)
+# G3-7F-R2 owner decision: there is no longer a standard body, a concern-aware body, a
+# generic body or a garbled body. `_LOC_FLOW_BODY_CONCERN`, `_LOC_FLOW_BODY_STANDARD`,
+# `_VEH_FLOW_BODY_GENERIC` and `_VEH_FLOW_BODY_GARBLED` are DELETED rather than left
+# unreachable, so no configuration, caller or future edit can reach a second wording.
+# One introduction per family, above.
 # Out-of-coverage deterministic response (exact copy)
 _COVERAGE_RESPONSE = (
     "Por el momento trabajamos en CABA y GBA.\n\n"
@@ -4613,22 +4611,24 @@ class ConversationEngine:
         return cycle_key(state)
 
     def _required_next_information_authorized(self, ctx, state, evidence=None) -> bool:
-        """Does THIS TURN's service action require the missing value in order to proceed?
+        """Does THIS TURN's service action require the missing LOCATION in order to proceed?
 
-        The canonical conditions — qualifying stage, a categorised focus, no location yet —
-        plus one more that the others cannot supply on their own: an admitted service intent
-        in this turn.
+        Scope is deliberate and narrow: a categorised vehicle, mid-qualification, with no
+        resolved inspection locality. That is the one requirement the existing typed schema
+        can establish without matching a phrase.
 
-        That last clause is load-bearing. Without it the predicate is purely a statement
-        about STORED state, so a customer asking about payment methods while an old
-        candidate happened to lack a zone is treated as requiring location clarification and
-        handed to a person. That is exactly the defect owner policy 2.8 names: the existence
-        of an old focused vehicle must not, by itself, prove that the customer's current
-        message requires clarification.
+        It is NOT symmetric, and the asymmetry is a recorded limitation rather than an
+        oversight. The equivalent vehicle-side requirement would have to fire on a turn where
+        no candidate exists at all, and the only typed signal then available is
+        `last_intent == PREPURCHASE_INSPECTION`, which persists across turns — so it would
+        also fire on the FAQ and soft-close turns that follow, which owner policy 2.8
+        forbids. The marker that could suppress those (`_turn_service_question`) is set by
+        `_routing_gate`, which now runs AFTER this decision. See the closeout: STOP-02.
 
-        `INSPECTION` and `QUOTE_REQUEST` are the two intents whose workflow genuinely cannot
-        continue without a vehicle and a location. They are typed evidence from the
-        reconciler, not a phrase list, and an FAQ or soft-close turn carries neither.
+        Owner policy 2.8 is preserved by two guards: an admitted semantic service intent that
+        is not an inspection or a quote governs and returns False, and a turn the
+        deterministic FAQ detector already marked returns False. Stored incompleteness alone
+        is never a requirement.
         """
         if state is None or getattr(state, "needs_human", False):
             return False
@@ -4640,18 +4640,11 @@ class ConversationEngine:
         # RESOLVED, not merely present. A customer who names a locality the zone resolver
         # cannot place leaves `zone_detail` set and `zone_group` empty — "San Francisco
         # Solano" is the measured case — and treating that as a known location silenced the
-        # very question the workflow still needs answered. The test is the same one the
-        # router uses, so the two cannot disagree about whether a location exists.
+        # very question the workflow still needs answered.
         zone_grp, _zone_det = self._get_active_inspection_location(ctx, state)
         if zone_grp or resolve_field_evidence(ctx, state).location_known():
             return False
         if getattr(self, "_turn_service_question", False):
-            # A typed marker set by `_routing_gate`'s service-FAQ/soft-close detector. The
-            # detector is a bounded deterministic interpreter and its phrase set is used here
-            # in one direction only: it can DECLINE to treat a turn as service progression,
-            # never authorize asking the customer anything. Owner policy 2.8 — a question
-            # about payment methods must not become a location form because an old candidate
-            # happens to lack a zone.
             return False
         from ..schemas.turn_evidence import ServiceIntentKind
         wanted = (ServiceIntentKind.INSPECTION.value, ServiceIntentKind.QUOTE_REQUEST.value)
@@ -4665,15 +4658,7 @@ class ConversationEngine:
             if kind in wanted:
                 return True
         if _admitted_any:
-            # Semantic evidence spoke about this turn's service intent and did NOT claim an
-            # inspection or a quote. It governs: owner policy 2.8 is exactly the case where a
-            # payment question arrives beside an old zone-less candidate, and the stored
-            # candidate must not turn that into a required-information escalation.
             return False
-        # Semantic silence is absence, not denial (owner policy 2.1), so the structural
-        # envelope governs rather than the question disappearing: a categorised vehicle with
-        # no inspection locality, mid-qualification, genuinely cannot be quoted or scheduled.
-        # One typed exclusion applies — see `_turn_service_question`.
         return True
 
     def _clarification_disposition(self, ctx, state, cand_data):
@@ -4697,6 +4682,28 @@ class ConversationEngine:
         from . import pending_correction as _pcmod
         return resolution, _pcmod.proposal_disposition(
             state, resolution.corrected_fields)
+
+    def _mark_service_question(self, ai_input_messages: list[str]) -> bool:
+        """Record whether this turn is a service question. ONE-DIRECTIONAL, by design.
+
+        The inherited FAQ/soft-close detector is a bounded deterministic interpreter. Its
+        phrase set is consulted here for exactly one purpose: to DECLINE to treat a turn as
+        service progression, so stored incompleteness cannot turn a question about payment
+        methods into a location form (owner policy 2.8). It can never authorize asking the
+        customer anything — that is `_turn_clarification_decision`'s job, and it reads only
+        typed facts.
+
+        Evaluated before the clarification decision rather than inside `_routing_gate`,
+        because the decision now runs first: a suppressor that fires after the thing it is
+        meant to suppress suppresses nothing.
+        """
+        combined = " ".join(ai_input_messages or ())
+        marked = bool(
+            _is_general_faq_or_soft_close(combined)
+            and not _has_vehicle_concern(combined)
+            and not _wants_price_quote(combined))
+        self._turn_service_question = marked
+        return marked
 
     def _turn_clarification_decision(self, ctx, state, *, reconciled=None,
                                      resolution=None, disposition=None,
@@ -6638,14 +6645,13 @@ class ConversationEngine:
                     return _proposal, False
 
         # Priority 3 — FAQ / soft-close / service-info → reply model.
-        if (
-            _is_general_faq_or_soft_close(combined)
-            and not _has_vehicle_concern(combined)
-            and not _wants_price_quote(combined)
-        ):
-            # Typed, one-directional: records that this turn is a service question so the
-            # clarification decision does not treat stored incompleteness as a reason to ask.
-            self._turn_service_question = True
+        # Priority 3 — a service FAQ or soft close goes to the reply model.
+        # `_mark_service_question` records the verdict for the clarification decision, which
+        # runs later in the turn: the detector is evaluated exactly once, so the gate and the
+        # decision can never disagree about whether this was a service question, and the
+        # phrase set is used in one direction only — it may DECLINE to treat a turn as
+        # service progression, never authorize asking the customer anything.
+        if self._mark_service_question(ai_input_messages):
             return None, True
 
         return None, True
@@ -6708,7 +6714,11 @@ class ConversationEngine:
         self._answer_source = "VEHICLE_RESOLVER"
         # Part E: the composer owns the wording when the router dispatches; the legacy
         # priority ladder keeps its own certified bodies.
-        body = body or (_LOC_FLOW_BODY_CONCERN if concern else _LOC_FLOW_BODY_STANDARD)
+        # One introduction per family. `concern` is retained in the signature because the
+        # certified Flow dispatch contract includes it, but it no longer selects wording:
+        # a customer who mentions a concern is asked for the locality the same way as
+        # anyone else, and the concern is addressed in the inspection itself.
+        body = body or _LOCATION_CLARIFICATION_INTRO
         logger.info(
             "M20 location_flow_direct thread_id=%s flow_id=%s concern=%s",
             ctx.thread.id, flow_id, concern,
@@ -7763,18 +7773,17 @@ class ConversationEngine:
         # resolver's target; it is a refused configuration, here and in
         # `_arm_pending_correction`, so neither the gate nor a direct caller can reach it.
         # ══ G3-7F SEQUENCING: the ONE clarification decision for this turn ════════
-        # Placed here, and the placement is the whole milestone. Above this line the turn's
-        # reconciled proposal already exists (`_proposals` / `_cand_data`, from
+        # Above this line the turn's reconciled proposal exists (`_cand_data`, from
         # `_reconciled_reply_proposals`), carrying the numeric-model disambiguation that
-        # keeps "Focus 2008" a Ford Focus of year 2008 rather than a Peugeot 2008. Below
-        # this line `_apply_candidate` performs the canonical mutation. The decision
-        # therefore sees reconciled proposed state AND committed canonical state, and it is
-        # made before anything is written — which is exactly what the inherited decision at
-        # `_routing_gate`, 207 lines earlier, could not do.
+        # keeps "Focus 2008" a Ford Focus of year 2008. Below it `_apply_candidate` performs
+        # the canonical mutation. The decision therefore sees reconciled proposed state AND
+        # committed canonical state, and is made before anything is written.
         #
-        # The ordering is structural, not a comment: `_cand_data` is assigned from
-        # `_proposals` above, and `self._apply_candidate(...)` is called below, in this same
-        # method. Neither can be reordered without the other failing.
+        # G3-7F-R2 note: it was NOT moved above the reply-model call. Doing so is what the
+        # certified M20.6D "AI must not be called" contract would require, but the reply
+        # model is consulted before reconciliation today, so hoisting the decision means
+        # hoisting reconciliation — which broke twelve identities including this milestone's
+        # own sequencing invariants. Recorded as STOP-03 rather than forced.
         _pc_resolution_d, _disposition_d = self._clarification_disposition(
             ctx, state, _cand_data)
         _clar = self._turn_clarification_decision(
@@ -7786,19 +7795,9 @@ class ConversationEngine:
             ce_location=bool(_vehicle_location_written),
             current_turn_text=current_turn_text or "")
         if _clar.requires_clarification:
-            # SAFE PARTIAL MUTATION (§13). A clarification response may coexist with facts
-            # this turn genuinely resolved, but only through the existing canonical writer
-            # and only for the family that is NOT in question.
-            #
-            #   * Location unresolved, vehicle resolved -> the vehicle is written normally,
-            #     then the Location Flow asks for what is actually missing.
-            #   * Vehicle unresolved -> nothing about the vehicle is written. The locality,
-            #     if the customer named one, was already persisted by `_apply_zone_from_text`
-            #     above, through the same canonical path, before this decision ran.
-            #   * Generic human -> nothing is written at all. A person owns the turn.
-            #
-            # There is no second writer here and no field is written that the reconciler did
-            # not resolve.
+            # SAFE PARTIAL MUTATION (§13 of the sequencing brief). A clarification response
+            # may coexist with facts this turn genuinely resolved, but only through the
+            # existing canonical writer and only for the family that is NOT in question.
             if _clar.route == _CR_LOCATION_FLOW_REQUIRED:
                 _outcome = self._apply_candidate(
                     ctx, _cand_data, zone_protected=_vehicle_location_written)
@@ -7808,8 +7807,6 @@ class ConversationEngine:
             _clar_result = self._execute_clarification(ctx, state, _clar)
             if _clar_result is not None:
                 return _clar_result
-            # `None` means a Flow is already outstanding with this customer: say nothing
-            # further this turn rather than giving one answer two referents.
             return _out("skipped_clarification_outstanding")
 
         _pc_resolution = getattr(self, "_turn_candidate_resolution", None)

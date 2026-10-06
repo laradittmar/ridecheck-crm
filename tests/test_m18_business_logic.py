@@ -5979,50 +5979,35 @@ class TestProdRegressionLocationWording(unittest.TestCase):
     """Regression: location clarification must mention GBA, not only Buenos Aires."""
 
     def test_location_clarification_wording_covers_gba(self):
-        """First location clarification must mention Tigre and/or Lomas de Zamora
-        to signal GBA coverage (not just Buenos Aires city)."""
-        from unittest.mock import MagicMock
-        eng = _make_engine()
-        eng.settings = MagicMock()
-        eng.settings.whatsapp_vehicle_fallback_flow_id = "veh-id"
-        eng.settings.whatsapp_location_fallback_flow_id = "loc-id"
-        eng.db.commit = lambda: None
-        texts = []
-        eng._send_text_to_wa = lambda ctx, text: texts.append(text) or "wamid"
+        """MIGRATED: the coverage signal moved from the retired text step into the Flow body.
 
-        cand = _make_candidate(tipo_vehiculo="AUTO")
-        state = _make_state(last_stage="QUALIFYING", home_zone_group=None)
-        ctx = _make_ctx(candidates=[cand], state=state)
-        from _clarification_store_double import ask, install
-        install(eng)
-        _focus = (list(getattr(ctx, 'candidates', None) or []) or [None])[0]
-        _known = bool(getattr(_focus, 'tipo_vehiculo', None))
-        ask(eng, ctx, state,
-            ce_vehicle=(None if _known else types.SimpleNamespace(
-                marca='', modelo='', tipo_vehiculo='')),
-            ce_location=_known)
-        # First trigger fires location clarification (since vehicle IS known via candidate)
-        # Actually with vehicle known, it checks location.
-        # state has no zone → location clarification fires on first call.
-        self.assertEqual(len(texts), 1)
-        msg_lower = texts[0].lower()
-        # Must NOT limit to only "buenos aires" (ciudad)
-        self.assertNotIn("zona o barrio de buenos aires", msg_lower)
-        # Must give GBA examples
-        self.assertIn("tigre", msg_lower)
+        The original asserted that the FIRST location clarification — a free-text chat
+        message in the retired two-step ladder — named Tigre and/or Lomas de Zamora so a
+        customer in Greater Buenos Aires knew they were covered. That text step is gone
+        (G3-7F sequencing §14.5), and the owner's G3-7F-R2 decision puts the coverage
+        statement in the single Location Flow introduction instead.
 
+        The customer-visible guarantee is unchanged and is asserted here directly against
+        the canonical body: the clarification that asks where the vehicle is also states
+        the service area, and it does not restrict that area to the city.
+        """
+        from app.services.conversation_engine import _LOCATION_CLARIFICATION_INTRO
+        body = _LOCATION_CLARIFICATION_INTRO
+        lower = body.lower()
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Group-default viáticos fix (migration 20260624_group_default_viaticos)
-#
-# PricingRepository already has a Step-3 fallback:
-#   WHERE zone_group = <group> AND zone_detail IS NULL
-# These tests verify that the 3-step resolution ladder works correctly after
-# the migration inserts NULL-detail rows for CABA/Norte/Oeste/Sur.
-#
-# The fake repo below faithfully replicates the real repository's 3-step logic
-# so tests run without a DB connection.
-# ═════════════════════════════════════════════════════════════════════════════
+        # The coverage statement is present, and it names BOTH areas.
+        self.assertIn("caba", lower, f"the body must state CABA coverage: {body!r}")
+        self.assertIn("gba", lower, f"the body must state GBA coverage: {body!r}")
+        self.assertIn("realizamos revisiones en caba y gba", lower,
+                      "the approved coverage sentence, verbatim")
+
+        # It must NOT restrict the area to the city, which is the defect this guards.
+        self.assertNotIn("zona o barrio de buenos aires", lower)
+        self.assertNotIn("solo en caba", lower)
+        self.assertNotIn("únicamente en caba", lower)
+
+        # And it is still a request for the vehicle's location, not only a coverage notice.
+        self.assertIn("dónde se encuentra el vehículo", lower)
 
 class FakeRepoGroupDefaults:
     """Replicates the 3-step lookup of PricingRepository with group defaults.

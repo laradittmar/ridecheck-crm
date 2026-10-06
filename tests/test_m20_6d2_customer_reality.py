@@ -87,12 +87,25 @@ from app.schemas.conversation import ConversationHandleIn
 from app.services.conversation_engine import (
     ConversationEngine,
     _COVERAGE_RESPONSE,
-    _LOC_FLOW_BODY_CONCERN,
-    _LOC_FLOW_BODY_STANDARD,
-    _VEH_FLOW_BODY_GENERIC,
-    _VEH_FLOW_BODY_GARBLED,
+    _LOCATION_CLARIFICATION_INTRO,
+    _VEHICLE_CLARIFICATION_INTRO,
     _is_general_faq_or_soft_close,
 )
+
+# ── G3-7F-R2 owner decision: ONE introduction per clarification family ──────────
+# `_LOC_FLOW_BODY_STANDARD`, `_LOC_FLOW_BODY_CONCERN`, `_VEH_FLOW_BODY_GENERIC` and
+# `_VEH_FLOW_BODY_GARBLED` are deleted from the engine. There is no standard-versus-concern
+# distinction and no generic-versus-garbled one: a customer who mentions a concern is asked
+# for the locality exactly like anyone else, and the concern is addressed in the inspection.
+#
+# Each name is bound to the ONE approved body, so every assertion in this file still checks
+# the COMPLETE, EXACT customer-facing text — the whole constant, never a fragment of it.
+# A test that asserted the concern variant was ABSENT now asserts the single Location body
+# is absent, which is the stronger and still-correct reading of "no Location Flow here".
+_LOC_FLOW_BODY_STANDARD = _LOCATION_CLARIFICATION_INTRO
+_LOC_FLOW_BODY_CONCERN = _LOCATION_CLARIFICATION_INTRO
+_VEH_FLOW_BODY_GENERIC = _VEHICLE_CLARIFICATION_INTRO
+_VEH_FLOW_BODY_GARBLED = _VEHICLE_CLARIFICATION_INTRO
 from app.services.pricing import PricingService
 from app.services.schedule import ScheduleService
 
@@ -127,6 +140,11 @@ def _ensure_zones(db: Session) -> None:
 
 # ── DB helpers ─────────────────────────────────────────────────────────────────
 _CLEAN_TABLES = [
+    # G3-7F-R2: clarification attempt history is per-thread durable state, and this suite
+    # reuses thread ids across tests. It is listed FIRST because of its foreign keys to
+    # whatsapp_threads and whatsapp_messages. Without it a later test inherits an earlier
+    # test's spent attempt and is escalated to a human instead of being asked.
+    "whatsapp_clarification_attempts",
     "thread_revisions", "revisions",
     "whatsapp_outbound_dedup", "whatsapp_messages",
     "whatsapp_thread_candidates", "whatsapp_thread_states",
@@ -1481,8 +1499,12 @@ class TestRC16PriceWithKnownVehicleDirectFlow(unittest.TestCase):
         # Standard Location Flow body (not concern body)
         self.assertTrue(any(_LOC_FLOW_BODY_STANDARD in t for t in blocked),
                         f"Standard Location Flow body expected: {blocked}")
-        self.assertFalse(any(_LOC_FLOW_BODY_CONCERN in t for t in blocked),
-                         f"Concern body must NOT fire (no concern in message): {blocked}")
+        # MIGRATED (G3-7F-R2 owner decision): there is one Location Flow introduction, so
+        # "the standard body and not the concern body" no longer names a distinction. What
+        # the test actually guarantees — the customer receives the one approved body, in
+        # full and exactly — is asserted above and strengthened to equality here.
+        self.assertIn(_LOCATION_CLARIFICATION_INTRO, blocked,
+                      f"the blocked audit must carry the EXACT approved body: {blocked}")
 
         # No plain-text locality clarification
         plain = any("¿En qué localidad" in t or "¿En qué barrio" in t for t in blocked)
@@ -1530,8 +1552,12 @@ class TestRC16PriceWithKnownVehicleDirectFlow(unittest.TestCase):
         self.assertTrue(any(_LOC_FLOW_BODY_STANDARD in t for t in blocked),
                         f"Standard Location Flow must fire for bare vehicle + missing zone: {blocked}")
         # NOT concern body (no concern word in message)
-        self.assertFalse(any(_LOC_FLOW_BODY_CONCERN in t for t in blocked),
-                         f"Concern body must not fire: {blocked}")
+        # MIGRATED (G3-7F-R2 owner decision): there is one Location Flow introduction, so
+        # "the standard body and not the concern body" no longer names a distinction. What
+        # the test actually guarantees — the customer receives the one approved body, in
+        # full and exactly — is asserted above and strengthened to equality here.
+        self.assertIn(_LOCATION_CLARIFICATION_INTRO, blocked,
+                      f"the blocked audit must carry the EXACT approved body: {blocked}")
         self.assertEqual(result.action, "blocked_dispatch")
         self.assertEqual(mock_urlopen.call_count, 0, "AI must not be called")
 
