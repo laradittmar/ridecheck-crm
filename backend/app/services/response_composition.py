@@ -59,6 +59,11 @@ class PropositionId:
     #: G3-6. The one required-next-information question, keyed by the field it is missing,
     #: so two producers asking for the same field are one proposition.
     CLARIFICATION_REQUIRED = "clarification.required"
+    #: G3-7H P4. The factual answer an unrelated service FAQ is owed, registered as a
+    #: PROPOSITION so a mixed FAQ-plus-service turn keeps both claims instead of losing the
+    #: service action to an early return. Registration does not decide the wording and does
+    #: not promise a second message: the plan bounds and deduplicates what is sent.
+    GENERAL_INFORMATION_ANSWER = "faq.general_information"
     #: G3-6. A canonical fact the response must reconcile rather than imply.
     CANONICAL_VEHICLE = "canonical.vehicle"
     #: G3-6-BC (audit G36-03). The price the pricing service authorized for THIS turn. It is

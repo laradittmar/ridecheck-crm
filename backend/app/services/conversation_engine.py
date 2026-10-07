@@ -3355,6 +3355,39 @@ class ConversationEngine:
         self._turn_clarification_reason = None   # why it chose it
         self._turn_clarification_flow = None     # "VEHICLE" | "LOCATION", after dispatch
         self._turn_clarification_intro = None    # (family, composer-rendered sentence)
+        # ── G3-7H P1: the rest of the per-turn clarification memory ───────────────
+        # The G3-7G audit found `_turn_clarification_decision_obj` was the only field in
+        # this block that was never reset, and measured the consequence: on a second turn
+        # through the same engine instance the memo returned turn 1's verdict, so an FAQ
+        # turn followed by a price question never re-decided and the Location Flow was
+        # never offered. That is the real `rc14` defect.
+        #
+        # The audit's field inventory showed fourteen more in the same state. Every one of
+        # them feeds `_clarification_for_trace`, so a reused engine would also report the
+        # previous turn's attempt id, reservation, dispatch and completion as if they
+        # belonged to this turn. They are reset together, here, for the same reason.
+        #
+        # PROCESS MEMORY ONLY. `_clarification_attempt_store` is deliberately NOT reset:
+        # it is the session factory for durable attempt history, and that history —
+        # `whatsapp_clarification_attempts` — is the authority for "this family already had
+        # its one attempt". Nothing here may stand in for it.
+        self._turn_clarification_decision_obj = None    # P1: the memo itself
+        self._turn_clarification_decision_count = 0     # exactly one decision per turn
+        self._turn_clarification_family = None
+        self._turn_clarification_attempt = None
+        self._turn_clarification_attempt_id = None
+        self._turn_clarification_reservation = None
+        self._turn_clarification_cycle_key = None
+        self._turn_clarification_dispatch = None
+        self._turn_clarification_completion = None
+        self._turn_clarification_prevented_second = False
+        self._turn_clarification_store_fault = None
+        self._turn_clarification_burst = None
+        self._turn_clar_semantic = None
+        self._turn_clar_deterministic = None
+        self._turn_clar_identity = None
+        self._turn_clar_location = None
+        self._turn_general_information_registered = False
         self._turn_handoff_reason = None         # truthful generic-handoff reason
         self._turn_generic_handoff = False       # a person owns the turn from here
         self._turn_confirmation_bound = None     # Part A: why authority was or was not bound
@@ -3919,14 +3952,73 @@ class ConversationEngine:
 
     # ── G3-7 — the reply model's former mutation authority, moved to typed evidence ──
 
+    def _register_general_information_proposition(self, ctx, ai_input_messages) -> bool:
+        """Record that this burst is owed a factual answer, then let the turn continue.
+
+        G3-7H P4. The claim is registered; the WORDS are not decided here. Factual authority
+        stays exactly where it is — `_compose_secondary_answers` and `_FAQ_TOPIC_ANSWERS`,
+        with the DEF-04 business-hours protection that rejects prose asserting hours
+        canonical truth denies. This method adds no answer text, invents no fact and reads no
+        phrase list; it exists so the FAQ claim survives a turn that also carries a service
+        action, which the inherited early return discarded.
+
+        It registers a NON-RENDERING proposition on purpose. `render=None` means the plan
+        composes nothing for it, so the customer-visible message count is unchanged and a
+        selected clarification Flow remains exactly one message with its approved body.
+        Rendering a secondary factual answer ALONGSIDE a Flow needs the response-plan
+        composition move that follows this milestone — the registration is the foundation,
+        and the dependency is recorded rather than faked.
+        """
+        plan = getattr(self, "_live_plan", None)
+        if plan is None:
+            return False
+        if getattr(plan, "human_owns_turn", False):
+            return False                      # a person owns the turn; nothing is added
+        self._turn_general_information_registered = True
+        return bool(plan.register(Proposition(
+            proposition_id=PropositionId.GENERAL_INFORMATION_ANSWER,
+            kind=ResponseItemKind.FAQ_ANSWER,
+            claim_family="faq.general_information",
+            render=None,                      # P4: registration only, no second message
+            decision_authority=DecisionAuthority.DETERMINISTIC_RULE,
+            fact_sources=("CANONICAL_FAQ",),
+            renderer_source=RendererSource.DETERMINISTIC_TEMPLATE,
+            policy="G3-7H-P4-REGISTER-AND-CONTINUE",
+            redundant=True,                   # recorded for the trace, composes nothing
+            dispatch_path=DispatchPath.TEXT,
+        )))
+
+    def _layer_d_register_and_continue_on(self) -> bool:
+        """Is Layer D allowed to register its FAQ answer and continue the turn?
+
+        G3-7H P4. Default OFF, and off is byte-compatible with the parent: Layer D answers
+        and returns exactly as before. On, Layer D registers a typed
+        `GENERAL_INFORMATION_ANSWER` proposition and falls through, so a burst that carries
+        both an FAQ and a service action keeps both claims instead of losing the service
+        action to an early return 776 lines before reconciliation.
+
+        Deliberately does NOT make a reply-generation call of its own when on. Layer D built
+        its messages from the same `ai_input_messages` the one downstream reply call already
+        receives, so continuing costs nothing and the turn still makes at most one
+        reply-generation call — which is the rule this flag exists to respect.
+        """
+        return getattr(getattr(self, "settings", None),
+                       "layer_d_register_and_continue_enabled", False) is True
+
     def _reply_renderer_demotion_on(self) -> bool:
         """Is the reply model demoted to a renderer on this deployment?
 
-        Default OFF. The cutover is gated because the replacement's INPUT is the semantic
-        interpreter's output, and proving it covers the durable corpus — the messy quote
-        request, the vehicle replacement, the Wild reproductions — needs a live
-        interpretation this milestone is not authorized to make. The plumbing is here and
-        tested against injected evidence; arming it is a separate, evidenced decision.
+        Default OFF when the attribute is absent, which is the deployed `840bce0` shape.
+        The cutover is gated because the replacement's INPUT is the semantic interpreter's
+        output, and proving it covers the durable corpus — the messy quote request, the
+        vehicle replacement, the Wild reproductions — needs a live interpretation no
+        milestone has yet been authorized to make.
+
+        G3-7H measured exactly what that proof is worth: with the strip made unconditional,
+        46 real-customer identities lose their candidate proposal. Until the corpus
+        evaluation lands, this flag still decides, and the divergence G3-7G recorded between
+        the deployed image and HEAD remains an open deployment blocker rather than a
+        resolved one.
         """
         return getattr(getattr(self, "settings", None),
                        "reply_renderer_demotion_enabled", False) is True
@@ -6947,7 +7039,16 @@ class ConversationEngine:
                      and (not self._acceptance_authority_on()
                           or self._authorize_acceptance(ctx, state, ai_input_messages).allows))
         ):
-            return self._handle_general_information_ai(ctx, event, ai_input_messages)
+            # ── G3-7H P4: register-and-continue, or the inherited answer-and-return ──
+            if self._layer_d_register_and_continue_on():
+                self._register_general_information_proposition(ctx, ai_input_messages)
+                # Fall through. The service action in this burst — a Vehicle or Location
+                # Flow, a correction confirmation, a quote, a handoff — is still decided
+                # downstream from reconciled evidence, and the FAQ claim travels with the
+                # plan instead of ending the turn.
+            else:
+                return self._handle_general_information_ai(
+                    ctx, event, ai_input_messages)
 
         # ── M21.1.2 Layer G: Vehicle inspectability gate (all stages) ─────
         # After FAQ bypass (Layer D); before website-form, QUOTED acceptance,
@@ -7743,6 +7844,22 @@ class ConversationEngine:
             and _cand_data.get("action") in ("create", "update")
         ):
             return self._motorcycle_human_handoff(ctx, state)  # AI path: no source_text
+        # ╔══ G3-7H P3: CATEGORY FLOOR + CLARIFICATION DECISION — ONE MOVABLE BLOCK ══╗
+        # Everything from here to `_execute_clarification` below is a single unit, and the
+        # later reply-phase move must relocate it as one. The G3-7G audit measured what
+        # happens otherwise: the experimental hoist moved the decision and left the floor
+        # behind, `g37f_26` caught it (`the floor must run BEFORE the writer`), and owner
+        # policy 19 — an unplaceable category is never announced as a motorcycle — was
+        # broken by the move itself rather than by any logic change.
+        #
+        # The floor must precede EVERY category-dependent mutation: `_apply_candidate`,
+        # `_create_candidate_from_catalog`, `_apply_vehicle_identity` and the focus switch.
+        # `_apply_extracted` above is not one of them — it writes thread-state fields and
+        # touches no candidate identity or category, which is why it may precede the floor.
+        # `test_g37h_p3_*` asserts the ordering against every writer by call site, not by
+        # character offset, so a legitimate move cannot read as a regression and an illegal
+        # move cannot hide.
+        # ╚═══════════════════════════════════════════════════════════════════════════╝
         # ── G3-7F MOTO/category safety floor ──────────────────────────────────────
         # A complete identity whose category is established by neither the catalogue nor
         # confirmed evidence is not an ordinary car. G37DR-04 measured a `Honda/Titan`
@@ -12008,6 +12125,18 @@ class ConversationEngine:
         # reply decision crosses. A consumer cannot opt back in, and a future consumer
         # cannot find them by accident: past this point the decision carries renderer
         # material only. `_reconciled_reply_proposals` supplies what they used to.
+        #
+        # G3-7H P2 — ATTEMPTED, MEASURED, REVERTED. Making this strip unconditional is the
+        # right end state and it works: all six settings postures (attribute absent, false,
+        # true, malformed, None, MagicMock) then strip every field. But the full regression
+        # measured the cost: 46 real-customer identities — vehicle replacement, focus
+        # switching, zone correction, quote and acceptance progression in
+        # `messy_turn_reconciliation`, `wild04r_f3/f4/f6` — obtain their candidate proposal
+        # ONLY from this field set in the deployed posture, which has no demotion attribute
+        # at all. The reconciled alternative exists but needs admitted semantic evidence,
+        # and whether the frozen prompt covers the durable corpus is the very proof G3-7G
+        # named as missing. Stop condition §13.1. Do not restore authority elsewhere and do
+        # not add phrases; the dependency is the corpus evaluation, not a workaround.
         if self._reply_renderer_demotion_on():
             for field in self._REPLY_MUTATION_FIELDS:
                 decision.pop(field, None)
