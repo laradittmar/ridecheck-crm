@@ -702,6 +702,13 @@ class CandidateHoldReason:
     CREATE_UNCONFIRMED = "CREATE_UNCONFIRMED"
     #: The vehicle category is established by neither the catalogue nor confirmed evidence.
     CATEGORY_NOT_ESTABLISHED = "CATEGORY_NOT_ESTABLISHED"
+    # ── G3-7K W1: survivorship must be proven, never inferred from emission order ──
+    #: Two or more genuinely distinct vehicle identities were admitted in ONE burst and
+    #: supersession did not identify exactly one survivor. Which car the customer kept is
+    #: therefore unproven, so nothing may be selected, corrected or created. Emission order
+    #: is not authority: the interpreter may list the DISCARDED car last (observed in
+    #: G3-7J-R2 B04, 3/3 attempts), so "last mention wins" can pick the wrong vehicle.
+    UNMARKED_MULTI_IDENTITY = "UNMARKED_MULTI_IDENTITY"
 
 
 class CandidateGroundingBasis:
@@ -719,8 +726,13 @@ class CandidateGroundingBasis:
     G2_SINGLETON = "G2_SINGLETON"
     #: G3 — a typed in-burst reference resolving to one row (superseded mentions included).
     G3_REFERENCE = "G3_REFERENCE"
+    #: G4 — G3-7K W1. An explicit CONFIRMED REPLACE_CANDIDATE whose single surviving
+    #: identity is absent from the thread, named in the correction's own to-value, said
+    #: literally by the customer and confirmed by the vehicle catalogue. A replacement
+    #: names its own target, so it grounds itself without needing a pointer to the old car.
+    G4_NAMED_REPLACEMENT = "G4_NAMED_REPLACEMENT"
 
-    ALL = (NONE, G1_IDENTITY, G2_SINGLETON, G3_REFERENCE)
+    ALL = (NONE, G1_IDENTITY, G2_SINGLETON, G3_REFERENCE, G4_NAMED_REPLACEMENT)
 
 
 class CandidateSelectionBasis:
@@ -749,7 +761,7 @@ class CandidateSelectionBasis:
 CANDIDATE_RULE_ID = "reconcile.candidate_selection"
 #: G3-7F. v2 is the Grounded-Target Invariant: the reconciler establishes the target from
 #: a ground it verifies itself, never from the interpreter's own confidence labels.
-CANDIDATE_RULE_VERSION = "v2"
+CANDIDATE_RULE_VERSION = "v3"
 
 
 @dataclass(frozen=True)
@@ -799,6 +811,10 @@ class CandidateResolution:
     literally_grounded: Optional[bool] = None
     #: Did the canonical zone table recognise the corrected locality?
     zone_lookup_hit: Optional[bool] = None
+    #: G3-7K W1. How many genuinely distinct vehicle identities this burst admitted after
+    #: superseded mentions were excluded. 1 is the only value that permits progression;
+    #: 2+ is why `UNMARKED_MULTI_IDENTITY` held. A count only — never customer text.
+    surviving_identity_count: Optional[int] = None
     #: Set by the turn once the re-quote guards have run, so the trace shows the
     #: consequence of the correction and not merely its intent.
     quote_invalidated: Optional[bool] = None
@@ -828,6 +844,7 @@ class CandidateResolution:
             "correlation_id": self.correlation_id,
             "selection_basis": self.selection_basis,
             "grounding_basis": self.grounding_basis,
+            "surviving_identity_count": self.surviving_identity_count,
             "literally_grounded": self.literally_grounded,
             "correction_evidence_ref": self.correction_evidence_ref,
             "target_relation": self.target_relation,

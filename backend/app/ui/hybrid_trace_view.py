@@ -860,11 +860,15 @@ def _candidate_resolution_card(trace: dict) -> str:
         "CREATE_UNCONFIRMED": "crear exige marca y modelo dichos textualmente",
         "CATEGORY_NOT_ESTABLISHED": "la categoría no está establecida: pasa a revisión humana",
         "EVIDENCE_UNAVAILABLE": "sin evidencia utilizable",
+        "UNMARKED_MULTI_IDENTITY": ("el turno nombró dos vehículos distintos y ninguno quedó "
+                                    "marcado como descartado — no se adivina cuál queda"),
     }
     _GROUND = {
         "G1_IDENTITY": "el cliente nombró marca y modelo, textualmente, y coinciden con una fila",
         "G2_SINGLETON": "un único candidato, con foco canónico válido y nada que lo excluya",
         "G3_REFERENCE": "una referencia tipada de este turno resolvió a una sola fila",
+        "G4_NAMED_REPLACEMENT": ("un reemplazo CONFIRMED nombró el vehículo entrante, que el "
+                                 "hilo no tenía, y el catálogo lo confirmó"),
         "NONE": "ningún fundamento verificable",
     }
     action = str(res.get("action") or "")
@@ -887,6 +891,9 @@ def _candidate_resolution_card(trace: dict) -> str:
         ("Cambio de foco requerido", _e(res.get("focus_transition_required"))),
         ("Candidatos compatibles", _e(res.get("compatible_candidate_count"))),
     ]
+    if res.get("surviving_identity_count") is not None:
+        rows.append(("Identidades de vehículo sobrevivientes",
+                     _e(res.get("surviving_identity_count"))))
     if hold:
         rows.append(("Motivo de HOLD", _e(_HOLD.get(str(hold), hold))))
     changed = res.get("corrected_fields") or []

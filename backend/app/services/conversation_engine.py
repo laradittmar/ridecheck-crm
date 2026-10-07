@@ -4155,7 +4155,125 @@ class ConversationEngine:
                     if cls._evidence_admitted(v)]
         if not mentions:
             return None
+        # ── G3-7K W1 ──────────────────────────────────────────────────────────────
+        # Survivorship is proven here, at the single admission authority, so EVERY
+        # caller inherits it — including `_resolution_to_candidate_data`, which builds
+        # the writer's input and used to re-read the burst with the last-wins rule
+        # below. One guard, not one per handler.
+        identified = [v for v in mentions if any(cls._evidence_identity(v))]
+        if identified:
+            survivor, distinct_n, year_conflict = cls._vehicle_identity_survivorship(
+                evidence)
+            # Contested burst: which car the customer kept is unproven, so no caller may
+            # be handed one. The resolver holds on this; returning None means a handler
+            # that reaches past the resolver still cannot mutate the wrong vehicle.
+            if distinct_n != 1 or year_conflict:
+                return None
+            return survivor
+        # No identity token anywhere — a bare year, a lone category. Order may pick the
+        # attribute here because no vehicle is being chosen: within a single identity the
+        # last stated value supersedes the earlier one, which is the corpus's own rule.
         return sorted(mentions, key=lambda v: getattr(v, "mention_index", 0))[-1]
+
+    # ══ G3-7K W1: survivorship authority ═══════════════════════════════════════════
+    #
+    # ROOT CAUSE this replaces. `_admitted_vehicle_evidence` returns
+    # `sorted(mentions, key=mention_index)[-1]` — last mention wins. That is sound ONLY
+    # while `understand/1.20` rule V4 holds ("el que fue descartado va con
+    # is_superseded=true. No los inviertas"), because `_evidence_admitted` then excludes
+    # the discarded car. G3-7J-R2 proved the model breaks V4: on corpus case B04 — a burst
+    # that drops one named car and offers another — it emitted BOTH cars with
+    # is_superseded=false and the DISCARDED one LAST, on 3/3 attempts. Last-wins therefore
+    # selected the car the customer had just rejected, carrying a year the burst never
+    # states for it. Emission order is not authority.
+    #
+    # The fix is to require survivorship be PROVEN before any vehicle is selected.
+
+    @classmethod
+    def _vehicle_identity_survivorship(cls, evidence) -> tuple:
+        """`(survivor_mention, distinct_identity_count, year_conflict)` for one burst.
+
+        Compares normalized canonical identities, exactly as the writer compares them, so
+        duplicate mentions of ONE car collapse and genuinely distinct cars do not. Mentions
+        explicitly marked superseded are already excluded by `_evidence_admitted`, which is
+        what lets rule 3 work: when the interpreter does obey V4 and marks the discarded
+        car, exactly one identity survives here and reconciliation continues normally.
+
+        Partial identities are never assumed equivalent to complete ones. ("ford","focus")
+        and ("","focus") are two entries, not one, because nothing in the evidence proves
+        the bare model names the same car — so the burst reads as contested and holds. That
+        is the required fail-closed reading, not an oversight.
+
+        A bare year or a lone category carries no identity and is not counted: those are
+        handled by the existing ladder and must not be promoted into an identity contest.
+        """
+        admitted = [v for v in (getattr(evidence, "vehicle_mentions", ()) or ())
+                    if cls._evidence_admitted(v)]
+        identified = [v for v in admitted if any(cls._evidence_identity(v))]
+        distinct = {cls._evidence_identity(v) for v in identified}
+        if len(distinct) != 1:
+            return (None, len(distinct), False)
+        # One identity. Two different stated years for it is still an unproven attribute
+        # set, so it holds rather than letting an arbitrary mention supply the year.
+        years = {y for y in (getattr(v, "year", None) for v in identified) if y}
+        if len(years) > 1:
+            return (None, 1, True)
+        # Prefer the most completely populated mention of the one surviving identity.
+        survivor = max(identified, key=lambda v: (
+            bool(getattr(v, "make", None)), bool(getattr(v, "model", None)),
+            bool(getattr(v, "year", None)), -getattr(v, "mention_index", 0)))
+        return (survivor, 1, False)
+
+    def _named_replacement_identity(self, correction, survivor, haystack):
+        """May this CONFIRMED replacement ground the incoming car it names, by itself?
+
+        W1 rule 4. A replacement names its own target, so it does not need a pointer to the
+        car being dropped — but every one of these must hold, and each is typed or
+        canonical, never a phrase, an alias or a position in the burst:
+
+        1. the relation is explicitly REPLACE_CANDIDATE (never inferred from a mention);
+        2. the correction itself is CONFIRMED — PROPOSED is not replacement authority;
+        3. it carries no `target_ref` (an explicit reference belongs to the rung-4 path);
+        4. the surviving identity is COMPLETE — make AND model, so a year-only or
+           otherwise incomplete correction can never self-ground;
+        5. the correction's own `to_value` names that identity, so the relation and the
+           mention are talking about the same car;
+        6. the customer said the model token literally;
+        7. the vehicle catalogue — not the interpreter — confirms make for that model.
+
+        Condition 7 is what makes 6 sufficient for B01, where the customer said "Focus"
+        but never "Ford": the catalogue is already this system's authority for make given a
+        model, so the make is canonical rather than model-asserted.
+        """
+        from ..schemas.turn_evidence import CorrectionRelation
+        relation = (getattr(getattr(correction, "relation", None), "value",
+                            getattr(correction, "relation", None)))
+        if relation != CorrectionRelation.REPLACE_CANDIDATE.value:
+            return None
+        status = (getattr(getattr(correction, "status", None), "value",
+                          getattr(correction, "status", None)))
+        if status != "CONFIRMED":
+            return None
+        if getattr(correction, "target_ref", None):
+            return None
+        if survivor is None or not self._identity_complete(survivor):
+            return None
+        make, model = self._evidence_identity(survivor)
+        to_value = getattr(correction, "to_value", None)
+        if not to_value:
+            return None
+        to_tokens = set(_strip_accents(str(to_value)).lower().replace(",", " ").split())
+        if not ({make, model} & to_tokens):
+            return None
+        if not self._value_said_literally(model, haystack):
+            return None
+        from .vehicle_catalog import lookup_vehicle
+        match = lookup_vehicle(model)
+        if match is None:
+            return None
+        if (getattr(match, "marca", None) or "").strip().lower() != make:
+            return None
+        return survivor
 
     @classmethod
     def _admitted_location_evidence(cls, evidence):
@@ -5364,6 +5482,21 @@ class ConversationEngine:
             return CandidateResolution(action=CandidateAction.HOLD, hold_reason=reason,
                                        compatible_candidate_count=count, **common)
 
+        # ══ G3-7K W1 · the Proven-Survivorship Invariant ═══════════════════════════
+        # Deliberately ahead of BOTH postures of CORRECTION_TARGET_GROUNDING_ENABLED and
+        # ahead of every rung. Which car survives a burst is not a correction-target
+        # question, so it must not depend on that flag — and the deployed runtime
+        # currently leaves the flag unset, which is exactly the posture that would
+        # otherwise be unguarded. Nothing is read from emission order here.
+        survivor, _surviving_n, _year_conflict = self._vehicle_identity_survivorship(
+            evidence)
+        if _surviving_n > 1 or _year_conflict:
+            return CandidateResolution(
+                action=CandidateAction.HOLD,
+                hold_reason=CandidateHoldReason.UNMARKED_MULTI_IDENTITY,
+                compatible_candidate_count=0,
+                surviving_identity_count=_surviving_n, **common)
+
         def _select(target, basis):
             """Rungs 1-3 and 8: the customer identified a car; select it (focus may move)."""
             is_focus = focus is not None and target.id == getattr(focus, "id", None)
@@ -5411,6 +5544,27 @@ class ConversationEngine:
                     action=CandidateAction.HOLD, hold_reason=reason,
                     compatible_candidate_count=count, grounding_basis=basis,
                     literally_grounded=False, **common)
+
+            # W1 rule 4: an explicit CONFIRMED replacement grounds the car it names.
+            # Ahead of `_grounded_target` because that helper asks "which EXISTING row does
+            # this correct?" — the wrong question for a replacement, whose target is a car
+            # the thread does not have yet. It is what returned EXCLUDED_REFERENT for every
+            # legitimate B01/B03 replacement. The guard above has already run, so a
+            # contested burst can never reach here.
+            if correction is not None:
+                incoming = self._named_replacement_identity(
+                    correction, survivor, haystack)
+                if incoming is not None and not _compatible_for(incoming):
+                    return CandidateResolution(
+                        action=CandidateAction.CREATE,
+                        focus_transition_required=focus is not None,
+                        locality_binding_permitted=bool(zone_detail),
+                        zone_group=zone_group, zone_detail=zone_detail,
+                        compatible_candidate_count=0,
+                        selection_basis=CandidateSelectionBasis.EVIDENCE_IDENTITY,
+                        grounding_basis=_G.G4_NAMED_REPLACEMENT,
+                        literally_grounded=True,
+                        surviving_identity_count=1, **common)
 
             # A correction — stated, or implied by a corrected value with no new identity.
             if correction is not None:

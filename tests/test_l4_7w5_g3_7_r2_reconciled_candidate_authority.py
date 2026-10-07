@@ -154,13 +154,38 @@ class A_SelectionRules(unittest.TestCase):
                     value="Focus", make="Ford", model="Focus", status=status)]))
                 self.assertIn(r.action, (CandidateAction.NONE, CandidateAction.CREATE))
 
-    def test_r2_09_the_last_admitted_mention_in_a_burst_wins(self):
-        """The corpus records exactly this rule: the last stated value supersedes."""
+    def test_r2_09_two_unmarked_identities_hold_instead_of_letting_order_decide(self):
+        """CORRECTED BY G3-7K W1. This test previously asserted that the LAST of two
+        distinct unmarked identities wins, citing the corpus rule "the last stated value
+        supersedes". That rule is about the last stated VALUE within one identity; applying
+        it across two distinct IDENTITIES is the conflation G3-7J-R2 proved unsafe. On
+        corpus case B04 the interpreter emitted the DISCARDED car last on 3/3 attempts, so
+        order-wins selected the car the customer had just rejected.
+
+        The corpus rule is not weakened — it is held to its actual scope. Survivorship
+        across identities must be PROVEN (see the companion assertion below), and the
+        attribute-supersession rule is still exercised by the no-identity branch of
+        `_admitted_vehicle_evidence` and by `test_r2_09b`.
+        """
+        from app.schemas.hybrid_trace import CandidateHoldReason as H
         r, d = resolve([], evidence([
             vehicle(value="208", make="Peugeot", model="208", mention_index=0),
             vehicle(value="Focus", make="Ford", model="Focus", mention_index=1)]))
-        self.assertEqual(d["marca"], "Ford")
-        self.assertEqual(d["modelo"], "Focus")
+        self.assertEqual(r.action, CandidateAction.HOLD)
+        self.assertEqual(r.hold_reason, H.UNMARKED_MULTI_IDENTITY)
+        self.assertEqual(d, {"action": "none"},
+                         "neither car may be written while survivorship is unproven")
+
+    def test_r2_09b_explicit_supersession_still_lets_the_surviving_car_win(self):
+        """The original intent of r2_09, expressed safely: when the interpreter obeys
+        `understand/1.20` rule V4 and marks the discarded car, the survivor progresses."""
+        r, d = resolve([], evidence([
+            vehicle(value="208", make="Peugeot", model="208", mention_index=0,
+                    is_superseded=True),
+            vehicle(value="Focus", make="Ford", model="Focus", mention_index=1)]))
+        self.assertIn(r.action, (CandidateAction.CREATE, CandidateAction.NONE))
+        if d.get("action") == "create":
+            self.assertEqual((d["marca"], d["modelo"]), ("Ford", "Focus"))
 
     def test_r2_10_a_moto_candidate_is_never_repurposed_for_an_auto_mention(self):
         r, d = resolve([cand(1, "Honda", "Titan", tipo="MOTO", status="current_focus")],

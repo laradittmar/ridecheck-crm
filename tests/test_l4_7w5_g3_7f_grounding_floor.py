@@ -424,8 +424,12 @@ class H_Contracts(unittest.TestCase):
     def test_g37f_29_the_trace_contract_is_1_7(self):
         self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.9")
 
-    def test_g37f_30_the_rule_version_moved_to_v2(self):
-        self.assertEqual(CANDIDATE_RULE_VERSION, "v2")
+    def test_g37f_30_the_rule_version_moved_past_v2(self):
+        """G3-7K W1 moved the reconciler rule set to v3 by adding the proven-survivorship
+        guard and G4_NAMED_REPLACEMENT. The pin is updated, not relaxed: a replayed
+        decision must still be able to name the exact rule set that produced it, and v2
+        decisions must never be replayed under v3 rules."""
+        self.assertEqual(CANDIDATE_RULE_VERSION, "v3")
 
     def test_g37f_31_historical_rows_render_by_what_their_contract_carried(self):
         """1.6 introduced the section, so on a 1.6 row an absent decision is a fact worth
