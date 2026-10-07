@@ -703,10 +703,13 @@ class NothingElseMoved(unittest.TestCase):
         migrations = sorted(p.name for p in
                             (ROOT / "backend" / "migrations" / "versions").glob("*.py"))
         # +1: the single additive clarification-attempt migration (G3-7F sequencing).
-        self.assertEqual(len(migrations), 47)
-        # G3-7F sequencing added one more, so pending_correction is no longer last.
-        self.assertEqual(migrations[-1], "20261006_clarification_attempts.py",
-                         "the clarification attempt table is the newest migration")
+        # +1 again: SB1's booking-representation migration (Smart Booking Track B).
+        self.assertEqual(len(migrations), 48)
+        # G3-7F sequencing added one more, so pending_correction is no longer last; SB1
+        # then added its own after it.
+        self.assertEqual(migrations[-2:], ["20261006_clarification_attempts.py",
+                                           "20261007_sb1_booking_representation.py"],
+                         "the clarification attempt table immediately precedes SB1")
         source = (ROOT / "backend" / "app" / "services"
                   / "hybrid_trace.py").read_text(encoding="utf-8-sig")
         for forbidden in ("UPDATE hybrid_decision_traces", "update(HybridDecisionTraceRow",
