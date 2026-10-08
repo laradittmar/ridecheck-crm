@@ -709,6 +709,19 @@ class CandidateHoldReason:
     #: is not authority: the interpreter may list the DISCARDED car last (observed in
     #: G3-7J-R2 B04, 3/3 attempts), so "last mention wins" can pick the wrong vehicle.
     UNMARKED_MULTI_IDENTITY = "UNMARKED_MULTI_IDENTITY"
+    # ── G3-7K W2 ──────────────────────────────────────────────────────────────────
+    #: ONE surviving vehicle identity, but two different stated values for an attribute
+    #: of it (e.g. two years). W1 reported this as UNMARKED_MULTI_IDENTITY, which was
+    #: false: `surviving_identity_count` was 1 while the Inspector said two vehicles had
+    #: been named. The hold is unchanged; only the classification is now truthful.
+    CONFLICTING_VEHICLE_ATTRIBUTES = "CONFLICTING_VEHICLE_ATTRIBUTES"
+    #: The interpreter did not say which referent the correction is about, and canonical
+    #: state could not establish it either (no identity named, no corroborating
+    #: `from_value`). Fail-closed: a bare attribute change with no referent is unsafe.
+    TARGET_SCOPE_UNRESOLVED = "TARGET_SCOPE_UNRESOLVED"
+    #: A `from_value` was supplied and it contradicts canonical state. Admitting the
+    #: correction anyway would mean trusting a value the thread disproves, so it holds.
+    TARGET_SCOPE_CONTRADICTED = "TARGET_SCOPE_CONTRADICTED"
 
 
 class CandidateGroundingBasis:
@@ -761,7 +774,7 @@ class CandidateSelectionBasis:
 CANDIDATE_RULE_ID = "reconcile.candidate_selection"
 #: G3-7F. v2 is the Grounded-Target Invariant: the reconciler establishes the target from
 #: a ground it verifies itself, never from the interpreter's own confidence labels.
-CANDIDATE_RULE_VERSION = "v3"
+CANDIDATE_RULE_VERSION = "v4"
 
 
 @dataclass(frozen=True)
@@ -815,6 +828,19 @@ class CandidateResolution:
     #: superseded mentions were excluded. 1 is the only value that permits progression;
     #: 2+ is why `UNMARKED_MULTI_IDENTITY` held. A count only — never customer text.
     surviving_identity_count: Optional[int] = None
+    # ── G3-7K W2: how the customer's own words corroborated the proposed identity ──
+    #: "EXACT" | "FUZZY_UNIQUE" | "NONE" — see `vehicle_catalog.SurfaceCorroboration`.
+    corroboration_method: Optional[str] = None
+    #: The canonical identity the surface corroborated, as `marca modelo`. Never prose.
+    corroborated_identity: Optional[str] = None
+    #: Matcher similarity for the corroborating token, and its margin over the nearest
+    #: competing catalogue model. Both come from the deterministic matcher.
+    corroboration_score: Optional[float] = None
+    corroboration_gap: Optional[float] = None
+    #: Why corroboration was refused: "NO_SURFACE" | "AMBIGUOUS_SURFACE".
+    corroboration_reason: Optional[str] = None
+    #: The typed target scope the interpreter reported, as the reconciler read it.
+    target_scope: Optional[str] = None
     #: Set by the turn once the re-quote guards have run, so the trace shows the
     #: consequence of the correction and not merely its intent.
     quote_invalidated: Optional[bool] = None
@@ -845,6 +871,12 @@ class CandidateResolution:
             "selection_basis": self.selection_basis,
             "grounding_basis": self.grounding_basis,
             "surviving_identity_count": self.surviving_identity_count,
+            "corroboration_method": self.corroboration_method,
+            "corroborated_identity": self.corroborated_identity,
+            "corroboration_score": self.corroboration_score,
+            "corroboration_gap": self.corroboration_gap,
+            "corroboration_reason": self.corroboration_reason,
+            "target_scope": self.target_scope,
             "literally_grounded": self.literally_grounded,
             "correction_evidence_ref": self.correction_evidence_ref,
             "target_relation": self.target_relation,

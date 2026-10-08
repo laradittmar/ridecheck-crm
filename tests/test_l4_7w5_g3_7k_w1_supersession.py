@@ -69,6 +69,13 @@ class Cand:
         self.zone_group = self.zone_detail = None
 
 
+def _identity(result):
+    """G3-7K W2 changed `_named_replacement_identity` to return
+    `(identity, SurfaceCorroboration)` so the reconciler can record HOW the customer's
+    words corroborated the car. These assertions are about the identity half."""
+    return result[0] if isinstance(result, tuple) else result
+
+
 def engine(grounding=True):
     eng = CE.__new__(CE)
     eng._correlation_id = "w1"
@@ -352,7 +359,8 @@ class W1_Trace(unittest.TestCase):
 
     def test_w1_36_rule_version_records_the_rule_change(self):
         """A replayed decision must be able to tell which rule set produced it."""
-        self.assertEqual(CANDIDATE_RULE_VERSION, "v3")
+        self.assertEqual(CANDIDATE_RULE_VERSION, "v4",
+                         "G3-7K W2 moved the rule set to v4: the attribute-conflict\n                         reason and the unconditional target-scope guard changed the\n                         rules a stored decision was produced under.")
 
 
 # ═══ E · mutation proofs — does this suite actually catch the regressions? ════════════
@@ -416,7 +424,8 @@ class W1_MutationProofs(unittest.TestCase):
     def test_w1_40_mention_without_a_relation_never_self_grounds(self):
         ev = TE([V("Ford", "Focus", 2020, "CONFIRMED", 0)], [])
         eng = engine()
-        self.assertIsNone(eng._named_replacement_identity(None, V("Ford", "Focus", 2020), "ford focus"))
+        self.assertIsNone(_identity(eng._named_replacement_identity(
+            None, V("Ford", "Focus", 2020), "ford focus")))
         r = resolve(eng, ONE_208(), ev, ["Tengo un Ford Focus 2020."])
         self.assertNotEqual(r.grounding_basis, G.G4_NAMED_REPLACEMENT)
 
@@ -442,32 +451,34 @@ class W1_MutationProofs(unittest.TestCase):
         """The make must be canonical. A model-asserted make the catalogue denies is not."""
         eng = engine()
         bogus = V("Fiat", "Focus", 2019)        # catalogue says Focus is a Ford
-        self.assertIsNone(eng._named_replacement_identity(
-            C("REPLACE_CANDIDATE", to="Fiat Focus 2019"), bogus, "tengo un fiat focus 2019"))
+        self.assertIsNone(_identity(eng._named_replacement_identity(
+            C("REPLACE_CANDIDATE", to="Fiat Focus 2019"), bogus,
+            "tengo un fiat focus 2019")))
 
-    def test_w1_44_unsaid_model_blocks_self_grounding(self):
+    def test_w1_44_no_corroborating_surface_blocks_self_grounding(self):
+        """W2: the check is no longer exact-token, but an absent surface still holds."""
         eng = engine()
-        self.assertIsNone(eng._named_replacement_identity(
+        self.assertIsNone(_identity(eng._named_replacement_identity(
             C("REPLACE_CANDIDATE", to="Ford Focus"), V("Ford", "Focus", 2019),
-            "al final ese auto se cayo."), "the model token was never said")
+            "al final ese auto se cayo.")), "nothing the customer wrote supports it")
 
     def test_w1_45_to_value_must_name_the_surviving_identity(self):
         eng = engine()
-        self.assertIsNone(eng._named_replacement_identity(
+        self.assertIsNone(_identity(eng._named_replacement_identity(
             C("REPLACE_CANDIDATE", to="Toyota Corolla"), V("Ford", "Focus", 2019),
-            "tengo un ford focus 2019"), "relation and mention must concern one car")
+            "tengo un ford focus 2019")), "relation and mention must concern one car")
 
     def test_w1_46_incomplete_identity_never_self_grounds(self):
         eng = engine()
         for inc in (V(None, "Focus", 2019), V("Ford", None, 2019), V(None, None, 2019)):
-            self.assertIsNone(eng._named_replacement_identity(
-                C("REPLACE_CANDIDATE", to="Ford Focus 2019"), inc, "ford focus 2019"))
+            self.assertIsNone(_identity(eng._named_replacement_identity(
+                C("REPLACE_CANDIDATE", to="Ford Focus 2019"), inc, "ford focus 2019")))
 
     def test_w1_47_explicit_target_ref_is_left_to_the_reference_path(self):
         eng = engine()
-        self.assertIsNone(eng._named_replacement_identity(
-            C("REPLACE_CANDIDATE", to="Ford Focus 2019", ref="v1"), V("Ford", "Focus", 2019),
-            "tengo un ford focus 2019"))
+        self.assertIsNone(_identity(eng._named_replacement_identity(
+            C("REPLACE_CANDIDATE", to="Ford Focus 2019", ref="v1"),
+            V("Ford", "Focus", 2019), "tengo un ford focus 2019")))
 
 
 # ═══ F · W2 and W3 remain unimplemented, on purpose ══════════════════════════════════

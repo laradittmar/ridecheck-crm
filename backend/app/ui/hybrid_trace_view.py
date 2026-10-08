@@ -862,6 +862,12 @@ def _candidate_resolution_card(trace: dict) -> str:
         "EVIDENCE_UNAVAILABLE": "sin evidencia utilizable",
         "UNMARKED_MULTI_IDENTITY": ("el turno nombró dos vehículos distintos y ninguno quedó "
                                     "marcado como descartado — no se adivina cuál queda"),
+        "CONFLICTING_VEHICLE_ATTRIBUTES": ("un solo vehículo, pero con dos valores distintos "
+                                           "para el mismo dato — no se elige uno al azar"),
+        "TARGET_SCOPE_UNRESOLVED": ("no se pudo establecer a qué vehículo se refiere la "
+                                    "corrección: no nombra ninguno ni coincide con el actual"),
+        "TARGET_SCOPE_CONTRADICTED": ("el valor anterior que trae la corrección no coincide "
+                                      "con lo que el sistema tiene registrado"),
     }
     _GROUND = {
         "G1_IDENTITY": "el cliente nombró marca y modelo, textualmente, y coinciden con una fila",
@@ -891,6 +897,30 @@ def _candidate_resolution_card(trace: dict) -> str:
         ("Cambio de foco requerido", _e(res.get("focus_transition_required"))),
         ("Candidatos compatibles", _e(res.get("compatible_candidate_count"))),
     ]
+    _method = res.get("corroboration_method")
+    if _method:
+        _label = {"EXACT": "el cliente escribió el modelo tal cual",
+                  "FUZZY_UNIQUE": "variante de escritura, resuelta a un único modelo",
+                  "NONE": "sin respaldo suficiente en las palabras del cliente"}.get(
+                      str(_method), _method)
+        rows.append(("Respaldo del vehículo", _e(_label)))
+        if res.get("corroborated_identity"):
+            rows.append(("Identidad respaldada", _e(res.get("corroborated_identity"))))
+        if res.get("corroboration_score") is not None:
+            rows.append(("Similitud / margen", _e(
+                f'{res.get("corroboration_score"):.2f} / {res.get("corroboration_gap"):.2f}')))
+        if res.get("corroboration_reason"):
+            rows.append(("Motivo del rechazo", _e(
+                {"NO_SURFACE": "el cliente no escribió nada parecido a ese modelo",
+                 "AMBIGUOUS_SURFACE": "lo que escribió se parece a más de un modelo"}.get(
+                     str(res.get("corroboration_reason")), res.get("corroboration_reason")))))
+    if res.get("target_scope"):
+        rows.append(("Referente de la corrección", _e(
+            {"CURRENT_REFERENT": "el vehículo en discusión",
+             "ALTERNATE_REFERENT": "explícitamente otro, no el actual",
+             "NAMED_REFERENT": "uno nombrado en este mensaje",
+             "UNRESOLVED_REFERENT": "el intérprete no lo determinó"}.get(
+                 str(res.get("target_scope")), res.get("target_scope")))))
     if res.get("surviving_identity_count") is not None:
         rows.append(("Identidades de vehículo sobrevivientes",
                      _e(res.get("surviving_identity_count"))))

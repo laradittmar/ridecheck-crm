@@ -429,7 +429,7 @@ class H_Contracts(unittest.TestCase):
         guard and G4_NAMED_REPLACEMENT. The pin is updated, not relaxed: a replayed
         decision must still be able to name the exact rule set that produced it, and v2
         decisions must never be replayed under v3 rules."""
-        self.assertEqual(CANDIDATE_RULE_VERSION, "v3")
+        self.assertEqual(CANDIDATE_RULE_VERSION, "v4")
 
     def test_g37f_31_historical_rows_render_by_what_their_contract_carried(self):
         """1.6 introduced the section, so on a 1.6 row an absent decision is a fact worth

@@ -4189,6 +4189,19 @@ class ConversationEngine:
     #
     # The fix is to require survivorship be PROVEN before any vehicle is selected.
 
+    @staticmethod
+    def _target_scope_value(correction):
+        """The typed scope as a plain value, defaulting to UNRESOLVED. Never a guess."""
+        from ..schemas.turn_evidence import CorrectionTargetScope
+        if correction is None:
+            return None
+        raw = getattr(getattr(correction, "target_scope", None), "value",
+                      getattr(correction, "target_scope", None))
+        try:
+            return CorrectionTargetScope(str(raw)).value
+        except (ValueError, TypeError):
+            return CorrectionTargetScope.UNRESOLVED_REFERENT.value
+
     @classmethod
     def _vehicle_identity_survivorship(cls, evidence) -> tuple:
         """`(survivor_mention, distinct_identity_count, year_conflict)` for one burst.
@@ -4224,6 +4237,107 @@ class ConversationEngine:
             bool(getattr(v, "year", None)), -getattr(v, "mention_index", 0)))
         return (survivor, 1, False)
 
+    @staticmethod
+    def _identity_complete_candidate_match(cand, vehicle) -> bool:
+        """Does this turn's evidence name THAT candidate well enough to act on it?
+
+        W2. Used only to decide whether an explicitly ALTERNATE referent is uniquely
+        resolved. A bare year names no vehicle, so it never resolves an alternate — which
+        is exactly the "No, el otro es del 2016." case.
+        """
+        if vehicle is None:
+            return False
+        marca, modelo = ConversationEngine._evidence_identity(vehicle)
+        if not (marca or modelo):
+            return False
+        return ConversationEngine._candidate_matches_evidence(
+            cand, marca, modelo, getattr(vehicle, "category_suggestion", None))
+
+    def _unresolved_scope_hold(self, ctx, focus, correction, vehicle):
+        """`None` to let an UNRESOLVED-scope correction proceed, else the hold reason.
+
+        The interpreter declined to name the referent, so the reconciler establishes it
+        from canonical state or refuses. Three outcomes, in order:
+
+        0. the correction carries an explicit `target_ref` — an in-burst reference is its
+           own ground (G3), so the reference path owns it and this guard stands aside;
+        1. the burst names a vehicle identity — the identity ladder below owns that, and
+           it is already grounded, so this guard stands aside;
+        2. a `from_value` is supplied and MATCHES the focused candidate's current value
+           for a field this correction changes — the customer is demonstrably talking
+           about the car in focus, so the current referent is corroborated by canonical
+           state rather than asserted by the model;
+        3. a `from_value` is supplied and contradicts canonical state, or none is supplied
+           at all — hold. `from_value` is a checkable constraint here, never an anchor:
+           G3-7J-R2 showed the interpreter can invent one, and an invented value simply
+           fails to match and holds.
+
+        This is what keeps "No, el otro es del 2016." (no `from_value`, no identity) from
+        touching the focused car while leaving a genuine current-referent correction
+        ("...es 2018", `from_value` 2019 against a 2019 candidate) admissible.
+        """
+        from ..schemas.hybrid_trace import CandidateHoldReason as _H
+        if getattr(correction, "target_ref", None):
+            # An explicit in-burst reference IS a ground (G3). The reference path resolves
+            # it against this turn's mentions and holds on its own terms if it cannot.
+            return None
+        if vehicle is not None and any(self._evidence_identity(vehicle)):
+            return None                       # an identity is present; not our question
+        # Delegate focus validity to the existing strict predicate rather than
+        # second-guessing it: when it refuses, its own reason (FOCUS_NOT_ESTABLISHED /
+        # _POINTER_INVALID / _NOT_UNIQUE) is more informative than a generic scope hold
+        # and is just as closed, so this guard stands aside and the ladder reports it.
+        target, _why = self._correction_focus(ctx)
+        if target is None:
+            return None
+        raw_from = getattr(correction, "from_value", None)
+        if raw_from is None:
+            # Nothing ties this correction to the focused car. G3-7D's narrow rule applies:
+            # a correction that is not CONFIRMED may not select a target by IMPLICIT focus.
+            # Measured basis (W2, 45 calls): "No, el otro es del 2016." came back PROPOSED
+            # on 8 of 8 attempts across understand/1.20 and 1.21, while current-referent
+            # corrections came back CONFIRMED on 8 of 11. So the hedge is the signal the
+            # model does reliably give, and the scope field is the one it does not.
+            status = (getattr(getattr(correction, "status", None), "value",
+                              getattr(correction, "status", None)))
+            if status != "CONFIRMED":
+                return _H.TARGET_SCOPE_UNRESOLVED
+            return None
+        if self._from_value_matches_canonical(target, raw_from):
+            return None                       # current referent corroborated
+        return _H.TARGET_SCOPE_CONTRADICTED
+
+    @staticmethod
+    def _from_value_matches_canonical(target, raw_from) -> bool:
+        """Does `from_value` equal a value the canonical row actually holds right now?
+
+        Compared field-agnostically across the attributes a correction can carry, because
+        the interpreter does not reliably say WHICH field its `from_value` belongs to.
+        String comparison is case/space folded; the year is compared numerically.
+        """
+        if raw_from is None:
+            return False
+        text = str(raw_from).strip().lower()
+        if not text:
+            return False
+        anio = getattr(target, "anio", None)
+        if anio is not None and text == str(anio):
+            return True
+        for attr in ("marca", "modelo", "zone_detail", "zone_group"):
+            value = getattr(target, attr, None)
+            if value and str(value).strip().lower() == text:
+                return True
+        return False
+
+    @staticmethod
+    def _surface_corroboration(vehicle, haystack):
+        """The deterministic matcher's verdict on whether the burst supports this model."""
+        from .vehicle_catalog import corroborate_vehicle_surface
+        _marca, modelo = ConversationEngine._evidence_identity(vehicle)
+        if not modelo:
+            return None
+        return corroborate_vehicle_surface(modelo, haystack)
+
     def _named_replacement_identity(self, correction, survivor, haystack):
         """May this CONFIRMED replacement ground the incoming car it names, by itself?
 
@@ -4249,31 +4363,37 @@ class ConversationEngine:
         relation = (getattr(getattr(correction, "relation", None), "value",
                             getattr(correction, "relation", None)))
         if relation != CorrectionRelation.REPLACE_CANDIDATE.value:
-            return None
+            return (None, None)
         status = (getattr(getattr(correction, "status", None), "value",
                           getattr(correction, "status", None)))
         if status != "CONFIRMED":
-            return None
+            return (None, None)
         if getattr(correction, "target_ref", None):
-            return None
+            return (None, None)
         if survivor is None or not self._identity_complete(survivor):
-            return None
+            return (None, None)
         make, model = self._evidence_identity(survivor)
         to_value = getattr(correction, "to_value", None)
         if not to_value:
-            return None
+            return (None, None)
         to_tokens = set(_strip_accents(str(to_value)).lower().replace(",", " ").split())
         if not ({make, model} & to_tokens):
-            return None
-        if not self._value_said_literally(model, haystack):
-            return None
-        from .vehicle_catalog import lookup_vehicle
+            return (None, None)
+        # W2 correction C: corroboration is still required — the W1 review proved it is
+        # the ONLY barrier to a model-invented but catalogue-valid identity — but it no
+        # longer demands canonical spelling. The deterministic matcher answers "did the
+        # customer refer to this car?", so a resolved misspelling corroborates and an
+        # ambiguous or absent surface still holds.
+        from .vehicle_catalog import corroborate_vehicle_surface, lookup_vehicle
+        corroboration = corroborate_vehicle_surface(model, haystack)
+        if corroboration.method == "NONE":
+            return (None, corroboration)
         match = lookup_vehicle(model)
         if match is None:
-            return None
+            return (None, corroboration)
         if (getattr(match, "marca", None) or "").strip().lower() != make:
-            return None
-        return survivor
+            return (None, corroboration)
+        return (survivor, corroboration)
 
     @classmethod
     def _admitted_location_evidence(cls, evidence):
@@ -5444,7 +5564,7 @@ class ConversationEngine:
         """
         from ..schemas.hybrid_trace import (CandidateAction, CandidateHoldReason,
                                             CandidateResolution, CandidateSelectionBasis)
-        from ..schemas.turn_evidence import CorrectionRelation
+        from ..schemas.turn_evidence import CorrectionRelation, CorrectionTargetScope
 
         try:
             focus = self._focus_candidate(ctx, repair=False)
@@ -5471,6 +5591,7 @@ class ConversationEngine:
         relation = (getattr(getattr(correction, "relation", None), "value",
                             getattr(correction, "relation", None))
                     if correction is not None else None)
+        _scope_of = self._target_scope_value
         zone_group, zone_detail, zone_hit = self._canonical_zone(location)
         candidates = list(getattr(ctx, "candidates", None) or ())
 
@@ -5491,11 +5612,87 @@ class ConversationEngine:
         survivor, _surviving_n, _year_conflict = self._vehicle_identity_survivorship(
             evidence)
         if _surviving_n > 1 or _year_conflict:
+            # W2 correction A: two causes, two reasons. A single identity carrying two
+            # stated years is NOT a multi-vehicle ambiguity, and reporting it as one made
+            # the Inspector contradict `surviving_identity_count` in the same payload.
             return CandidateResolution(
                 action=CandidateAction.HOLD,
-                hold_reason=CandidateHoldReason.UNMARKED_MULTI_IDENTITY,
+                hold_reason=(CandidateHoldReason.CONFLICTING_VEHICLE_ATTRIBUTES
+                             if _year_conflict
+                             else CandidateHoldReason.UNMARKED_MULTI_IDENTITY),
                 compatible_candidate_count=0,
-                surviving_identity_count=_surviving_n, **common)
+                surviving_identity_count=_surviving_n,
+                target_scope=_scope_of(correction), **common)
+
+        # ══ G3-7K W2 · the Target-Scope Invariant ══════════════════════════════════
+        # Unconditional, and ahead of the flag split, the legacy ladder, singleton
+        # fallback, focus mutation, `_apply_candidate` and every canonical write. Which
+        # referent a correction is about is not a flag-dependent question.
+        #
+        # Measured constraint this is built around: across 17 attempts on three families
+        # and two prompt versions (understand/1.20 and 1.21), gpt-4o-mini emitted
+        # UNRESOLVED_REFERENT for BOTH "the other one is a 2016" and "no, it's a 2022".
+        # So scope cannot be taken from the model today. It is taken from the model when
+        # the model supplies it, and otherwise established against canonical state — or
+        # held. Nothing here reads customer wording.
+        # ── W2 correction C, unconditional half: no phantom vehicles ──────────────
+        # The W1 review proved corroboration is the ONLY barrier between a model-invented
+        # but catalogue-valid identity and a new candidate. W1 placed it on the G4 path
+        # only, which left the DEPLOYED posture (grounding flag unset) creating phantoms.
+        # A complete identity the thread does not have would CREATE, so it must be
+        # corroborated by the customer's own words first — in either posture.
+        #
+        # Conditioned on a reconstructed burst: with no burst there is nothing to
+        # corroborate against, and pre-existing behaviour stands rather than holding on
+        # the absence of evidence about evidence.
+        if vehicle is not None and self._identity_complete(vehicle):
+            _burst = self._burst_haystack()
+            _m, _mo = self._evidence_identity(vehicle)
+            _already = [c for c in candidates if self._candidate_matches_evidence(
+                c, _m, _mo, getattr(vehicle, "category_suggestion", None))]
+            if _burst and not _already:
+                _c = self._surface_corroboration(vehicle, _burst)
+                if _c is not None and _c.method == "NONE":
+                    return CandidateResolution(
+                        action=CandidateAction.HOLD,
+                        hold_reason=CandidateHoldReason.CREATE_UNCONFIRMED,
+                        compatible_candidate_count=0,
+                        surviving_identity_count=_surviving_n or None,
+                        corroboration_method=_c.method,
+                        corroboration_score=_c.score,
+                        corroboration_gap=_c.gap,
+                        corroboration_reason=(_c.reason or None),
+                        target_scope=_scope_of(correction), **common)
+
+        # Scoped to CORRECT_EXISTING on purpose. The hazard this closes is an ATTRIBUTE
+        # landing on an unestablished referent. A switch relation selects a referent and
+        # writes nothing, so its existing SOLE_NON_FOCUS rung stays in charge; a
+        # replacement names its own target and is handled by G4 below.
+        if (correction is not None
+                and relation == CorrectionRelation.CORRECT_EXISTING.value):
+            _scope = _scope_of(correction)
+            _scoped = dict(common)
+            if _scope == CorrectionTargetScope.ALTERNATE_REFERENT.value:
+                # Explicitly NOT the referent under discussion. The focus is never the
+                # fallback, and "it is the only candidate" is never a resolution.
+                _alt = [c for c in candidates
+                        if focus is None or c.id != getattr(focus, "id", None)]
+                if len(_alt) != 1 or not self._identity_complete_candidate_match(
+                        _alt[0], vehicle):
+                    return CandidateResolution(
+                        action=CandidateAction.HOLD,
+                        hold_reason=CandidateHoldReason.EXCLUDED_REFERENT,
+                        compatible_candidate_count=len(_alt),
+                        surviving_identity_count=_surviving_n or None,
+                        target_scope=_scope, **_scoped)
+            elif _scope == CorrectionTargetScope.UNRESOLVED_REFERENT.value:
+                hold = self._unresolved_scope_hold(ctx, focus, correction, vehicle)
+                if hold is not None:
+                    return CandidateResolution(
+                        action=CandidateAction.HOLD, hold_reason=hold,
+                        compatible_candidate_count=0,
+                        surviving_identity_count=_surviving_n or None,
+                        target_scope=_scope, **_scoped)
 
         def _select(target, basis):
             """Rungs 1-3 and 8: the customer identified a car; select it (focus may move)."""
@@ -5552,9 +5749,10 @@ class ConversationEngine:
             # legitimate B01/B03 replacement. The guard above has already run, so a
             # contested burst can never reach here.
             if correction is not None:
-                incoming = self._named_replacement_identity(
+                incoming, _corr = self._named_replacement_identity(
                     correction, survivor, haystack)
                 if incoming is not None and not _compatible_for(incoming):
+                    _marca, _modelo = self._evidence_identity(incoming)
                     return CandidateResolution(
                         action=CandidateAction.CREATE,
                         focus_transition_required=focus is not None,
@@ -5563,8 +5761,17 @@ class ConversationEngine:
                         compatible_candidate_count=0,
                         selection_basis=CandidateSelectionBasis.EVIDENCE_IDENTITY,
                         grounding_basis=_G.G4_NAMED_REPLACEMENT,
-                        literally_grounded=True,
-                        surviving_identity_count=1, **common)
+                        literally_grounded=(_corr.method == "EXACT"
+                                            if _corr is not None else False),
+                        surviving_identity_count=1,
+                        target_scope=_scope_of(correction),
+                        corroboration_method=getattr(_corr, "method", None),
+                        corroborated_identity=(f"{_marca} {_modelo}".strip()
+                                               if _corr is not None else None),
+                        corroboration_score=getattr(_corr, "score", None),
+                        corroboration_gap=getattr(_corr, "gap", None),
+                        corroboration_reason=(getattr(_corr, "reason", None) or None),
+                        **common)
 
             # A correction — stated, or implied by a corrected value with no new identity.
             if correction is not None:

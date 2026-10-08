@@ -14,6 +14,7 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
+from typing import Optional
 from pathlib import Path
 
 
@@ -130,6 +131,9 @@ _BRAND_NORMS = _BRAND_NORMS_DEDUP
 del _seen_brands, _BRAND_NORMS_DEDUP, _nb, _ob
 
 # Pre-build a mapping from normalized(brand + model) → catalog entry for O(1) lookup.
+#: Every distinct canonical model form, for W2's uniqueness test.
+_MODEL_FORMS: list[str] = []
+
 _FULL_FORM_TO_ENTRY: dict[str, dict] = {}
 _FULL_FORM_ORDER: list[str] = []
 for _key in _SORTED_KEYS:
@@ -138,6 +142,8 @@ for _key in _SORTED_KEYS:
     if _nfull not in _FULL_FORM_TO_ENTRY:
         _FULL_FORM_TO_ENTRY[_nfull] = _entry
         _FULL_FORM_ORDER.append(_nfull)
+_MODEL_FORMS = sorted({_norm(_CAT[_k]["modelo"]) for _k in _SORTED_KEYS
+                       if _CAT[_k].get("modelo")})
 del _key, _entry, _nfull
 
 
@@ -243,6 +249,78 @@ def _best_ngram_score(n: str, form: str) -> float:
         if r > best:
             best = r
     return best
+
+
+@dataclass(frozen=True)
+class SurfaceCorroboration:
+    """Did the customer's own words refer to this canonical identity, and uniquely?
+
+    G3-7K W2. `fuzzy_lookup_vehicle` answers "which car is in this text?" and is anchored
+    to catalogue vocabulary, so a pure misspelling with no other catalogue word in it
+    ("tengo un foccus 2019") yields no fragment and no score. Corroboration is the
+    narrower, DIRECTIONAL question: the semantic interpreter has already proposed an
+    identity, and we need to know whether the customer's surface text supports it. The
+    anchor is therefore the proposed canonical model itself, not the catalogue at large.
+
+    Safety comes from uniqueness, never from proximity: the best-matching surface token
+    must beat every OTHER catalogue model by a margin. "Closest wins" is exactly what this
+    must not be, because that is how a model-invented identity would find a home.
+    """
+    method: str                       # "EXACT" | "FUZZY_UNIQUE" | "NONE"
+    score: float
+    matched_surface: Optional[str]    # the customer token that corroborated, if any
+    runner_up: Optional[str]          # the competing canonical model, when there is one
+    gap: float
+    reason: str                       # "" when corroborated; else why it was refused
+
+
+def corroborate_vehicle_surface(modelo: str, text: str) -> SurfaceCorroboration:
+    """Deterministic, bounded corroboration of ONE proposed model against the burst.
+
+    Returns NONE — never a guess — when the customer said nothing close enough
+    (`NO_SURFACE`) or when the closest token is nearly as close to a different catalogue
+    model (`AMBIGUOUS_SURFACE`). Both are HOLD conditions for the caller.
+
+    Thresholds are the module's existing ones, so there is one notion of "close enough"
+    in this codebase rather than two.
+    """
+    none = SurfaceCorroboration("NONE", 0.0, None, None, 0.0, "NO_SURFACE")
+    n, form = _norm(text or ""), _norm(modelo or "")
+    if not n or not form:
+        return none
+
+    # Exact first: the customer wrote the canonical token (accent/case tolerant).
+    if form in n.split() or f" {form} " in f" {n} ":
+        return SurfaceCorroboration("EXACT", 1.0, form, None, 1.0, "")
+
+    # Best same-length word window. Deliberately NOT catalogue-anchored: the anchor here
+    # is `form`, and very short windows are skipped because they score noisily.
+    words, k = n.split(), len(form.split())
+    best, surface = 0.0, None
+    if k and k <= len(words):
+        for i in range(len(words) - k + 1):
+            window = " ".join(words[i:i + k])
+            if len(window) < 3:
+                continue
+            r = SequenceMatcher(None, window, form).ratio()
+            if r > best:
+                best, surface = r, window
+    if surface is None or best < _HIGH_THRESHOLD:
+        return SurfaceCorroboration("NONE", best, surface, None, 0.0, "NO_SURFACE")
+
+    # Uniqueness: could that same surface token be a DIFFERENT catalogue model?
+    competitor, competitor_score = None, 0.0
+    for other in _MODEL_FORMS:
+        if other == form:
+            continue
+        r = SequenceMatcher(None, surface, other).ratio()
+        if r > competitor_score:
+            competitor, competitor_score = other, r
+    gap = best - competitor_score
+    if gap < _GAP_THRESHOLD:
+        return SurfaceCorroboration("NONE", best, surface, competitor, gap,
+                                    "AMBIGUOUS_SURFACE")
+    return SurfaceCorroboration("FUZZY_UNIQUE", best, surface, competitor, gap, "")
 
 
 def fuzzy_lookup_vehicle(text: str) -> FuzzyLookupResult:
