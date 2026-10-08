@@ -621,11 +621,13 @@ class H_Governance(unittest.TestCase):
 
     def test_cl_49_exactly_one_additive_migration_was_added(self):
         versions = pathlib.Path(__file__).resolve().parents[1] / "backend/migrations/versions"
-        # SB1 (Smart Booking Track B) later added its own, separately reviewed migration.
+        # SB1 and SB2A (Smart Booking Track B) later added their own, separately reviewed
+        # migrations.
         self.assertEqual(sorted(p.name for p in versions.glob("2026100*.py")),
                          ["20261005_pending_correction.py",
                           "20261006_clarification_attempts.py",
-                          "20261007_sb1_booking_representation.py"])
+                          "20261007_sb1_booking_representation.py",
+                          "20261008_sb2a_booking_authority.py"])
 
     def test_cl_50_the_migration_is_additive_and_reversible(self):
         src = (pathlib.Path(__file__).resolve().parents[1]

@@ -17,6 +17,7 @@ from sqlalchemy import func, or_, select, update
 from ..db import get_db
 from ..models import Agencia, Lead, Revision, Profesional, Vendedor
 from ..services.lead_lifecycle import set_lead_estado
+from ..services.booking_authority import BookingAuthority, BookingSource, command_for_edit
 from .kanban_view import (
     ESTADOS_VALIDOS,
     MOTIVOS_PERDIDA_VALIDOS,
@@ -497,6 +498,47 @@ def ui_commit_delete(
     return JSONResponse({"ok": True, "committed": True})
 
 
+def _render_booking_refusal(db: Session, lead_id: int, result, requested_day):
+    """A controlled CRM conflict page: no stack trace, no SQL, the original booking intact,
+    and the times still free that day so the operator can choose another."""
+    import html as _html
+    from fastapi.responses import HTMLResponse
+    from ..schemas.schedule import ScheduleCheckIn
+    from ..services.schedule import ScheduleService
+
+    free: list[str] = []
+    if requested_day is not None and result.outcome.value in ("SLOT_CONFLICT", "CALENDAR_EXCEPTION"):
+        try:
+            hours_start = time(9, 0)
+            out = ScheduleService(db).list_slots(ScheduleCheckIn(
+                address="-", preferred_day=requested_day, preferred_time=hours_start,
+                zone_group=None, is_holiday=False))
+            free = [s for s in (out.slots or []) if isinstance(s, str)]
+        except Exception:
+            logger.exception("BOOKING_REFUSAL could not list free slots lead_id=%s", lead_id)
+    items = "".join(f"<li>{_html.escape(s)}</li>" for s in free) or "<li>—</li>"
+    body = (
+        "<!doctype html><meta charset='utf-8'><title>Turno no disponible</title>"
+        "<main style='font-family:system-ui;max-width:40rem;margin:2rem auto'>"
+        f"<h1>No se guardó el cambio del turno</h1><p>{_html.escape(result.message)}</p>"
+        "<p>El turno original quedó sin cambios. Volvé a la ficha y elegí otro horario.</p>"
+        + (f"<h2>Horarios libres ese día</h2><ul>{items}</ul>" if requested_day else "")
+        + f"<p><a href='/kanban#lead-{int(lead_id)}'>Volver a la ficha</a></p>"
+        f"<p style='color:#6b7280;font-size:.8rem'>Código: {_html.escape(result.outcome.value)}</p>"
+        "</main>"
+    )
+    status = _CRM_REFUSAL_STATUS.get(result.outcome.value, 409)
+    return HTMLResponse(body, status_code=status)
+
+
+#: Refusals are controlled outcomes, never a 500. Only a genuine internal failure is.
+_CRM_REFUSAL_STATUS = {
+    "SLOT_CONFLICT": 409, "CALENDAR_EXCEPTION": 409, "STALE_VERSION": 409,
+    "INVALID_TRANSITION": 409, "MISSING_PROFESSIONAL": 409, "VALIDATION_FAILED": 422,
+    "RETRYABLE_FAILURE": 503, "INTERNAL_FAILURE": 500,
+}
+
+
 def ui_revision_latest_update(
     lead_id: int = Form(...),
 
@@ -539,6 +581,8 @@ def ui_revision_latest_update(
     resultado: str | None = Form(None),
     motivo_rechazo: str | None = Form(None),
     profesional_id: str | None = Form(None),
+    # SB2A: the booking version the form was rendered at (optimistic concurrency).
+    booking_version: str | None = Form(None),
 
     db: Session = Depends(get_db),
 ):
@@ -611,29 +655,28 @@ def ui_revision_latest_update(
     latest.pago = _to_bool(pago)
     latest.medio_pago = _clean_str(medio_pago)
 
-    latest.turno_fecha = _to_date(turno_fecha)
-    latest.turno_hora = _to_time(turno_hora)
+    # SB2A: turno_fecha / turno_hora / estado_revision / profesional_id are booking fields.
+    # They are never written here — they become one command to the booking authority below.
+    new_turno_fecha = _to_date(turno_fecha)
+    new_turno_hora = _to_time(turno_hora)
     latest.cliente_presente = _to_bool(cliente_presente)
     latest.turno_notas = _clean_str(turno_notas)
 
     # Operational status dropdown (only accept valid options if provided)
     er = _clean_str(estado_revision)
-    if er is not None:
-        if er in ESTADO_REVISION_OPCIONES:
-            latest.estado_revision = er
-        # else ignore silently (don’t overwrite with junk)
+    new_estado = er if er is not None and er in ESTADO_REVISION_OPCIONES else None
+    # else ignore silently (don’t overwrite with junk)
 
     latest.resultado = _clean_str(resultado)
     latest.motivo_rechazo = _clean_str(motivo_rechazo)
 
+    # A blank professional is "no explicit change": an occupying booking keeps its eligible
+    # professional or receives the launch default — it is never left unassigned (SB2A).
     prof_raw = _clean_str(profesional_id)
-    if prof_raw is None:
-        latest.profesional_id = None
-    else:
-        try:
-            latest.profesional_id = int(prof_raw)
-        except ValueError:
-            latest.profesional_id = None
+    try:
+        new_prof = int(prof_raw) if prof_raw is not None else None
+    except ValueError:
+        new_prof = None
 
     if recalcular_presupuesto.strip().lower() == "true":
         if _clean_str(precio_base) is None:
@@ -647,8 +690,23 @@ def ui_revision_latest_update(
     if latest.precio_total is None and latest.precio_base is not None and latest.viaticos is not None:
         latest.precio_total = latest.precio_base + latest.viaticos
 
-    db.commit()
-    return RedirectResponse(url="/kanban", status_code=303)
+    try:
+        expected_version = int(booking_version) if _clean_str(booking_version) else None
+    except ValueError:
+        expected_version = None
+    command = command_for_edit(
+        latest, source=BookingSource.CRM, new_date=new_turno_fecha, new_time=new_turno_hora,
+        new_status=new_estado, new_profesional_id=new_prof, expected_version=expected_version)
+    if command is None:
+        db.commit()                     # nothing booking-related changed
+        return RedirectResponse(url="/kanban", status_code=303)
+
+    # One transaction: the non-booking edits above and the booking change commit together,
+    # or — on any refusal — neither does and the original booking is left exactly as it was.
+    result = BookingAuthority(db).execute(command)
+    if result.ok:
+        return RedirectResponse(url="/kanban", status_code=303)
+    return _render_booking_refusal(db, lead_id, result, new_turno_fecha)
 
 
 def ui_profesional_create(

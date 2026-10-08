@@ -219,8 +219,16 @@ class E_ConcurrencyPosture(unittest.TestCase):
 
     def test_own_19_the_slot_is_revalidated_before_a_booking_is_created(self):
         body = inspect.getsource(bfs.BookingFlowService.handle_confirm_booking)
-        self.assertIn("_acquire_advisory_lock", body)
+        # SB2A rewrite: the lock is the booking authority's — blocking, fail-closed, keyed
+        # on (professional, date) — and the revalidation runs inside it (revalidate=…).
+        self.assertIn("self._authority.execute(", body)
+        self.assertIn("revalidate=_revalidate", body)
         self.assertIn("ScheduleCheckIn", body)
+        from app.services import booking_authority as ba
+        locks = inspect.getsource(ba.BookingAuthority._acquire_locks)
+        self.assertIn("pg_advisory_xact_lock(:p, :d)", locks)
+        run = inspect.getsource(ba.BookingAuthority.execute)
+        self.assertLess(run.index("self._acquire_locks("), run.index("revalidate(self.db, target)"))
 
     def test_own_20_a_lost_slot_raises_a_conflict_rather_than_booking_anyway(self):
         body = inspect.getsource(bfs.BookingFlowService.handle_confirm_booking)

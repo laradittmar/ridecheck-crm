@@ -40,6 +40,7 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
 import app.models
+from _sb2a_fixtures import ensure_launch_professional  # noqa: E402
 from app.models import (Lead, ThreadRevision, ViaticosZone, WhatsAppContact, WhatsAppThread,
                         WhatsAppThreadCandidate, WhatsAppThreadState)
 from app.schemas.schedule import ScheduleCheckOut, ScheduleSlotOut, ScheduleSlotsOut
@@ -106,7 +107,9 @@ class _World(unittest.TestCase):
         self.db.add(self.cand); self.db.flush()
         self.state = WhatsAppThreadState(thread_id=self.thread.id,
                                          flow_booking_token=self.token, needs_human=False)
-        self.db.add(self.state); self.db.commit()
+        self.db.add(self.state)
+        ensure_launch_professional(self.db)  # SB2A: booking requires a designated professional
+        self.db.commit()
         self.svc = BookingFlowService(self.db)
         self._mock_schedule()
 

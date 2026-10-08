@@ -7,6 +7,7 @@ from typing import Optional
 from sqlalchemy import (
     String,
     Integer,
+    BigInteger,
     DateTime,
     ForeignKey,
     CheckConstraint,
@@ -110,6 +111,9 @@ class Profesional(Base):
     resource_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     is_launch_default: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("false"))
+    # SB2A: eligibility. An inactive professional is never assigned a new booking.
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=text("true"))
 
     revisions: Mapped[list["Revision"]] = relationship("Revision", back_populates="profesional")
 
@@ -157,6 +161,7 @@ class Revision(Base):
     __table_args__ = (
         CheckConstraint("service_minutes > 0", name="ck_revisions_service_minutes_positive"),
         CheckConstraint("buffer_minutes >= 0", name="ck_revisions_buffer_minutes_nonneg"),
+        CheckConstraint("booking_version >= 0", name="ck_revisions_booking_version_nonneg"),
         CheckConstraint(f"turno_timezone = '{APPOINTMENT_TIMEZONE}'",
                         name="ck_revisions_turno_timezone"),
     )
@@ -222,6 +227,11 @@ class Revision(Base):
     turno_timezone: Mapped[str] = mapped_column(
         String(64), nullable=False, default=APPOINTMENT_TIMEZONE,
         server_default=text(f"'{APPOINTMENT_TIMEZONE}'"))
+    # SB2A: optimistic-concurrency version of the booking (slot, durations, status,
+    # professional). The booking authority bumps it; a PostgreSQL trigger bumps it for any
+    # writer that does not, so a stale edit can be detected whoever made the newer one.
+    booking_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0"))
 
     # --- REVISION PIPELINE ---
     estado_revision: Mapped[str] = mapped_column(String(20), default="PENDIENTE")
@@ -281,6 +291,63 @@ class CalendarException(Base):
     created_by: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class BookingCommandRecord(Base):
+    """SB2A: one row per committed booking command that carried an idempotency key.
+
+    Written in the same transaction as the booking it records, so the ledger and the agenda
+    can never disagree. `UNIQUE (idempotency_key)` is the final duplicate authority.
+    Acknowledgement state is deliberately separate from commit state.
+    """
+    __tablename__ = "booking_commands"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_booking_commands_idempotency_key"),
+        CheckConstraint(
+            "source IN ('WHATSAPP_FLOW', 'CRM', 'API', 'CONVERSATION_ENGINE', 'OTHER')",
+            name="ck_booking_commands_source"),
+        CheckConstraint(
+            "operation IN ('CREATE', 'RESCHEDULE', 'CANCEL', 'MARK_FOR_RESCHEDULE', "
+            "'SET_STATUS', 'UNSCHEDULE', 'REQUEST_MANUAL_SCHEDULING')",
+            name="ck_booking_commands_operation"),
+        CheckConstraint(
+            "ack_status IN ('NOT_APPLICABLE', 'PENDING', 'SENDING', 'SENT', 'FAILED')",
+            name="ck_booking_commands_ack_status"),
+        Index("ix_booking_commands_revision_id", "revision_id"),
+        Index("ix_booking_commands_thread_revision_id", "thread_revision_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    operation: Mapped[str] = mapped_column(String(32), nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    revision_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("revisions.id", ondelete="SET NULL"), nullable=True)
+    thread_revision_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("thread_revisions.id", ondelete="SET NULL"), nullable=True)
+    lead_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    thread_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    profesional_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    slot_start: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    slot_end: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    occupying: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    booking_version: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    correlation_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    actor: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    committed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now())
+    ack_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="NOT_APPLICABLE",
+        server_default=text("'NOT_APPLICABLE'"))
+    ack_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0"))
+    ack_updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    replay_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0"))
+    last_replayed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True)
 
 
 class ViaticosZone(Base):
@@ -516,7 +583,8 @@ class ThreadRevision(Base):
     __tablename__ = "thread_revisions"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('draft', 'collecting_data', 'booked', 'completed', 'provisional')",
+            "status IN ('draft', 'collecting_data', 'booked', 'completed', 'provisional', "
+            "'cancelled', 'reschedule_pending')",
             name="ck_thread_revisions_status",
         ),
     )

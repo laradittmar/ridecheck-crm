@@ -5770,6 +5770,7 @@ def render_edit_latest_revision_form(
 
           <form method="post" action="/ui/revision_latest_update" class="revEditPanel" data-revision-id="{last_rev.id}" data-current-turno-time="{th_val}">
             <input type="hidden" name="lead_id" value="{lead_id}"/>
+            <input type="hidden" name="booking_version" value="{getattr(last_rev, 'booking_version', '') if getattr(last_rev, 'booking_version', None) is not None else ''}"/>
             <div class="revModalBody">
               <style>
                 #editrev-{lead_id} .revSection {{ margin-bottom:12px; }}

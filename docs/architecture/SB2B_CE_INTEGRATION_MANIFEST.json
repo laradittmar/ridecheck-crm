@@ -1,0 +1,48 @@
+{
+  "schema": "sb2b-ce-integration-manifest/1",
+  "milestone": "PRELAUNCH-SB2A-BOOKING-AUTHORITY-CORE",
+  "status": "CONTRACT ONLY — conversation_engine.py is not modified in SB2A; SB2B wires these sites",
+  "source_file": "backend/app/services/conversation_engine.py",
+  "adapter_module": "app.services.booking_ce_adapter",
+  "sites": [
+    {
+      "id": "CE-W1",
+      "function": "_process_flow_response",
+      "anchors": ["crm_rev = Revision(", "status=\"booked\"", "turno_fecha=sched_date", "turno_hora=sched_time"],
+      "current_operation": "Writes ThreadRevision(status='booked') and an occupying Revision at state.preferred_day/preferred_time, then self.db.commit(). No advisory lock, no revalidation, no calendar check, no professional, no idempotency; under SB1 an overlap raises 23P01 inside CE.",
+      "adapter": "book_from_flow_response",
+      "request": "CeFlowBookingRequest",
+      "command": {
+        "operation": "CREATE (REQUEST_MANUAL_SCHEDULING when no agreed slot)",
+        "source": "CONVERSATION_ENGINE",
+        "idempotency_key": "ce-flow-response:<sha256(flow_token)[:48]> | ce-flow-response-msg:<sha256(inbound wamid)[:48]>",
+        "requested_date": "state.preferred_day",
+        "requested_time": "state.preferred_time",
+        "attach": "writes the booked ThreadRevision + lead/state updates + token consumption; returns the ThreadRevision"
+      },
+      "expected_results": ["COMMITTED", "IDEMPOTENT_REPLAY", "SLOT_CONFLICT", "CALENDAR_EXCEPTION", "MISSING_PROFESSIONAL", "RETRYABLE_FAILURE", "INTERNAL_FAILURE", "VALIDATION_FAILED"],
+      "sb2b_rules": [
+        "COMMITTED/IDEMPOTENT_REPLAY: keep the flow-txn:<ThreadRevision.id> acknowledgement keyed on result.thread_revision_id",
+        "SLOT_CONFLICT/CALENDAR_EXCEPTION: book nothing; call request_manual_scheduling so the human escalation survives",
+        "any other refusal: book nothing, acknowledge nothing as confirmed, hand off"
+      ]
+    },
+    {
+      "id": "CE-W2",
+      "function": "_handle_scheduling_escalation",
+      "anchors": ["crm_rev = Revision(", "status=\"provisional\"", "turno_notas=\"Pendiente coordinación manual"],
+      "current_operation": "Writes an OCCUPYING Revision (default PENDIENTE) at the time the customer insists on after CE judged it unavailable. Under SB1 an overlap raises 23P01, CE's catch-all rolls back the entire turn and returns action='error' (handled=True): no reply, and the escalation, needs_human and handoff e-mail are lost.",
+      "adapter": "request_manual_scheduling",
+      "request": "CeSchedulingEscalationRequest",
+      "command": {
+        "operation": "REQUEST_MANUAL_SCHEDULING",
+        "source": "CONVERSATION_ENGINE",
+        "idempotency_key": "ce-escalation:<sha256(escalation_id)[:48]> where escalation_id = '<thread_id>:<cycle_key>'",
+        "target_status": "REPROGRAMAR (non-occupying)",
+        "attach": "optional: writes the provisional ThreadRevision"
+      },
+      "expected_results": ["COMMITTED", "IDEMPOTENT_REPLAY"],
+      "invariants": ["never occupies the agenda", "never SLOT_CONFLICT", "the human escalation is preserved even when the requested slot is unavailable"]
+    }
+  ]
+}

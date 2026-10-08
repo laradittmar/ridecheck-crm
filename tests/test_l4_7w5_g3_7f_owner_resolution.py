@@ -927,11 +927,13 @@ class H_State(unittest.TestCase):
     def test_or_56_no_new_migration_was_added(self):
         """Part F: the canonical persisted Flow state already exists."""
         versions = pathlib.Path(__file__).resolve().parents[1] / "backend/migrations/versions"
-        # SB1 (Smart Booking Track B) later added its own, separately reviewed migration.
+        # SB1 and SB2A (Smart Booking Track B) later added their own, separately reviewed
+        # migrations.
         self.assertEqual(sorted(p.name for p in versions.glob("2026100*.py")),
                          ["20261005_pending_correction.py",
                           "20261006_clarification_attempts.py",
-                          "20261007_sb1_booking_representation.py"])
+                          "20261007_sb1_booking_representation.py",
+                          "20261008_sb2a_booking_authority.py"])
 
 
 # ══ I — observability (requirements 57-63) ════════════════════════════════════════

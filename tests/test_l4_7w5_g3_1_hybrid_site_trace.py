@@ -629,11 +629,12 @@ class PrivacyHistoryContract(unittest.TestCase):
         the assertion now names its own scope instead of freezing a global total."""
         versions = sorted(p.name for p in
                           (ROOT / "backend" / "migrations" / "versions").glob("*.py"))
-        self.assertEqual(len(versions), 48)
+        self.assertEqual(len(versions), 49)
         self.assertIn("20260918_hybrid_decision_traces.py", versions)  # G3-1's table
         self.assertIn("20261005_pending_correction.py", versions)  # G3-7F Commit 3
         self.assertIn("20261006_clarification_attempts.py", versions)  # G3-7F sequencing
         self.assertIn("20261007_sb1_booking_representation.py", versions)  # SB1 (Track B)
+        self.assertIn("20261008_sb2a_booking_authority.py", versions)  # SB2A (Track B)
 
     def test_site_42_no_pii_in_the_new_row_fields(self):
         h = HandoffSite()

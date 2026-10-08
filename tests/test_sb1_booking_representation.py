@@ -337,7 +337,6 @@ _FROZEN_AT_PARENT = {
     "backend/app/services/response_composition.py": "aa60cbc06578efcbc69aa8d046374690674c0789",
     "backend/app/services/response_validator.py": "7085211b96771b802c177789e8c4460e4525dfad",
     "backend/app/services/pricing.py": "9aed0358cfba7b08a4082bd7b1ecebcc778e5b5a",
-    "backend/app/services/booking_flow_service.py": "58a227e065fdc1afc19c0b3cc893c25c1bc3da98",
     "backend/app/services/schedule.py": "00487c9a46ee168ae12dc76667863f0fbb5f71ad",
     "backend/app/services/travel.py": "fc95b0550e486b55ddf2cbb2af19e6c6d104d11d",
     "backend/app/services/outbound_safety_gate.py": "73481ce2d8473edfc7ba04c123f5e12d6f1d5395",
@@ -357,7 +356,9 @@ class UnchangedContracts(unittest.TestCase):
         # availability still occupies 45 minutes from the start, which is exactly the SB1
         # default interval — so the database and the offer path agree on every row today
         self.assertEqual(sched.SERVICE_MINUTES, br.OCCUPIED_MINUTES_DEFAULT)
-        for name in ("schedule.py", "booking_flow_service.py"):
+        # SB2A cut booking_flow_service.py over to the booking authority; schedule.py and the
+        # Flow JSON remain frozen.
+        for name in ("schedule.py",):
             rel = f"backend/app/services/{name}"
             self.assertEqual(_git_blob_sha1(os.path.join(_ROOT, rel)), _FROZEN_AT_PARENT[rel])
         rel = "meta/flows/booking/PUBLISHED_28104222025943520_v7.3.json"

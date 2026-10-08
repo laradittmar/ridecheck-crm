@@ -985,10 +985,12 @@ class I_Invariants(unittest.TestCase):
             pathlib.Path(__file__).resolve().parents[1] / "backend/migrations/versions")
         recent = sorted(p.name for p in versions.glob("2026100*.py"))
         # G3-7F sequencing adds exactly ONE additive migration, by design (§4).
-        # SB1 (Smart Booking Track B) later added its own, separately reviewed migration.
+        # SB1 and SB2A (Smart Booking Track B) later added their own, separately reviewed
+        # migrations.
         self.assertEqual(recent, ["20261005_pending_correction.py",
                                   "20261006_clarification_attempts.py",
-                                  "20261007_sb1_booking_representation.py"],
+                                  "20261007_sb1_booking_representation.py",
+                                  "20261008_sb2a_booking_authority.py"],
                          f"an unexpected migration appeared: {recent}")
 
 

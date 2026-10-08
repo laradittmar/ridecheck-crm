@@ -15,7 +15,7 @@ import sys
 import time as _time
 import types
 import unittest
-from datetime import date, time, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -56,6 +56,7 @@ def _pragmas(conn, _rec):
 
 
 import app.models  # noqa: F401
+from _sb2a_fixtures import ensure_launch_professional  # noqa: E402
 from app.models import (
     Lead,
     Revision,
@@ -142,6 +143,7 @@ def _make_world(db: Session) -> tuple[WhatsAppThread, WhatsAppThreadState, Whats
         needs_human=False,
     )
     db.add(state)
+    ensure_launch_professional(db)  # SB2A: booking requires a designated professional
     db.commit()
 
     return thread, state, candidate, lead
@@ -648,12 +650,21 @@ class TestBF18_AdvisoryLockSkipOnSQLite(unittest.TestCase):
         self.db.close()
 
     def test_bf18_lock_skip_does_not_raise(self):
-        """On SQLite, _acquire_advisory_lock catches the exception and proceeds."""
+        """SB2A rewrite (was: "_acquire_advisory_lock catches the exception and proceeds").
+
+        Swallowing a lock failure is exactly SB0-05. The lock now belongs to the booking
+        authority: blocking and fail-closed on PostgreSQL, and on SQLite an explicit,
+        LABELLED mode that is never reported as concurrency evidence. Stricter: the silent
+        catch-all is gone and the mode is asserted, not assumed."""
+        from app.services.booking_authority import (BookingAuthority, BookingCommand,
+                                                    BookingOperation, BookingSource)
         svc = BookingFlowService(self.db)
-        _mock_sched_valid(svc)
-        lock_key = int(hashlib.sha256(_FUTURE.isoformat().encode()).hexdigest()[:8], 16) & 0x7FFFFFFF
-        # Should not raise despite SQLite not supporting pg_try_advisory_xact_lock
-        svc._acquire_advisory_lock(lock_key, _FUTURE.isoformat())
+        self.assertFalse(hasattr(svc, "_acquire_advisory_lock"))
+        result = BookingAuthority(self.db).execute(BookingCommand(
+            operation=BookingOperation.CREATE, source=BookingSource.OTHER,
+            lead_id=self.lead.id, requested_date=_FUTURE, requested_time=time(10, 0)))
+        self.assertEqual(result.outcome.value, "COMMITTED", result.reason)
+        self.assertEqual(result.lock_mode, "sqlite-serialized")
 
     def test_bf18_full_confirm_works_on_sqlite(self):
         """Confirm booking completes end-to-end on SQLite (lock no-ops silently)."""
@@ -798,12 +809,25 @@ class TestBF23_TokenConsumed(unittest.TestCase):
         self.assertIsNone(state.flow_booking_token)
 
     def test_bf23_second_confirm_with_same_token_fails(self):
+        """SB2A rewrite (was: the second confirm raises BookingTokenError).
+
+        SB0-04: a Meta retry after a successful commit showed an error screen to a customer
+        whose booking had succeeded. The token is still consumed — but a retry of the SAME
+        committed submission now replays its ORIGINAL success and books nothing twice; a
+        token that never committed is still refused. Stricter: it also proves no duplicate."""
         svc = BookingFlowService(self.db)
         _mock_sched_valid(svc)
-        svc.handle_confirm_booking(self.token, _confirm_data(self.token))
-        # Token is consumed — second call should raise
+        first = svc.handle_confirm_booking(self.token, _confirm_data(self.token))
+        second = svc.handle_confirm_booking(self.token, _confirm_data(self.token))
+        self.assertEqual(second, first)
+        self.assertEqual(second["screen"], "SUCCESS")
+        self.assertEqual(self.db.query(ThreadRevision).count(), 1)
+        self.assertEqual(self.db.query(Revision).count(), 1)
+        self.db.refresh(self.state)
+        self.assertIsNone(self.state.flow_booking_token)
+        never_committed = f"{self.thread.id}-{int(datetime.now().timestamp())}-deadbeef"
         with self.assertRaises(BookingTokenError):
-            svc.handle_confirm_booking(self.token, _confirm_data(self.token))
+            svc.handle_confirm_booking(never_committed, _confirm_data(never_committed))
 
 
 class TestBF24_LastStageBooked(unittest.TestCase):

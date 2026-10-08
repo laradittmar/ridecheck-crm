@@ -100,10 +100,18 @@ class TestBookingReceipt(unittest.TestCase):
         """BOOK-END-01 — the send happens after the commit, inside the confirm handler."""
         fn = _fn(BFS_SOURCE, "handle_confirm_booking")
         self.assertIn("self._send_booking_receipt(", fn)
-        i_commit = fn.index("self.db.commit()")
+        # SB2A rewrite: the commit is the booking authority's; it returns COMMITTED only after
+        # it. The receipt follows that call and is gated on the COMMITTED outcome.
+        i_commit = fn.index("self._authority.execute(")
         i_send = fn.index("_send_booking_receipt")
         self.assertLess(i_commit, i_send,
                         "the booking must be durable before we acknowledge it")
+        self.assertLess(fn.index("if result.outcome is not BookingOutcome.COMMITTED"), i_send)
+        import inspect
+        from app.services.booking_authority import BookingAuthority
+        auth = inspect.getsource(BookingAuthority.execute)
+        self.assertLess(auth.index("self.db.commit()"),
+                        auth.index("return _result(BookingOutcome.COMMITTED"))
 
     def test_book_end_02_it_never_claims_the_appointment_is_confirmed(self):
         """BOOK-END-02 — approval is PENDING; saying 'turno confirmado' would be false."""

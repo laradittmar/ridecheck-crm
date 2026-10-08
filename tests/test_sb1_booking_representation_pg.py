@@ -38,7 +38,19 @@ from sqlalchemy.exc import IntegrityError, DBAPIError  # noqa: E402
 PG_URL = os.environ.get("SB1_PG_URL", "")
 PG_BASE_URL = os.environ.get("SB1_PG_BASE_URL", "")
 
-HEAD = "20261007_sb1_booking_repr"
+SB1_REVISION = "20261007_sb1_booking_repr"
+
+
+def _script_head() -> str:
+    """The current Alembic head. SB2A rewrite: the ORM models always describe the HEAD schema,
+    so the ORM-using tests here must run at head; every SB1 property they assert still holds
+    there, and the downgrade target (PARENT) is unchanged."""
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+    return ScriptDirectory.from_config(Config(os.path.join(_BACKEND, "alembic.ini"))).get_current_head()
+
+
+HEAD = _script_head()
 PARENT = "20261006_clarification_attempts"
 EXCLUSION = "ex_revisions_professional_occupied_overlap"
 

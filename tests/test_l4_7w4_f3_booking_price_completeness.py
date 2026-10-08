@@ -45,6 +45,7 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
 import app.models
+from _sb2a_fixtures import ensure_launch_professional  # noqa: E402
 from app.models import (Lead, Revision, ThreadRevision, ViaticosZone, WhatsAppContact,
                         WhatsAppThread, WhatsAppThreadCandidate, WhatsAppThreadState)
 from app.schemas.schedule import ScheduleCheckOut, ScheduleSlotsOut, ScheduleSlotOut
@@ -97,7 +98,9 @@ def _world(db, *, tipo=W4_TIPO, group=W4_GROUP, detail=W4_DETAIL, seed_zone=True
     db.add(cand); db.flush()
     state = WhatsAppThreadState(thread_id=thread.id, flow_booking_token=token,
                                 needs_human=False)
-    db.add(state); db.commit()
+    db.add(state)
+    ensure_launch_professional(db)  # SB2A: booking requires a designated professional
+    db.commit()
     return thread, state, cand, lead, token
 
 
@@ -228,9 +231,18 @@ class TestAtomicity(_Base):
         """BOOKPRICE-10 — no window where a booked Revision exists without its price."""
         fn = next(ast.unparse(n) for n in ast.walk(ast.parse(BFS_SOURCE))
                   if isinstance(n, ast.FunctionDef) and n.name == "handle_confirm_booking")
+        # SB2A rewrite: the single commit moved into the booking authority. The price is
+        # stamped in the attach step handed to it, and the authority runs attach before its
+        # one commit — the same "no window" guarantee, now asserted on both sides.
         i_price = fn.index("recalculate_revision_if_possible")
-        i_commit = fn.index("self.db.commit()")
-        self.assertLess(i_price, i_commit, "the price must be stamped before the commit")
+        i_exec = fn.index("self._authority.execute(")
+        self.assertLess(i_price, i_exec, "pricing is part of the attach handed to the authority")
+        self.assertIn("attach=_create_booking", fn)
+        import inspect
+        from app.services.booking_authority import BookingAuthority
+        auth = inspect.getsource(BookingAuthority.execute)
+        self.assertLess(auth.index("attach(self.db, revision)"), auth.index("self.db.commit()"),
+                        "the price must be stamped before the commit")
         rev = self.book()
         tr = self.db.query(ThreadRevision).one()
         self.assertEqual(tr.status, "booked")
