@@ -268,6 +268,15 @@ _MOTORCYCLE_ADVISOR_REPLY = (
 # BEFORE the booking-flow handler.  Must not clash with booking tokens (no prefix there).
 _MOTO_HANDOFF_TOKEN_PREFIX = "moto-handoff-"
 
+#: G3-7N. A withdrawn scheduling offer leaves a TOMBSTONE in `flow_booking_token` rather
+#: than simply clearing it. Clearing is not revocation: the booking path's token check is
+#: `if expected and flow_token and flow_token != expected`, so a NULL `expected`
+#: short-circuits and a late tap sails through. The tombstone keeps `expected` non-null and
+#: unmatchable, which is what makes the refusal durable — it survives process restart,
+#: duplicate delivery, delayed submission and the issuing of a later offer, because a new
+#: offer simply overwrites the same column. Only a hash of the superseded token is kept.
+_WITHDRAWN_OFFER_TOKEN_PREFIX = "withdrawn-offer-"
+
 # Candidate type-safety: tipo_vehiculo values that represent motorcycles.
 # A MOTO candidate must never be repurposed as an automotive candidate and vice versa.
 _MOTO_TIPO_VALUES = frozenset({"MOTO", "MOTOCICLETA"})
@@ -3598,14 +3607,58 @@ class ConversationEngine:
         if "zona_general" in flow_data:
             return self._process_location_fallback_response(ctx, state, flow_data)
 
-        # Token validation (warn only — don't hard-block in case of token mismatch due to clock skew)
+        # ── G3-7N: a WITHDRAWN offer is refused before anything is written ────────
+        # The check below this one is deliberately warn-only for clock skew, and that is
+        # exactly why clearing the token could not revoke an offer: a NULL `expected`
+        # short-circuits it. A tombstone cannot be matched by any real token, so a late tap
+        # on the superseded Flow stops here — before any Revision, ThreadRevision, booking,
+        # agenda occupancy or lead-state change.
         expected = state.flow_booking_token
         self._flow_token_expected = expected
-        if expected and flow_token and flow_token != expected:
-            logger.warning(
-                "M18 flow token mismatch thread_id=%s expected=%s got=%s",
-                ctx.thread.id, expected, flow_token,
-            )
+        if (expected or "").startswith(_WITHDRAWN_OFFER_TOKEN_PREFIX):
+            self._turn_booking_refusal = "OFFER_WITHDRAWN"
+            self._decision_log(ctx, "booking_offer_withdrawn",
+                               reason="OFFER_WITHDRAWN", had_token=bool(flow_token))
+            logger.info("G3-7N refused a withdrawn scheduling offer thread_id=%s — "
+                        "no revision, no booking", ctx.thread.id)
+            state.needs_human = True
+            lead.necesita_humano = True
+            self.db.commit()
+            sent_id = self._send_text_to_wa(ctx, _FALLBACK_WARM_HANDOFF)
+            self._send_fallback_human_review_notification(
+                ctx, state, reason="stale_vehicle_scheduling_offer")
+            return _out("replied", wa_message_id=sent_id)
+
+        # ── G3-7N: a token for another thread, or a superseded one, is refused ────
+        # These were previously one warn-only comparison, justified by clock skew. The
+        # token is an opaque `{thread_id}-{unix_ts}` string WE mint and Meta echoes back
+        # verbatim, so skew cannot alter it — and warn-only left two live holes the G3-7N
+        # late-tap matrix found: an old token regained authority as soon as a NEW offer
+        # overwrote the tombstone, and a token carried to a different thread was accepted
+        # there because that thread had no expected value to compare against.
+        _refusal = None
+        if flow_token:
+            _tok_thread = None
+            try:
+                _tok_thread = int(str(flow_token).split("-", 1)[0])
+            except (ValueError, TypeError, IndexError):
+                _tok_thread = None
+            if _tok_thread is not None and _tok_thread != ctx.thread.id:
+                _refusal = "FOREIGN_OFFER"
+            elif expected and flow_token != expected:
+                _refusal = "SUPERSEDED_OFFER"
+        if _refusal:
+            self._turn_booking_refusal = _refusal
+            self._decision_log(ctx, "booking_offer_refused", reason=_refusal)
+            logger.info("G3-7N refused a booking submission thread_id=%s reason=%s — "
+                        "no revision, no booking", ctx.thread.id, _refusal)
+            state.needs_human = True
+            lead.necesita_humano = True
+            self.db.commit()
+            sent_id = self._send_text_to_wa(ctx, _FALLBACK_WARM_HANDOFF)
+            self._send_fallback_human_review_notification(
+                ctx, state, reason="stale_or_foreign_scheduling_offer")
+            return _out("replied", wa_message_id=sent_id)
 
         # Determine lead source so we can fill missing fields from context.
         is_website = getattr(state, "is_website_lead", False)
@@ -3786,7 +3839,7 @@ class ConversationEngine:
     #: validated, accepted and committed. Says only what is true at that moment: an
     #: operator still has to approve the appointment, so it promises contact, not a turn.
     _FLOW_COMPLETION_ACK = (
-        "Gracias por completarlo. Un representante de RideCheck se va a comunicar con vos.")
+        "Gracias por completarlo. Un representante de RideCheck se estará comunicando con vos.")
 
     @staticmethod
     def _flow_transaction_key(thread_rev_id) -> "str | None":
@@ -6935,6 +6988,54 @@ class ConversationEngine:
             _T.UNRESOLVED_TARGET, None, considered, compat_ids, submitted, None,
             "MULTIPLE_COMPATIBLE_CANDIDATES")
 
+    def _withdraw_vehicle_dependent_scheduling_state(self, ctx, state, *, reason: str):
+        """Withdraw every scheduling fact whose validity depended on the previous vehicle.
+
+        G3-7N. One canonical operation, called only when an accepted vehicle completion
+        actually changes what is being scheduled. The G3-7M review proved that resetting
+        the stage and the lead flag is not enough: the booking token, the offered and
+        visible slots and the requested date all survived a vehicle change, and a late tap
+        on the superseded Flow created a Revision for a car the customer no longer had.
+
+        WITHDRAW (their validity is vehicle- or quote-dependent):
+          `flow_booking_token`   — replaced by a tombstone, see below
+          `last_offered_slots`   — slots offered for the old vehicle's service duration
+          `last_visible_slots`   — what the customer was shown for that offer
+          `active_requested_date`, `last_requested_time` — the request that produced it
+          `preferred_day`, `preferred_time` — the accepted slot of the withdrawn offer
+
+        PRESERVE (not vehicle-dependent, and losing them would discard real evidence):
+          the candidate rows themselves, conversation and message history, contact and
+          lead identity, locality/zone facts, `current_cycle_*` identity, clarification
+          attempt history, `needs_human`.
+
+        RECOMPUTE elsewhere: `last_stage` and `lead.flag`, which the existing re-quote
+        guard already resets; the quote itself, which the caller recomputes when it can.
+
+        IRRELEVANT: `current_revision_id` — a booked revision is history, not an offer, and
+        this path never books. It is deliberately left alone rather than nulled.
+
+        The tombstone is the durable half. Clearing the token would leave `expected` NULL,
+        and the booking path's comparison short-circuits on NULL — so clearing alone is not
+        revocation. Keeping a non-null, unmatchable value is.
+        """
+        import hashlib
+
+        previous = state.flow_booking_token or ""
+        if previous and not previous.startswith(_WITHDRAWN_OFFER_TOKEN_PREFIX):
+            digest = hashlib.sha256(previous.encode("utf-8")).hexdigest()[:32]
+            state.flow_booking_token = f"{_WITHDRAWN_OFFER_TOKEN_PREFIX}{digest}"
+        for field in ("last_offered_slots", "last_visible_slots", "active_requested_date",
+                      "last_requested_time", "preferred_day", "preferred_time"):
+            if getattr(state, field, None) is not None:
+                setattr(state, field, None)
+        self._turn_scheduling_withdrawn = reason
+        self._decision_log(ctx, "scheduling_offer_withdrawn", reason=reason,
+                           had_offer=bool(previous))
+        logger.info("G3-7N withdrew vehicle-dependent scheduling state thread_id=%s "
+                    "reason=%s had_offer=%s", getattr(ctx.thread, "id", None), reason,
+                    bool(previous))
+
     def _process_vehicle_fallback_response(
         self,
         ctx: _Context,
@@ -7060,8 +7161,25 @@ class ConversationEngine:
             _data.update(action="update", id=_target.target_candidate_id)
         else:
             _data.update(action="create")
+        _focus_before_completion = getattr(state, "current_focus_candidate_id", None)
         _applied, _created = self._apply_candidate(ctx, _data)
         self._turn_completion_applied = bool(_applied)
+
+        # ── G3-7N: withdraw the superseded scheduling offer ───────────────────────
+        # Only when the completion actually changed what is being scheduled: the focused
+        # candidate moved, a new focused candidate appeared, or the focused row's own
+        # identity was materially corrected. Resubmitting the same identity with nothing
+        # changed withdraws nothing, and a dispatched-but-uncompleted clarification never
+        # reaches here at all. Same transaction as the candidate write above — the single
+        # `commit()` below makes both authoritative together or neither.
+        _focus_after_completion = getattr(state, "current_focus_candidate_id", None)
+        _material = bool(
+            _created
+            or _focus_after_completion != _focus_before_completion
+            or (_applied and _target.outcome == _T.MATCH_EXISTING_CANDIDATE))
+        if _material:
+            self._withdraw_vehicle_dependent_scheduling_state(
+                ctx, state, reason="VEHICLE_CLARIFICATION_COMPLETED")
         if _created and not any(getattr(c, "id", None) == _created
                                 for c in (ctx.candidates or ())):
             from app.models import WhatsAppThreadCandidate as _WTC

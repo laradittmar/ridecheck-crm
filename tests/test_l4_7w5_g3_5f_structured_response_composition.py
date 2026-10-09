@@ -620,7 +620,8 @@ class D_FlowCompletionAck(unittest.TestCase):
         for forbidden in ("turno confirmado", "confirmado", "agendado", "reservado"):
             with self.subTest(word=forbidden):
                 self.assertNotIn(forbidden, ack)
-        self.assertIn("se va a comunicar", ack)
+        # G3-7N owner policy §13: approved copy is "se estará comunicando con vos."
+        self.assertIn("se estará comunicando", ack)
 
 
 # ══ E — trace 1.5 and the Inspector ═════════════════════════════════════════

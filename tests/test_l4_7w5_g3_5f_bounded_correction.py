@@ -172,8 +172,15 @@ class A_TransactionIdentity(unittest.TestCase):
         body = inspect.getsource(ConversationEngine._process_flow_response)
         self.assertLess(body.index("self.db.commit()"),
                         body.index("_txn_key = self._flow_transaction_key("))
+        # G3-7N: the anchor is the send that FOLLOWS the transaction, not the first send
+        # anywhere in the method. The key is derived from a committed `ThreadRevision.id`,
+        # so it cannot exist before one — and G3-7N added legitimately earlier sends on
+        # paths that book nothing (a withdrawn, foreign or superseded offer is refused and
+        # handed to a person). Those have no transaction to key. The invariant this guards
+        # is unchanged: the ledger row for a BOOKING CONFIRMATION must carry its key.
+        _txn_at = body.index("_txn_key = self._flow_transaction_key(")
         self.assertLess(body.index("self._correlation_id = _txn_key"),
-                        body.index("sent_id = self._send_text_to_wa("),
+                        body.index("sent_id = self._send_text_to_wa(", _txn_at),
                         "the ledger row would not carry the transaction key")
 
     def test_bc_08_the_sentence_is_no_longer_an_idempotency_key(self):
@@ -403,7 +410,9 @@ class C_SafetyConditionsIntact(unittest.TestCase):
                           "aprobado"):
             with self.subTest(word=forbidden):
                 self.assertNotIn(forbidden, ack)
-        self.assertIn("se va a comunicar", ack)
+        # G3-7N owner policy §13: the approved copy is "se estará comunicando con vos."
+        # The older "se va a comunicar" variant is retired.
+        self.assertIn("se estará comunicando", ack)
 
     def test_bc_26_receipt_and_acknowledgement_remain_one_message(self):
         e = self.engine()
