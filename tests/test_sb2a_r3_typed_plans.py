@@ -220,7 +220,8 @@ class R3_Attachments(unittest.TestCase):
         for bad in ("booked", "completed", "cancelled"):
             r = BookingAuthority(db).execute(_cmd(lead, op=Op.REQUEST_MANUAL_SCHEDULING),
                                              attachments=_plan(tid, non_occupying_status=bad))
-            self.assertEqual(r.reason, "ATTACHMENT_STATUS_NOT_ALLOWED")
+            # SB2A-R4 rewrite: the strict schema refuses a non-declared status at admission
+            self.assertEqual(r.reason, "PLAN_NOT_DATA:attachments")
 
     def test_r3_09_attachment_scope_is_enforced_after_rollback_leaves_nothing(self):
         db, lead, tid = _world()
@@ -249,8 +250,10 @@ class R3_Attachments(unittest.TestCase):
         lead.nombre = "Existing"; db.commit()
         plan = BookingAttachmentPlan(
             thread_revision=ThreadRevisionAttachment(thread_id=tid),
+            # SB2A-R4 rewrite: identity is ONE bundle. Canonical "Existing" vs submitted "Nuevo"
+            # conflicts, so nothing about the person is written (no "Existing Apellido").
             lead=LeadUpdate(estado="COORDINAR_DISPONIBILIDAD", flag="ACEPTADO", necesita_humano=True,
-                            nombre_if_empty="Nuevo", apellido_if_empty="Apellido"),
+                            identity=ba.LeadIdentity(nombre="Nuevo", apellido="Apellido")),
             thread_state=ThreadStateUpdate(link_current_revision=True, last_stage="BOOKED",
                                            needs_human=True, consume_flow_token=True))
         r = BookingAuthority(db).execute(_cmd(lead, thread_id=tid), attachments=plan)
@@ -258,7 +261,8 @@ class R3_Attachments(unittest.TestCase):
         db.expire_all()
         lead = db.get(Lead, lead.id)
         self.assertEqual((lead.estado, lead.flag, lead.necesita_humano, lead.nombre, lead.apellido),
-                         ("COORDINAR_DISPONIBILIDAD", "ACEPTADO", True, "Existing", "Apellido"))
+                         ("COORDINAR_DISPONIBILIDAD", "ACEPTADO", True, "Existing", None))
+        self.assertEqual(r.identity_outcome, "CONFLICT")
         st = db.query(WhatsAppThreadState).filter_by(thread_id=tid).one()
         self.assertEqual((st.current_revision_id, st.last_stage, st.needs_human, st.flow_booking_token),
                          (r.thread_revision_id, "BOOKED", True, None))
@@ -407,6 +411,10 @@ class R3_DefenceInDepth(unittest.TestCase):
         self.assertIn("transaction_status", cont)
         self.assertIn("txid_current()", cont)
         ver = inspect.getsource(BookingAuthority._verify_before_commit)
+        # SB2A-R4 rewrite: the set checks moved into _audit_transaction_writes (PostgreSQL) and
+        # _window_diff (SQLite), both called from _verify_before_commit.
+        ver += inspect.getsource(BookingAuthority._audit_transaction_writes)
+        ver += inspect.getsource(BookingAuthority._window_diff)
         for check in ("self._assert_continuous(txid)", "verify_booking_schema(self.db)", "OCCUPANCY_SET_CHANGED",
                       "BOOKED_THREAD_REVISION_SET_CHANGED", "BOOKING_FIELDS_CHANGED"):
             self.assertIn(check, ver)
@@ -449,7 +457,14 @@ class R3_Ack(unittest.TestCase):
         t = T0
         for _ in range(ba.ACK_MAX_ATTEMPTS):
             self.claim(t); t += timedelta(seconds=ba.ACK_LEASE_SECONDS + 1)
+        # SB2A-R4 rewrite (R3A-07): the view is READ-ONLY and flags the row; terminalization
+        # is the explicit, separate operation.
         with mock.patch.object(ba, "_app_now", return_value=t):
+            rows = self.auth.acknowledgements_needing_attention()
+            self.assertEqual([(r["ack_status"], r["pending_terminalization"]) for r in rows],
+                             [("SENDING", True)])
+            self.assertEqual(self.auth.terminalize_exhausted_acknowledgements(), 1)
+            self.assertEqual(self.auth.terminalize_exhausted_acknowledgements(), 0)
             rows = self.auth.acknowledgements_needing_attention()
         self.assertEqual([r["ack_status"] for r in rows], ["FAILED"])
         self.assertTrue(rows[0]["ack_last_error"].startswith("ACK_EXHAUSTED"))

@@ -228,7 +228,8 @@ class SB2AAuthorityPostgres(unittest.TestCase):
         it blocks on the holder's uncommitted row and then fails 23P01 — translated."""
         p = self.prof(default=True)
         B = self.ba.BookingAuthority
-        with mock.patch.object(B, "_acquire_locks", lambda self_, p_, t_: "bypassed"), \
+        # SB2A-R4 rewrite: _acquire_locks now takes the sorted (professional, date) key set
+        with mock.patch.object(B, "_acquire_locks", lambda self_, keys_: "bypassed"), \
              mock.patch.object(B, "_check_overlap", lambda self_, *a, **k: None):
             h, c, st = self.race(self.cmd(time(10)), self.cmd(time(10, 15)))
         self.assertEqual(h.outcome.value, "COMMITTED")

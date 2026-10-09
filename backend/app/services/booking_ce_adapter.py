@@ -94,6 +94,42 @@ class CeSchedulingEscalationRequest:
     attachments: Optional[BookingAttachmentPlan] = None
 
 
+#: SB2A-R4: request fields admitted by exact type before ANY use (the key derivation below
+#: would otherwise apply truthiness/strip to caller objects). kind, nullable.
+_REQUEST_SCHEMA = {
+    "CeFlowBookingRequest": {"thread_id": ("int", False), "lead_id": ("int", False),
+                             "inbound_event_id": ("str", True), "flow_token": ("str", True),
+                             "requested_date": ("date", True), "requested_time": ("time", True),
+                             "revision_fields": ("dict", False), "attachments": ("plan", True)},
+    "CeSchedulingEscalationRequest": {"thread_id": ("int", False), "lead_id": ("int", False),
+                                      "escalation_id": ("str", True), "requested_date": ("date", True),
+                                      "requested_time": ("time", True), "revision_fields": ("dict", False),
+                                      "cycle_key": ("int", True), "inbound_event_id": ("str", True),
+                                      "attachments": ("plan", True)},
+}
+
+
+def _request_is_data(req, cls) -> bool:
+    """Exact type admission of a CE request; only type() identity is consulted."""
+    from .booking_authority import BookingAttachmentPlan
+    if type(req) is not cls:
+        return False
+    values = object.__getattribute__(req, "__dict__")
+    schema = _REQUEST_SCHEMA[cls.__name__]
+    if set(values) != set(schema):
+        return False
+    exact = {"int": int, "str": str, "date": date, "time": time, "dict": dict,
+             "plan": BookingAttachmentPlan}
+    for name, (kind, nullable) in schema.items():
+        v = values[name]
+        if v is None:
+            if not nullable:
+                return False
+        elif type(v) is not exact[kind] or (kind == "int" and v < 0):
+            return False
+    return True
+
+
 def _nonblank(value: Optional[str]) -> Optional[str]:
     value = (value or "").strip()
     return value or None
@@ -158,6 +194,8 @@ def book_from_flow_response(
     A response without a complete agreed slot cannot be a booking: it is recorded as a
     non-occupying manual-scheduling request with whatever part of the slot is known.
     """
+    if not _request_is_data(req, CeFlowBookingRequest):
+        return refuse(BookingOutcome.VALIDATION_FAILED, "REQUEST_NOT_DATA")
     key = ce_flow_booking_key(req)
     if key is None:
         return _no_identity()
@@ -166,7 +204,7 @@ def book_from_flow_response(
         operation=BookingOperation.CREATE if complete else BookingOperation.REQUEST_MANUAL_SCHEDULING,
         source=BookingSource.CONVERSATION_ENGINE, idempotency_key=key, lead_id=req.lead_id,
         thread_id=req.thread_id, requested_date=req.requested_date,
-        requested_time=req.requested_time, revision_fields=req.revision_fields,
+        requested_time=req.requested_time, revision_fields=dict(req.revision_fields),
         tracks_acknowledgement=complete)
     with isolated_session(db) as session:
         return BookingAuthority(session, lock_timeout_ms=lock_timeout_ms).execute(
@@ -182,6 +220,8 @@ def request_manual_scheduling(
     lost to an overlap or to an incomplete slot. `req.attachments` may add CE's provisional
     ThreadRevision (non-occupying status) in the same transaction.
     """
+    if not _request_is_data(req, CeSchedulingEscalationRequest):
+        return refuse(BookingOutcome.VALIDATION_FAILED, "REQUEST_NOT_DATA")
     key = ce_escalation_key(req)
     if key is None:
         return _no_identity()
@@ -189,7 +229,7 @@ def request_manual_scheduling(
         operation=BookingOperation.REQUEST_MANUAL_SCHEDULING,
         source=BookingSource.CONVERSATION_ENGINE, idempotency_key=key, lead_id=req.lead_id,
         thread_id=req.thread_id, requested_date=req.requested_date,
-        requested_time=req.requested_time, revision_fields=req.revision_fields)
+        requested_time=req.requested_time, revision_fields=dict(req.revision_fields))
     with isolated_session(db) as session:
         return BookingAuthority(session, lock_timeout_ms=lock_timeout_ms).execute(
             command, attachments=req.attachments)

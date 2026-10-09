@@ -36,6 +36,28 @@ booking row) are defence in depth, not the sandbox.
 
 The advisory lock is coordination. The exclusion constraint is the guarantee.
 
+LOCK ORDER (SB2A-R4 — every authority writer acquires in exactly this order):
+
+    L1  shared per-date advisory locks        (DATE_LOCK_NAMESPACE, yyyymmdd), sorted by date
+    L2  exclusive (professional, date) locks  for the CURRENT and the TARGET occupancy,
+                                              sorted by (professional, date)
+    L3  the target Revision row               SELECT … FOR UPDATE (re-read; a change since
+                                              the unlocked read is STALE_VERSION or
+                                              RETRYABLE_FAILURE/CONCURRENT_CHANGE)
+    L4  occupying Revisions of the SAME professional whose protected interval overlaps
+        the proposed interval                 FOR SHARE, ordered by id (normally none: an
+                                              overlap is refused)
+    L5  the linked ThreadRevision (sync)      FOR UPDATE
+    L6  the command's lead row (identity)     FOR NO KEY UPDATE (compatible with the FK's
+                                              KEY SHARE taken by the Revision INSERT)
+    L7  the attachment thread's state row     row write
+    L8  the ledger row                        INSERT (UNIQUE idempotency key)
+
+Nothing else is locked: no other professional's bookings, no non-occupying rows, no
+unrelated ThreadRevision and no calendar day as a whole. Operations whose current and target
+are both non-occupying take no advisory lock and start at L3. A lock wait beyond
+`lock_timeout` or a detected deadlock is RETRYABLE_FAILURE; nothing partial survives.
+
 SQLite (tests) has neither advisory locks nor exclusion constraints. There the lock step is an
 explicit, labelled `sqlite-serialized` mode — SQLite serializes writers database-wide — and
 nothing about SQLite is evidence of concurrency safety. Any other dialect fails closed.
@@ -231,6 +253,9 @@ class BookingResult:
     retryable: bool = False
     conflicts: tuple[ConflictInfo, ...] = ()
     ack_status: Optional[str] = None
+    #: SB2A-R4: what happened to the submitted person identity (LeadUpdate.identity):
+    #: ADMITTED | FILLED | UNCHANGED | CONFLICT, or None when no identity was submitted.
+    identity_outcome: Optional[str] = None
 
     @property
     def ok(self) -> bool:
@@ -430,14 +455,22 @@ class ThreadRevisionAttachment:
 
 
 @dataclass(frozen=True)
+class LeadIdentity:
+    """One person's submitted identity, applied as ONE bundle (SB2A-R4, R3A-03): it is either
+    admitted whole, used to fill gaps only when it agrees with every populated canonical
+    field, or not applied at all (IDENTITY_CONFLICT). Fields are never merged across people."""
+    nombre: str
+    apellido: Optional[str] = None
+    email: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class LeadUpdate:
     """Lead fields the booking contract may set. Always the command's own lead."""
     estado: Optional[str] = None
     flag: Optional[str] = None
     necesita_humano: Optional[bool] = None
-    nombre_if_empty: Optional[str] = None
-    apellido_if_empty: Optional[str] = None
-    email_if_empty: Optional[str] = None
+    identity: Optional[LeadIdentity] = None
     canal_if_empty: Optional[str] = None
 
 
@@ -466,34 +499,133 @@ class BookingAttachmentPlan:
     price: Optional[PriceRecalculation] = None
 
 
-_PLAN_TYPES = (AvailabilityRevalidation, ThreadRevisionAttachment, LeadUpdate, ThreadStateUpdate,
-               PriceRecalculation, BookingAttachmentPlan)
+# ── strict plan schema (SB2A-R4, R3A-01/R3A-02) ─────────────────────────────
+#
+# Every field has ONE declared kind. Admission uses only `type(value) is T` — never
+# isinstance (which may consult a hostile `__class__`), truthiness, len() or iteration before
+# the exact type is admitted — so validation never executes caller-supplied behaviour.
+# `bool` is never an integer and never a string; strings are bounded by their column length
+# and may not contain NUL. A wrong scalar never reaches PostgreSQL.
+
+def _col_len(model_name: str, column: str) -> Optional[int]:
+    from .. import models
+    return getattr(getattr(models, model_name).__table__.c[column].type, "length", None)
 
 
-#: The only nested plans, each in exactly its declared slot.
-_NESTED_PLANS = {"thread_revision": ThreadRevisionAttachment, "lead": LeadUpdate,
-                 "thread_state": ThreadStateUpdate, "price": PriceRecalculation}
+#: kind, nullable, extra. Kinds: int (exact int, never bool, >= extra), bool (exact bool),
+#: str (exact str, len <= column length from extra=(model, column) or None, no NUL),
+#: choice (exact str in extra), plan (exact nested plan type extra), str3 (exact tuple of
+#: three exact str-or-None).
+_PLAN_SCHEMA: dict = {
+    "AvailabilityRevalidation": {
+        "address": ("str", False, None), "zone_group": ("str", True, ("ThreadRevision", "zone_group")),
+        "is_holiday": ("bool", False, None)},
+    "ThreadRevisionAttachment": {
+        "thread_id": ("int", False, 1), "candidate_id": ("int", True, 1),
+        **{f: ("str", True, ("ThreadRevision", f)) for f in (
+            "buyer_name", "buyer_phone", "buyer_email", "seller_type", "seller_name", "address",
+            "tipo_vehiculo", "marca", "modelo", "publication_url", "zone_group")},
+        "anio": ("int", True, 1900), "request_approval": ("bool", False, None),
+        "non_occupying_status": ("choice", False, ("provisional", "collecting_data", "draft"))},
+    "LeadIdentity": {
+        "nombre": ("str", False, ("Lead", "nombre")), "apellido": ("str", True, ("Lead", "apellido")),
+        "email": ("str", True, ("Lead", "email"))},
+    "LeadUpdate": {
+        "estado": ("str", True, ("Lead", "estado")), "flag": ("str", True, ("Lead", "flag")),
+        "necesita_humano": ("bool", True, None), "identity": ("plan", True, "LeadIdentity"),
+        "canal_if_empty": ("str", True, ("Lead", "canal"))},
+    "ThreadStateUpdate": {
+        "link_current_revision": ("bool", False, None),
+        "last_stage": ("str", True, ("WhatsAppThreadState", "last_stage")),
+        "needs_human": ("bool", True, None), "consume_flow_token": ("bool", False, None)},
+    "PriceRecalculation": {"require_inputs": ("str3", True, None)},
+    "BookingAttachmentPlan": {
+        "thread_revision": ("plan", True, "ThreadRevisionAttachment"),
+        "lead": ("plan", True, "LeadUpdate"), "thread_state": ("plan", True, "ThreadStateUpdate"),
+        "price": ("plan", True, "PriceRecalculation")},
+}
+
+
+def _ok_str(value, limit) -> bool:
+    if type(value) is not str or "\x00" in value:
+        return False
+    if limit is not None:
+        length = _col_len(*limit)
+        if length is not None and len(value) > length:
+            return False
+    return True
+
+
+def _field_ok(kind: str, nullable: bool, extra, value) -> bool:
+    if value is None:
+        return nullable
+    if kind == "int":
+        return type(value) is int and (extra is None or value >= extra)
+    if kind == "bool":
+        return type(value) is bool
+    if kind == "str":
+        return _ok_str(value, extra)
+    if kind == "choice":
+        return type(value) is str and value in extra
+    if kind == "plan":
+        return _plan_is_data(value, _PLAN_CLASSES[extra])
+    if kind == "str3":
+        return type(value) is tuple and len(value) == 3 and all(
+            v is None or _ok_str(v, None) for v in value)
+    return False
 
 
 def _plan_is_data(obj, expected: type) -> bool:
-    """True iff `obj` is exactly `expected` and contains only plain data / nested plans of
-    exactly their declared type."""
+    """True iff `obj` is exactly `expected` and every declared field holds exactly its declared
+    kind. Only `type()` identity is consulted on untrusted values (R3A-02)."""
     if type(obj) is not expected:
         return False
-    for f in dataclasses.fields(obj):
-        value = getattr(obj, f.name)
-        if expected is BookingAttachmentPlan:
-            if value is not None and not _plan_is_data(value, _NESTED_PLANS[f.name]):
-                return False
-            continue
-        if isinstance(value, _PLAN_TYPES):
-            return False                       # plans nest only inside BookingAttachmentPlan
-        elif type(value) is tuple:
-            if not all(type(v) in _PLAIN_TYPES for v in value):
-                return False
-        elif type(value) not in _PLAIN_TYPES:          # exact built-ins: no subclasses, no Enum
-            return False
+    schema = _PLAN_SCHEMA[expected.__name__]
+    values = object.__getattribute__(obj, "__dict__")      # our own frozen dataclass
+    if set(values) != set(schema):
+        return False
+    return all(_field_ok(kind, nullable, extra, values[name])
+               for name, (kind, nullable, extra) in schema.items())
+
+
+#: Command fields: kind, nullable, extra (same kinds as the plan schema).
+_COMMAND_SCHEMA = {
+    "idempotency_key": ("str", True, ("BookingCommandRecord", "idempotency_key")),
+    "lead_id": ("int", True, 1), "revision_id": ("int", True, 1), "thread_id": ("int", True, 1),
+    "profesional_id": ("int", True, 1),
+    # range is a DOMAIN rule (INVALID_SERVICE / INVALID_BUFFER), checked after type admission
+    "service_minutes": ("int", True, None), "buffer_minutes": ("int", True, None),
+    "target_status": ("str", True, None),
+    "expected_version": ("int", True, 0),
+    "correlation_id": ("str", True, ("BookingCommandRecord", "correlation_id")),
+    "actor": ("str", True, ("BookingCommandRecord", "actor")),
+    "tracks_acknowledgement": ("bool", False, None),
+}
+
+#: Revision column type name → the exact Python types a value for it may have.
+_COLUMN_PY = {"Integer": (int,), "BigInteger": (int,), "String": (str,), "Text": (str,),
+              "Date": (date,), "Time": (time,), "DateTime": (datetime,), "Boolean": (bool,)}
+
+
+def _revision_field_ok(name: str, value) -> bool:
+    from ..models import Revision
+    col = Revision.__table__.c[name]
+    if value is None:
+        return bool(col.nullable)
+    allowed = _COLUMN_PY.get(type(col.type).__name__)
+    if allowed is None or type(value) not in allowed:
+        return False
+    if type(value) is str:
+        return _ok_str(value, ("Revision", name))
     return True
+
+
+_PLAN_CLASSES: dict = {}
+
+
+_PLAN_CLASSES.update({c.__name__: c for c in (
+    AvailabilityRevalidation, ThreadRevisionAttachment, LeadIdentity, LeadUpdate,
+    ThreadStateUpdate, PriceRecalculation, BookingAttachmentPlan)})
 
 
 class _InvariantBreach(Exception):
@@ -644,25 +776,34 @@ class BookingAuthority:
         return res.rowcount == 1
 
     def acknowledgements_needing_attention(self) -> list[dict]:
-        """Operator view: terminal (exhausted) acknowledgements, rows with duplicate risk, and
-        SENDING rows whose lease is gone. Exhausted crashed SENDING rows are first made
-        terminal, so nothing stays invisibly stuck."""
+        """READ-ONLY operator view (SB2A-R4, R3A-07): terminal (exhausted) acknowledgements,
+        rows with duplicate risk, and SENDING rows whose lease is gone — the latter flagged
+        `pending_terminalization` when their attempts are exhausted. Performs no write and no
+        commit; terminalization is the explicit `terminalize_exhausted_acknowledgements()`."""
         from ..models import BookingCommandRecord as R
-        self._terminalize_exhausted(None)
-        self.db.commit()
         now = self._clock()
-        rows = self.db.execute(
-            select(R.idempotency_key, R.ack_status, R.ack_attempts, R.ack_duplicate_risk,
-                   R.ack_last_error, R.ack_transport_id, R.revision_id, R.ack_updated_at)
-            .where(R.ack_status != AckStatus.NOT_APPLICABLE.value)
-            .where(or_(and_(R.ack_status == AckStatus.FAILED.value,
-                            R.ack_attempts >= ACK_MAX_ATTEMPTS),
-                       R.ack_duplicate_risk.is_(True),
-                       and_(R.ack_status == AckStatus.SENDING.value,
-                            or_(R.ack_lease_expires_at.is_(None),
-                                R.ack_lease_expires_at < now))))
-            .order_by(R.id)).all()
+        lease_gone = and_(R.ack_status == AckStatus.SENDING.value,
+                          or_(R.ack_lease_expires_at.is_(None), R.ack_lease_expires_at < now))
+        query = (select(R.idempotency_key, R.ack_status, R.ack_attempts, R.ack_duplicate_risk,
+                        R.ack_last_error, R.ack_transport_id, R.revision_id, R.ack_updated_at,
+                        and_(lease_gone, R.ack_attempts >= ACK_MAX_ATTEMPTS)
+                        .label("pending_terminalization"))
+                 .where(R.ack_status != AckStatus.NOT_APPLICABLE.value)
+                 .where(or_(and_(R.ack_status == AckStatus.FAILED.value,
+                                 R.ack_attempts >= ACK_MAX_ATTEMPTS),
+                            R.ack_duplicate_risk.is_(True), lease_gone))
+                 .order_by(R.id))
+        with self.db.no_autoflush:                      # a read never flushes anything
+            rows = self.db.execute(query).all()
         return [dict(r._mapping) for r in rows]
+
+    def terminalize_exhausted_acknowledgements(self) -> int:
+        """EXPLICIT write: move every exhausted SENDING row whose lease is gone to terminal
+        FAILED (ACK_EXHAUSTED_AFTER_CRASH, duplicate risk). Idempotent — a second call, or a
+        concurrent one, finds nothing left (the UPDATE re-checks SENDING). Returns the count."""
+        count = self._terminalize_exhausted(None)
+        self.db.commit()
+        return count
 
     def note_replay(self, idempotency_key: str) -> None:
         from ..models import BookingCommandRecord
@@ -680,12 +821,16 @@ class BookingAuthority:
                 attachments: Optional[BookingAttachmentPlan] = None) -> BookingResult:
         """Run one booking command in ONE authority-owned transaction.
 
-        `availability` and `attachments` are typed DATA (SB2A-R3). No caller code runs inside
-        the transaction; the authority performs every read and write itself.
+        `availability` and `attachments` are typed DATA. No caller code runs inside the
+        transaction; the authority performs every read and write itself. Locks are taken in
+        the documented order (module docstring).
         """
         lock_mode: Optional[str] = None
         fingerprint = ""
-        token = _TXN_SCOPE.set(_TxnScope(str(getattr(cmd, "operation", "?"))))
+        identity_outcome: Optional[str] = None
+        deletes_at_start = 0
+        # Nothing about an unvalidated command is touched (no attribute, no str()): R3A-02.
+        token = _TXN_SCOPE.set(_TxnScope("BOOKING"))
         try:
             spec = self._validate(cmd)
             fingerprint = request_fingerprint(cmd)
@@ -697,6 +842,7 @@ class BookingAuthority:
                     raise _Refused(_result(BookingOutcome.INTERNAL_FAILURE, reason))
                 self.db.execute(text(f"SET LOCAL lock_timeout = {self.lock_timeout_ms}"))
                 txid = self.db.execute(text("SELECT txid_current()")).scalar()
+                deletes_at_start = self._booking_deletes()
 
             if cmd.idempotency_key:
                 replay = self._check_replay(cmd.idempotency_key, fingerprint)
@@ -705,7 +851,7 @@ class BookingAuthority:
                     self.note_replay(cmd.idempotency_key)
                     return replay
 
-            revision = self._load_revision(cmd)
+            revision = self._load_revision(cmd)                # unlocked read
             current = _Snapshot.of(revision)
             if cmd.expected_version is not None and revision is not None \
                     and current.version != cmd.expected_version:
@@ -718,28 +864,41 @@ class BookingAuthority:
             profesional_id = None
             if target.occupying:
                 profesional_id = self._resolve_professional(cmd, current)
-                lock_mode = self._acquire_locks(profesional_id, target)
-                if cmd.idempotency_key:
-                    replay = self._check_replay(cmd.idempotency_key, fingerprint)
-                    if replay is not None:
-                        self.db.rollback()
-                        self.note_replay(cmd.idempotency_key)
-                        return replay
-                self._check_calendar(profesional_id, target)
-                self._check_overlap(profesional_id, target,
-                                    exclude_id=revision.id if revision is not None else None)
             elif cmd.operation is not BookingOperation.UNSCHEDULE:
                 profesional_id = current.profesional_id if revision is not None else None
+
+            # L1 + L2: advisory locks for the current AND the target occupancy, sorted
+            keys = self._lock_keys(current, target, profesional_id)
+            if keys:
+                lock_mode = self._acquire_locks(keys)
+            # L3: the target row, re-read under the locks
+            if revision is not None:
+                revision, current = self._lock_revision(cmd, revision, current)
+            if keys and cmd.idempotency_key:
+                replay = self._check_replay(cmd.idempotency_key, fingerprint)
+                if replay is not None:
+                    self.db.rollback()
+                    self.note_replay(cmd.idempotency_key)
+                    return replay
+            if target.occupying:
+                self._check_calendar(profesional_id, target)
+                # L4: only same-professional occupying rows overlapping the proposed interval
+                self._lock_overlapping(profesional_id, target,
+                                       exclude_id=revision.id if revision is not None else None)
+                self._check_overlap(profesional_id, target,
+                                    exclude_id=revision.id if revision is not None else None)
 
             if availability is not None and target.occupying:
                 self._revalidate_availability(availability, target, lock_mode)
 
             window = self._window_days(target, current)
-            before = self._window_state(window, lock=True)
+            before = None if self._postgres() else self._window_state(window)
             revision = self._write(cmd, revision, target, profesional_id, current)
             expected_row = self._booking_row(revision.id)
-            thread_revision_id = self._apply_attachments(cmd, attachments, revision, target) \
-                if attachments is not None else None
+            thread_revision_id = None
+            if attachments is not None:
+                thread_revision_id, identity_outcome = self._apply_attachments(
+                    cmd, attachments, revision, target)
             self._assert_continuous(txid)          # before any further write (e.g. the ledger)
             linked_id = self._sync_thread_revision(cmd, revision, target, thread_revision_id)
             self.db.flush()
@@ -748,26 +907,31 @@ class BookingAuthority:
                 self._record(cmd, fingerprint, revision, thread_revision_id or linked_id,
                              target, version)
             self._verify_before_commit(txid, revision, expected_row, target, window, before,
-                                       allowed_tr={i for i in (thread_revision_id, linked_id) if i})
+                                       allowed_tr={i for i in (thread_revision_id, linked_id) if i},
+                                       deletes_at_start=deletes_at_start)
             self.db.commit()
+            if identity_outcome == "CONFLICT":
+                logger.warning("BOOKING_IDENTITY_CONFLICT revision_id=%s — submitted identity "
+                               "not applied; canonical lead identity preserved", revision.id)
             return _result(BookingOutcome.COMMITTED, "COMMITTED", revision_id=revision.id,
                            thread_revision_id=thread_revision_id,
                            profesional_id=revision.profesional_id,
                            slot_start=target.start, slot_end=target.end,
                            occupying=target.occupying, booking_version=version,
                            idempotency_key=cmd.idempotency_key, lock_mode=lock_mode,
+                           identity_outcome=identity_outcome,
                            ack_status=(AckStatus.PENDING if cmd.tracks_acknowledgement
                                        else AckStatus.NOT_APPLICABLE).value)
         except _InvariantBreach as breach:
             self._safe_rollback()
             logger.error("BOOKING_AUTHORITY invariant breach %s op=%s source=%s",
-                         breach.kind, cmd.operation.value, cmd.source.value)
+                         breach.kind, *_safe_label(cmd))
             return _result(BookingOutcome.INTERNAL_FAILURE, f"INVARIANT_BREACH:{breach.kind}",
-                           idempotency_key=cmd.idempotency_key, lock_mode=lock_mode)
+                           idempotency_key=_safe_key(cmd), lock_mode=lock_mode)
         except _Refused as refused:
             self._safe_rollback()
             return replace(refused.result, lock_mode=refused.result.lock_mode or lock_mode,
-                           idempotency_key=cmd.idempotency_key)
+                           idempotency_key=_safe_key(cmd))
         except IntegrityError as exc:
             self._safe_rollback()
             return self._translate_integrity(exc, cmd, fingerprint)
@@ -778,16 +942,16 @@ class BookingAuthority:
                     or exc.connection_invalidated:
                 return _result(BookingOutcome.RETRYABLE_FAILURE,
                                "LOCK_TIMEOUT" if state == "55P03" else f"DB_{state or 'DISCONNECT'}",
-                               idempotency_key=cmd.idempotency_key, lock_mode=lock_mode)
+                               idempotency_key=_safe_key(cmd), lock_mode=lock_mode)
             logger.error("BOOKING_AUTHORITY database error sqlstate=%s", state)
             return _result(BookingOutcome.INTERNAL_FAILURE, f"DB_{state or 'ERROR'}",
-                           idempotency_key=cmd.idempotency_key)
+                           idempotency_key=_safe_key(cmd))
         except Exception:
             self._safe_rollback()
             logger.exception("BOOKING_AUTHORITY internal failure op=%s source=%s",
-                             cmd.operation.value, cmd.source.value)
+                             *_safe_label(cmd))
             return _result(BookingOutcome.INTERNAL_FAILURE, "INTERNAL",
-                           idempotency_key=cmd.idempotency_key)
+                           idempotency_key=_safe_key(cmd))
         finally:
             _TXN_SCOPE.reset(token)
 
@@ -894,18 +1058,23 @@ class BookingAuthority:
             tr_id = tr.id
         if plan.price is not None:
             self._recalculate_price(plan.price, revision)
+        identity_outcome = None
         if plan.lead is not None:
-            lead = self.db.get(Lead, revision.lead_id)
+            # L6: the command's lead row, locked so concurrent identities serialize. FOR NO KEY
+            # UPDATE, not FOR UPDATE: the Revision INSERT already holds the FK's KEY SHARE on
+            # this row, and two bookings of one lead upgrading to FOR UPDATE would deadlock.
+            lead = self.db.get(Lead, revision.lead_id,
+                               with_for_update={"key_share": True} if self._postgres() else None)
             if lead is None:
                 raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, "LEAD_NOT_FOUND"))
             u = plan.lead
             for name in ("estado", "flag", "necesita_humano"):
                 if getattr(u, name) is not None:
                     setattr(lead, name, getattr(u, name))
-            for name in ("nombre", "apellido", "email", "canal"):
-                value = getattr(u, f"{name}_if_empty")
-                if value is not None and not getattr(lead, name):
-                    setattr(lead, name, value)
+            if u.canal_if_empty is not None and not lead.canal:
+                lead.canal = u.canal_if_empty
+            if u.identity is not None:
+                identity_outcome = _apply_identity(lead, u.identity)
         if plan.thread_state is not None:
             st = self.db.execute(select(WhatsAppThreadState).where(
                 WhatsAppThreadState.thread_id == thread_id)).scalar_one_or_none()
@@ -921,7 +1090,7 @@ class BookingAuthority:
             if u.consume_flow_token:
                 st.flow_booking_token = None
         self.db.flush()
-        return tr_id
+        return tr_id, identity_outcome
 
     def _recalculate_price(self, plan: PriceRecalculation, revision) -> None:
         if plan.require_inputs is not None:
@@ -947,36 +1116,21 @@ class BookingAuthority:
             days.add(current.day)
         return tuple(sorted(days))
 
-    def _window_state(self, days: tuple, *, lock: bool = False) -> tuple:
-        """Occupying Revisions and booked/completed ThreadRevisions on `days`, as
-        {id: (fields…)}. With `lock` (PostgreSQL, before the write) the existing rows are taken
-        FOR SHARE: until this transaction ends nobody else can delete or change them, so any
-        later disappearance or change of one of them can only be this transaction's own."""
+    def _window_state(self, days: tuple) -> tuple:
+        """SQLite only: the day's occupying Revisions and booked ThreadRevisions (no locks)."""
         from ..models import Revision, ThreadRevision
         if not days:
             return {}, {}
-        rq = select(Revision).where(Revision.turno_fecha.in_(days))
-        tq = (select(ThreadRevision).where(ThreadRevision.scheduled_date.in_(days))
-              .where(ThreadRevision.scheduled_time.is_not(None))
-              .where(ThreadRevision.status.in_(("booked", "completed"))))
-        if lock and self._postgres():
-            rq, tq = rq.with_for_update(read=True), tq.with_for_update(read=True)
         occ = {r.id: (r.turno_fecha, r.turno_hora, normalize_status(r.estado_revision) or r.estado_revision,
                       r.profesional_id)
-               for r in self.db.execute(rq).scalars().all()
+               for r in self.db.execute(select(Revision).where(Revision.turno_fecha.in_(days))).scalars().all()
                if br.is_occupying(r.turno_fecha, r.turno_hora, r.estado_revision)}
         trs = {t.id: (t.status, t.scheduled_date, t.scheduled_time)
-               for t in self.db.execute(tq).scalars().all()}
+               for t in self.db.execute(
+                   select(ThreadRevision).where(ThreadRevision.scheduled_date.in_(days))
+                   .where(ThreadRevision.scheduled_time.is_not(None))
+                   .where(ThreadRevision.status.in_(("booked", "completed")))).scalars().all()}
         return occ, trs
-
-    def _written_by_me(self, table: str, ids) -> set:
-        """Of `ids`, those last written by THIS transaction (PostgreSQL xmin)."""
-        ids = [int(i) for i in ids]
-        if not ids or not self._postgres():
-            return set()
-        return set(self.db.execute(text(
-            f"SELECT id FROM {table} WHERE id = ANY(:ids) "
-            "AND xmin::text::bigint = txid_current() % 4294967296"), {"ids": ids}).scalars())
 
     def _assert_continuous(self, txid) -> None:
         """The server still holds the transaction we opened. The driver's server-reported
@@ -994,7 +1148,8 @@ class BookingAuthority:
             raise _InvariantBreach("TRANSACTION_NOT_CONTINUOUS")
 
     def _verify_before_commit(self, txid, revision, expected_row: tuple, target: "_Target",
-                              window: tuple, before: tuple, allowed_tr: set) -> None:
+                              window: tuple, before: tuple, allowed_tr: set,
+                              deletes_at_start: int = 0) -> None:
         """The transaction is still the one we opened, the schema and session state are still
         bookable, the booking row is as written, and in the locked window no occupying
         Revision or booked ThreadRevision appeared or disappeared except this booking's own."""
@@ -1006,49 +1161,80 @@ class BookingAuthority:
                 raise _InvariantBreach(f"POST_OPERATION_{reason}")
         if self._booking_row(revision.id) != expected_row:
             raise _InvariantBreach("BOOKING_FIELDS_CHANGED")
+        if self._postgres():
+            self._audit_transaction_writes(revision, allowed_tr, deletes_at_start)
+        else:
+            self._window_diff(revision, target, window, before, allowed_tr)
+
+    def _booking_deletes(self) -> int:
+        """Pending tuple-delete count for revisions + thread_revisions in this backend.
+        PostgreSQL 15+ keeps EARLIER committed transactions' counts pending until the backend
+        idles, so only the DELTA within one transaction is meaningful (SB2A-R4)."""
+        return int(self.db.execute(text(
+            "SELECT coalesce(sum(n_tup_del), 0) FROM pg_stat_xact_user_tables "
+            "WHERE relname IN ('revisions', 'thread_revisions') AND schemaname = current_schema()"
+        )).scalar())
+
+    def _audit_transaction_writes(self, revision, allowed_tr: set, deletes_at_start: int) -> None:
+        """PostgreSQL defence in depth WITHOUT locking anything: what did THIS transaction
+        write? No Revision or ThreadRevision may have been deleted (pg_stat_xact delta since
+        the transaction started), and the rows it inserted or updated (xmin) must be exactly
+        this booking's own."""
+        dels = self._booking_deletes() - deletes_at_start
+        mine = "xmin::text::bigint = txid_current() % 4294967296"
+        revs = set(self.db.execute(text(f"SELECT id FROM revisions WHERE {mine}")).scalars())
+        if revs - {revision.id}:
+            raise _InvariantBreach("OCCUPANCY_SET_CHANGED")
+        trs = set(self.db.execute(text(f"SELECT id FROM thread_revisions WHERE {mine}")).scalars())
+        if trs - set(allowed_tr):
+            raise _InvariantBreach("BOOKED_THREAD_REVISION_SET_CHANGED")
+        if dels:
+            raise _InvariantBreach("OCCUPANCY_SET_CHANGED")
+
+    def _window_diff(self, revision, target, window, before, allowed_tr) -> None:
+        """SQLite (single writer): any change to the day's bookings other than ours."""
         occ_before, tr_before = before
         occ_after, tr_after = self._window_state(window)
         own_rev = {revision.id}
-        # 1. no pre-existing occupying booking was removed or changed (they are locked FOR
-        #    SHARE on PostgreSQL, so only this transaction could have done it)
         for rid, row in occ_before.items():
             if rid not in own_rev and occ_after.get(rid) != row:
                 raise _InvariantBreach("OCCUPANCY_SET_CHANGED")
-        added = set(occ_after) - set(occ_before) - own_rev
-        if self._postgres():
-            # 2. new occupying rows: other professionals' concurrent bookings are legitimate;
-            #    a new row for OUR professional cannot come from any authority writer while we
-            #    hold its exclusive lock, and none may come from this transaction itself
-            mine = {i for i in added if occ_after[i][3] == revision.profesional_id}
-            if mine or self._written_by_me("revisions", added):
-                raise _InvariantBreach("OCCUPANCY_SET_CHANGED")
-        elif added:                                   # SQLite: one writer — any change is ours
+        if set(occ_after) - set(occ_before) - own_rev:
             raise _InvariantBreach("OCCUPANCY_SET_CHANGED")
         if target.occupying and target.day in window and revision.id not in occ_after:
             raise _InvariantBreach("BOOKING_NOT_OCCUPYING")
-        # 3. no pre-existing booked ThreadRevision was un-booked, moved or deleted, and no
-        #    booked ThreadRevision other than this booking's own was written by us
         for tid, row in tr_before.items():
             if tid not in allowed_tr and tr_after.get(tid) != row:
                 raise _InvariantBreach("BOOKED_THREAD_REVISION_SET_CHANGED")
-        tr_added = set(tr_after) - set(tr_before) - set(allowed_tr)
-        if tr_added and (not self._postgres() or self._written_by_me("thread_revisions", tr_added)):
+        if set(tr_after) - set(tr_before) - set(allowed_tr):
             raise _InvariantBreach("BOOKED_THREAD_REVISION_SET_CHANGED")
 
     def _validate(self, cmd: BookingCommand) -> "_Spec":
         # SB2A-R3: the command is DATA too — exact built-in types only, so nothing a caller
         # supplies can execute code inside the transaction (a Mapping or date subclass would).
-        if type(cmd) is not BookingCommand or type(cmd.operation) is not BookingOperation \
-                or type(cmd.source) is not BookingSource or type(cmd.revision_fields) is not dict:
+        # SB2A-R4: exact DECLARED types (not merely "plain"): bool is never an id, a date is
+        # never a datetime, strings are bounded. Only type() identity is consulted.
+        if type(cmd) is not BookingCommand:
             raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, "COMMAND_NOT_DATA"))
-        for f in dataclasses.fields(cmd):
-            if f.name in ("operation", "source", "revision_fields"):
-                continue
-            if type(getattr(cmd, f.name)) not in _PLAIN_TYPES:
-                raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, f"COMMAND_NOT_DATA:{f.name}"))
-        if any(type(k) is not str or type(v) not in _PLAIN_TYPES
-               for k, v in cmd.revision_fields.items()):
-            raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, "COMMAND_NOT_DATA:revision_fields"))
+        values = object.__getattribute__(cmd, "__dict__")
+        if type(values.get("operation")) is not BookingOperation \
+                or type(values.get("source")) is not BookingSource \
+                or type(values.get("revision_fields")) is not dict:
+            raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, "COMMAND_NOT_DATA"))
+        for name, (kind, nullable, extra) in _COMMAND_SCHEMA.items():
+            if not _field_ok(kind, nullable, extra, values.get(name)):
+                raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, f"COMMAND_NOT_DATA:{name}"))
+        for name, kind in (("requested_date", date), ("requested_time", time)):
+            if values.get(name) is not None and type(values[name]) is not kind:
+                raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, f"COMMAND_NOT_DATA:{name}"))
+        allowed = _revision_data_columns()
+        for k, v in values["revision_fields"].items():
+            if type(k) is not str:
+                raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, "COMMAND_NOT_DATA:revision_fields"))
+            if k not in allowed:
+                raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, f"FIELD_NOT_ALLOWED:{k}"))
+            if not _revision_field_ok(k, v):
+                raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, f"COMMAND_NOT_DATA:revision_fields.{k}"))
         op = cmd.operation
         if op in (BookingOperation.CREATE, BookingOperation.REQUEST_MANUAL_SCHEDULING):
             if cmd.revision_id is None and cmd.lead_id is None:
@@ -1070,7 +1256,7 @@ class BookingAuthority:
             if status is None:
                 raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, "UNKNOWN_STATUS"))
         for name, value in (("service", cmd.service_minutes), ("buffer", cmd.buffer_minutes)):
-            if value is not None and (not isinstance(value, int) or value < (1 if name == "service" else 0)):
+            if value is not None and (type(value) is not int or value < (1 if name == "service" else 0)):
                 raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, f"INVALID_{name.upper()}"))
         if cmd.idempotency_key is not None and not (0 < len(cmd.idempotency_key) <= 128):
             raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, "INVALID_IDEMPOTENCY_KEY"))
@@ -1090,10 +1276,9 @@ class BookingAuthority:
         from ..models import Revision
         if cmd.revision_id is None:
             return None
-        stmt = select(Revision).where(Revision.id == cmd.revision_id)
-        if self._postgres():
-            stmt = stmt.with_for_update()
-        revision = self.db.execute(stmt).scalar_one_or_none()
+        # unlocked read: the row lock is L3, taken after the advisory locks (lock order)
+        revision = self.db.execute(
+            select(Revision).where(Revision.id == cmd.revision_id)).scalar_one_or_none()
         if revision is None:
             raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, "REVISION_NOT_FOUND"))
         if cmd.lead_id is not None and revision.lead_id != cmd.lead_id:
@@ -1174,20 +1359,72 @@ class BookingAuthority:
                                    profesional_id=defaults[0].id))
         return defaults[0].id
 
-    def _acquire_locks(self, profesional_id: int, target: "_Target") -> str:
+    @staticmethod
+    def _days(start: datetime, end: datetime) -> set:
+        return {start.date(), (end - timedelta(microseconds=1)).date()}
+
+    def _lock_keys(self, current: "_Snapshot", target: "_Target",
+                   profesional_id: Optional[int]) -> tuple:
+        """(professional, day) pairs whose occupancy this command can change: the target's
+        (if it occupies) and the current booking's (if it occupies). Sorted — L2 order."""
+        keys = set()
+        if target.occupying and profesional_id is not None:
+            keys |= {(int(profesional_id), d) for d in self._days(target.start, target.end)}
+        if current.occupying and current.profesional_id is not None and current.day is not None:
+            iv = br.occupied_interval(current.day, current.at, current.service, current.buffer)
+            if iv is not None:
+                keys |= {(int(current.profesional_id), d) for d in self._days(iv.start, iv.end)}
+        return tuple(sorted(keys))
+
+    def _acquire_locks(self, keys: tuple) -> str:
+        """L1 then L2, each in sorted order, so two authority writers can never wait on each
+        other's advisory locks in opposite orders."""
         dialect = self.db.get_bind().dialect.name
         if dialect == "sqlite":
             return "sqlite-serialized"         # labelled; never evidence of concurrency safety
         if dialect != "postgresql":
             raise _Refused(_result(BookingOutcome.INTERNAL_FAILURE, "NO_LOCK_PRIMITIVE"))
-        days = sorted({target.start.date(), (target.end - timedelta(microseconds=1)).date()})
-        for d in days:
+        for d in sorted({d for _, d in keys}):
             self.db.execute(text("SELECT pg_advisory_xact_lock_shared(:ns, :d)"),
                             {"ns": DATE_LOCK_NAMESPACE, "d": _ymd(d)})
-        for d in days:
-            self.db.execute(text("SELECT pg_advisory_xact_lock(:p, :d)"),
-                            {"p": int(profesional_id), "d": _ymd(d)})
+        for p, d in keys:
+            self.db.execute(text("SELECT pg_advisory_xact_lock(:p, :d)"), {"p": p, "d": _ymd(d)})
         return "pg-advisory-xact"
+
+    def _lock_revision(self, cmd, revision, unlocked: "_Snapshot"):
+        """L3: lock the target row AFTER the advisory locks and re-read it. A change since the
+        unlocked read is STALE_VERSION (caller sent a version) or a bounded retry."""
+        from ..models import Revision
+        if not self._postgres():
+            return revision, unlocked
+        revision = self.db.execute(
+            select(Revision).where(Revision.id == revision.id).with_for_update()
+            .execution_options(populate_existing=True)).scalar_one()
+        locked = _Snapshot.of(revision)
+        if locked != unlocked:
+            if cmd.expected_version is not None and locked.version != cmd.expected_version:
+                raise _Refused(_result(BookingOutcome.STALE_VERSION, "VERSION_MISMATCH",
+                                       revision_id=revision.id, booking_version=locked.version))
+            raise _Refused(_result(BookingOutcome.RETRYABLE_FAILURE, "CONCURRENT_CHANGE",
+                                   revision_id=revision.id))
+        return revision, locked
+
+    def _lock_overlapping(self, profesional_id: int, target: "_Target",
+                          exclude_id: Optional[int]) -> tuple:
+        """L4: FOR SHARE only the occupying Revisions of THIS professional (plus unattributed
+        rows when it is the launch default) whose protected interval overlaps the proposed
+        one, ordered by id. Normally empty — an overlap is then refused."""
+        if not self._postgres():
+            return ()
+        rows = self.db.execute(text(
+            "SELECT r.id FROM revisions r WHERE r.agenda_occupying "
+            "AND r.occupied_during && tsrange(:s, :e, '[)') AND r.id <> :x "
+            "AND (r.profesional_id = :p OR (r.profesional_id IS NULL AND EXISTS ("
+            "  SELECT 1 FROM profesionales pr WHERE pr.id = :p AND pr.is_launch_default))) "
+            "ORDER BY r.id FOR SHARE OF r"),
+            {"s": target.start, "e": target.end, "x": exclude_id or 0,
+             "p": int(profesional_id)}).scalars().all()
+        return tuple(rows)
 
     def _check_calendar(self, profesional_id: int, target: "_Target") -> None:
         from ..models import CalendarException
@@ -1239,11 +1476,7 @@ class BookingAuthority:
         from ..models import Revision
         if revision is None:
             revision = Revision(lead_id=cmd.lead_id)
-            allowed = _revision_data_columns()
-            for key, value in dict(cmd.revision_fields).items():
-                # only mapped, non-booking data columns, and only plain values (SB2A-R3)
-                if key not in allowed or type(value) not in _PLAIN_TYPES:
-                    raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, f"FIELD_NOT_ALLOWED:{key}"))
+            for key, value in cmd.revision_fields.items():     # validated in _validate
                 setattr(revision, key, value)
             revision.booking_version = 0
             self.db.add(revision)
@@ -1277,7 +1510,7 @@ class BookingAuthority:
             .order_by(BookingCommandRecord.id.desc()).limit(1)).scalar()
         if linked is None or linked == attached_id:
             return linked
-        tr = self.db.get(ThreadRevision, linked)
+        tr = self.db.get(ThreadRevision, linked, with_for_update=self._postgres())   # L5
         if tr is None or tr.status not in ("booked", "completed", "cancelled", "reschedule_pending"):
             return linked
         tr.scheduled_date = target.day
@@ -1332,6 +1565,60 @@ class BookingAuthority:
 _BOOKING_FIELDS = frozenset({"turno_fecha", "turno_hora", "service_minutes", "buffer_minutes",
                              "estado_revision", "profesional_id", "booking_version", "lead_id",
                              "id", "turno_timezone", "occupied_during", "agenda_occupying"})
+
+
+def _norm(value: Optional[str]) -> Optional[str]:
+    """Exact normalization only: trim, collapse whitespace, casefold. No fuzzy matching."""
+    if value is None:
+        return None
+    v = " ".join(value.split()).casefold()
+    return v or None
+
+
+def _apply_identity(lead, identity: "LeadIdentity") -> str:
+    """SB2A-R4 (R3A-03) coherent identity policy. The submitted (nombre, apellido, email) is
+    ONE person:
+      * canonical identity entirely empty → admit the submitted bundle (ADMITTED);
+      * every populated canonical field equals the submitted one (normalized) → fill only the
+        missing canonical fields from the same bundle (FILLED), or nothing (UNCHANGED);
+      * otherwise → change nothing (CONFLICT). Never merge fields of two people."""
+    canon = {"nombre": lead.nombre, "apellido": lead.apellido, "email": lead.email}
+    sub_ = {"nombre": identity.nombre, "apellido": identity.apellido, "email": identity.email}
+    if _norm(sub_["nombre"]) is None:
+        return "CONFLICT"
+    populated = {k for k, v in canon.items() if _norm(v) is not None}
+    if not populated:
+        for k, v in sub_.items():
+            if _norm(v) is not None:
+                setattr(lead, k, " ".join(v.split()))
+        return "ADMITTED"
+    if any(_norm(sub_[k]) != _norm(canon[k]) for k in populated):
+        return "CONFLICT"
+    filled = False
+    for k, v in sub_.items():
+        if k not in populated and _norm(v) is not None:
+            setattr(lead, k, " ".join(v.split()))
+            filled = True
+    return "FILLED" if filled else "UNCHANGED"
+
+
+def _safe_label(cmd) -> tuple:
+    """(operation, source) for logs, without touching an unvalidated command."""
+    if type(cmd) is not BookingCommand:
+        return ("?", "?")
+    v = object.__getattribute__(cmd, "__dict__")
+    op, src = v.get("operation"), v.get("source")
+    return (op.value if type(op) is BookingOperation else "?",
+            src.value if type(src) is BookingSource else "?")
+
+
+def _safe_key(cmd) -> Optional[str]:
+    """The idempotency key of a command for error reporting, without touching anything a
+    caller supplied unless it is exactly our command type holding exactly a str."""
+    if type(cmd) is not BookingCommand:
+        return None
+    key = object.__getattribute__(cmd, "__dict__").get("idempotency_key")
+    return key if type(key) is str else None
 
 
 def _revision_data_columns() -> frozenset:

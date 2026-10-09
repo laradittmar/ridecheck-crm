@@ -49,6 +49,7 @@ from .booking_authority import (
     BookingOperation,
     BookingOutcome,
     BookingSource,
+    LeadIdentity,
     LeadUpdate,
     PriceRecalculation,
     ThreadRevisionAttachment,
@@ -835,10 +836,14 @@ class BookingFlowService:
             ),
             price=PriceRecalculation(require_inputs=(
                 candidate.tipo_vehiculo, zone_group, zone_detail)) if candidate else None,
+            # SB2A-R4 (R3A-03): the submitted person is ONE identity bundle — admitted whole,
+            # used to fill gaps only when consistent, or not applied at all (CONFLICT).
             lead=LeadUpdate(
                 estado="COORDINAR_DISPONIBILIDAD", flag="ACEPTADO", necesita_humano=True,
-                nombre_if_empty=(name_parts[0] if name_parts else None),
-                apellido_if_empty=(" ".join(name_parts[1:]) or None) if len(name_parts) > 1 else None,
+                identity=LeadIdentity(
+                    nombre=name_parts[0],
+                    apellido=" ".join(name_parts[1:]) or None,
+                    email=email or None) if name_parts else None,
             ),
             thread_state=ThreadStateUpdate(
                 link_current_revision=True, last_stage=STAGE_BOOKED, needs_human=True,
@@ -920,6 +925,12 @@ class BookingFlowService:
             "BOOKING_CREATED thread_id=%s thread_rev=%s crm_rev=%s date=%s time=%s",
             ctx.thread.id, result.thread_revision_id, result.revision_id, date_str, time_str,
         )
+        if result.identity_outcome == "CONFLICT":
+            # SB2A-R4: the booking stands on the canonical lead; the submitted contact details
+            # disagreed with it and were NOT applied. Recorded for operator review.
+            _log_event(self.db, ctx.thread.id, "BOOKING_IDENTITY_CONFLICT",
+                       booking_token=booking_token,
+                       extra={"crm_rev_id": result.revision_id, "lead_id": ctx.lead.id})
 
         # The booking is committed above. The acknowledgement is best-effort BY DESIGN:
         # a delivery problem must never roll back or cast doubt on a booking that exists.
@@ -1018,10 +1029,17 @@ class BookingFlowService:
         from zoneinfo import ZoneInfo
 
         from ..ui.whatsapp_ui import MetaSendError, _send_whatsapp_cloud_text
+        from .outbound_guard import OutboundBlockedError
         from .outbound_path_registry import OutboundPathId, get_deployment_id
         from .outbound_safety_gate import GateOutcome, OutboundSafetyGate
 
         text = BOOKING_FLOW_RECEIPT_TEXT          # owner-approved copy (SB2A-R3)
+        # SB2A-R4 (R3A-05): failures KNOWN to precede any transport attempt are definitive —
+        # no gate record, no network call, no duplicate risk, retryable once fixed.
+        config_error = _receipt_pre_dispatch_error(ctx)
+        if config_error is not None:
+            logger.error("BOOKING_RECEIPT not attempted thread_id=%s: %s", ctx.thread.id, config_error)
+            return ReceiptOutcome(False, None, config_error)
         try:
             gate = OutboundSafetyGate(self.db)
             result = gate.attempt(
@@ -1038,6 +1056,11 @@ class BookingFlowService:
             try:
                 wa_message_id, _ = _send_whatsapp_cloud_text(
                     to_wa_id=ctx.contact.wa_id, text=text)
+            except OutboundBlockedError:
+                # raised by enforce_outbound_enabled, the transport's FIRST statement: nothing
+                # left the process
+                gate.mark_failed(result.message_id)
+                return ReceiptOutcome(False, None, "PRE_DISPATCH_OUTBOUND_BLOCKED")
             except MetaSendError as exc:
                 status = exc.http_status
                 gate.mark_failed(result.message_id, meta_http_status=status,
@@ -1074,6 +1097,22 @@ class BookingFlowService:
             logger.error("BOOKING_RECEIPT failed before dispatch thread_id=%s: %s",
                          ctx.thread.id, exc)
         return ReceiptOutcome(False, None, "PRE_SEND_FAILURE")
+
+def _receipt_pre_dispatch_error(ctx) -> Optional[str]:
+    """Local transport configuration that would make the send fail BEFORE the network
+    boundary (mirrors `_send_whatsapp_cloud_text`'s own pre-network checks). None if a send
+    could be attempted."""
+    from ..settings import get_settings
+    wa_id = ctx.contact.wa_id if ctx is not None and ctx.contact is not None else None
+    if type(wa_id) is not str or not wa_id.strip():
+        return "PRE_DISPATCH_CONFIG_DESTINATION_MISSING"
+    settings = get_settings()
+    token = (settings.whatsapp_token or "").strip()
+    phone_number_id = (settings.whatsapp_phone_number_id or "").strip()
+    if token and token.lower() != "dummy" and not phone_number_id:
+        return "PRE_DISPATCH_CONFIG_PHONE_NUMBER_ID_MISSING"
+    return None
+
 
 # ── Observability helpers ─────────────────────────────────────────────────────
 

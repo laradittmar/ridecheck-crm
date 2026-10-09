@@ -222,31 +222,47 @@ class R3Postgres(unittest.TestCase):
         self._assert_detected(r, "TRANSACTION_NOT_CONTINUOUS")
         self.assertEqual(self.counts()[2], 0)                       # no ledger was written
 
-    def test_pg_r3_04_side_channel_writes_in_the_locked_window_are_detected(self):
-        def raw(s, rev):
-            from sqlalchemy import create_engine as _ce  # noqa: F401
+    def test_pg_r3_04_side_channel_writes_are_legitimate_concurrency_unless_they_overlap(self):
+        """SB2A-R4 rewrite (R3A-04): the booking no longer locks or diffs the whole day, so a
+        committed write by ANOTHER transaction that does not overlap is ordinary concurrency
+        and the booking commits; an OVERLAPPING side write still cannot coexist — the
+        exclusion constraint stops it. In-transaction writes stay audited (pg_r3_02)."""
+        def raw(at):
+            def fault(s, rev):
+                conn = self.engine.raw_connection()
+                try:
+                    cur = conn.cursor()
+                    cur.execute("INSERT INTO revisions (lead_id, created_at, estado_revision, turno_fecha, "
+                                "turno_hora) VALUES (%s, now(), 'CONFIRMADO', %s, %s)", (self.lead, self.day, at))
+                    conn.commit(); return "committed"
+                except Exception as exc:
+                    conn.rollback(); return type(exc).__name__
+                finally:
+                    conn.close()
+            return fault
+        r = self.run_cmd(self.cmd(time(10), key=f"side-ok-{self.lead}"), authority=self.injected(raw("18:00")),
+                         attachments=self.ba.BookingAttachmentPlan())
+        self.assertEqual(r.outcome.value, "COMMITTED", r.reason)
+        side = {}
+
+        def overlapping(s, rev):
+            # a bypass writer racing an uncommitted booking: it blocks on our row; give up fast
             conn = self.engine.raw_connection()
-            cur = conn.cursor()
-            cur.execute("INSERT INTO revisions (lead_id, created_at, estado_revision, turno_fecha, "
-                        "turno_hora) VALUES (%s, now(), 'CONFIRMADO', %s, '18:00')", (self.lead, self.day))
-            conn.commit(); conn.close()
-
-        def thread_side(s, rev):
-            def go():
-                with Session(self.engine) as s2:
-                    s2.execute(text("INSERT INTO revisions (lead_id, created_at, estado_revision, "
-                                    "turno_fecha, turno_hora) VALUES (:l, now(), 'CONFIRMADO', :d, "
-                                    "'19:00')"), {"l": self.lead, "d": self.day}); s2.commit()
-            t = threading.Thread(target=go); t.start(); t.join()
-
-        for i, fault in enumerate((raw, thread_side)):
-            r = self.run_cmd(self.cmd(time(10), key=f"side{i}-{self.lead}"), authority=self.injected(fault),
-                             attachments=self.ba.BookingAttachmentPlan())
-            self._assert_detected(r, "OCCUPANCY_SET_CHANGED")
-        # the authority's own booking rolled back; only the injected side rows remain
+            try:
+                cur = conn.cursor(); cur.execute("SET lock_timeout = '300ms'")
+                cur.execute("INSERT INTO revisions (lead_id, created_at, estado_revision, turno_fecha, "
+                            "turno_hora) VALUES (%s, now(), 'CONFIRMADO', %s, '12:15')", (self.lead, self.day))
+                conn.commit(); side["r"] = "committed"
+            except Exception as exc:
+                conn.rollback(); side["r"] = type(exc).__name__
+            finally:
+                conn.close()
+        r2 = self.run_cmd(self.cmd(time(12), key=f"side-ov-{self.lead}"), authority=self.injected(overlapping),
+                          attachments=self.ba.BookingAttachmentPlan())
+        self.assertEqual(r2.outcome.value, "COMMITTED", r2.reason)
+        self.assertNotEqual(side["r"], "committed")              # the overlap never coexists
         self.assertEqual(sorted(t for (t,) in self.q(
-            "SELECT turno_hora FROM revisions WHERE lead_id=:l", l=self.lead)), [time(18), time(19)])
-        self.assertEqual(self.counts()[2], 0)
+            "SELECT turno_hora FROM revisions WHERE lead_id=:l", l=self.lead)), [time(10), time(12), time(18)])
 
     # ══ 3. Database clock authority ═══════════════════════════════════════════
 
