@@ -534,8 +534,13 @@ class J_WriterIntegrity(unittest.TestCase):
                          and n.name.startswith("_apply_candidate"))
         self.assertEqual(writers, ["_apply_candidate"],
                          f"a second candidate writer appeared: {writers}")
-        self.assertEqual(src.count("WhatsAppThreadCandidate("), 4,
-                         "a new candidate-row construction site appeared")
+        self.assertEqual(src.count("WhatsAppThreadCandidate("), 3,
+                         "a new candidate-row construction site appeared. G3-7M removed "
+                         "one: the Vehicle-Flow completion handler built a candidate "
+                         "directly, which is how a successful clarification could create "
+                         "a duplicate of the customer's own car. It now routes through "
+                         "`_apply_candidate` like every other path, so 4 -> 3 — this "
+                         "invariant got stronger, not weaker. Original note")
 
     def test_g37f_120_the_pending_patch_is_never_read_as_canonical_truth(self):
         """Canonical reads go to the candidate row. Nothing consults the proposal for a

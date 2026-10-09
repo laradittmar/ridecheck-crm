@@ -448,6 +448,31 @@ class ClarificationAttemptStore:
                 thread_id, cycle, family, _fault_kind(exc), type(exc).__name__)
             return None
 
+    def attempt_in_other_cycle(self, *, thread_id: int, cycle: int, family: str) -> bool:
+        """Is there an attempt for this family in a DIFFERENT cycle of this thread?
+
+        G3-7M. `load()` returning None is two different facts. "We have no record at all"
+        may mean we died after dispatching, and the existing policy deliberately lets the
+        customer's data through rather than discarding it. "We have a record, but for an
+        earlier cycle" means this submission belongs to a cycle that has since closed —
+        a stale form, and acting on it would write last cycle's answer onto this cycle's
+        vehicle. Read-only; never raises on I/O, and an unreadable store answers True so
+        the caller fails closed.
+        """
+        try:
+            with self._session() as session:
+                row = session.execute(
+                    select(WhatsAppClarificationAttempt.id)
+                    .where(WhatsAppClarificationAttempt.thread_id == thread_id,
+                           WhatsAppClarificationAttempt.family == family,
+                           WhatsAppClarificationAttempt.cycle_key != cycle)
+                    .limit(1)).first()
+                return row is not None
+        except Exception:                      # noqa: BLE001 - absence is not denial
+            logger.warning("G3-7M stale-cycle probe unavailable thread_id=%s — failing closed",
+                           thread_id)
+            return True
+
     def spent_families(self, *, thread_id: int, cycle: int) -> "SpentFamiliesResult":
         """Which families have already spent their attempt in this cycle.
 
@@ -474,7 +499,8 @@ class ClarificationAttemptStore:
 
     # ── transitions ───────────────────────────────────────────────────────────
 
-    def transition(self, attempt_id: int, new_status: str, **fields):
+    def transition(self, attempt_id: int, new_status: str, *, claim: bool = False,
+                   **fields):
         """Advance one attempt. Illegal transitions raise rather than corrupt the record.
 
         The row is never deleted and `thread_id`, `cycle_key`, `family` and
@@ -485,8 +511,24 @@ class ClarificationAttemptStore:
             raise ValueError(f"unknown attempt status: {new_status!r}")
         try:
             with self._session() as sess:
-                row = sess.get(WhatsAppClarificationAttempt, attempt_id)
+                if claim:
+                    # G3-7M §13. A completion must be won, not merely recorded. The row is
+                    # locked so two concurrent deliveries serialize here, and a status that
+                    # already equals the target means someone else won: return None rather
+                    # than the usual no-op, so the caller treats it as the duplicate it is.
+                    # Without the lock both callers read a non-terminal status and both
+                    # proceed to mutate — convergent, but two writes where one is allowed.
+                    row = sess.execute(
+                        select(WhatsAppClarificationAttempt)
+                        .where(WhatsAppClarificationAttempt.id == attempt_id)
+                        .with_for_update()).scalar_one_or_none()
+                else:
+                    row = sess.get(WhatsAppClarificationAttempt, attempt_id)
                 if row is None:
+                    return None
+                if claim and row.status == new_status:
+                    logger.info("G3-7M completion already claimed attempt_id=%s status=%s",
+                                attempt_id, row.status)
                     return None
                 allowed = ALLOWED_TRANSITIONS.get(row.status, ())
                 if new_status != row.status and new_status not in allowed:

@@ -919,7 +919,13 @@ class I_Invariants(unittest.TestCase):
         ctors = sum(1 for n in ast.walk(tree) if isinstance(n, ast.Call)
                     and getattr(n.func, "id", getattr(n.func, "attr", None))
                     == "WhatsAppThreadCandidate")
-        self.assertEqual(ctors, 4, "candidate construction sites changed; re-examine")
+        self.assertEqual(ctors, 3,
+                         "candidate construction sites changed; re-examine. G3-7M removed "
+                         "one: the Vehicle-Flow completion handler built a candidate "
+                         "directly, which is how a successful clarification could create a "
+                         "duplicate. It now routes through `_apply_candidate` like every "
+                         "other path, so the count went 4 -> 3 — the invariant this "
+                         "tripwire guards got stronger, not weaker.")
 
     def test_r2_69_the_pending_module_still_writes_nothing(self):
         src = pathlib.Path(inspect.getsourcefile(pc)).read_text(encoding="utf-8")

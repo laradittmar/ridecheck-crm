@@ -5000,6 +5000,11 @@ class ConversationEngine:
         flags-off turn — both values are None and the decision simply has no correction
         inputs, which is the correct reading rather than a missing one.
         """
+        # G3-7M F3: `CandidateAction` was referenced below with no import in this scope
+        # and none at module level, so this method raised NameError the moment BOTH
+        # correction flags were armed — the exact configuration activation requires. The
+        # early returns above it hid that for as long as either flag stayed off.
+        from ..schemas.hybrid_trace import CandidateAction as _CAction
         resolution = getattr(self, "_turn_candidate_resolution", None)
         if resolution is None:
             return None, None
@@ -5007,7 +5012,7 @@ class ConversationEngine:
             return resolution, None
         if (cand_data or {}).get("action") != "update":
             return resolution, None
-        if getattr(resolution, "action", None) != CandidateAction.CORRECT_EXISTING:
+        if getattr(resolution, "action", None) != _CAction.CORRECT_EXISTING:
             return resolution, None
         from . import pending_correction as _pcmod
         return resolution, _pcmod.proposal_disposition(
@@ -5290,8 +5295,17 @@ class ConversationEngine:
         status = (AttemptStatus.COMPLETED_RESOLVED if resolved
                   else (AttemptStatus.COMPLETED_UNRESOLVED
                         if result == "UNRESOLVED" else AttemptStatus.INVALID_COMPLETION))
-        self._turn_clarification_attempt = store.transition(
-            attempt.id, status, completion_result=result, resolved_family=bool(resolved))
+        _claimed = store.transition(
+            attempt.id, status, claim=True, completion_result=result,
+            resolved_family=bool(resolved))
+        if _claimed is None:
+            # G3-7M: another delivery of this same completion won the claim. Treat it as
+            # the duplicate it is so no second mutation follows.
+            logger.info("G3-7M concurrent duplicate completion thread_id=%s family=%s "
+                        "— no second mutation", ctx.thread.id, family)
+            self._turn_clarification_completion = "DUPLICATE"
+            return attempt, True
+        self._turn_clarification_attempt = _claimed
         self._turn_clarification_completion = result
         logger.info("G3-7F clarification completion thread_id=%s family=%s -> %s",
                     ctx.thread.id, family, status)
@@ -6838,6 +6852,89 @@ class ConversationEngine:
         return bool(probe) and probe in normalized_reply
 
 
+    def _resolve_completion_target(self, ctx, *, marca, modelo, anio, tipo):
+        """WHICH candidate a Vehicle-Flow completion is about. Decided BEFORE any write.
+
+        G3-7M F1. The completion path wrote onto `focus` unconditionally, so in a
+        multi-candidate thread a customer who correctly clarified "the other one" had the
+        FOCUSED car overwritten with the selected identity — destroying it and leaving a
+        duplicate. The Flow returns customer-confirmed structured fields, so the target is
+        resolvable; it was simply never asked for.
+
+        Compatibility uses canonical fields and the existing category authority
+        (`_tipo_compatible`), never prose:
+
+          * make must match when both sides state one;
+          * model must match when both sides state one;
+          * category must be compatible, so a MOTO row is never repurposed for an AUTO.
+
+        The YEAR is deliberately NOT part of compatibility. It is a DISCRIMINATOR among
+        several compatible rows, not evidence of a different car: "no, it's a 2016" about
+        the one Ford Focus on file is a year correction, and treating the mismatch as a new
+        vehicle would duplicate the customer's only car. Where two rows share make and
+        model, an exactly equal year is what proves which one.
+
+        Exactly one compatible row selects it. None creates. More than one narrows by an
+        exactly equal year and, failing that, refuses: focus is never the tie-break, nor
+        list order, nor row age, nor recency.
+        """
+        from ..schemas.hybrid_trace import (ClarificationCompletionTarget as _T,
+                                            CompletionTargetDecision)
+        rows = list(getattr(ctx, "candidates", None) or ())
+        considered = tuple(c.id for c in rows if getattr(c, "id", None) is not None)
+        want_ma = (marca or "").strip().lower()
+        want_mo = (modelo or "").strip().lower()
+        submitted = " ".join(str(x) for x in (marca, modelo, anio) if x) or None
+
+        def _compatible(c):
+            c_ma = (getattr(c, "marca", None) or "").strip().lower()
+            c_mo = (getattr(c, "modelo", None) or "").strip().lower()
+            if want_ma and c_ma and c_ma != want_ma:
+                return False
+            if want_mo and c_mo and c_mo != want_mo:
+                return False
+            if not _tipo_compatible(getattr(c, "tipo_vehiculo", None), tipo):
+                return False
+            return True
+
+        def _names_something(c):
+            return bool((getattr(c, "marca", None) or "").strip()
+                        or (getattr(c, "modelo", None) or "").strip())
+
+        # Rows that actually NAME the submitted car take precedence. A placeholder — a row
+        # carrying no make and no model — is considered only when nothing named matches:
+        # it is an empty slot awaiting an identity, and the Flow is what fills it. Treating
+        # it as incompatible duplicated the customer's own row (§4.3: an identity is not
+        # "new" merely because the existing candidate is incomplete).
+        compatible = [c for c in rows if _compatible(c) and _names_something(c)]
+        if not compatible:
+            placeholders = [c for c in rows if _compatible(c) and not _names_something(c)]
+            if len(placeholders) == 1:
+                return CompletionTargetDecision(
+                    _T.MATCH_EXISTING_CANDIDATE, placeholders[0].id, considered,
+                    (placeholders[0].id,), submitted, "update")
+        compat_ids = tuple(c.id for c in compatible)
+
+        if len(compatible) == 1:
+            return CompletionTargetDecision(
+                _T.MATCH_EXISTING_CANDIDATE, compatible[0].id, considered, compat_ids,
+                submitted, "update")
+        if not compatible:
+            return CompletionTargetDecision(
+                _T.CREATE_NEW_CANDIDATE, None, considered, compat_ids, submitted, "create")
+        # Several rows are compatible. One exactly-equal year is a proof of identity;
+        # anything less is a guess, and guessing is what F1 was.
+        if anio:
+            exact = [c for c in compatible
+                     if getattr(c, "anio", None) and int(c.anio) == int(anio)]
+            if len(exact) == 1:
+                return CompletionTargetDecision(
+                    _T.MATCH_EXISTING_CANDIDATE, exact[0].id, considered, compat_ids,
+                    submitted, "update")
+        return CompletionTargetDecision(
+            _T.UNRESOLVED_TARGET, None, considered, compat_ids, submitted, None,
+            "MULTIPLE_COMPATIBLE_CANDIDATES")
+
     def _process_vehicle_fallback_response(
         self,
         ctx: _Context,
@@ -6886,6 +6983,28 @@ class ConversationEngine:
             result=("RESOLVED" if _vfr_valid
                     else ("UNRESOLVED" if tipo in _FALLBACK_VEHICLE_TYPES
                           else "INVALID_FIELDS")))
+        # ── G3-7M §7: a STALE-cycle submission must not write ─────────────────────
+        # `_complete_clarification_attempt` returns no attempt for two different reasons,
+        # and only one of them is safe to proceed on. No record at all may mean we died
+        # after dispatching, and the established policy keeps the customer's data. A
+        # record that exists for an EARLIER cycle means this form belongs to a cycle that
+        # has closed, and applying it would write last cycle's answer onto this cycle's
+        # vehicle.
+        if _vfr_attempt is None and not _vfr_duplicate:
+            _cycle_now = self._clarification_cycle_key(state)
+            if self._attempt_store().attempt_in_other_cycle(
+                    thread_id=ctx.thread.id, cycle=_cycle_now, family="VEHICLE"):
+                logger.info("G3-7M stale-cycle vehicle completion thread_id=%s cycle=%s "
+                            "— no mutation, human", ctx.thread.id, _cycle_now)
+                self._turn_clarification_completion = "STALE_CYCLE"
+                state.needs_human = True
+                lead.necesita_humano = True
+                self.db.commit()
+                sent_id = self._send_text_to_wa(ctx, _FALLBACK_WARM_HANDOFF)
+                self._send_fallback_human_review_notification(
+                    ctx, state, reason="vehicle_completion_stale_cycle")
+                return _out("replied", wa_message_id=sent_id)
+
         if _vfr_duplicate:
             # Step 3: a duplicate or replayed submission performs no second mutation.
             logger.info("G3-7F duplicate vehicle completion thread_id=%s — no mutation",
@@ -6907,28 +7026,48 @@ class ConversationEngine:
             )
             return _out("replied", wa_message_id=sent_id)
 
-        # Update or create candidate
-        focus = self._focus_candidate(ctx)
-        if focus:
-            # L4.7C.2: single canonical vehicle write path.
-            self._apply_vehicle_identity(ctx, focus, marca=marca, modelo=modelo,
-                                         tipo=tipo, anio=anio, source="flow_or_form",
-                                         state=state)
+        # ── G3-7M: resolve the target BEFORE mutating anything ────────────────────
+        from ..schemas.hybrid_trace import ClarificationCompletionTarget as _T
+        _target = self._resolve_completion_target(
+            ctx, marca=marca, modelo=modelo, anio=anio, tipo=tipo)
+        self._turn_completion_target = _target
+        self._decision_log(ctx, "clarification_completion_target",
+                           **_target.to_payload())
+        logger.info("G3-7M completion target thread_id=%s outcome=%s target=%s "
+                    "compatible=%s", getattr(ctx.thread, "id", None), _target.outcome,
+                    _target.target_candidate_id, list(_target.compatible_candidate_ids))
+
+        if _target.outcome == _T.UNRESOLVED_TARGET:
+            # Several existing rows fit and none can be proven. Writing either would be
+            # the F1 defect in a different costume, so nothing is written and a person
+            # takes the turn. No second Flow: the attempt for this cycle is already spent.
+            logger.info("G3-7M completion target unresolved thread_id=%s — human",
+                        getattr(ctx.thread, "id", None))
+            state.needs_human = True
+            lead.necesita_humano = True
+            self.db.commit()
+            sent_id = self._send_text_to_wa(ctx, _FALLBACK_WARM_HANDOFF)
+            self._send_fallback_human_review_notification(
+                ctx, state, reason="vehicle_completion_target_unresolved")
+            return _out("replied", wa_message_id=sent_id)
+
+        # One writer, for both outcomes. `_apply_candidate` already owns create, update,
+        # the focus transition and the demotion of the previous focus, so no
+        # completion-only focus mechanism is introduced here.
+        _data = {"marca": marca or None, "modelo": modelo or None,
+                 "tipo_vehiculo": tipo, "anio": anio, "status": "current_focus"}
+        if _target.outcome == _T.MATCH_EXISTING_CANDIDATE:
+            _data.update(action="update", id=_target.target_candidate_id)
         else:
-            from app.models import WhatsAppThreadCandidate
-            cand = WhatsAppThreadCandidate(
-                thread_id=ctx.thread.id,
-                marca=marca or None,
-                modelo=modelo or None,
-                tipo_vehiculo=tipo,
-                anio=anio,
-                status="current_focus",
-                source_text=f"vehicle_fallback_flow: {marca} {modelo}".strip(),
-            )
-            self.db.add(cand)
-            self.db.flush()
-            ctx.candidates.append(cand)
-            state.current_focus_candidate_id = cand.id
+            _data.update(action="create")
+        _applied, _created = self._apply_candidate(ctx, _data)
+        self._turn_completion_applied = bool(_applied)
+        if _created and not any(getattr(c, "id", None) == _created
+                                for c in (ctx.candidates or ())):
+            from app.models import WhatsAppThreadCandidate as _WTC
+            _new = self.db.get(_WTC, _created)
+            if _new is not None:
+                ctx.candidates.append(_new)
 
         logger.info(
             "M18 vehicle_fallback resolved tipo=%s thread_id=%s",
@@ -6950,6 +7089,18 @@ class ConversationEngine:
             sent_id = self._send_text_to_wa(ctx, reply)
             self._answer_source = "PRICING_SERVICE"
             return _out("replied", wa_message_id=sent_id, answer_source="PRICING_SERVICE")
+
+        # ── G3-7M §8: a quote that belongs to the PREVIOUS vehicle must not survive ──
+        # No fresh quote could be computed (the zone is still unknown), so the stage and
+        # lead flag would otherwise keep asserting a sent quote for the car the customer
+        # just moved away from. This is the SAME invalidation the vehicle-change re-quote
+        # guard already applies — reused, not reinvented.
+        if state.last_stage in (STAGE_QUOTED, STAGE_SCHEDULING, STAGE_FLOW_SENT):
+            logger.info("G3-7M stale quote invalidated after vehicle clarification "
+                        "thread_id=%s stage=%s", ctx.thread.id, state.last_stage)
+            lead.flag = "PRESUPUESTANDO"
+            state.last_stage = STAGE_QUALIFYING
+            self._record_quote_consequence(invalidated=True, recomputed=False)
 
         # Zone not yet known — dispatch Location Fallback Flow directly.
         self.db.commit()

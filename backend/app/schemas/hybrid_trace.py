@@ -656,6 +656,52 @@ class ResponsePlan:
         }
 
 
+class ClarificationCompletionTarget:
+    """WHICH candidate a Vehicle-Flow completion is about, decided before any write.
+
+    G3-7M. The completion path used to write the customer's confirmed identity onto
+    `focus` unconditionally. In a multi-candidate thread that destroyed the focused car:
+    a customer clarifying "no, el otro es del 2016" and correctly selecting their Peugeot
+    had their Ford Focus overwritten into a second Peugeot. The Flow hands us
+    customer-confirmed structured fields, so the target is resolvable — it was simply
+    never asked for.
+
+    Ordering is the safety property: resolve the target, THEN mutate. Never the reverse,
+    and never "focus by default".
+    """
+    #: Exactly one existing candidate is compatible with the confirmed identity.
+    MATCH_EXISTING_CANDIDATE = "MATCH_EXISTING_CANDIDATE"
+    #: No existing candidate is compatible — a genuinely different vehicle.
+    CREATE_NEW_CANDIDATE = "CREATE_NEW_CANDIDATE"
+    #: More than one candidate is compatible and none can be uniquely proven. Nothing is
+    #: written, nothing is created, focus stands, and a person takes the turn.
+    UNRESOLVED_TARGET = "UNRESOLVED_TARGET"
+
+    ALL = (MATCH_EXISTING_CANDIDATE, CREATE_NEW_CANDIDATE, UNRESOLVED_TARGET)
+
+
+@dataclass(frozen=True)
+class CompletionTargetDecision:
+    """What the completion resolver decided, and from what. Ids and counts only — the
+    customer's own words never enter this record."""
+    outcome: str                       # ClarificationCompletionTarget
+    target_candidate_id: Optional[int] = None
+    considered_candidate_ids: tuple = ()
+    compatible_candidate_ids: tuple = ()
+    submitted_identity: Optional[str] = None     # "marca modelo anio", canonical values
+    action: Optional[str] = None                 # "update" | "create" | None
+    reason: str = ""                             # why, when unresolved
+
+    def to_payload(self) -> dict:
+        return {"outcome": self.outcome,
+                "target_candidate_id": self.target_candidate_id,
+                "considered_candidate_ids": list(self.considered_candidate_ids),
+                "compatible_candidate_ids": list(self.compatible_candidate_ids),
+                "submitted_identity": self.submitted_identity,
+                "action": self.action,
+                "reason": self.reason or None}
+
+
 class CandidateAction:
     """What the candidate reconciler decided to do with the turn's admitted evidence.
 
