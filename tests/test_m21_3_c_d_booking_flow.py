@@ -160,6 +160,9 @@ def _mock_sched_valid(svc: BookingFlowService, slots=None) -> None:
     if slots is None:
         slots = [_SLOT, "11:00", "15:00"]
     svc._sched = MagicMock()
+    # SB2A-R3 rewrite: revalidation is the booking authority's own; point its internal
+    # availability reader at the same mock so the test controls both offer and revalidation.
+    svc._authority._availability_service = lambda: svc._sched
     svc._sched.list_slots.return_value = ScheduleSlotsOut(
         preferred_day=_FUTURE,
         business_hours="09:00-18:00",
@@ -177,6 +180,9 @@ def _mock_sched_valid(svc: BookingFlowService, slots=None) -> None:
 def _mock_sched_invalid(svc: BookingFlowService) -> None:
     """Patch ScheduleService to reject slots (no availability / check fails)."""
     svc._sched = MagicMock()
+    # SB2A-R3 rewrite: revalidation is the booking authority's own; point its internal
+    # availability reader at the same mock so the test controls both offer and revalidation.
+    svc._authority._availability_service = lambda: svc._sched
     svc._sched.list_slots.return_value = ScheduleSlotsOut(
         preferred_day=_FUTURE,
         business_hours="09:00-18:00",

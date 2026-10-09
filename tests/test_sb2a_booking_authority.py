@@ -60,6 +60,15 @@ def _lead(db):
     return lead
 
 
+def _thread(db, lead):
+    import secrets as _s
+    c = WhatsAppContact(wa_id="5491" + str(_s.randbelow(10**9)).zfill(9), display_name="Fixture")
+    db.add(c); db.flush()
+    t = WhatsAppThread(contact_id=c.id, lead_id=lead.id)
+    db.add(t); db.commit()
+    return t.id
+
+
 def _create(db, lead, at=time(10, 0), day=D, key=None, prof=None, src=Src.OTHER, **kw):
     return BookingAuthority(db).execute(BookingCommand(
         operation=Op.CREATE, source=src, idempotency_key=key, lead_id=lead.id,
@@ -239,7 +248,8 @@ class Idempotency(unittest.TestCase):
         self.assertEqual(replay.outcome, Out.IDEMPOTENT_REPLAY)     # committed, not re-booked
         second = auth.claim_acknowledgement("ack-1")               # recovery claims once
         self.assertIsNotNone(second)
-        auth.record_acknowledgement(second, sent=True)
+        # SB2A-R3: a definitive SENT requires the transport identity (WAMID)
+        auth.record_acknowledgement(second, sent=True, transport_id="wamid.SB2A-15")
         self.assertIsNone(auth.claim_acknowledgement("ack-1"))     # SENT: silent forever
         self.assertEqual(db.query(Revision).count(), 1)
         rec = db.query(BookingCommandRecord).one()
@@ -288,15 +298,14 @@ class Transitions(unittest.TestCase):
     def test_sb2a_19_rollback_leaves_nothing_partial(self):
         db = _db(); _prof(db, default=True); lead = _lead(db)
 
-        def attach(db_, rev):
-            db_.add(ThreadRevision(thread_id=1, status="booked"))
-            db_.flush()
-            raise RuntimeError("attach failed after the Revision was written")
-
+        # SB2A-R3 rewrite: no callback exists; an attachment that fails AFTER the Revision was
+        # written (its thread does not exist) must still leave nothing behind.
         r = BookingAuthority(db).execute(BookingCommand(
             operation=Op.CREATE, source=Src.OTHER, idempotency_key="rb", lead_id=lead.id,
-            requested_date=D, requested_time=time(10)), attach=attach)
-        self.assertEqual(r.outcome, Out.INTERNAL_FAILURE)
+            requested_date=D, requested_time=time(10)),
+            attachments=ba.BookingAttachmentPlan(
+                thread_revision=ba.ThreadRevisionAttachment(thread_id=999999)))
+        self.assertEqual((r.outcome, r.reason), (Out.VALIDATION_FAILED, "ATTACHMENT_THREAD_NOT_FOUND"))
         self.assertEqual((db.query(Revision).count(), db.query(ThreadRevision).count(),
                           db.query(BookingCommandRecord).count()), (0, 0, 0))
 
@@ -473,25 +482,21 @@ class CeContract(unittest.TestCase):
 
     def test_sb2a_29_flow_response_adapter(self):
         db = _db(); _prof(db, default=True); lead = _lead(db)
-        made = []
-
-        def tr(db_, rev):
-            t = ThreadRevision(thread_id=7, status="booked", scheduled_date=rev.turno_fecha,
-                               scheduled_time=rev.turno_hora)
-            db_.add(t); db_.flush(); made.append(t.id)
-            return t
-
-        req = ce.CeFlowBookingRequest(thread_id=7, lead_id=lead.id, inbound_event_id="wamid.X",
+        t7, t8 = _thread(db, lead), _thread(db, lead)
+        # SB2A-R3 rewrite: the booked ThreadRevision is a typed attachment, not a callback.
+        plan = lambda t: ba.BookingAttachmentPlan(thread_revision=ba.ThreadRevisionAttachment(thread_id=t))
+        req = ce.CeFlowBookingRequest(thread_id=t7, lead_id=lead.id, inbound_event_id="wamid.X",
                                       flow_token="7-1-abc", requested_date=D,
-                                      requested_time=time(10))
-        r = ce.book_from_flow_response(db, req, create_thread_revision=tr)
+                                      requested_time=time(10), attachments=plan(t7))
+        r = ce.book_from_flow_response(db, req)
         self.assertEqual(r.outcome, Out.COMMITTED)
+        made = [t.id for t in db.query(ThreadRevision).all()]
         self.assertEqual(r.thread_revision_id, made[0])            # flow-txn key source
-        again = ce.book_from_flow_response(db, req, create_thread_revision=tr)
+        again = ce.book_from_flow_response(db, req)
         self.assertEqual((again.outcome, again.revision_id), (Out.IDEMPOTENT_REPLAY, r.revision_id))
         clash = ce.book_from_flow_response(db, ce.CeFlowBookingRequest(
-            thread_id=8, lead_id=lead.id, inbound_event_id="wamid.Y", flow_token="8-1-x",
-            requested_date=D, requested_time=time(10, 30)), create_thread_revision=tr)
+            thread_id=t8, lead_id=lead.id, inbound_event_id="wamid.Y", flow_token="8-1-x",
+            requested_date=D, requested_time=time(10, 30), attachments=plan(t8)))
         self.assertIn(clash.outcome, ce.CE_W1_FALLBACK_TO_MANUAL)
 
     def test_sb2a_30_manual_scheduling_preserves_escalation_on_unavailable_slot(self):

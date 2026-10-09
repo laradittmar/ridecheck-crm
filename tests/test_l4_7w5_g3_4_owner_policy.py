@@ -222,15 +222,17 @@ class E_ConcurrencyPosture(unittest.TestCase):
         # SB2A rewrite: the lock is the booking authority's — blocking, fail-closed, keyed
         # on (professional, date) — and the revalidation runs inside it (revalidate=…).
         self.assertIn("self._authority.execute(", body)
-        self.assertIn("revalidate=_revalidate", body)
-        self.assertIn("ScheduleCheckIn", body)
+        # SB2A-R3 rewrite: the Flow hands TYPED plans to the booking authority (no callback);
+        # revalidation, ThreadRevision, price and token consumption are the authority's.
+        self.assertIn("availability=availability", body)
+        self.assertIn("AvailabilityRevalidation(", body)
         from app.services import booking_authority as ba
         locks = inspect.getsource(ba.BookingAuthority._acquire_locks)
         self.assertIn("pg_advisory_xact_lock(:p, :d)", locks)
         run = inspect.getsource(ba.BookingAuthority.execute)
-        # SB2A-R2 rewrite: revalidate runs under the enforced callback guard; still after the locks.
+        # SB2A-R3 rewrite: the authority's own revalidation, still after the locks.
         self.assertLess(run.index("self._acquire_locks("),
-                        run.index('self._run_callback("revalidate", revalidate, target)'))
+                        run.index("self._revalidate_availability("))
 
     def test_own_20_a_lost_slot_raises_a_conflict_rather_than_booking_anyway(self):
         body = inspect.getsource(bfs.BookingFlowService.handle_confirm_booking)

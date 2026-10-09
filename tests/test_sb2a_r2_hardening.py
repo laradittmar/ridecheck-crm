@@ -130,7 +130,7 @@ class R01PartialManualScheduling(unittest.TestCase):
         db = _db(); _prof(db); lead = _lead(db)
         r = ce.book_from_flow_response(db, ce.CeFlowBookingRequest(
             thread_id=9, lead_id=lead.id, inbound_event_id="wamid.R2-05", flow_token=None,
-            requested_date=D, requested_time=None), create_thread_revision=lambda s, rev: None)
+            requested_date=D, requested_time=None))
         self.assertEqual(r.outcome, Out.COMMITTED, r.reason)
         self.assertFalse(r.occupying)
         self.assertEqual(db.get(Revision, r.revision_id).estado_revision, "REPROGRAMAR")
@@ -145,8 +145,7 @@ class R09EventIdentity(unittest.TestCase):
         for blank in (None, "", "   ", "\t"):
             r = ce.book_from_flow_response(db, ce.CeFlowBookingRequest(
                 thread_id=1, lead_id=lead.id, inbound_event_id=blank, flow_token=blank,
-                requested_date=D, requested_time=time(10)),
-                create_thread_revision=lambda s, rev: None)
+                requested_date=D, requested_time=time(10)))
             self.assertEqual((r.outcome, r.reason), (Out.VALIDATION_FAILED, "EVENT_IDENTITY_REQUIRED"))
             r = ce.request_manual_scheduling(db, ce.CeSchedulingEscalationRequest(
                 thread_id=1, lead_id=lead.id, escalation_id=blank, inbound_event_id=blank))
@@ -196,19 +195,28 @@ class R02AdapterIsolationOrm(unittest.TestCase):
             thread_id=1, lead_id=lead_id, cycle_key=1))
         refused = ce.book_from_flow_response(db, ce.CeFlowBookingRequest(
             thread_id=1, lead_id=lead_id, inbound_event_id="w", flow_token=None,
-            requested_date=D, requested_time=time(10)), create_thread_revision=lambda s, r: None)
+            requested_date=D, requested_time=time(10)))
         self.assertEqual(ok.outcome, Out.COMMITTED)
         self.assertEqual(refused.outcome, Out.SLOT_CONFLICT)       # refusal rolls back ITS session
         self.assertEqual(calls, [])
         self.assertIn(pending, db.new)                             # still the caller's to decide
 
-    def test_r2_10_callback_gets_the_adapter_session_not_the_callers(self):
+    def test_r2_10_authority_runs_on_the_adapter_session_not_the_callers(self):
+        # SB2A-R3 rewrite: there is no callback to observe; observe the authority's session.
         db = _db(); _prof(db); lead = _lead(db)
         seen = []
-        ce.book_from_flow_response(db, ce.CeFlowBookingRequest(
-            thread_id=1, lead_id=lead.id, inbound_event_id="w", flow_token="t",
-            requested_date=D, requested_time=time(10)),
-            create_thread_revision=lambda s, rev: seen.append(s))
+        real = ce.BookingAuthority
+
+        class Spy(real):
+            def __init__(self, s, **k):
+                seen.append(s); super().__init__(s, **k)
+        ce.BookingAuthority = Spy
+        try:
+            ce.book_from_flow_response(db, ce.CeFlowBookingRequest(
+                thread_id=1, lead_id=lead.id, inbound_event_id="w", flow_token="t",
+                requested_date=D, requested_time=time(10)))
+        finally:
+            ce.BookingAuthority = real
         self.assertEqual(len(seen), 1)
         self.assertIsNot(seen[0], db)
 
@@ -238,121 +246,29 @@ class R02AdapterIsolationOrm(unittest.TestCase):
         self.assertTrue(made[0].closed)
 
 
-# ══ R-04 — the callback guard is enforced ═════════════════════════════════════════════
+# ══ R-04 — superseded by SB2A-R3: there is no callback interface at all ═════════════════
+#
+# SB2A-R2 guarded caller callbacks; the R2 audit showed a guard over arbitrary write-capable
+# code is bypassable (comment-prefixed COMMIT, DO-block DDL, raw DELETE…). SB2A-R3 removed the
+# callbacks: callers hand TYPED DATA plans to the authority. The R2 guard tests that drove
+# callbacks are replaced by these interface assertions; behaviour and defence in depth are
+# proven in test_sb2a_r3_typed_plans.py / test_sb2a_r3_typed_plans_pg.py.
 
-class R04CallbackGuard(unittest.TestCase):
+class R04NoCallbackInterface(unittest.TestCase):
 
-    def _attempt(self, attach=None, revalidate=None):
+    def test_r2_12_execute_rejects_callback_keywords(self):
         db = _db(); _prof(db); lead = _lead(db)
-        r = BookingAuthority(db).execute(_cmd(lead, key="cb"), attach=attach, revalidate=revalidate)
-        return db, r
-
-    def assertViolation(self, r, fragment):
-        self.assertEqual(r.outcome, Out.INTERNAL_FAILURE)
-        self.assertTrue(r.reason.startswith("CALLBACK_VIOLATION:"), r.reason)
-        self.assertIn(fragment, r.reason)
-
-    def test_r2_12_callback_commit_is_refused_and_nothing_persists(self):
-        def attach(s, rev):
-            s.commit()
-            raise RuntimeError("after commit")                       # hostile c01
-        db, r = self._attempt(attach)
-        self.assertViolation(r, "session.commit")
+        for kw in ({"attach": lambda s, r: None}, {"revalidate": lambda s, t: None}):
+            with self.assertRaises(TypeError):
+                BookingAuthority(db).execute(_cmd(lead), **kw)
         self.assertEqual(_counts(db), (0, 0, 0))
 
-    def test_r2_13_rollback_begin_nested_and_close_are_refused(self):
-        for name in ("rollback", "begin_nested", "begin", "close", "expunge_all"):
-            db, r = self._attempt(lambda s, rev, n=name: getattr(s, n)())
-            self.assertViolation(r, f"session.{name}")
-            self.assertEqual(_counts(db), (0, 0, 0), name)
-
-    def test_r2_14_transaction_control_sql_is_refused(self):
-        for sql in ("COMMIT", "SAVEPOINT x", "  rollback", "BEGIN"):
-            db, r = self._attempt(lambda s, rev, q=sql: s.execute(text(q)))
-            self.assertViolation(r, "sql:")
-            self.assertEqual(_counts(db), (0, 0, 0), sql)
-
-    def test_r2_15_a_swallowed_violation_still_fails_the_booking(self):
-        def attach(s, rev):
-            try:
-                s.commit()
-            except Exception:
-                pass
-            return None
-        db, r = self._attempt(attach)
-        self.assertViolation(r, "session.commit")
-        self.assertEqual(_counts(db), (0, 0, 0))
-
-    def test_r2_16_callback_may_not_add_a_revision(self):
-        def attach(s, rev):                                          # hostile c02 (part 1)
-            s.add(Revision(lead_id=rev.lead_id, turno_fecha=D, turno_hora=time(15),
-                           estado_revision="CONFIRMADO"))
-            return None
-        db, r = self._attempt(attach)
-        self.assertViolation(r, "attach:wrote_another_revision")
-        self.assertEqual(_counts(db), (0, 0, 0))
-
-    def test_r2_17_callback_may_not_change_booking_fields_or_write_padded_status(self):
-        for field, value in (("estado_revision", " cancelado "), ("estado_revision", "MYSTERY"),
-                             ("turno_hora", time(15)), ("turno_fecha", D + timedelta(days=1)),
-                             ("profesional_id", None), ("service_minutes", 90)):
-            db, r = self._attempt(lambda s, rev, f=field, v=value: setattr(rev, f, v))
-            self.assertViolation(r, "attach:booking_fields_changed")
-            self.assertEqual(_counts(db), (0, 0, 0), field)
-
-    def test_r2_18_callback_may_not_write_a_booked_thread_revision_elsewhere(self):
-        def attach(s, rev):
-            t = ThreadRevision(thread_id=1, status="booked", scheduled_date=D,
-                               scheduled_time=time(16))
-            s.add(t); s.flush()
-            return t
-        db, r = self._attempt(attach)
-        self.assertViolation(r, "attach:thread_revision_elsewhere")
-        self.assertEqual(_counts(db), (0, 0, 0))
-
-    def test_r2_19_the_booked_thread_revision_at_the_slot_is_allowed(self):
-        def attach(s, rev):
-            t = ThreadRevision(thread_id=1, status="booked", scheduled_date=rev.turno_fecha,
-                               scheduled_time=rev.turno_hora)
-            s.add(t); s.flush()
-            return t
-        db, r = self._attempt(attach)
-        self.assertEqual(r.outcome, Out.COMMITTED, r.reason)
-        self.assertEqual(_counts(db), (1, 1, 1))
-
-    def test_r2_20_no_external_transport_inside_a_callback(self):
-        from app.services.outbound_safety_gate import OutboundSafetyGate
-
-        def attach(s, rev):
-            try:
-                OutboundSafetyGate(s).attempt(wa_id="0", thread_id=1, text="x",
-                                              path_id="BOOKING_FLOW")
-            except Exception:
-                pass                                                 # swallowing does not help
-            return None
-        db, r = self._attempt(attach)
-        self.assertViolation(r, "external_io:outbound_gate")
-        self.assertEqual(_counts(db), (0, 0, 0))
-        self.assertIsNone(ba.booking_callback_active())
-
-    def test_r2_21_revalidation_is_read_only(self):
-        def revalidate(s, target):
-            s.add(Lead()); s.flush()
-            return None
-        db, r = self._attempt(revalidate=revalidate)
-        self.assertViolation(r, "revalidate:wrote")
-        self.assertEqual(_counts(db), (0, 0, 0))
-
-    def test_r2_22_guard_is_removed_after_a_raising_callback(self):
+    def test_r2_13_adapter_rejects_callback_keywords(self):
         db = _db(); _prof(db); lead = _lead(db)
-        def attach(s, rev):
-            raise ValueError("boom")
-        r = BookingAuthority(db).execute(_cmd(lead), attach=attach)
-        self.assertEqual(r.outcome, Out.INTERNAL_FAILURE)
-        self.assertFalse({"commit", "rollback", "begin", "begin_nested", "close"} & set(db.__dict__))
-        self.assertIsNone(ba.booking_callback_active())
-        db.add(Lead()); db.commit()                                 # the session works again
-        self.assertEqual(BookingAuthority(db).execute(_cmd(lead)).outcome, Out.COMMITTED)
+        with self.assertRaises(TypeError):
+            ce.book_from_flow_response(db, ce.CeFlowBookingRequest(
+                thread_id=1, lead_id=lead.id, inbound_event_id="w", flow_token="t",
+                requested_date=D, requested_time=time(10)), create_thread_revision=lambda s, r: None)
 
     def test_r2_23_outbound_gate_carries_the_guard_as_its_first_statement(self):
         from app.services.outbound_safety_gate import OutboundSafetyGate
@@ -370,26 +286,34 @@ class R03AckLease(unittest.TestCase):
     def setUp(self):
         self.db = _db(); _prof(self.db); lead = _lead(self.db)
         r = BookingAuthority(self.db).execute(_cmd(lead, key="ack", tracks_acknowledgement=True))
+        # SB2A-R3 rewrite: claims take no `now=`; PostgreSQL uses the database clock and
+        # SQLite the application clock, which these tests control.
+        from unittest import mock
+        self._mock = mock
         self.assertEqual(r.ack_status, "PENDING")
         self.auth = BookingAuthority(self.db)
+
+    def _claim(self, at):
+        with self._mock.patch.object(ba, "_app_now", return_value=at):
+            return self.auth.claim_acknowledgement("ack")
 
     def rec(self):
         self.db.expire_all()
         return self.db.query(BookingCommandRecord).one()
 
     def test_r2_24_pending_is_claimable_once_and_an_active_lease_cannot_be_stolen(self):
-        c = self.auth.claim_acknowledgement("ack", now=T0)
+        c = self._claim(T0)
         self.assertIsNotNone(c)
         self.assertFalse(c.duplicate_risk)
-        self.assertIsNone(self.auth.claim_acknowledgement("ack", now=T0 + timedelta(seconds=60)))
+        self.assertIsNone(self._claim(T0 + timedelta(seconds=60)))
         rec = self.rec()
         self.assertEqual((rec.ack_status, rec.ack_attempts, rec.ack_claim_token),
                          ("SENDING", 1, c.token))
 
     def test_r2_25_expired_sending_is_reclaimed_and_flags_duplicate_risk(self):
-        dead = self.auth.claim_acknowledgement("ack", now=T0)        # process dies mid-send
+        dead = self._claim(T0)        # process dies mid-send
         later = T0 + timedelta(seconds=ba.ACK_LEASE_SECONDS + 1)
-        c = self.auth.claim_acknowledgement("ack", now=later)
+        c = self._claim(later)
         self.assertIsNotNone(c)
         self.assertTrue(c.duplicate_risk)
         self.assertEqual(c.attempt, 2)
@@ -401,28 +325,28 @@ class R03AckLease(unittest.TestCase):
                          ("SENT", "wamid.OK", True))
 
     def test_r2_26_failed_is_retried_and_records_the_error_category(self):
-        c = self.auth.claim_acknowledgement("ack", now=T0)
+        c = self._claim(T0)
         self.assertTrue(self.auth.record_acknowledgement(c, sent=False, error="META_400"))
         rec = self.rec()
         self.assertEqual((rec.ack_status, rec.ack_last_error), ("FAILED", "META_400"))
-        c2 = self.auth.claim_acknowledgement("ack", now=T0 + timedelta(seconds=1))
+        c2 = self._claim(T0 + timedelta(seconds=1))
         self.assertIsNotNone(c2)
         self.assertFalse(c2.duplicate_risk)                         # a FAILED send never left
 
     def test_r2_27_sent_is_never_resent(self):
-        c = self.auth.claim_acknowledgement("ack", now=T0)
+        c = self._claim(T0)
         self.auth.record_acknowledgement(c, sent=True, transport_id="wamid.1")
         for dt in (0, 10_000, 10**7):
-            self.assertIsNone(self.auth.claim_acknowledgement("ack", now=T0 + timedelta(seconds=dt)))
+            self.assertIsNone(self._claim(T0 + timedelta(seconds=dt)))
 
     def test_r2_28_retries_are_bounded(self):
         now = T0
         for i in range(ba.ACK_MAX_ATTEMPTS):
-            c = self.auth.claim_acknowledgement("ack", now=now)
+            c = self._claim(now)
             self.assertIsNotNone(c, i)
             self.auth.record_acknowledgement(c, sent=False, error="TRANSPORT_ERROR")
             now += timedelta(seconds=1)
-        self.assertIsNone(self.auth.claim_acknowledgement("ack", now=now))
+        self.assertIsNone(self._claim(now))
         self.assertEqual((self.rec().ack_status, self.rec().ack_attempts),
                          ("FAILED", ba.ACK_MAX_ATTEMPTS))
 
@@ -542,8 +466,9 @@ class R07PreflightUncached(unittest.TestCase):
         self.assertFalse(hasattr(ba, "_SCHEMA_OK"))
         src = inspect.getsource(ba.verify_booking_schema)
         self.assertNotIn("_SCHEMA_OK", src)
-        self.assertIn("tgenabled IN ('O', 'A')", ba._PREFLIGHT_SQL)
-        self.assertIn("session_replication_role", ba._PREFLIGHT_SQL)
+        sql = ba._preflight_sql(ba._required_columns())       # SB2A-R3: column set expanded
+        self.assertIn("tgenabled IN ('O', 'A')", sql)
+        self.assertIn("session_replication_role", sql)
         run = inspect.getsource(BookingAuthority.execute)
         self.assertIn("verify_booking_schema(self.db)", run)
 

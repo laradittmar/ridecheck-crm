@@ -42,13 +42,18 @@ from ..schemas.schedule import ScheduleCheckIn
 from ..services.pricing import PricingService
 from ..services.schedule import ScheduleService
 from .booking_authority import (
+    AvailabilityRevalidation,
+    BookingAttachmentPlan,
     BookingAuthority,
     BookingCommand,
     BookingOperation,
     BookingOutcome,
     BookingSource,
+    LeadUpdate,
+    PriceRecalculation,
+    ThreadRevisionAttachment,
+    ThreadStateUpdate,
     flow_idempotency_key,
-    refuse,
 )
 
 logger = logging.getLogger(__name__)
@@ -57,6 +62,14 @@ logger = logging.getLogger(__name__)
 BOOKING_HORIZON_DAYS = 14
 TOKEN_MAX_AGE_SECONDS = 7200        # 2-hour Flow session window
 STAGE_BOOKED = "BOOKED"
+
+#: SB2A-R3 — the owner-approved successful-Flow acknowledgement (owner decision, final). It
+#: supersedes the earlier "Recibimos tu solicitud…" receipt on Track B's Flow confirmation
+#: path. `build_booking_receipt_message` below is left untouched because the Conversation
+#: Engine (Track A) still imports it; aligning CE copy is a Track A item.
+BOOKING_FLOW_RECEIPT_TEXT = (
+    "Gracias por completarlo. Un representante de RideCheck se estará comunicando con vos."
+)
 
 FLOW_VERSION = "3.0"
 
@@ -111,10 +124,14 @@ _FLOW_REFUSAL_MESSAGES: dict = {
 
 @dataclass(frozen=True)
 class ReceiptOutcome:
-    """Result of one receipt attempt. Truthy only when Meta accepted the message."""
+    """Result of one receipt attempt. Truthy only when Meta accepted the message AND returned
+    a usable message id. `ambiguous` means the request may have reached Meta but the outcome
+    is unknown (timeout after dispatch, 2xx without id, malformed success) — recorded as
+    duplicate risk, never as delivered or as not delivered."""
     sent: bool
     wamid: Optional[str]
     error: Optional[str]
+    ambiguous: bool = False
 
     def __bool__(self) -> bool:
         return self.sent
@@ -755,30 +772,10 @@ class BookingFlowService:
         zone_group = ctx.zone_group
         zone_detail = ctx.zone_detail
 
-        # Revalidate slot — runs INSIDE the authority's transaction, under its locks.
-        check_in = ScheduleCheckIn(
-            address=inspection_address or "-",
-            preferred_day=selected_date,
-            preferred_time=selected_time,
-            zone_group=ctx.zone_group,
-            is_holiday=False,
-        )
-
-        def _revalidate(db, _target):
-            check_out = self._sched.check(check_in)
-            if check_out.valid:
-                _log_event(
-                    self.db, ctx.thread.id, "BOOKING_REVALIDATION_PASS",
-                    booking_token=booking_token,
-                    extra={"date": date_str, "time": time_str},
-                )
-                return None
-            _log_event(
-                self.db, ctx.thread.id, "BOOKING_REVALIDATION_FAIL",
-                booking_token=booking_token,
-                extra={"date": date_str, "time": time_str, "reasons": check_out.reasons},
-            )
-            return refuse(BookingOutcome.SLOT_CONFLICT, "SCHEDULE_REVALIDATION")
+        # Revalidation is the AUTHORITY's: it runs ScheduleService.check itself, inside its
+        # transaction and under its locks, from these typed inputs (SB2A-R3 — no callback).
+        availability = AvailabilityRevalidation(
+            address=inspection_address or "-", zone_group=ctx.zone_group, is_holiday=False)
 
         # L4.7W4-F4: a booking with no canonical inspection location cannot be priced, and an
         # appointment in the CRM with no money attached is a commercial defect — the operator
@@ -807,94 +804,49 @@ class BookingFlowService:
                 },
             })
 
-        def _create_booking(db, crm_rev):
-            # The booking authority's attach step: runs inside ITS transaction, after the
-            # Revision is written and before the single commit.
-            thread_rev = ThreadRevision(
+        # SB2A-R3: the associated writes are DATA the booking authority executes in its own
+        # transaction — the booked ThreadRevision (status and slot derived from the booking),
+        # the price, the lead and the thread state with the consumed token. No code of ours runs
+        # inside the booking transaction.
+        #
+        # L4.7W4-F3 (preserved): the quote has no stored identity — it is a deterministic
+        # function of (tipo_vehiculo, zone_group, zone_detail) over the pricing catalog, and the
+        # Revision persists all three. The price is stamped only if the Revision's inputs equal
+        # the live focus candidate's; otherwise it is left unset (BOOKING_PRICE_INPUT_MISMATCH)
+        # rather than written from mismatched commercial inputs.
+        name_parts = name.split()
+        attachments = BookingAttachmentPlan(
+            thread_revision=ThreadRevisionAttachment(
                 thread_id=ctx.thread.id,
                 candidate_id=candidate.id if candidate else None,
-                status="booked",
                 buyer_name=name or None,
                 buyer_phone=phone or None,
                 buyer_email=email or None,
                 seller_type=None,
                 seller_name=seller_name or None,
                 address=inspection_address or None,
-                scheduled_date=selected_date,
-                scheduled_time=selected_time,
                 tipo_vehiculo=candidate.tipo_vehiculo if candidate else None,
                 marca=candidate.marca if candidate else None,
                 modelo=candidate.modelo if candidate else None,
                 anio=candidate.anio if candidate else None,
                 publication_url=listing_url or None,
                 zone_group=zone_group,
-                appointment_approval_status="PENDING",
-                appointment_approval_token=secrets.token_urlsafe(32),
-            )
-            db.add(thread_rev)
-            db.flush()
-
-            # ── L4.7W4-F3: preserve the accepted commercial quote ──────────────────
-            # W4-F2 produced a correct booking with "Total presupuestado: -": the Revision was
-            # created without precio_base/viaticos/precio_total, so the price the customer had
-            # already accepted existed nowhere in the CRM.
-            #
-            # The quote has no stored identity — it is a deterministic function of
-            # (tipo_vehiculo, zone_group, zone_detail) over the pricing catalog, and the
-            # Revision persists all three beside the price. So the quote identity IS those
-            # inputs, and stamping from them through the same PricingService reproduces the
-            # accepted amount exactly rather than inventing or re-estimating one.
-            #
-            # The inputs are read from the live cycle-bounded focus candidate (resolve_context),
-            # which is the same candidate CE priced. The check below is defence in depth: if the
-            # Revision were ever built from something other than that candidate, the price must
-            # not be written at all rather than written from mismatched commercial inputs.
-            price_inputs_ok = candidate is not None and (
-                crm_rev.tipo_vehiculo == candidate.tipo_vehiculo
-                and crm_rev.zone_group == zone_group
-                and crm_rev.zone_detail == zone_detail
-            )
-            if not price_inputs_ok:
-                _log_event(
-                    db, ctx.thread.id, "BOOKING_PRICE_INPUT_MISMATCH",
-                    booking_token=booking_token,
-                    extra={"crm_rev_id": crm_rev.id,
-                           "rev_tipo": crm_rev.tipo_vehiculo,
-                           "rev_zone_group": crm_rev.zone_group,
-                           "rev_zone_detail": crm_rev.zone_detail},
-                )
-            else:
-                self._pricing.recalculate_revision_if_possible(db=db, revision=crm_rev)
-                if crm_rev.precio_total is None:
-                    # Priceable inputs that the catalog cannot price is a real commercial gap,
-                    # not a silent "-". Recorded so it is visible without reading the booking.
-                    _log_event(
-                        db, ctx.thread.id, "BOOKING_PRICE_UNRESOLVED",
-                        booking_token=booking_token,
-                        extra={"crm_rev_id": crm_rev.id,
-                               "tipo_vehiculo": crm_rev.tipo_vehiculo,
-                               "zone_group": crm_rev.zone_group,
-                               "zone_detail": crm_rev.zone_detail},
-                    )
-                db.flush()
-
-            # Lead state
-            lead = ctx.lead
-            lead.estado = "COORDINAR_DISPONIBILIDAD"
-            lead.flag = "ACEPTADO"
-            lead.necesita_humano = True
-            if name and not lead.nombre:
-                parts = name.split()
-                lead.nombre = parts[0] if parts else name
-                lead.apellido = " ".join(parts[1:]) if len(parts) > 1 else None
-
-            # Thread state — consume token (same transaction as the booking)
-            state = ctx.state
-            state.current_revision_id = thread_rev.id
-            state.last_stage = STAGE_BOOKED
-            state.needs_human = True
-            state.flow_booking_token = None  # token consumed
-            return thread_rev
+                request_approval=True,
+            ),
+            price=PriceRecalculation(require_inputs=(
+                candidate.tipo_vehiculo, zone_group, zone_detail)) if candidate else None,
+            lead=LeadUpdate(
+                estado="COORDINAR_DISPONIBILIDAD", flag="ACEPTADO", necesita_humano=True,
+                nombre_if_empty=(name_parts[0] if name_parts else None),
+                apellido_if_empty=(" ".join(name_parts[1:]) or None) if len(name_parts) > 1 else None,
+            ),
+            thread_state=ThreadStateUpdate(
+                link_current_revision=True, last_stage=STAGE_BOOKED, needs_human=True,
+                consume_flow_token=True),
+        )
+        if candidate is None:
+            _log_event(self.db, ctx.thread.id, "BOOKING_PRICE_INPUT_MISMATCH",
+                       booking_token=booking_token, extra={"reason": "no_focus_candidate"})
 
         command = BookingCommand(
             operation=BookingOperation.CREATE,
@@ -919,8 +871,11 @@ class BookingFlowService:
                 "tipo_vendedor": None,
             },
         )
-        result = self._authority.execute(command, revalidate=_revalidate,
-                                         attach=_create_booking)
+        result = self._authority.execute(command, availability=availability,
+                                         attachments=attachments)
+        if result.reason == "SCHEDULE_REVALIDATION":
+            _log_event(self.db, ctx.thread.id, "BOOKING_REVALIDATION_FAIL",
+                       booking_token=booking_token, extra={"date": date_str, "time": time_str})
 
         if result.outcome is BookingOutcome.IDEMPOTENT_REPLAY:
             # A concurrent duplicate of this very submission committed first.
@@ -997,7 +952,8 @@ class BookingFlowService:
         """Record one receipt attempt under its lease (WAMID or error category)."""
         recorded = self._authority.record_acknowledgement(
             claim, sent=bool(outcome), transport_id=getattr(outcome, "wamid", None),
-            error=getattr(outcome, "error", None) or (None if outcome else "NOT_SENT"))
+            error=getattr(outcome, "error", None) or (None if outcome else "NOT_SENT"),
+            ambiguous=bool(getattr(outcome, "ambiguous", False)))
         if not recorded:
             logger.warning("BOOKING_RECEIPT outcome not recorded: lease was reclaimed "
                            "attempt=%s", claim.attempt)
@@ -1046,8 +1002,13 @@ class BookingFlowService:
         that atomically claims the ledger's acknowledgement (PENDING/FAILED → SENDING). The
         outbound gate's dedup window is a second line of defence, not the mechanism.
 
-        Returns a ReceiptOutcome: truthy only when Meta accepted the message, carrying its
-        WAMID (recorded in the ledger) or an error category.
+        Returns a ReceiptOutcome (SB2A-R3 classification):
+          * definitive pre-send refusal (gate) or failure before dispatch → not sent
+          * definitive Meta rejection (4xx)                              → not sent
+          * success with a non-empty WAMID                               → sent
+          * ambiguous: network/timeout after dispatch, 2xx without a usable id, malformed
+            success, Meta 5xx                                            → AMBIGUOUS
+        Exactly-once external delivery is never claimed.
 
         Routed through OutboundSafetyGate on the registered BOOKING_FLOW path — the same
         path that dispatched the Flow — so the acknowledgement is attributed to the booking
@@ -1060,11 +1021,7 @@ class BookingFlowService:
         from .outbound_path_registry import OutboundPathId, get_deployment_id
         from .outbound_safety_gate import GateOutcome, OutboundSafetyGate
 
-        first_name = (name or "").strip().split(" ")[0] if name else ""
-        text = build_booking_receipt_message(
-            first_name or None, _date_title(selected_date),
-            selected_time.strftime("%H:%M"),
-        )
+        text = BOOKING_FLOW_RECEIPT_TEXT          # owner-approved copy (SB2A-R3)
         try:
             gate = OutboundSafetyGate(self.db)
             result = gate.attempt(
@@ -1081,26 +1038,42 @@ class BookingFlowService:
             try:
                 wa_message_id, _ = _send_whatsapp_cloud_text(
                     to_wa_id=ctx.contact.wa_id, text=text)
-                gate.mark_sent(result.message_id, wa_message_id)
-                logger.info("BOOKING_RECEIPT sent thread_id=%s wamid=%s",
-                            ctx.thread.id, wa_message_id)
-                return ReceiptOutcome(True, wa_message_id, None)
             except MetaSendError as exc:
-                gate.mark_failed(result.message_id, meta_http_status=exc.http_status,
+                status = exc.http_status
+                gate.mark_failed(result.message_id, meta_http_status=status,
                                  meta_error_payload=exc.to_payload())
-                logger.error("BOOKING_RECEIPT Meta send failed thread_id=%s: %s",
-                             ctx.thread.id, exc)
-                return ReceiptOutcome(False, None, f"META_{exc.http_status}")
+                logger.error("BOOKING_RECEIPT Meta send failed thread_id=%s status=%s",
+                             ctx.thread.id, status)
+                if status is not None and 400 <= status < 500:
+                    return ReceiptOutcome(False, None, f"META_REJECTED_{status}")
+                if status is None:
+                    return ReceiptOutcome(False, None, "AMBIGUOUS_NETWORK_OR_TIMEOUT",
+                                          ambiguous=True)
+                if 200 <= status < 300:
+                    return ReceiptOutcome(False, None, "AMBIGUOUS_2XX_WITHOUT_MESSAGE_ID",
+                                          ambiguous=True)
+                return ReceiptOutcome(False, None, f"AMBIGUOUS_META_{status}", ambiguous=True)
             except Exception as exc:
                 gate.mark_failed(result.message_id)
-                logger.error("BOOKING_RECEIPT send failed thread_id=%s: %s",
-                             ctx.thread.id, exc)
-                return ReceiptOutcome(False, None, "TRANSPORT_ERROR")
+                logger.error("BOOKING_RECEIPT transport outcome unknown thread_id=%s: %s",
+                             ctx.thread.id, type(exc).__name__)
+                return ReceiptOutcome(False, None, "AMBIGUOUS_TRANSPORT_EXCEPTION",
+                                      ambiguous=True)
+            wamid = (wa_message_id or "").strip()
+            if not wamid:
+                return ReceiptOutcome(False, None, "AMBIGUOUS_SUCCESS_WITHOUT_WAMID",
+                                      ambiguous=True)
+            try:
+                gate.mark_sent(result.message_id, wamid)
+            except Exception:                    # bookkeeping failure ≠ delivery failure
+                logger.exception("BOOKING_RECEIPT sent but gate bookkeeping failed")
+            logger.info("BOOKING_RECEIPT sent thread_id=%s wamid=%s", ctx.thread.id, wamid)
+            return ReceiptOutcome(True, wamid, None)
         except Exception as exc:
             # The booking is already committed; nothing here may undo it.
-            logger.error("BOOKING_RECEIPT unexpected failure thread_id=%s: %s",
+            logger.error("BOOKING_RECEIPT failed before dispatch thread_id=%s: %s",
                          ctx.thread.id, exc)
-        return ReceiptOutcome(False, None, "UNEXPECTED")
+        return ReceiptOutcome(False, None, "PRE_SEND_FAILURE")
 
 # ── Observability helpers ─────────────────────────────────────────────────────
 

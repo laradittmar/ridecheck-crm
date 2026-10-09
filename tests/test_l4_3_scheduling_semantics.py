@@ -573,8 +573,10 @@ class TestBookingFlowWiring(unittest.TestCase):
         import inspect
         from app.services.booking_flow_service import BookingFlowService
         source = inspect.getsource(BookingFlowService.handle_confirm_booking)
-        self.assertIn("self._sched.check(", source)
-        self.assertIn("check_out.valid", source)
+        # SB2A-R3 rewrite: the re-check is the booking authority's own, from a typed plan.
+        self.assertIn("availability=availability", source)
+        from app.services.booking_authority import BookingAuthority
+        self.assertIn("out.valid", inspect.getsource(BookingAuthority._revalidate_availability))
         self.assertIn("BookingSlotConflictError", source)
 
     def test_flow_08_text_path_cannot_create_a_booking(self):

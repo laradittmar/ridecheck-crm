@@ -106,6 +106,9 @@ def _world(db, *, tipo=W4_TIPO, group=W4_GROUP, detail=W4_DETAIL, seed_zone=True
 
 def _sched_ok(svc):
     svc._sched = MagicMock()
+    # SB2A-R3 rewrite: revalidation is the booking authority's own; point its internal
+    # availability reader at the same mock so the test controls both offer and revalidation.
+    svc._authority._availability_service = lambda: svc._sched
     svc._sched.list_slots.return_value = ScheduleSlotsOut(
         preferred_day=FUTURE, business_hours="09:30-14:00", slots=[SLOT])
     svc._sched.check.return_value = ScheduleCheckOut(
@@ -201,18 +204,30 @@ class TestPriceIntegrity(_Base):
                                  f"{node.name} computes a total itself")
                 self.assertNotIn("PRECIO_BASE_BY_TIPO", body,
                                  f"{node.name} reads a second price table")
-        self.assertIn("self._pricing.recalculate_revision_if_possible", BFS_SOURCE)
+        # SB2A-R3 rewrite: the Flow no longer runs code inside the booking transaction; it
+        # hands a typed PriceRecalculation to the authority, which delegates to the SAME
+        # PricingService — still exactly one pricing authority.
+        self.assertIn("PriceRecalculation(require_inputs=", BFS_SOURCE)
+        import inspect
+        from app.services.booking_authority import BookingAuthority
+        self.assertIn("recalculate_revision_if_possible",
+                      inspect.getsource(BookingAuthority._recalculate_price))
 
     def test_mismatched_commercial_inputs_are_recorded_and_not_priced(self):
         """Defence in depth: the live cycle-bounded candidate makes this unreachable
         today, so it is asserted structurally rather than simulated."""
         fn = next(ast.unparse(n) for n in ast.walk(ast.parse(BFS_SOURCE))
                   if isinstance(n, ast.FunctionDef) and n.name == "handle_confirm_booking")
-        self.assertIn("BOOKING_PRICE_INPUT_MISMATCH", fn)
-        self.assertIn("price_inputs_ok", fn)
-        i_guard = fn.index("price_inputs_ok =")
-        i_price = fn.index("recalculate_revision_if_possible")
-        self.assertLess(i_guard, i_price, "the guard must precede the stamp")
+        # SB2A-R3 rewrite: the input guard moved into the authority's typed price step
+        # (PriceRecalculation.require_inputs); the Flow supplies the candidate's inputs.
+        self.assertIn("PriceRecalculation(require_inputs=(candidate.tipo_vehiculo, zone_group, zone_detail))", fn)
+        import inspect
+        from app.services.booking_authority import BookingAuthority
+        src = inspect.getsource(BookingAuthority._recalculate_price)
+        self.assertIn("BOOKING_PRICE_INPUT_MISMATCH", src)
+        self.assertLess(src.index("BOOKING_PRICE_INPUT_MISMATCH"),
+                        src.index("recalculate_revision_if_possible"),
+                        "the guard must precede the stamp")
 
 
 class TestAtomicity(_Base):
@@ -231,20 +246,15 @@ class TestAtomicity(_Base):
         """BOOKPRICE-10 — no window where a booked Revision exists without its price."""
         fn = next(ast.unparse(n) for n in ast.walk(ast.parse(BFS_SOURCE))
                   if isinstance(n, ast.FunctionDef) and n.name == "handle_confirm_booking")
-        # SB2A rewrite: the single commit moved into the booking authority. The price is
-        # stamped in the attach step handed to it, and the authority runs attach before its
-        # one commit — the same "no window" guarantee, now asserted on both sides.
-        i_price = fn.index("recalculate_revision_if_possible")
-        i_exec = fn.index("self._authority.execute(")
-        self.assertLess(i_price, i_exec, "pricing is part of the attach handed to the authority")
-        self.assertIn("attach=_create_booking", fn)
+        # SB2A-R3 rewrite: the price is a typed attachment (PriceRecalculation) handed to the
+        # authority, which applies its attachments before its one commit — the same "no
+        # window" guarantee, asserted on both sides.
+        self.assertLess(fn.index("PriceRecalculation("), fn.index("self._authority.execute("))
+        self.assertIn("attachments=attachments", fn)
         import inspect
         from app.services.booking_authority import BookingAuthority
         auth = inspect.getsource(BookingAuthority.execute)
-        # SB2A-R2 rewrite: attach now runs under the enforced callback guard (_run_callback);
-        # the ordering asserted is unchanged — attach (and its pricing) before the commit.
-        self.assertLess(auth.index('self._run_callback("attach", attach, revision)'),
-                        auth.index("self.db.commit()"),
+        self.assertLess(auth.index("self._apply_attachments("), auth.index("self.db.commit()"),
                         "the price must be stamped before the commit")
         rev = self.book()
         tr = self.db.query(ThreadRevision).one()

@@ -205,7 +205,9 @@ class TestCanonicalBookingLocation(_Base):
         fn = _fn(BFS_SOURCE, "handle_confirm_booking")
         self.assertIn("BOOKING_REFUSED_NO_CANONICAL_LOCATION", fn)
         i_guard = fn.index("BOOKING_REFUSED_NO_CANONICAL_LOCATION")
-        i_write = fn.index("thread_rev = ThreadRevision(")
+        # SB2A-R3 rewrite: the Flow hands TYPED plans to the booking authority (no callback);
+        # revalidation, ThreadRevision, price and token consumption are the authority's.
+        i_write = fn.index("ThreadRevisionAttachment(")
         self.assertLess(i_guard, i_write, "the refusal must precede the write")
 
     def test_bookctx_04_05_the_quote_and_the_booking_share_inputs(self):
@@ -215,7 +217,9 @@ class TestCanonicalBookingLocation(_Base):
                       zone_group="CABA", zone_detail="La Paternal")
         self.assertEqual(q.precio_total, q.precio_base + q.viaticos)
         fn = _fn(BFS_SOURCE, "handle_confirm_booking")
-        self.assertIn("self._pricing.recalculate_revision_if_possible", fn)
+        # SB2A-R3 rewrite: the Flow hands TYPED plans to the booking authority (no callback);
+        # revalidation, ThreadRevision, price and token consumption are the authority's.
+        self.assertIn("PriceRecalculation(require_inputs=", fn)
 
     def test_bookctx_06_the_exact_wild_case_now_prices(self):
         """BOOKCTX-06 — Peugeot 3008 in 'paternal' resolves and prices. No hardcoded total:
@@ -260,12 +264,17 @@ class TestFlowPrefillWithinPublishedLimits(unittest.TestCase):
         fn = _fn(BFS_SOURCE, "_appointment_screen_data")
         self.assertIn("still_free", fn)
         confirm = _fn(BFS_SOURCE, "handle_confirm_booking")
-        self.assertIn("self._sched.check(check_in)", confirm)
+        # SB2A-R3 rewrite: the Flow hands TYPED plans to the booking authority (no callback);
+        # revalidation, ThreadRevision, price and token consumption are the authority's.
+        self.assertIn("availability=availability", confirm)
+        self.assertIn("AvailabilityRevalidation(", confirm)
         self.assertIn("BOOKING_REVALIDATION_FAIL", confirm)
 
     def test_flow_prefill_10_no_duplicate_booking(self):
         confirm = _fn(BFS_SOURCE, "handle_confirm_booking")
-        self.assertIn("state.flow_booking_token = None", confirm)
+        # SB2A-R3 rewrite: the Flow hands TYPED plans to the booking authority (no callback);
+        # revalidation, ThreadRevision, price and token consumption are the authority's.
+        self.assertIn("consume_flow_token=True", confirm)
 
     def test_flow_prefill_04_05_06_phone_and_name_are_blocked_by_the_published_flow(self):
         """FLOW-PREFILL-04/05/06 — recorded as an external constraint, not silently skipped.

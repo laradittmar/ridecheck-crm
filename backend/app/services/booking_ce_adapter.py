@@ -18,8 +18,7 @@ SB2A-R2 corrections:
   session it would commit the Conversation Engine's half-finished turn on success and erase
   its pending work on a refusal. Every adapter call therefore runs in its OWN short-lived
   session on its own connection, closed before returning. The caller's session is never
-  flushed, committed or rolled back here. The callback receives the ADAPTER's session and
-  must load what it writes by id in that session — never mutate the caller's objects.
+  flushed, committed or rolled back here.
 * **Identity (SB2A-R-09).** Every command needs a stable, non-empty event identity, scoped
   to the thread. With none, the call fails closed (`VALIDATION_FAILED /
   EVENT_IDENTITY_REQUIRED`) without touching the database; an empty string is never
@@ -27,6 +26,10 @@ SB2A-R2 corrections:
 * **Partial slots (SB2A-R-01).** A manual-scheduling request stores whatever part of the
   requested slot is known — complete, date only, time only or nothing — as non-occupying
   `REPROGRAMAR`. It can never collide, so the human escalation always survives.
+
+SB2A-R3: no callback. CE describes its associated writes (the ThreadRevision, lead and thread
+state) as a typed `BookingAttachmentPlan`; the booking authority performs them inside its
+own transaction. The binding SB2B rules are in the integration manifest.
 """
 from __future__ import annotations
 
@@ -34,12 +37,13 @@ import hashlib
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, time
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Mapping, Optional
 
 from sqlalchemy.orm import Session
 
 from .booking_authority import (
     DEFAULT_LOCK_TIMEOUT_MS,
+    BookingAttachmentPlan,
     BookingAuthority,
     BookingCommand,
     BookingOperation,
@@ -68,6 +72,8 @@ class CeFlowBookingRequest:
     requested_time: Optional[time] = None
     #: Non-booking Revision fields CE already computes (vehicle, zone, address, seller…).
     revision_fields: Mapping[str, Any] = field(default_factory=dict)
+    #: Typed associated writes (booked ThreadRevision, lead, thread state) — data only.
+    attachments: Optional[BookingAttachmentPlan] = None
 
 
 @dataclass(frozen=True)
@@ -84,6 +90,8 @@ class CeSchedulingEscalationRequest:
     #: `COALESCE(state.current_cycle_start_message_db_id, 0)` — one escalation per cycle.
     cycle_key: Optional[int] = None
     inbound_event_id: Optional[str] = None
+    #: Typed associated writes (provisional ThreadRevision, lead, thread state) — data only.
+    attachments: Optional[BookingAttachmentPlan] = None
 
 
 def _nonblank(value: Optional[str]) -> Optional[str]:
@@ -141,13 +149,11 @@ def _no_identity() -> BookingResult:
 
 def book_from_flow_response(
     db: Session, req: CeFlowBookingRequest, *,
-    create_thread_revision: Callable[[Session, Any], Any],
     lock_timeout_ms: int = DEFAULT_LOCK_TIMEOUT_MS,
 ) -> BookingResult:
-    """CE-W1. `create_thread_revision(adapter_session, revision)` writes CE's booked
-    ThreadRevision and the lead/thread-state updates — loaded by id in the ADAPTER session —
-    inside the authority's transaction and returns the ThreadRevision; CE keeps keying its
-    `flow-txn:<ThreadRevision.id>` acknowledgement on the returned `thread_revision_id`.
+    """CE-W1. Books the agreed slot and performs `req.attachments` (typically the booked
+    ThreadRevision, lead and thread-state updates) in the authority's transaction; CE keeps
+    keying its `flow-txn:<ThreadRevision.id>` acknowledgement on `result.thread_revision_id`.
 
     A response without a complete agreed slot cannot be a booking: it is recorded as a
     non-occupying manual-scheduling request with whatever part of the slot is known.
@@ -164,18 +170,17 @@ def book_from_flow_response(
         tracks_acknowledgement=complete)
     with isolated_session(db) as session:
         return BookingAuthority(session, lock_timeout_ms=lock_timeout_ms).execute(
-            command, attach=create_thread_revision)
+            command, attachments=req.attachments)
 
 
 def request_manual_scheduling(
     db: Session, req: CeSchedulingEscalationRequest, *,
-    create_thread_revision: Optional[Callable[[Session, Any], Any]] = None,
     lock_timeout_ms: int = DEFAULT_LOCK_TIMEOUT_MS,
 ) -> BookingResult:
     """CE-W2. Records the requested time — complete, partial or absent — as NON-OCCUPYING
     (`REPROGRAMAR`): it cannot collide with any booking, so the human escalation is never
-    lost to an overlap or to an incomplete slot. The optional `create_thread_revision` writes
-    CE's provisional ThreadRevision in the same (adapter) transaction.
+    lost to an overlap or to an incomplete slot. `req.attachments` may add CE's provisional
+    ThreadRevision (non-occupying status) in the same transaction.
     """
     key = ce_escalation_key(req)
     if key is None:
@@ -187,4 +192,4 @@ def request_manual_scheduling(
         requested_time=req.requested_time, revision_fields=req.revision_fields)
     with isolated_session(db) as session:
         return BookingAuthority(session, lock_timeout_ms=lock_timeout_ms).execute(
-            command, attach=create_thread_revision)
+            command, attachments=req.attachments)

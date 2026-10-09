@@ -141,12 +141,17 @@ class TestBookingReceipt(unittest.TestCase):
         self.assertLess(i_fail, i_send)
         self.assertIn("raise BookingSlotConflictError", fn)
         # the conflict raise sits between them, so the send is unreachable on failure
-        self.assertLess(i_fail, fn.index("raise BookingSlotConflictError"))
+        # SB2A-R3 rewrite: the Flow hands TYPED plans to the booking authority (no callback);
+        # revalidation, ThreadRevision, price and token consumption are the authority's.
+        self.assertLess(i_fail, fn.rindex("raise BookingSlotConflictError"))
+        self.assertLess(fn.rindex("raise BookingSlotConflictError"), i_send)
 
     def test_book_end_05_06_exactly_once_comes_from_the_consumed_token(self):
         """BOOK-END-05/06 — a Meta retry or duplicate confirm cannot reach the send."""
         confirm = _fn(BFS_SOURCE, "handle_confirm_booking")
-        self.assertIn("state.flow_booking_token = None", confirm)
+        # SB2A-R3 rewrite: the Flow hands TYPED plans to the booking authority (no callback);
+        # revalidation, ThreadRevision, price and token consumption are the authority's.
+        self.assertIn("consume_flow_token=True", confirm)
         resolve = _fn(BFS_SOURCE, "resolve_context")
         self.assertIn("token invalid or already consumed", resolve)
         self.assertIn("raise BookingTokenError", resolve)

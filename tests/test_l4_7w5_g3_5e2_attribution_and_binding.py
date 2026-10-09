@@ -651,9 +651,18 @@ class F_NonRegression(unittest.TestCase):
         self.assertEqual(src.count("Gracias por completarlo"), 1,
                          "the acknowledgement copy exists in more than one place")
         import app.services.booking_flow_service as bfs
-        self.assertNotIn("Gracias por completarlo",
-                         pathlib.Path(bfs.__file__).read_text(encoding="utf-8"),
-                         "the two booking paths hold competing acknowledgement copy")
+        # SB2A-R3 rewrite (owner decision, final): Track B's Flow receipt must be EXACTLY the
+        # owner-approved sentence, so booking_flow_service now holds it — once, as the approved
+        # copy, never a variant. CE's constant (Track A) still reads "se va a comunicar"; that
+        # divergence is an open Track A ALIGNMENT item, asserted here so it cannot be forgotten.
+        approved = ("Gracias por completarlo. Un representante de RideCheck se estará "
+                    "comunicando con vos.")
+        bfs_src = pathlib.Path(bfs.__file__).read_text(encoding="utf-8")
+        self.assertEqual(bfs.BOOKING_FLOW_RECEIPT_TEXT, approved)
+        self.assertEqual(bfs_src.count("Gracias por completarlo"), 1,
+                         "Track B holds the acknowledgement copy exactly once")
+        self.assertNotEqual(ce.ConversationEngine._FLOW_COMPLETION_ACK, approved,
+                            "CE now matches the approved copy — update this alignment note")
         authorizer = inspect.getsource(ce.ConversationEngine._plan_flow_completion_ack)
         self.assertIn("flow_completion_ack_authorized(evidence)", authorizer)
         # Every pinned condition is evidenced by name; none is assumed.

@@ -181,8 +181,7 @@ class R2Postgres(unittest.TestCase):
         caller = self.caller_session()
         r = self.ce.book_from_flow_response(caller, self.ce.CeFlowBookingRequest(
             thread_id=self.thread(), lead_id=self.lead, inbound_event_id="wamid.R2-03",
-            flow_token=None, requested_date=self.day, requested_time=time(10, 15)),
-            create_thread_revision=lambda s, rev: None)
+            flow_token=None, requested_date=self.day, requested_time=time(10, 15)))
         self.assertEqual(r.outcome.value, "SLOT_CONFLICT")
         caller.commit(); caller.close()                           # the caller still owns its work
         self.assertEqual(self.caller_work_visible(), 1)
@@ -191,12 +190,17 @@ class R2Postgres(unittest.TestCase):
         caller = self.caller_session()
         before = self.engine.pool.checkedout()
 
-        def boom(s, rev):
-            raise RuntimeError("callback failure")
-        r = self.ce.book_from_flow_response(caller, self.ce.CeFlowBookingRequest(
-            thread_id=self.thread(), lead_id=self.lead, inbound_event_id="wamid.R2-04",
-            flow_token=None, requested_date=self.day, requested_time=time(11)),
-            create_thread_revision=boom)
+        # SB2A-R3 rewrite: no callback exists; fail the authority's own attachment step.
+        from unittest import mock
+        tid = self.thread()
+        plan = self.ba.BookingAttachmentPlan(
+            thread_revision=self.ba.ThreadRevisionAttachment(thread_id=tid))
+        with mock.patch.object(self.ba.BookingAuthority, "_apply_attachments",
+                               side_effect=RuntimeError("attachment failure")):
+            r = self.ce.book_from_flow_response(caller, self.ce.CeFlowBookingRequest(
+                thread_id=tid, lead_id=self.lead, inbound_event_id="wamid.R2-04",
+                flow_token=None, requested_date=self.day, requested_time=time(11),
+                attachments=plan))
         self.assertEqual(r.outcome.value, "INTERNAL_FAILURE")
         self.assertEqual(self.engine.pool.checkedout(), before)  # adapter connection returned
         caller.commit(); caller.close()
@@ -219,20 +223,17 @@ class R2Postgres(unittest.TestCase):
         self.assertEqual(self.rows()[0], 1)
 
     def test_pg_r2_06_caller_holding_a_row_lock_yields_retryable_not_a_hang(self):
-        """SB2B rule evidence: if the caller has locked a row the attach callback writes, the
-        adapter's own transaction cannot wait for its caller — lock_timeout turns that
-        self-deadlock into RETRYABLE_FAILURE, and the caller's work is untouched."""
+        """SB2B rule SB2B-1 evidence: if the caller has locked a row the typed attachment
+        writes, the adapter's own transaction cannot wait for its caller — lock_timeout turns
+        that self-deadlock into RETRYABLE_FAILURE, and the caller's work is untouched."""
         caller = Session(self.engine)
         caller.execute(text("UPDATE leads SET estado='R2-LOCKED' WHERE id=:l"), {"l": self.lead})
-
-        def attach(s, rev):
-            s.execute(text("UPDATE leads SET estado='R2-ATTACH' WHERE id=:l"), {"l": self.lead})
-            return None
         t0 = datetime.now()
         r = self.ce.book_from_flow_response(caller, self.ce.CeFlowBookingRequest(
             thread_id=self.thread(), lead_id=self.lead, inbound_event_id="wamid.R2-06",
-            flow_token=None, requested_date=self.day, requested_time=time(12)),
-            create_thread_revision=attach, lock_timeout_ms=400)
+            flow_token=None, requested_date=self.day, requested_time=time(12),
+            attachments=self.ba.BookingAttachmentPlan(
+                lead=self.ba.LeadUpdate(necesita_humano=True))), lock_timeout_ms=400)
         self.assertEqual((r.outcome.value, r.reason), ("RETRYABLE_FAILURE", "LOCK_TIMEOUT"))
         self.assertLess((datetime.now() - t0).total_seconds(), 10)
         caller.commit(); caller.close()
@@ -250,80 +251,29 @@ class R2Postgres(unittest.TestCase):
             r = self.ce.book_from_flow_response(caller, self.ce.CeFlowBookingRequest(
                 thread_id=self.thread(), lead_id=self.lead, inbound_event_id="wamid.R2-07",
                 flow_token=None, requested_date=self.day, requested_time=time(13)),
-                create_thread_revision=lambda s, rev: None, lock_timeout_ms=300)
+                lock_timeout_ms=300)
             holder.rollback()
         self.assertEqual(r.outcome.value, "RETRYABLE_FAILURE")
         caller.commit(); caller.close()
         self.assertEqual(self.caller_work_visible(), 1)
 
-    # ══ R-04 — hostile callbacks against the real database ═════════════════
+    # ══ R-04 — superseded by SB2A-R3 (no callback interface) ════════════════
+    # The R2 hostile-callback probes (c01/c02, raw SQL, trigger/transaction SQL, side
+    # connections) are re-run against the typed-plan architecture, with fault injection into
+    # the authority's own steps, in test_sb2a_r3_typed_plans_pg.py.
 
-    def assertViolation(self, r, fragment):
-        self.assertEqual(r.outcome.value, "INTERNAL_FAILURE")
-        self.assertTrue(r.reason.startswith("CALLBACK_VIOLATION:"), r.reason)
-        self.assertIn(fragment, r.reason)
-        self.assertEqual(self.rows()[0::2], (0, 0))               # zero partial rows
-
-    def test_pg_r2_08_c01_callback_commits_then_raises(self):
-        def attach(s, rev):
-            s.commit()
-            raise RuntimeError("after commit")
-        self.assertViolation(self.run_cmd(self.cmd(key=f"c01{self.lead}"), attach=attach),
-                             "session.commit")
-
-    def test_pg_r2_09_c02_callback_adds_a_revision_and_pads_the_status(self):
-        from app.models import Revision
-
-        def attach(s, rev):
-            s.add(Revision(lead_id=self.lead, turno_fecha=self.day, turno_hora=time(15),
-                           estado_revision=" confirmado "))
-            rev.estado_revision = " cancelado "
-            return None
-        self.assertViolation(self.run_cmd(self.cmd(key=f"c02{self.lead}"), attach=attach), "attach:")
-
-    def test_pg_r2_10_raw_sql_writes_are_caught_by_the_database_check(self):
-        tid = self.thread()
-        cases = {
-            "wrote_another_revision": lambda s, rev: s.execute(text(
-                "INSERT INTO revisions (lead_id, created_at, estado_revision, turno_fecha, turno_hora) "
-                "VALUES (:l, now(), 'CONFIRMADO', :d, '16:00')"), {"l": self.lead, "d": self.day}),
-            "booking_fields_changed": lambda s, rev: s.execute(text(
-                "UPDATE revisions SET estado_revision=' cancelado ' WHERE id=:i"), {"i": rev.id}),
-            "thread_revision_elsewhere": lambda s, rev: s.execute(text(
-                "INSERT INTO thread_revisions (thread_id, status, scheduled_date, scheduled_time, "
-                "created_at) VALUES (:t, 'booked', :d, '17:00', now())"), {"t": tid, "d": self.day}),
-        }
-        for kind, attach in cases.items():
-            r = self.run_cmd(self.cmd(), attach=attach)
-            self.assertViolation(r, kind)
-            self.assertEqual(self.rows()[1], 0, kind)
-
-    def test_pg_r2_11_trigger_and_transaction_sql_and_side_connections_are_refused(self):
-        hostile = {
-            "sql:SET": lambda s, rev: s.execute(text("SET session_replication_role = replica")),
-            "sql:SAVEPOINT": lambda s, rev: s.execute(text("SAVEPOINT x")),
-            "sql:COMMIT": lambda s, rev: s.execute(text("COMMIT")),
-            "sql:ALTER": lambda s, rev: s.execute(text(
-                "ALTER TABLE revisions DISABLE TRIGGER trg_revisions_sb2a_booking_version")),
-            "engine.new_connection": lambda s, rev: self.engine.connect().close(),
-            "session.begin_nested": lambda s, rev: s.begin_nested(),
-        }
-        for frag, attach in hostile.items():
-            self.assertViolation(self.run_cmd(self.cmd(), attach=attach), frag)
-        with self.engine.connect() as c:                          # nothing got disabled
-            self.assertEqual(c.execute(text(
-                "SELECT tgenabled FROM pg_trigger WHERE tgname='trg_revisions_sb2a_booking_version'"
-            )).scalar(), "O")
-
-    def test_pg_r2_12_guard_is_per_context_other_threads_book_normally(self):
+    def test_pg_r2_12_a_parked_booking_does_not_affect_other_threads(self):
         parked, release, out = threading.Event(), threading.Event(), {}
+        base = self.ba.BookingAuthority
 
-        def attach(s, rev):
-            parked.set(); release.wait(10)
-            return None
+        class _Park(base):
+            def _verify_before_commit(inner, *a, **k):
+                parked.set(); release.wait(10)
+                return base._verify_before_commit(inner, *a, **k)
 
         def holder():
-            out["h"] = self.run_cmd(self.cmd(time(10)), attach=attach).outcome.value
+            with Session(self.engine) as s:
+                out["h"] = _Park(s).execute(self.cmd(time(10))).outcome.value
 
         th = threading.Thread(target=holder); th.start()
         self.assertTrue(parked.wait(10))
@@ -331,20 +281,19 @@ class R2Postgres(unittest.TestCase):
         out["o"] = self.run_cmd(self.cmd(time(10), day=other_day)).outcome.value
         release.set(); th.join(15)
         self.assertEqual(out, {"h": "COMMITTED", "o": "COMMITTED"})
-        self.assertIsNone(self.ba.booking_callback_active())
+        self.assertIsNone(self.ba.booking_transaction_active())
 
     def test_pg_r2_13_booked_thread_revision_at_the_slot_still_commits(self):
         tid = self.thread()
-        from app.models import ThreadRevision
-
-        def attach(s, rev):
-            t = ThreadRevision(thread_id=tid, status="booked", scheduled_date=rev.turno_fecha,
-                               scheduled_time=rev.turno_hora)
-            s.add(t); s.flush()
-            return t
-        r = self.run_cmd(self.cmd(key=f"ok{self.lead}"), attach=attach)
+        plan = self.ba.BookingAttachmentPlan(
+            thread_revision=self.ba.ThreadRevisionAttachment(thread_id=tid))
+        r = self.run_cmd(self.cmd(key=f"ok{self.lead}"), attachments=plan)
         self.assertEqual(r.outcome.value, "COMMITTED", r.reason)
         self.assertEqual(self.rows(), (1, 1, 1))
+        with self.engine.connect() as c:
+            st = c.execute(text("SELECT status, scheduled_date, scheduled_time FROM thread_revisions "
+                                "WHERE id=:i"), {"i": r.thread_revision_id}).one()
+        self.assertEqual(tuple(st), ("booked", self.day, time(10)))
 
     # ══ R-03 — lease under real concurrency ═══════════════════════════════════
 
@@ -376,9 +325,12 @@ class R2Postgres(unittest.TestCase):
         key = f"ack-x-{self.lead}"
         self._tracked(key)
         with Session(self.engine) as s:                          # a claimant that died
-            dead = self.ba.BookingAuthority(s).claim_acknowledgement(
-                key, now=datetime.now(timezone.utc) - timedelta(seconds=self.ba.ACK_LEASE_SECONDS + 5))
+            dead = self.ba.BookingAuthority(s).claim_acknowledgement(key)
         self.assertIsNotNone(dead)
+        # SB2A-R3 rewrite: leases run on the DATABASE clock; age the dead lease in the database.
+        with self.engine.begin() as c:
+            c.execute(text("UPDATE booking_commands SET ack_lease_expires_at = clock_timestamp() "
+                           "- interval '5 seconds' WHERE idempotency_key=:k"), {"k": key})
         won = self._race_claims(key)
         self.assertEqual(len(won), 1)
         self.assertTrue(won[0].duplicate_risk)
@@ -510,8 +462,7 @@ class R2Postgres(unittest.TestCase):
         for blank in (None, "", "  "):
             r = self.ce.book_from_flow_response(Session(self.engine), self.ce.CeFlowBookingRequest(
                 thread_id=tid, lead_id=self.lead, inbound_event_id=blank, flow_token=blank,
-                requested_date=self.day, requested_time=time(10)),
-                create_thread_revision=lambda s, rev: None)
+                requested_date=self.day, requested_time=time(10)))
             self.assertEqual((r.outcome.value, r.reason), ("VALIDATION_FAILED", "EVENT_IDENTITY_REQUIRED"))
             r = self.ce.request_manual_scheduling(Session(self.engine), self.ce.CeSchedulingEscalationRequest(
                 thread_id=tid, lead_id=self.lead, escalation_id=blank, inbound_event_id=blank))

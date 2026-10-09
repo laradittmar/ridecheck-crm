@@ -23,8 +23,16 @@ Order inside the transaction (PostgreSQL):
     8. overlap pre-check   — a typed conflict before the write (unattributed legacy rows count
                             against the launch resource); the SB1 exclusion constraint stays
                             the final authority and its violation is translated, not leaked
-    9. caller revalidation — e.g. the Flow's `ScheduleService.check`, under the same locks
-   10. write + attach + ledger, then ONE commit; success is reported only after it
+    9. revalidation        — the authority's own `ScheduleService.check` of a typed
+                            `AvailabilityRevalidation`, under the same locks
+   10. write + typed attachments + ledger, defence-in-depth checks, then ONE commit;
+                            success is reported only after it
+
+SB2A-R3: callers never hand the authority code. There is no `attach`/`revalidate` callable:
+associated writes are a typed `BookingAttachmentPlan` of data that the authority itself
+executes, so no caller code ever runs inside the booking transaction. The pre-commit checks
+(transaction continuity, a second preflight, occupancy and booked-ThreadRevision sets, the
+booking row) are defence in depth, not the sandbox.
 
 The advisory lock is coordination. The exclusion constraint is the guarantee.
 
@@ -35,17 +43,19 @@ nothing about SQLite is evidence of concurrency safety. Any other dialect fails 
 from __future__ import annotations
 
 import contextvars
+import dataclasses
 import hashlib
 import json
 import logging
+import secrets
 import uuid
-from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta, timezone
+from decimal import Decimal
 from enum import Enum
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Mapping, Optional
 
-from sqlalchemy import and_, event, or_, select, text, update
+from sqlalchemy import and_, case, func, literal_column, or_, select, text, update
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session
 
@@ -123,8 +133,21 @@ class AckStatus(str, Enum):
 
 #: SB2A-R2 acknowledgement lease. A SENDING claim older than this may be reclaimed.
 ACK_LEASE_SECONDS = 120
-#: Bounded retries: after this many claims the acknowledgement stays FAILED for an operator.
+#: Bounded retries. A FAILED acknowledgement with this many attempts is TERMINAL: never claimed
+#: again, `ack_last_error` starts with `ACK_EXHAUSTED`, and it is listed for operators
+#: (`acknowledgements_needing_attention`). The booking itself is unaffected.
 ACK_MAX_ATTEMPTS = 5
+ACK_EXHAUSTED_PREFIX = "ACK_EXHAUSTED"
+#: An SB2A-era SENDING row has no lease at all: its sender's fate is unknown.
+ACK_LEGACY_NO_LEASE = "LEGACY_SENDING_NO_LEASE"
+#: Transport outcome categories that leave the delivery unknown (SB2A-R3, R2A-06).
+ACK_AMBIGUOUS_PREFIX = "AMBIGUOUS"
+
+
+def _app_now() -> datetime:
+    """The application clock — used for the lease ONLY on SQLite (tests). PostgreSQL leases
+    use the database clock, so a skewed application host cannot steal an active lease."""
+    return datetime.now(timezone.utc)
 
 
 @dataclass(frozen=True)
@@ -226,7 +249,7 @@ class _Refused(Exception):
 
 
 def refuse(outcome: BookingOutcome, reason: str, **kw) -> BookingResult:
-    """For revalidation callbacks: build a typed refusal."""
+    """Build a typed refusal (for callers that refuse before reaching the authority)."""
     return _result(outcome, reason, **kw)
 
 
@@ -268,24 +291,46 @@ def form_idempotency_key(source: BookingSource, revision_id: int, expected_versi
 _CRITICAL_TRIGGERS = ("trg_revisions_sb1_attribute_professional",
                       "trg_revisions_sb2a_booking_version",
                       "trg_calendar_exceptions_sb2a_lock")
-_CRITICAL_COLUMNS = (("revisions", "occupied_during"), ("revisions", "agenda_occupying"),
-                     ("revisions", "booking_version"), ("revisions", "service_minutes"),
-                     ("revisions", "buffer_minutes"), ("profesionales", "is_active"),
-                     ("profesionales", "is_launch_default"), ("booking_commands", "idempotency_key"),
-                     ("booking_commands", "ack_claim_token"),
-                     ("booking_commands", "ack_lease_expires_at"))
-_PREFLIGHT_SQL = f"""
+#: Every column the authority, its typed attachments and the acknowledgement lifecycle read or
+#: write (SB2A-R3). `booking_commands` is taken whole from the ORM model; the rest are listed.
+_REQUIRED_COLUMNS_LISTED = {
+    "revisions": ("id", "lead_id", "turno_fecha", "turno_hora", "turno_timezone", "estado_revision",
+                  "profesional_id", "service_minutes", "buffer_minutes", "booking_version",
+                  "occupied_during", "agenda_occupying", "precio_total", "tipo_vehiculo",
+                  "zone_group", "zone_detail"),
+    "profesionales": ("id", "is_active", "is_launch_default", "resource_key"),
+    "calendar_exceptions": ("exception_date", "kind", "start_time", "end_time", "profesional_id"),
+    "thread_revisions": ("id", "thread_id", "candidate_id", "status", "scheduled_date",
+                         "scheduled_time", "appointment_approval_status",
+                         "appointment_approval_token"),
+    "whatsapp_thread_states": ("thread_id", "current_revision_id", "last_stage", "needs_human",
+                               "flow_booking_token"),
+    "whatsapp_threads": ("id", "lead_id"),
+    "leads": ("id", "estado", "flag", "necesita_humano", "nombre", "apellido", "email", "canal"),
+}
+
+
+def _required_columns() -> tuple[tuple[str, str], ...]:
+    from ..models import BookingCommandRecord
+    cols = {(t, c) for t, names in _REQUIRED_COLUMNS_LISTED.items() for c in names}
+    cols |= {("booking_commands", c.name) for c in BookingCommandRecord.__table__.columns}
+    return tuple(sorted(cols))
+
+
+def _preflight_sql(columns) -> str:
+    trig = ", ".join("'" + t + "'" for t in _CRITICAL_TRIGGERS)
+    pairs = ", ".join(f"('{t}', '{c}')" for t, c in columns)
+    return f"""
 SELECT
   (SELECT count(*) FROM pg_constraint
      WHERE conname = 'ex_revisions_professional_occupied_overlap' AND contype = 'x'
        AND convalidated),
-  (SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal
-     AND tgname IN ({", ".join("'" + t + "'" for t in _CRITICAL_TRIGGERS)})),
+  (SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal AND tgname IN ({trig})),
   (SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal AND tgenabled IN ('O', 'A')
-     AND tgname IN ({", ".join("'" + t + "'" for t in _CRITICAL_TRIGGERS)})),
+     AND tgname IN ({trig})),
   (SELECT count(*) FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
-     WHERE NOT a.attisdropped AND a.attnum > 0
-       AND (c.relname, a.attname) IN ({", ".join(f"('{t}', '{c}')" for t, c in _CRITICAL_COLUMNS)})),
+     JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = current_schema()
+     WHERE NOT a.attisdropped AND a.attnum > 0 AND (c.relname, a.attname) IN ({pairs})),
   current_setting('session_replication_role')
 """
 
@@ -299,8 +344,9 @@ def verify_booking_schema(db: Session) -> Optional[str]:
     """
     if db.get_bind().dialect.name != "postgresql":
         return None
-    constraint, present, enabled, columns, role = db.execute(text(_PREFLIGHT_SQL)).one()
-    if constraint != 1 or present != len(_CRITICAL_TRIGGERS) or columns != len(_CRITICAL_COLUMNS):
+    required = _required_columns()
+    constraint, present, enabled, columns, role = db.execute(text(_preflight_sql(required))).one()
+    if constraint != 1 or present != len(_CRITICAL_TRIGGERS) or columns != len(required):
         return "BOOKING_SCHEMA_INCOMPLETE"
     if role != "origin":
         return "TRIGGERS_DISABLED_FOR_SESSION"
@@ -309,61 +355,154 @@ def verify_booking_schema(db: Session) -> Optional[str]:
     return None
 
 
-# ── callback guard ───────────────────────────────────────────────────────────
+# ── booking transaction scope (no external I/O before the commit) ───────────
 
-class CallbackViolation(RuntimeError):
-    """A revalidate/attach callback tried something only the authority may do."""
+class _TxnScope:
+    __slots__ = ("operation",)
 
+    def __init__(self, operation: str):
+        self.operation = operation
+
+
+_TXN_SCOPE: contextvars.ContextVar[Optional[_TxnScope]] = contextvars.ContextVar(
+    "booking_transaction_scope", default=None)
+
+
+class ExternalIOInsideBookingTransaction(RuntimeError):
+    """Something tried to reach an external transport before the booking committed."""
+
+
+def booking_transaction_active() -> Optional[str]:
+    scope = _TXN_SCOPE.get()
+    return scope.operation if scope is not None else None
+
+
+def forbid_external_io(channel: str) -> None:
+    """Called by external transports (the outbound gate). While a booking transaction is open
+    in this context nothing may leave the process — the booking may still roll back."""
+    if _TXN_SCOPE.get() is not None:
+        raise ExternalIOInsideBookingTransaction(channel)
+
+
+# ── typed plans (SB2A-R3): callers describe operations as DATA ──────────────
+
+#: The only value types a plan may carry. No callables, sessions, ORM objects or mappings.
+_PLAIN_TYPES = (str, int, float, bool, Decimal, date, time, datetime, type(None))
+
+
+@dataclass(frozen=True)
+class AvailabilityRevalidation:
+    """Revalidate the requested slot against business availability (`ScheduleService.check`)
+    inside the booking decision boundary. The AUTHORITY runs the check on its own read of the
+    database; the caller only supplies these inputs."""
+    address: str = "-"
+    zone_group: Optional[str] = None
+    is_holiday: bool = False
+
+
+#: Statuses a non-occupying attachment may carry (never one `schedule.py` counts).
+THREAD_REVISION_NON_OCCUPYING = frozenset({"provisional", "collecting_data", "draft"})
+
+
+@dataclass(frozen=True)
+class ThreadRevisionAttachment:
+    """Create the conversation-side ThreadRevision linked to this booking. Its status,
+    `scheduled_date` and `scheduled_time` are DERIVED by the authority from the booking —
+    never supplied — so it cannot diverge from the Revision or occupy anything else."""
+    thread_id: int
+    candidate_id: Optional[int] = None
+    buyer_name: Optional[str] = None
+    buyer_phone: Optional[str] = None
+    buyer_email: Optional[str] = None
+    seller_type: Optional[str] = None
+    seller_name: Optional[str] = None
+    address: Optional[str] = None
+    tipo_vehiculo: Optional[str] = None
+    marca: Optional[str] = None
+    modelo: Optional[str] = None
+    anio: Optional[int] = None
+    publication_url: Optional[str] = None
+    zone_group: Optional[str] = None
+    #: True → approval PENDING with an authority-generated token.
+    request_approval: bool = False
+    #: Status used when the booking does not occupy (manual scheduling).
+    non_occupying_status: str = "provisional"
+
+
+@dataclass(frozen=True)
+class LeadUpdate:
+    """Lead fields the booking contract may set. Always the command's own lead."""
+    estado: Optional[str] = None
+    flag: Optional[str] = None
+    necesita_humano: Optional[bool] = None
+    nombre_if_empty: Optional[str] = None
+    apellido_if_empty: Optional[str] = None
+    email_if_empty: Optional[str] = None
+    canal_if_empty: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ThreadStateUpdate:
+    """Thread-state fields the booking contract may set, for the attachment's thread."""
+    link_current_revision: bool = False      # current_revision_id ← the attached ThreadRevision
+    last_stage: Optional[str] = None
+    needs_human: Optional[bool] = None
+    consume_flow_token: bool = False         # flow_booking_token ← NULL
+
+
+@dataclass(frozen=True)
+class PriceRecalculation:
+    """Recalculate the booking's price from its own inputs. With `require_inputs`
+    (tipo_vehiculo, zone_group, zone_detail) the price is computed only if the Revision's
+    inputs equal them — otherwise it is left unset and logged, never guessed."""
+    require_inputs: Optional[tuple] = None
+
+
+@dataclass(frozen=True)
+class BookingAttachmentPlan:
+    thread_revision: Optional[ThreadRevisionAttachment] = None
+    lead: Optional[LeadUpdate] = None
+    thread_state: Optional[ThreadStateUpdate] = None
+    price: Optional[PriceRecalculation] = None
+
+
+_PLAN_TYPES = (AvailabilityRevalidation, ThreadRevisionAttachment, LeadUpdate, ThreadStateUpdate,
+               PriceRecalculation, BookingAttachmentPlan)
+
+
+#: The only nested plans, each in exactly its declared slot.
+_NESTED_PLANS = {"thread_revision": ThreadRevisionAttachment, "lead": LeadUpdate,
+                 "thread_state": ThreadStateUpdate, "price": PriceRecalculation}
+
+
+def _plan_is_data(obj, expected: type) -> bool:
+    """True iff `obj` is exactly `expected` and contains only plain data / nested plans of
+    exactly their declared type."""
+    if type(obj) is not expected:
+        return False
+    for f in dataclasses.fields(obj):
+        value = getattr(obj, f.name)
+        if expected is BookingAttachmentPlan:
+            if value is not None and not _plan_is_data(value, _NESTED_PLANS[f.name]):
+                return False
+            continue
+        if isinstance(value, _PLAN_TYPES):
+            return False                       # plans nest only inside BookingAttachmentPlan
+        elif type(value) is tuple:
+            if not all(type(v) in _PLAIN_TYPES for v in value):
+                return False
+        elif type(value) not in _PLAIN_TYPES:          # exact built-ins: no subclasses, no Enum
+            return False
+    return True
+
+
+class _InvariantBreach(Exception):
     def __init__(self, kind: str):
         super().__init__(kind)
         self.kind = kind
 
 
-@dataclass
-class _CallbackScope:
-    phase: str
-    violations: list = field(default_factory=list)
-    #: every ORM object the callback inserted, modified or deleted (captured at each flush
-    #: and once more after it returns) — reads never land here
-    written: list = field(default_factory=list)
-
-    def violate(self, kind: str) -> None:
-        self.violations.append(kind)
-        raise CallbackViolation(f"{self.phase}:{kind}")
-
-
-_CALLBACK_SCOPE: contextvars.ContextVar[Optional[_CallbackScope]] = contextvars.ContextVar(
-    "booking_callback_scope", default=None)
-
-
-def booking_callback_active() -> Optional[str]:
-    scope = _CALLBACK_SCOPE.get()
-    return scope.phase if scope is not None else None
-
-
-def forbid_external_io(channel: str) -> None:
-    """Called by external transports (the outbound gate). Inside a booking callback this
-    records a violation and raises: nothing may leave the process before the commit."""
-    scope = _CALLBACK_SCOPE.get()
-    if scope is not None:
-        scope.violate(f"external_io:{channel}")
-
-
-#: Session methods a callback may not call — the transaction belongs to the authority.
-_FORBIDDEN_SESSION_METHODS = ("commit", "rollback", "begin", "begin_nested", "close",
-                              "invalidate", "reset", "expunge_all")
-#: Transaction- and trigger-control SQL a callback may not issue through the session.
-_FORBIDDEN_SQL_HEADS = ("COMMIT", "ROLLBACK", "BEGIN", "START TRANSACTION", "END", "ABORT",
-                        "SAVEPOINT", "RELEASE", "PREPARE TRANSACTION", "SET TRANSACTION",
-                        "SET SESSION_REPLICATION_ROLE", "SET SESSION AUTHORIZATION",
-                        "RESET", "ALTER ", "DROP ", "CREATE ", "TRUNCATE")
-
-
 # ── the authority ────────────────────────────────────────────────────────────
-
-AttachFn = Callable[[Session, Any], Optional[Any]]
-RevalidateFn = Callable[[Session, Any], Optional[BookingResult]]
-
 
 class BookingAuthority:
     def __init__(self, db: Session, *, lock_timeout_ms: int = DEFAULT_LOCK_TIMEOUT_MS):
@@ -389,32 +528,70 @@ class BookingAuthority:
 
     # ── acknowledgement (separate from commit) ───────────────────────────
 
-    def claim_acknowledgement(self, idempotency_key: str, *, now: Optional[datetime] = None,
+    def _clock(self):
+        """The lease clock: the DATABASE clock on PostgreSQL (`clock_timestamp()`), so lease
+        decisions never depend on an application host's clock; the app clock on SQLite."""
+        return func.clock_timestamp() if self._postgres() else _app_now()
+
+    def _clock_plus(self, seconds: int):
+        if self._postgres():
+            return literal_column(f"clock_timestamp() + interval '{int(seconds)} seconds'")
+        return _app_now() + timedelta(seconds=int(seconds))
+
+    def _terminalize_exhausted(self, key: Optional[str] = None) -> int:
+        """SENDING rows whose lease is gone (expired, or SB2A-era with none) and whose attempts
+        are exhausted can never be claimed again: make that explicit and terminal instead of
+        leaving them indistinguishable from an in-flight send (R2A-05). The dead attempt may
+        have reached Meta, so duplicate risk is recorded."""
+        from ..models import BookingCommandRecord as R
+        now = self._clock()
+        stmt = (update(R)
+                .where(R.ack_status == AckStatus.SENDING.value)
+                .where(R.ack_attempts >= ACK_MAX_ATTEMPTS)
+                .where(or_(R.ack_lease_expires_at.is_(None), R.ack_lease_expires_at < now))
+                .values(ack_status=AckStatus.FAILED.value, ack_duplicate_risk=True,
+                        ack_last_error=f"{ACK_EXHAUSTED_PREFIX}_AFTER_CRASH",
+                        ack_lease_expires_at=None, ack_updated_at=now)
+                .execution_options(synchronize_session=False))
+        if key is not None:
+            stmt = stmt.where(R.idempotency_key == key)
+        res = self.db.execute(stmt)
+        if res.rowcount:
+            logger.error("BOOKING_ACK_EXHAUSTED rows=%s key_prefix=%s — terminal, needs an operator",
+                         res.rowcount, (key or "*")[:12])
+        return res.rowcount
+
+    def claim_acknowledgement(self, idempotency_key: str, *,
                               lease_seconds: int = ACK_LEASE_SECONDS) -> Optional[AckClaim]:
         """Atomically take a bounded lease to send the acknowledgement, or None.
 
-        Claimable: PENDING; FAILED (retry); SENDING whose lease has EXPIRED (its claimant
-        died). Never: SENT; an active SENDING lease; attempts exhausted. One UPDATE with the
-        whole condition — under concurrency PostgreSQL re-evaluates it after the first
-        claimant commits, so exactly one reclaimer wins.
+        Claimable: PENDING; FAILED below the attempt bound (retry); SENDING whose lease has
+        EXPIRED by the DATABASE clock (its claimant died), or an SB2A-era SENDING row with no
+        lease at all (one bounded recovery, recorded as LEGACY_SENDING_NO_LEASE). Never: SENT;
+        an active lease; exhausted attempts. Reclaiming any SENDING row records duplicate
+        risk. One UPDATE with the whole condition — PostgreSQL re-evaluates it after a
+        concurrent claimant commits, so exactly one wins.
         """
         from ..models import BookingCommandRecord as R
-        now = now or datetime.now(timezone.utc)
+        now = self._clock()
         token = str(uuid.uuid4())
+        self._terminalize_exhausted(idempotency_key)
+        no_lease = and_(R.ack_status == AckStatus.SENDING.value, R.ack_lease_expires_at.is_(None))
         res = self.db.execute(
             update(R)
             .where(R.idempotency_key == idempotency_key)
             .where(R.ack_attempts < ACK_MAX_ATTEMPTS)
             .where(or_(R.ack_status.in_((AckStatus.PENDING.value, AckStatus.FAILED.value)),
                        and_(R.ack_status == AckStatus.SENDING.value,
-                            R.ack_lease_expires_at < now)))
+                            or_(R.ack_lease_expires_at.is_(None), R.ack_lease_expires_at < now))))
             # every SET expression reads the OLD row: reclaiming SENDING ⇒ duplicate risk
             .values(ack_duplicate_risk=or_(R.ack_duplicate_risk,
                                            R.ack_status == AckStatus.SENDING.value),
+                    ack_last_error=case((no_lease, ACK_LEGACY_NO_LEASE), else_=R.ack_last_error),
                     ack_status=AckStatus.SENDING.value,
                     ack_attempts=R.ack_attempts + 1,
                     ack_claim_token=token, ack_claimed_at=now,
-                    ack_lease_expires_at=now + timedelta(seconds=int(lease_seconds)),
+                    ack_lease_expires_at=self._clock_plus(lease_seconds),
                     ack_updated_at=now)
             .execution_options(synchronize_session=False))
         self.db.commit()
@@ -427,16 +604,35 @@ class BookingAuthority:
 
     def record_acknowledgement(self, claim: AckClaim, *, sent: bool,
                                transport_id: Optional[str] = None,
-                               error: Optional[str] = None) -> bool:
+                               error: Optional[str] = None, ambiguous: bool = False) -> bool:
         """Record the outcome of THIS claim. A claimant whose lease was reclaimed by someone
-        else no longer owns the row and records nothing (returns False)."""
+        else no longer owns the row and records nothing (returns False).
+
+        * SENT requires a non-empty transport identity (WAMID). A "success" without one is
+          recorded as AMBIGUOUS — FAILED with duplicate risk — never as SENT.
+        * An ambiguous outcome (e.g. a timeout after the request left, a 2xx without a usable
+          id) is FAILED with duplicate risk and an `AMBIGUOUS_*` category: retried only within
+          the attempt bound, never claimed as delivered or as not delivered.
+        * A FAILED outcome on the last allowed attempt is terminal (`ACK_EXHAUSTED_*`).
+        """
         from ..models import BookingCommandRecord as R
-        values = {"ack_status": (AckStatus.SENT if sent else AckStatus.FAILED).value,
-                  "ack_updated_at": datetime.now(timezone.utc)}
-        if transport_id:
-            values["ack_transport_id"] = str(transport_id)[:128]
-        if error:
-            values["ack_last_error"] = str(error)[:64]
+        wamid = (str(transport_id).strip() if transport_id is not None else "")[:128]
+        if sent and not wamid:
+            sent, ambiguous, error = False, True, f"{ACK_AMBIGUOUS_PREFIX}_SENT_WITHOUT_TRANSPORT_ID"
+        if ambiguous and not (error or "").startswith(ACK_AMBIGUOUS_PREFIX):
+            error = f"{ACK_AMBIGUOUS_PREFIX}_{error or 'UNKNOWN'}"
+        now = self._clock()
+        values: dict = {"ack_status": (AckStatus.SENT if sent else AckStatus.FAILED).value,
+                        "ack_updated_at": now, "ack_lease_expires_at": None}
+        if sent:
+            values["ack_transport_id"] = wamid
+        else:
+            category = (error or "NOT_SENT")[:48]
+            values["ack_last_error"] = case(
+                (R.ack_attempts >= ACK_MAX_ATTEMPTS, f"{ACK_EXHAUSTED_PREFIX}:{category}"),
+                else_=category)
+            if ambiguous:
+                values["ack_duplicate_risk"] = True
         res = self.db.execute(
             update(R)
             .where(R.idempotency_key == claim.idempotency_key)
@@ -446,6 +642,27 @@ class BookingAuthority:
             .execution_options(synchronize_session=False))
         self.db.commit()
         return res.rowcount == 1
+
+    def acknowledgements_needing_attention(self) -> list[dict]:
+        """Operator view: terminal (exhausted) acknowledgements, rows with duplicate risk, and
+        SENDING rows whose lease is gone. Exhausted crashed SENDING rows are first made
+        terminal, so nothing stays invisibly stuck."""
+        from ..models import BookingCommandRecord as R
+        self._terminalize_exhausted(None)
+        self.db.commit()
+        now = self._clock()
+        rows = self.db.execute(
+            select(R.idempotency_key, R.ack_status, R.ack_attempts, R.ack_duplicate_risk,
+                   R.ack_last_error, R.ack_transport_id, R.revision_id, R.ack_updated_at)
+            .where(R.ack_status != AckStatus.NOT_APPLICABLE.value)
+            .where(or_(and_(R.ack_status == AckStatus.FAILED.value,
+                            R.ack_attempts >= ACK_MAX_ATTEMPTS),
+                       R.ack_duplicate_risk.is_(True),
+                       and_(R.ack_status == AckStatus.SENDING.value,
+                            or_(R.ack_lease_expires_at.is_(None),
+                                R.ack_lease_expires_at < now))))
+            .order_by(R.id)).all()
+        return [dict(r._mapping) for r in rows]
 
     def note_replay(self, idempotency_key: str) -> None:
         from ..models import BookingCommandRecord
@@ -458,17 +675,28 @@ class BookingAuthority:
 
     # ── the command ──────────────────────────────────────────────────────
 
-    def execute(self, cmd: BookingCommand, *, revalidate: Optional[RevalidateFn] = None,
-                attach: Optional[AttachFn] = None) -> BookingResult:
-        fingerprint = request_fingerprint(cmd)
+    def execute(self, cmd: BookingCommand, *,
+                availability: Optional[AvailabilityRevalidation] = None,
+                attachments: Optional[BookingAttachmentPlan] = None) -> BookingResult:
+        """Run one booking command in ONE authority-owned transaction.
+
+        `availability` and `attachments` are typed DATA (SB2A-R3). No caller code runs inside
+        the transaction; the authority performs every read and write itself.
+        """
         lock_mode: Optional[str] = None
+        fingerprint = ""
+        token = _TXN_SCOPE.set(_TxnScope(str(getattr(cmd, "operation", "?"))))
         try:
             spec = self._validate(cmd)
+            fingerprint = request_fingerprint(cmd)
+            self._validate_plans(cmd, availability, attachments)
+            txid = None
             if self._postgres():
                 reason = verify_booking_schema(self.db)        # every transaction
                 if reason:
                     raise _Refused(_result(BookingOutcome.INTERNAL_FAILURE, reason))
                 self.db.execute(text(f"SET LOCAL lock_timeout = {self.lock_timeout_ms}"))
+                txid = self.db.execute(text("SELECT txid_current()")).scalar()
 
             if cmd.idempotency_key:
                 replay = self._check_replay(cmd.idempotency_key, fingerprint)
@@ -503,26 +731,24 @@ class BookingAuthority:
             elif cmd.operation is not BookingOperation.UNSCHEDULE:
                 profesional_id = current.profesional_id if revision is not None else None
 
-            if revalidate is not None and target.occupying:
-                refusal, wrote = self._run_callback("revalidate", revalidate, target)
-                if wrote:
-                    raise CallbackViolation("revalidate:wrote")       # revalidation is read-only
-                if refusal is not None:
-                    raise _Refused(replace(refusal, lock_mode=lock_mode))
+            if availability is not None and target.occupying:
+                self._revalidate_availability(availability, target, lock_mode)
 
+            window = self._window_days(target, current)
+            before = self._window_state(window, lock=True)
             revision = self._write(cmd, revision, target, profesional_id, current)
-            expected = self._booking_row(revision.id)
-            thread_revision = None
-            if attach is not None:
-                thread_revision, wrote = self._run_callback("attach", attach, revision)
-                self._verify_after_attach(revision, expected, target, wrote)
-            thread_revision_id = getattr(thread_revision, "id", None)
+            expected_row = self._booking_row(revision.id)
+            thread_revision_id = self._apply_attachments(cmd, attachments, revision, target) \
+                if attachments is not None else None
+            self._assert_continuous(txid)          # before any further write (e.g. the ledger)
             linked_id = self._sync_thread_revision(cmd, revision, target, thread_revision_id)
             self.db.flush()
             version = revision.booking_version
             if cmd.idempotency_key:
                 self._record(cmd, fingerprint, revision, thread_revision_id or linked_id,
                              target, version)
+            self._verify_before_commit(txid, revision, expected_row, target, window, before,
+                                       allowed_tr={i for i in (thread_revision_id, linked_id) if i})
             self.db.commit()
             return _result(BookingOutcome.COMMITTED, "COMMITTED", revision_id=revision.id,
                            thread_revision_id=thread_revision_id,
@@ -532,11 +758,11 @@ class BookingAuthority:
                            idempotency_key=cmd.idempotency_key, lock_mode=lock_mode,
                            ack_status=(AckStatus.PENDING if cmd.tracks_acknowledgement
                                        else AckStatus.NOT_APPLICABLE).value)
-        except CallbackViolation as violation:
+        except _InvariantBreach as breach:
             self._safe_rollback()
-            logger.error("BOOKING_AUTHORITY callback violation %s op=%s source=%s",
-                         violation.kind, cmd.operation.value, cmd.source.value)
-            return _result(BookingOutcome.INTERNAL_FAILURE, f"CALLBACK_VIOLATION:{violation.kind}",
+            logger.error("BOOKING_AUTHORITY invariant breach %s op=%s source=%s",
+                         breach.kind, cmd.operation.value, cmd.source.value)
+            return _result(BookingOutcome.INTERNAL_FAILURE, f"INVARIANT_BREACH:{breach.kind}",
                            idempotency_key=cmd.idempotency_key, lock_mode=lock_mode)
         except _Refused as refused:
             self._safe_rollback()
@@ -562,6 +788,8 @@ class BookingAuthority:
                              cmd.operation.value, cmd.source.value)
             return _result(BookingOutcome.INTERNAL_FAILURE, "INTERNAL",
                            idempotency_key=cmd.idempotency_key)
+        finally:
+            _TXN_SCOPE.reset(token)
 
     # ── steps ────────────────────────────────────────────────────────────
 
@@ -574,114 +802,253 @@ class BookingAuthority:
         except Exception:                       # the original failure is what we report
             logger.exception("BOOKING_AUTHORITY rollback failed")
 
-    def _run_callback(self, phase: str, fn, arg):
-        """Run a caller callback with the transaction locked against it.
-
-        Enforced, not documented: commit/rollback/begin on the session raise; transaction- or
-        trigger-control SQL through the session raises; external transport (the outbound
-        gate) raises. Violations are recorded even if the callback swallows the exception,
-        and everything it writes is captured. All hooks are removed in `finally`, including
-        when the callback raises. Returns (callback result, objects it wrote).
-        """
-        db = self.db
-        scope = _CallbackScope(phase=phase)
-
-        def _forbid(name):
-            def _raise(*_a, **_k):
-                scope.violate(f"session.{name}")
-            return _raise
-
-        def _capture(session, _ctx, _instances):
-            scope.written.extend(list(session.new) + list(session.dirty) + list(session.deleted))
-
-        def _sql_hook(_conn, _cursor, statement, _params, _ctx, _many):
-            head = " ".join(str(statement).split()).upper()
-            if head.startswith(_FORBIDDEN_SQL_HEADS):
-                scope.violate("sql:" + head.split(" ")[0])
-
-        def _conn_txn(*_a, **_k):
-            scope.violate("connection.transaction_control")
-
-        def _second_connection(*_a, **_k):
-            # a side channel: another connection could commit outside this transaction.
-            # Engine-wide listener — only THIS context's callback is accused (contextvar).
-            if _CALLBACK_SCOPE.get() is scope:
-                scope.violate("engine.new_connection")
-
-        db.flush()                    # pending work before the callback is not the callback's
-        conn = db.connection()
-        engine = conn.engine
-        conn_events = ("commit", "rollback", "savepoint", "begin", "release_savepoint",
-                       "rollback_savepoint", "begin_twophase")
-        for name in _FORBIDDEN_SESSION_METHODS:
-            setattr(db, name, _forbid(name))
-        event.listen(db, "before_flush", _capture)
-        event.listen(conn, "before_cursor_execute", _sql_hook)
-        for ev in conn_events:
-            event.listen(conn, ev, _conn_txn)
-        event.listen(engine, "engine_connect", _second_connection)
-        token = _CALLBACK_SCOPE.set(scope)
-        try:
-            try:
-                result = fn(db, arg)
-                _capture(db, None, None)
-            except Exception as exc:
-                if scope.violations:          # a swallowed violation still decides the outcome
-                    raise CallbackViolation(f"{phase}:{scope.violations[0]}") from exc
-                raise
-        finally:
-            _CALLBACK_SCOPE.reset(token)
-            event.remove(engine, "engine_connect", _second_connection)
-            for ev in conn_events:
-                event.remove(conn, ev, _conn_txn)
-            event.remove(conn, "before_cursor_execute", _sql_hook)
-            event.remove(db, "before_flush", _capture)
-            for name in _FORBIDDEN_SESSION_METHODS:
-                db.__dict__.pop(name, None)
-        if scope.violations:
-            raise CallbackViolation(f"{phase}:{scope.violations[0]}")
-        return result, scope.written
-
     def _booking_row(self, revision_id: int) -> tuple:
         return tuple(self.db.execute(text(
             "SELECT turno_fecha, turno_hora, service_minutes, buffer_minutes, estado_revision, "
             "profesional_id, lead_id FROM revisions WHERE id = :i"), {"i": revision_id}).one())
 
-    def _verify_after_attach(self, revision, expected: tuple, target: "_Target",
-                             written: list) -> None:
-        """After `attach`: the authority's revision is untouched (so its status is still the
-        canonical one the authority wrote), and the callback wrote no other Revision and no
-        booked ThreadRevision anywhere but the booked slot."""
-        from ..models import Revision, ThreadRevision
-        if revision not in self.db or revision.id is None:
-            raise CallbackViolation("attach:revision_detached")
+    # ── typed plans ──────────────────────────────────────────────────────
+
+    def _validate_plans(self, cmd, availability, attachments) -> None:
+        if availability is not None and not _plan_is_data(availability, AvailabilityRevalidation):
+            raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, "PLAN_NOT_DATA:availability"))
+        if attachments is None:
+            return
+        if not _plan_is_data(attachments, BookingAttachmentPlan):
+            raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, "PLAN_NOT_DATA:attachments"))
+        tr = attachments.thread_revision
+        if tr is not None:
+            if cmd.operation not in (BookingOperation.CREATE,
+                                     BookingOperation.REQUEST_MANUAL_SCHEDULING):
+                raise _Refused(_result(BookingOutcome.VALIDATION_FAILED,
+                                       "ATTACHMENT_ONLY_FOR_NEW_BOOKINGS"))
+            if tr.non_occupying_status not in THREAD_REVISION_NON_OCCUPYING:
+                raise _Refused(_result(BookingOutcome.VALIDATION_FAILED,
+                                       "ATTACHMENT_STATUS_NOT_ALLOWED"))
+            if cmd.thread_id is not None and tr.thread_id != cmd.thread_id:
+                raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, "ATTACHMENT_THREAD_MISMATCH"))
+        if attachments.thread_state is not None and tr is None and cmd.thread_id is None:
+            raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, "THREAD_STATE_WITHOUT_THREAD"))
+        if attachments.thread_state is not None and attachments.thread_state.link_current_revision \
+                and tr is None:
+            raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, "LINK_WITHOUT_THREAD_REVISION"))
+
+    def _revalidate_availability(self, plan: AvailabilityRevalidation, target: "_Target",
+                                 lock_mode: Optional[str]) -> None:
+        """Authority-owned availability check, under the booking locks. Read-only."""
+        from ..schemas.schedule import ScheduleCheckIn
+        out = self._availability_service().check(ScheduleCheckIn(
+            address=plan.address or "-", preferred_day=target.day, preferred_time=target.at,
+            zone_group=plan.zone_group, is_holiday=plan.is_holiday))
+        if not out.valid:
+            logger.info("BOOKING_REVALIDATION_FAIL day=%s time=%s reasons=%s",
+                        target.day, target.at, getattr(out, "reasons", None))
+            raise _Refused(_result(BookingOutcome.SLOT_CONFLICT, "SCHEDULE_REVALIDATION",
+                                   lock_mode=lock_mode))
+
+    def _availability_service(self):
+        """The authority's own availability reader on its own session. Not a caller input;
+        tests replace this method on an instance to control availability."""
+        from .schedule import ScheduleService
+        return ScheduleService(self.db)
+
+    def _apply_attachments(self, cmd: BookingCommand, plan: BookingAttachmentPlan, revision,
+                           target: "_Target") -> Optional[int]:
+        """Perform the typed associated writes. Every row touched is chosen by the authority:
+        the booking's own lead, the attachment's thread (verified to belong to that lead), and
+        a new ThreadRevision whose status and slot are derived from the booking."""
+        from ..models import Lead, ThreadRevision, WhatsAppThread, WhatsAppThreadCandidate, \
+            WhatsAppThreadState
+        tr_id = None
+        thread_id = plan.thread_revision.thread_id if plan.thread_revision else cmd.thread_id
+        if plan.thread_revision is not None or plan.thread_state is not None:
+            thread = self.db.get(WhatsAppThread, thread_id)
+            if thread is None:
+                raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, "ATTACHMENT_THREAD_NOT_FOUND"))
+            if thread.lead_id is not None and thread.lead_id != revision.lead_id:
+                raise _Refused(_result(BookingOutcome.VALIDATION_FAILED,
+                                       "ATTACHMENT_THREAD_OF_ANOTHER_LEAD"))
+        a = plan.thread_revision
+        if a is not None:
+            if a.candidate_id is not None:
+                cand = self.db.get(WhatsAppThreadCandidate, a.candidate_id)
+                if cand is None or cand.thread_id != a.thread_id:
+                    raise _Refused(_result(BookingOutcome.VALIDATION_FAILED,
+                                           "ATTACHMENT_CANDIDATE_NOT_IN_THREAD"))
+            if target.occupying:
+                status = "completed" if target.status == "COMPLETADO" else "booked"
+            else:
+                status = a.non_occupying_status
+            tr = ThreadRevision(
+                thread_id=a.thread_id, candidate_id=a.candidate_id, status=status,
+                buyer_name=a.buyer_name, buyer_phone=a.buyer_phone, buyer_email=a.buyer_email,
+                seller_type=a.seller_type, seller_name=a.seller_name, address=a.address,
+                scheduled_date=target.day, scheduled_time=target.at,
+                tipo_vehiculo=a.tipo_vehiculo, marca=a.marca, modelo=a.modelo, anio=a.anio,
+                publication_url=a.publication_url, zone_group=a.zone_group)
+            if a.request_approval:
+                tr.appointment_approval_status = "PENDING"
+                tr.appointment_approval_token = secrets.token_urlsafe(32)
+            self.db.add(tr)
+            self.db.flush()
+            tr_id = tr.id
+        if plan.price is not None:
+            self._recalculate_price(plan.price, revision)
+        if plan.lead is not None:
+            lead = self.db.get(Lead, revision.lead_id)
+            if lead is None:
+                raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, "LEAD_NOT_FOUND"))
+            u = plan.lead
+            for name in ("estado", "flag", "necesita_humano"):
+                if getattr(u, name) is not None:
+                    setattr(lead, name, getattr(u, name))
+            for name in ("nombre", "apellido", "email", "canal"):
+                value = getattr(u, f"{name}_if_empty")
+                if value is not None and not getattr(lead, name):
+                    setattr(lead, name, value)
+        if plan.thread_state is not None:
+            st = self.db.execute(select(WhatsAppThreadState).where(
+                WhatsAppThreadState.thread_id == thread_id)).scalar_one_or_none()
+            if st is None:
+                raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, "THREAD_STATE_NOT_FOUND"))
+            u = plan.thread_state
+            if u.link_current_revision:
+                st.current_revision_id = tr_id
+            if u.last_stage is not None:
+                st.last_stage = u.last_stage
+            if u.needs_human is not None:
+                st.needs_human = u.needs_human
+            if u.consume_flow_token:
+                st.flow_booking_token = None
         self.db.flush()
-        if self._booking_row(revision.id) != expected:
-            raise CallbackViolation("attach:booking_fields_changed")
-        for obj in written:
-            if obj is revision:
-                continue
-            if isinstance(obj, Revision):
-                raise CallbackViolation("attach:wrote_another_revision")
-            if isinstance(obj, ThreadRevision) and obj.status in ("booked", "completed") \
-                    and obj.scheduled_date is not None and obj.scheduled_time is not None \
-                    and (obj.scheduled_date, obj.scheduled_time) != (target.day, target.at):
-                raise CallbackViolation("attach:thread_revision_elsewhere")
+        return tr_id
+
+    def _recalculate_price(self, plan: PriceRecalculation, revision) -> None:
+        if plan.require_inputs is not None:
+            actual = (revision.tipo_vehiculo, revision.zone_group, revision.zone_detail)
+            if tuple(plan.require_inputs) != actual:
+                logger.warning("BOOKING_PRICE_INPUT_MISMATCH revision_id=%s — price left unset",
+                               revision.id)
+                return
+        from ..repositories.pricing_repository import PricingRepository
+        from .pricing import PricingService
+        PricingService(repository=PricingRepository()).recalculate_revision_if_possible(
+            db=self.db, revision=revision)
+        if revision.precio_total is None:
+            logger.warning("BOOKING_PRICE_UNRESOLVED revision_id=%s", revision.id)
+
+    # ── defence in depth (not the sandbox) ───────────────────────────────
+
+    def _window_days(self, target: "_Target", current: "_Snapshot") -> tuple:
+        days = set()
+        if target.start is not None:
+            days |= {target.start.date(), (target.end - timedelta(microseconds=1)).date()}
+        if current.exists and current.day is not None:
+            days.add(current.day)
+        return tuple(sorted(days))
+
+    def _window_state(self, days: tuple, *, lock: bool = False) -> tuple:
+        """Occupying Revisions and booked/completed ThreadRevisions on `days`, as
+        {id: (fields…)}. With `lock` (PostgreSQL, before the write) the existing rows are taken
+        FOR SHARE: until this transaction ends nobody else can delete or change them, so any
+        later disappearance or change of one of them can only be this transaction's own."""
+        from ..models import Revision, ThreadRevision
+        if not days:
+            return {}, {}
+        rq = select(Revision).where(Revision.turno_fecha.in_(days))
+        tq = (select(ThreadRevision).where(ThreadRevision.scheduled_date.in_(days))
+              .where(ThreadRevision.scheduled_time.is_not(None))
+              .where(ThreadRevision.status.in_(("booked", "completed"))))
+        if lock and self._postgres():
+            rq, tq = rq.with_for_update(read=True), tq.with_for_update(read=True)
+        occ = {r.id: (r.turno_fecha, r.turno_hora, normalize_status(r.estado_revision) or r.estado_revision,
+                      r.profesional_id)
+               for r in self.db.execute(rq).scalars().all()
+               if br.is_occupying(r.turno_fecha, r.turno_hora, r.estado_revision)}
+        trs = {t.id: (t.status, t.scheduled_date, t.scheduled_time)
+               for t in self.db.execute(tq).scalars().all()}
+        return occ, trs
+
+    def _written_by_me(self, table: str, ids) -> set:
+        """Of `ids`, those last written by THIS transaction (PostgreSQL xmin)."""
+        ids = [int(i) for i in ids]
+        if not ids or not self._postgres():
+            return set()
+        return set(self.db.execute(text(
+            f"SELECT id FROM {table} WHERE id = ANY(:ids) "
+            "AND xmin::text::bigint = txid_current() % 4294967296"), {"ids": ids}).scalars())
+
+    def _assert_continuous(self, txid) -> None:
+        """The server still holds the transaction we opened. The driver's server-reported
+        status is read FIRST — after a stray COMMIT/ROLLBACK every further statement would
+        autocommit on its own — then the transaction id is compared."""
+        if not self._postgres():
+            return
+        dbapi = self.db.connection().connection.dbapi_connection
+        info = getattr(dbapi, "info", None)
+        if info is not None:
+            from psycopg.pq import TransactionStatus
+            if info.transaction_status != TransactionStatus.INTRANS:
+                raise _InvariantBreach("TRANSACTION_NOT_CONTINUOUS")
+        if self.db.execute(text("SELECT txid_current()")).scalar() != txid:
+            raise _InvariantBreach("TRANSACTION_NOT_CONTINUOUS")
+
+    def _verify_before_commit(self, txid, revision, expected_row: tuple, target: "_Target",
+                              window: tuple, before: tuple, allowed_tr: set) -> None:
+        """The transaction is still the one we opened, the schema and session state are still
+        bookable, the booking row is as written, and in the locked window no occupying
+        Revision or booked ThreadRevision appeared or disappeared except this booking's own."""
+        self.db.flush()
         if self._postgres():
-            # raw-SQL writes bypass the ORM: ask the database what THIS transaction touched
-            mine = "xmin::text::bigint = txid_current() % 4294967296"
-            if self.db.execute(text(f"SELECT count(*) FROM revisions WHERE {mine} AND id <> :i"),
-                               {"i": revision.id}).scalar():
-                raise CallbackViolation("attach:wrote_another_revision")
-            if self.db.execute(text(
-                    f"SELECT count(*) FROM thread_revisions WHERE {mine} "
-                    "AND status IN ('booked', 'completed') AND scheduled_date IS NOT NULL "
-                    "AND scheduled_time IS NOT NULL AND (scheduled_date, scheduled_time) "
-                    "IS DISTINCT FROM (CAST(:d AS date), CAST(:t AS time))"),
-                    {"d": target.day, "t": target.at}).scalar():
-                raise CallbackViolation("attach:thread_revision_elsewhere")
+            self._assert_continuous(txid)
+            reason = verify_booking_schema(self.db)
+            if reason:
+                raise _InvariantBreach(f"POST_OPERATION_{reason}")
+        if self._booking_row(revision.id) != expected_row:
+            raise _InvariantBreach("BOOKING_FIELDS_CHANGED")
+        occ_before, tr_before = before
+        occ_after, tr_after = self._window_state(window)
+        own_rev = {revision.id}
+        # 1. no pre-existing occupying booking was removed or changed (they are locked FOR
+        #    SHARE on PostgreSQL, so only this transaction could have done it)
+        for rid, row in occ_before.items():
+            if rid not in own_rev and occ_after.get(rid) != row:
+                raise _InvariantBreach("OCCUPANCY_SET_CHANGED")
+        added = set(occ_after) - set(occ_before) - own_rev
+        if self._postgres():
+            # 2. new occupying rows: other professionals' concurrent bookings are legitimate;
+            #    a new row for OUR professional cannot come from any authority writer while we
+            #    hold its exclusive lock, and none may come from this transaction itself
+            mine = {i for i in added if occ_after[i][3] == revision.profesional_id}
+            if mine or self._written_by_me("revisions", added):
+                raise _InvariantBreach("OCCUPANCY_SET_CHANGED")
+        elif added:                                   # SQLite: one writer — any change is ours
+            raise _InvariantBreach("OCCUPANCY_SET_CHANGED")
+        if target.occupying and target.day in window and revision.id not in occ_after:
+            raise _InvariantBreach("BOOKING_NOT_OCCUPYING")
+        # 3. no pre-existing booked ThreadRevision was un-booked, moved or deleted, and no
+        #    booked ThreadRevision other than this booking's own was written by us
+        for tid, row in tr_before.items():
+            if tid not in allowed_tr and tr_after.get(tid) != row:
+                raise _InvariantBreach("BOOKED_THREAD_REVISION_SET_CHANGED")
+        tr_added = set(tr_after) - set(tr_before) - set(allowed_tr)
+        if tr_added and (not self._postgres() or self._written_by_me("thread_revisions", tr_added)):
+            raise _InvariantBreach("BOOKED_THREAD_REVISION_SET_CHANGED")
 
     def _validate(self, cmd: BookingCommand) -> "_Spec":
+        # SB2A-R3: the command is DATA too — exact built-in types only, so nothing a caller
+        # supplies can execute code inside the transaction (a Mapping or date subclass would).
+        if type(cmd) is not BookingCommand or type(cmd.operation) is not BookingOperation \
+                or type(cmd.source) is not BookingSource or type(cmd.revision_fields) is not dict:
+            raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, "COMMAND_NOT_DATA"))
+        for f in dataclasses.fields(cmd):
+            if f.name in ("operation", "source", "revision_fields"):
+                continue
+            if type(getattr(cmd, f.name)) not in _PLAIN_TYPES:
+                raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, f"COMMAND_NOT_DATA:{f.name}"))
+        if any(type(k) is not str or type(v) not in _PLAIN_TYPES
+               for k, v in cmd.revision_fields.items()):
+            raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, "COMMAND_NOT_DATA:revision_fields"))
         op = cmd.operation
         if op in (BookingOperation.CREATE, BookingOperation.REQUEST_MANUAL_SCHEDULING):
             if cmd.revision_id is None and cmd.lead_id is None:
@@ -872,8 +1239,10 @@ class BookingAuthority:
         from ..models import Revision
         if revision is None:
             revision = Revision(lead_id=cmd.lead_id)
+            allowed = _revision_data_columns()
             for key, value in dict(cmd.revision_fields).items():
-                if key in _BOOKING_FIELDS or not hasattr(Revision, key):
+                # only mapped, non-booking data columns, and only plain values (SB2A-R3)
+                if key not in allowed or type(value) not in _PLAIN_TYPES:
                     raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, f"FIELD_NOT_ALLOWED:{key}"))
                 setattr(revision, key, value)
             revision.booking_version = 0
@@ -962,7 +1331,12 @@ class BookingAuthority:
 
 _BOOKING_FIELDS = frozenset({"turno_fecha", "turno_hora", "service_minutes", "buffer_minutes",
                              "estado_revision", "profesional_id", "booking_version", "lead_id",
-                             "id", "turno_timezone"})
+                             "id", "turno_timezone", "occupied_during", "agenda_occupying"})
+
+
+def _revision_data_columns() -> frozenset:
+    from ..models import Revision
+    return frozenset(c.name for c in Revision.__table__.columns) - _BOOKING_FIELDS
 
 
 def _ymd(d: date) -> int:

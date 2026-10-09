@@ -95,6 +95,9 @@ def _make_service_with_candidates(candidates: list) -> "tuple":
     svc = BookingFlowService.__new__(BookingFlowService)
     svc.db = db
     svc._sched = MagicMock()
+    # SB2A-R3 rewrite: revalidation is the booking authority's own; point its internal
+    # availability reader at the same mock so the test controls both offer and revalidation.
+    svc._authority._availability_service = lambda: svc._sched
     return svc, db
 
 

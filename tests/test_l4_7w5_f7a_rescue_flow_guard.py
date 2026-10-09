@@ -290,8 +290,10 @@ class TestAuthorityBoundaries(unittest.TestCase):
         """MAY_CREATE_OR_CONFIRM_BOOKING stays with BookingFlowService."""
         bfs = (ROOT / "backend" / "app" / "services"
                / "booking_flow_service.py").read_text(encoding="utf-8-sig")
-        self.assertIn("BOOKING_REVALIDATION_PASS", bfs)
-        self.assertIn("self._sched.check(check_in)", bfs)
+        # SB2A-R3 rewrite: the Flow hands TYPED plans to the booking authority (no callback);
+        # revalidation, ThreadRevision, price and token consumption are the authority's.
+        self.assertIn("BOOKING_REVALIDATION_FAIL", bfs)
+        self.assertIn("availability=availability", bfs)
         writers = {n.name for n in ast.walk(ast.parse(bfs))
                    if isinstance(n, ast.FunctionDef)
                    and 'status="booked"' in ast.unparse(n).replace("'", '"')}

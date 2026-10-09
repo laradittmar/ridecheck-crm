@@ -6,7 +6,7 @@
   SB2A_PG_STAMP_URL  a database built by create_all + `alembic stamp head` — the bootstrap
                      path that silently lacks every SB1/SB2A database object.
 
-Races use real sessions on separate connections. The attach hook can PARK a transaction
+Races use real sessions on separate connections. A test-only subclass can PARK a transaction
 after its locks and its write and before its commit, so the contender provably runs while
 the holder is open — timing is asserted, not assumed. All skip cleanly when unset.
 """
@@ -151,22 +151,37 @@ class SB2AAuthorityPostgres(unittest.TestCase):
                                 profesional_id=prof, requested_date=day,
                                 requested_time=at, expected_version=ver, **kw)
 
-    def run_cmd(self, command, *, lock_timeout_ms=5000, **kw):
+    def run_cmd(self, command, *, lock_timeout_ms=5000, park=None, on_revalidate=None, **kw):
+        # SB2A-R3 rewrite: the authority accepts no callbacks. Tests that must PARK a
+        # transaction after its locks + write (or observe revalidation) use a test-only
+        # subclass overriding internal steps — not a production interface.
+        base = self.ba.BookingAuthority
+
+        class _Probe(base):
+            def _verify_before_commit(inner, *a, **k):
+                if park is not None:
+                    park()
+                return base._verify_before_commit(inner, *a, **k)
+
+            def _revalidate_availability(inner, *a, **k):
+                if on_revalidate is not None:
+                    on_revalidate()
+                return base._revalidate_availability(inner, *a, **k)
+
         with Session(self.engine) as s:
-            return self.ba.BookingAuthority(s, lock_timeout_ms=lock_timeout_ms).execute(command, **kw)
+            return _Probe(s, lock_timeout_ms=lock_timeout_ms).execute(command, **kw)
 
     def race(self, holder_cmd, contender_cmd, *, contender_kw=None, park=1.0):
         """Run holder; park it after its locks+write, start contender, release, collect."""
         parked, release, out = threading.Event(), threading.Event(), {}
         stamps = {}
 
-        def park_attach(db, rev):
+        def park_attach():
             parked.set()
             release.wait(10)
-            return None
 
         def holder():
-            out["holder"] = self.run_cmd(holder_cmd, attach=park_attach)
+            out["holder"] = self.run_cmd(holder_cmd, park=park_attach)
             stamps["holder_done"] = _t.monotonic()
 
         def contender():
@@ -194,12 +209,12 @@ class SB2AAuthorityPostgres(unittest.TestCase):
         p = self.prof(default=True)
         revalidated_at = {}
 
-        def revalidate(db, target):
+        def revalidate():
             revalidated_at["t"] = _t.monotonic()
-            return None
 
         h, c, st = self.race(self.cmd(time(10)), self.cmd(time(10, 30)),
-                             contender_kw={"revalidate": revalidate})
+                             contender_kw={"on_revalidate": revalidate,
+                                           "availability": self.ba.AvailabilityRevalidation()})
         self.assertEqual(h.outcome.value, "COMMITTED")
         self.assertEqual((c.outcome.value, c.reason), ("SLOT_CONFLICT", "OVERLAP"))
         self.assertTrue(st["contender_alive_while_parked"], "contender must wait on the lock")
@@ -294,11 +309,11 @@ class SB2AAuthorityPostgres(unittest.TestCase):
         self.prof(default=True)
         parked, release, out = threading.Event(), threading.Event(), {}
 
-        def park(db, rev):
+        def park():
             parked.set(); release.wait(10)
 
         th = threading.Thread(target=lambda: out.setdefault(
-            "b", self.run_cmd(self.cmd(time(10)), attach=park)))
+            "b", self.run_cmd(self.cmd(time(10)), park=park)))
         th.start(); self.assertTrue(parked.wait(10))
 
         def add_exception():
@@ -389,12 +404,13 @@ class SB2AAuthorityPostgres(unittest.TestCase):
         self.prof(default=True)
         tid = self.make_thread()
         with Session(self.engine) as s:
-            def attach(db, rev):
-                db.execute(text("INSERT INTO thread_revisions (thread_id, status, created_at) "
-                                "VALUES (:t, 'booked', now())"), {"t": tid})
-                raise RuntimeError("fail after the write")
-            r = self.ba.BookingAuthority(s).execute(self.cmd(time(10), key="rb-1"), attach=attach)
-            self.assertEqual(r.outcome.value, "INTERNAL_FAILURE")
+            # SB2A-R3 rewrite: the failing step after the write is now a typed attachment that
+            # creates a ThreadRevision and then fails (its thread-state row does not exist).
+            plan = self.ba.BookingAttachmentPlan(
+                thread_revision=self.ba.ThreadRevisionAttachment(thread_id=tid),
+                thread_state=self.ba.ThreadStateUpdate(link_current_revision=True))
+            r = self.ba.BookingAuthority(s).execute(self.cmd(time(10), key="rb-1"), attachments=plan)
+            self.assertEqual((r.outcome.value, r.reason), ("VALIDATION_FAILED", "THREAD_STATE_NOT_FOUND"))
             self.assertEqual(s.execute(text("SELECT count(*) FROM revisions WHERE lead_id=:l"),
                                        {"l": self.lead}).scalar(), 0)
         self.assertEqual(self.rows("SELECT id FROM revisions WHERE lead_id=:l", l=self.lead), [])
@@ -503,6 +519,8 @@ class SB2AAuthorityPostgres(unittest.TestCase):
             with Session(self.engine) as s:
                 svc = BookingFlowService(s)
                 svc._sched = mock.MagicMock()
+                # SB2A-R3 rewrite: revalidation is the authority's own reader.
+                svc._authority._availability_service = lambda: svc._sched
                 svc._sched.check.return_value = ok
                 svc._sched.list_slots.return_value = slots
                 with mock.patch.object(BookingFlowService, "_send_booking_receipt",
@@ -539,12 +557,11 @@ class SB2AAuthorityPostgres(unittest.TestCase):
         self.prof(default=True)
         tid = self.make_thread()
         with Session(self.engine) as s:
-            def attach(db, rev):
-                from app.models import ThreadRevision
-                tr = ThreadRevision(thread_id=tid, status="booked",
-                                    scheduled_date=rev.turno_fecha, scheduled_time=rev.turno_hora)
-                db.add(tr); db.flush(); return tr
-            booked = self.ba.BookingAuthority(s).execute(self.cmd(time(10), key="link-1"), attach=attach)
+            # SB2A-R3 rewrite: the linked ThreadRevision is a typed attachment.
+            plan = self.ba.BookingAttachmentPlan(
+                thread_revision=self.ba.ThreadRevisionAttachment(thread_id=tid))
+            booked = self.ba.BookingAuthority(s).execute(self.cmd(time(10), key="link-1"),
+                                                         attachments=plan)
         moved = self.run_cmd(self.cmd(time(13), op="RESCHEDULE", rev=booked.revision_id))
         tr = self.rows("SELECT status, scheduled_time FROM thread_revisions WHERE id=:i",
                        i=booked.thread_revision_id)[0]

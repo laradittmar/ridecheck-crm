@@ -119,6 +119,8 @@ class _World(unittest.TestCase):
     def _mock_schedule(self, slots=None, valid=True):
         slots = SLOTS if slots is None else slots
         self.svc._sched = MagicMock()
+        # SB2A-R3 rewrite: point the authority's internal availability reader at the same mock.
+        self.svc._authority._availability_service = lambda: self.svc._sched
         self.svc._sched.list_slots.return_value = ScheduleSlotsOut(
             preferred_day=FUTURE, business_hours="09:00-18:00", slots=slots)
         self.svc._sched.check.return_value = ScheduleCheckOut(
@@ -197,7 +199,9 @@ class TestDateTimeSelection(_World):
         """DATE-TIME-08 — prefill is UX; safety is unchanged."""
         fn = next(ast.unparse(n) for n in ast.walk(ast.parse(BFS_SOURCE))
                   if isinstance(n, ast.FunctionDef) and n.name == "handle_confirm_booking")
-        self.assertIn("self._sched.check(check_in)", fn)
+        # SB2A-R3 rewrite: the Flow hands TYPED plans to the booking authority (no callback);
+        # revalidation, ThreadRevision, price and token consumption are the authority's.
+        self.assertIn("availability=availability", fn)
         self.assertIn("BOOKING_REVALIDATION_FAIL", fn)
 
 
@@ -339,7 +343,9 @@ class TestFlowContract(unittest.TestCase):
         self.assertTrue(writers <= {"handle_confirm_booking", "_create_booking"}, writers)
         confirm = next(ast.unparse(n) for n in ast.walk(ast.parse(BFS_SOURCE))
                        if isinstance(n, ast.FunctionDef) and n.name == "handle_confirm_booking")
-        self.assertIn("recalculate_revision_if_possible", confirm)       # FLOW-06
+        # SB2A-R3 rewrite: the Flow hands TYPED plans to the booking authority (no callback);
+        # revalidation, ThreadRevision, price and token consumption are the authority's.
+        self.assertIn("PriceRecalculation(", confirm)                    # FLOW-06
         self.assertIn("BOOKING_REFUSED_NO_CANONICAL_LOCATION", confirm)
 
     def test_the_candidate_declares_no_secret_bearing_field(self):

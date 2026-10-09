@@ -11,11 +11,13 @@ from ..models import Lead, Revision
 from ..schemas.revisions import RevisionCreate, RevisionUpdate, RevisionOut
 from ..services.db_errors import commit_or_400
 from ..services.booking_authority import (
+    BookingAttachmentPlan,
     BookingAuthority,
     BookingCommand,
     BookingOperation,
     BookingOutcome,
     BookingSource,
+    PriceRecalculation,
     command_for_edit,
     normalize_status,
     status_occupies,
@@ -86,8 +88,9 @@ def create_revision(lead_id: int, payload: RevisionCreate, db: Session = Depends
         idempotency_key=_api_idempotency_key(idempotency_key), lead_id=lead_id,
         requested_date=turno_fecha, requested_time=turno_hora, target_status=status,
         revision_fields=fields)
+    # SB2A-R3: the price is a typed attachment the authority performs, not a callback.
     result = BookingAuthority(db).execute(
-        command, attach=lambda db_, rev: _recalc_quote_if_possible(db_, rev))
+        command, attachments=BookingAttachmentPlan(price=PriceRecalculation()))
     if not result.ok:
         return _refusal_response(result)
     return db.get(Revision, result.revision_id)
