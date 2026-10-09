@@ -190,6 +190,11 @@ class OutboundSafetyGate:
           GateOutcome.BLOCKED_FLOOD     → do NOT call Meta; durable audit + needs_human written
           GateOutcome.BLOCKED_KILL_SWITCH → same; audit in separate session
         """
+        # SB2A-R2: nothing may leave the process from inside a booking callback, before the
+        # booking transaction has committed. Outside a callback this is a no-op.
+        from .booking_authority import forbid_external_io
+        forbid_external_io("outbound_gate")
+
         if now is None:
             from zoneinfo import ZoneInfo
             now = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))

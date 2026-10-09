@@ -34,6 +34,18 @@ PG_URL = os.environ.get("SB2A_PG_URL", "")
 PG_MIG_URL = os.environ.get("SB2A_PG_MIG_URL", "")
 PG_STAMP_URL = os.environ.get("SB2A_PG_STAMP_URL", "")
 HEAD = "20261008_sb2a_booking_authority"
+
+
+def _script_head() -> str:
+    """SB2A-R2 rewrite: the ORM models describe the CURRENT Alembic head (R2 added ledger lease
+    columns), so the behaviour and stamp databases run at it. The migration class still
+    upgrades/downgrades exactly the SB2A step (HEAD) it certifies."""
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+    return ScriptDirectory.from_config(Config(os.path.join(_BACKEND, "alembic.ini"))).get_current_head()
+
+
+SCRIPT_HEAD = _script_head()
 _DEFAULT = object()
 SB1 = "20261007_sb1_booking_repr"
 FIXTURE = "SB2A-PG-FIXTURE"
@@ -73,8 +85,8 @@ class SB2AAuthorityPostgres(unittest.TestCase):
         cls.engine = create_engine(PG_URL, pool_size=10)
         with cls.engine.connect() as c:
             current = _version(c)
-        if current != HEAD:
-            _alembic(PG_URL, "upgrade", HEAD)
+        if current != SCRIPT_HEAD:
+            _alembic(PG_URL, "upgrade", SCRIPT_HEAD)
 
     @classmethod
     def tearDownClass(cls):
@@ -324,23 +336,26 @@ class SB2AAuthorityPostgres(unittest.TestCase):
         self.assertNotEqual(a.revision_id, b.revision_id)
         with Session(self.engine) as s:
             auth = self.ba.BookingAuthority(s)
-            self.assertTrue(auth.claim_acknowledgement("rev-a"))
-            self.assertTrue(auth.claim_acknowledgement("rev-b"))    # each its own ack
+            # SB2A-R2 rewrite: a claim is an AckClaim lease (None when not claimable)
+            self.assertIsNotNone(auth.claim_acknowledgement("rev-a"))
+            self.assertIsNotNone(auth.claim_acknowledgement("rev-b"))   # each its own ack
 
     def test_pg11_ack_failure_then_retry_creates_no_duplicate(self):
         self.prof(default=True)
         first = self.run_cmd(self.cmd(time(10), key="ack-x", tracks_acknowledgement=True))
         with Session(self.engine) as s:
             auth = self.ba.BookingAuthority(s)
-            self.assertTrue(auth.claim_acknowledgement("ack-x"))
-            auth.record_acknowledgement("ack-x", sent=False)        # transport failure
+            # SB2A-R2 rewrite: the outcome is recorded by the claim (lease), not the key
+            claim_ = auth.claim_acknowledgement("ack-x")
+            self.assertIsNotNone(claim_)
+            auth.record_acknowledgement(claim_, sent=False)          # transport failure
         retry = self.run_cmd(self.cmd(time(10), key="ack-x", tracks_acknowledgement=True))
         self.assertEqual((retry.outcome.value, retry.revision_id, retry.ack_status),
                          ("IDEMPOTENT_REPLAY", first.revision_id, "FAILED"))
         claims = []
         def claim():
             with Session(self.engine) as s:
-                claims.append(self.ba.BookingAuthority(s).claim_acknowledgement("ack-x"))
+                claims.append(self.ba.BookingAuthority(s).claim_acknowledgement("ack-x") is not None)
         ts = [threading.Thread(target=claim) for _ in range(4)]
         [t.start() for t in ts]; [t.join(10) for t in ts]
         self.assertEqual(sorted(claims), [False, False, False, True])   # exactly one resend
@@ -550,7 +565,7 @@ class SB2AStampBootstrapRefused(unittest.TestCase):
         eng = create_engine(PG_STAMP_URL)
         try:
             with eng.connect() as c:
-                self.assertEqual(_version(c), HEAD)
+                self.assertEqual(_version(c), SCRIPT_HEAD)
                 self.assertEqual(c.execute(text(
                     "SELECT count(*) FROM pg_constraint WHERE conname="
                     "'ex_revisions_professional_occupied_overlap'")).scalar(), 0)

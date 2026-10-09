@@ -228,15 +228,19 @@ class Idempotency(unittest.TestCase):
         auth = BookingAuthority(db)
         r = _create(db, lead, key="ack-1", tracks_acknowledgement=True)
         self.assertEqual(r.ack_status, "PENDING")
-        self.assertTrue(auth.claim_acknowledgement("ack-1"))
-        self.assertFalse(auth.claim_acknowledgement("ack-1"))      # SENDING: nobody else
-        auth.record_acknowledgement("ack-1", sent=False)           # transport failure
+        # SB2A-R2 rewrite: claims are leases (AckClaim | None) and outcomes are recorded by
+        # the claim, not the key. The behaviour asserted is unchanged.
+        first = auth.claim_acknowledgement("ack-1")
+        self.assertIsNotNone(first)
+        self.assertIsNone(auth.claim_acknowledgement("ack-1"))     # active lease: nobody else
+        auth.record_acknowledgement(first, sent=False)             # transport failure
         self.assertEqual(auth.lookup("ack-1").ack_status, "FAILED")
         replay = _create(db, lead, key="ack-1", tracks_acknowledgement=True)
         self.assertEqual(replay.outcome, Out.IDEMPOTENT_REPLAY)     # committed, not re-booked
-        self.assertTrue(auth.claim_acknowledgement("ack-1"))       # recovery claims once
-        auth.record_acknowledgement("ack-1", sent=True)
-        self.assertFalse(auth.claim_acknowledgement("ack-1"))      # SENT: silent forever
+        second = auth.claim_acknowledgement("ack-1")               # recovery claims once
+        self.assertIsNotNone(second)
+        auth.record_acknowledgement(second, sent=True)
+        self.assertIsNone(auth.claim_acknowledgement("ack-1"))     # SENT: silent forever
         self.assertEqual(db.query(Revision).count(), 1)
         rec = db.query(BookingCommandRecord).one()
         self.assertEqual((rec.ack_status, rec.ack_attempts), ("SENT", 2))

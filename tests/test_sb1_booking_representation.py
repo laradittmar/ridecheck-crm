@@ -339,7 +339,8 @@ _FROZEN_AT_PARENT = {
     "backend/app/services/pricing.py": "9aed0358cfba7b08a4082bd7b1ecebcc778e5b5a",
     "backend/app/services/schedule.py": "00487c9a46ee168ae12dc76667863f0fbb5f71ad",
     "backend/app/services/travel.py": "fc95b0550e486b55ddf2cbb2af19e6c6d104d11d",
-    "backend/app/services/outbound_safety_gate.py": "73481ce2d8473edfc7ba04c123f5e12d6f1d5395",
+    # SB2A-R2: outbound_safety_gate.py un-frozen — attempt() gained one guard line that refuses
+    # external transport from inside a booking callback (tests/test_sb2a_r2_hardening.py pins it).
     "backend/app/services/outbound_guard.py": "db2e3766d540e1b858ddb31cdd68c031ed2c830b",
     "backend/app/services/scheduling_lexicon.py": "0df23923081484e221441a36ac36afde4a6bcfb3",
     "backend/app/services/acceptance_lexicon.py": "153e39d3975ad2bcdd29c06c43ff5fde9d3ddb7a",

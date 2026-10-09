@@ -241,7 +241,10 @@ class TestAtomicity(_Base):
         import inspect
         from app.services.booking_authority import BookingAuthority
         auth = inspect.getsource(BookingAuthority.execute)
-        self.assertLess(auth.index("attach(self.db, revision)"), auth.index("self.db.commit()"),
+        # SB2A-R2 rewrite: attach now runs under the enforced callback guard (_run_callback);
+        # the ordering asserted is unchanged — attach (and its pricing) before the commit.
+        self.assertLess(auth.index('self._run_callback("attach", attach, revision)'),
+                        auth.index("self.db.commit()"),
                         "the price must be stamped before the commit")
         rev = self.book()
         tr = self.db.query(ThreadRevision).one()

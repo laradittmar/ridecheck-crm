@@ -109,6 +109,17 @@ _FLOW_REFUSAL_MESSAGES: dict = {
 }
 
 
+@dataclass(frozen=True)
+class ReceiptOutcome:
+    """Result of one receipt attempt. Truthy only when Meta accepted the message."""
+    sent: bool
+    wamid: Optional[str]
+    error: Optional[str]
+
+    def __bool__(self) -> bool:
+        return self.sent
+
+
 class BookingTokenError(Exception):
     pass
 
@@ -957,11 +968,13 @@ class BookingFlowService:
 
         # The booking is committed above. The acknowledgement is best-effort BY DESIGN:
         # a delivery problem must never roll back or cast doubt on a booking that exists.
-        # Its state is tracked in the ledger, apart from the commit, so a replay can recover it.
-        if self._authority.claim_acknowledgement(key):
-            sent = self._send_booking_receipt(ctx, name=name, selected_date=selected_date,
-                                              selected_time=selected_time)
-            self._authority.record_acknowledgement(key, sent=bool(sent))
+        # Its state is a bounded lease in the ledger, apart from the commit, so a replay can
+        # recover it — including after a crash mid-send (SB2A-R2).
+        claim = self._authority.claim_acknowledgement(key)
+        if claim is not None:
+            outcome = self._send_booking_receipt(ctx, name=name, selected_date=selected_date,
+                                                 selected_time=selected_time)
+            self._record_receipt(claim, outcome)
 
         # Return Flow SUCCESS completion
         return self._success_response(booking_token)
@@ -980,34 +993,51 @@ class BookingFlowService:
             },
         }
 
+    def _record_receipt(self, claim, outcome) -> None:
+        """Record one receipt attempt under its lease (WAMID or error category)."""
+        recorded = self._authority.record_acknowledgement(
+            claim, sent=bool(outcome), transport_id=getattr(outcome, "wamid", None),
+            error=getattr(outcome, "error", None) or (None if outcome else "NOT_SENT"))
+        if not recorded:
+            logger.warning("BOOKING_RECEIPT outcome not recorded: lease was reclaimed "
+                           "attempt=%s", claim.attempt)
+        if claim.duplicate_risk:
+            logger.warning("BOOKING_RECEIPT attempt %s reclaimed an expired lease — the "
+                           "earlier attempt may have reached Meta; possible duplicate",
+                           claim.attempt)
+
     def _recover_acknowledgement(self, key: str, prior) -> None:
         """Acknowledgement recovery for a replayed, already-committed booking.
 
-        SENT → silent (exactly one receipt per booking). PENDING/FAILED → this caller claims
-        it atomically and sends once; a concurrent replay cannot also claim it.
+        SENT → silent. PENDING, FAILED or an EXPIRED SENDING lease → this caller claims it
+        atomically and sends once; an active lease or a concurrent replay cannot also claim.
+        A reclaimed lease carries `duplicate_risk`: the dead attempt may already have reached
+        Meta, so exactly-once delivery is not claimed.
         """
-        if prior.ack_status not in ("PENDING", "FAILED"):
+        if prior.ack_status in ("SENT", "NOT_APPLICABLE"):
             return
-        if not self._authority.claim_acknowledgement(key):
+        claim = self._authority.claim_acknowledgement(key)
+        if claim is None:
             return
         rev = self.db.get(Revision, prior.revision_id) if prior.revision_id else None
         thread_rev = self.db.get(ThreadRevision, prior.thread_revision_id) \
             if prior.thread_revision_id else None
         thread = self.db.get(WhatsAppThread, thread_rev.thread_id) if thread_rev else None
         contact = self.db.get(WhatsAppContact, thread.contact_id) if thread else None
-        sent = False
         if rev is not None and thread is not None and contact is not None:
             ctx = BookingContext(thread=thread, contact=contact, lead=None, state=None,
                                  candidate=None, vehicle_summary="", location_summary="",
                                  zone_group=None, zone_detail=None, booking_token="")
-            sent = self._send_booking_receipt(
+            outcome = self._send_booking_receipt(
                 ctx, name=thread_rev.buyer_name or "", selected_date=rev.turno_fecha,
                 selected_time=rev.turno_hora)
-        self._authority.record_acknowledgement(key, sent=bool(sent))
+            self._record_receipt(claim, outcome)
+        else:
+            self._authority.record_acknowledgement(claim, sent=False, error="CONTEXT_MISSING")
 
     def _send_booking_receipt(
         self, ctx: BookingContext, *, name: str, selected_date: date, selected_time: time
-    ) -> None:
+    ) -> "ReceiptOutcome":
         """Send the single canonical booking acknowledgement.
 
         Exactly-once comes from the booking ledger, not from a flag: a Meta retry or a
@@ -1016,7 +1046,8 @@ class BookingFlowService:
         that atomically claims the ledger's acknowledgement (PENDING/FAILED → SENDING). The
         outbound gate's dedup window is a second line of defence, not the mechanism.
 
-        Returns True only when Meta accepted the message.
+        Returns a ReceiptOutcome: truthy only when Meta accepted the message, carrying its
+        WAMID (recorded in the ledger) or an error category.
 
         Routed through OutboundSafetyGate on the registered BOOKING_FLOW path — the same
         path that dispatched the Flow — so the acknowledgement is attributed to the booking
@@ -1046,28 +1077,30 @@ class BookingFlowService:
                 logger.warning(
                     "BOOKING_RECEIPT not sent thread_id=%s outcome=%s — booking stands",
                     ctx.thread.id, result.outcome.value)
-                return False
+                return ReceiptOutcome(False, None, f"GATE_{result.outcome.value}"[:64])
             try:
                 wa_message_id, _ = _send_whatsapp_cloud_text(
                     to_wa_id=ctx.contact.wa_id, text=text)
                 gate.mark_sent(result.message_id, wa_message_id)
                 logger.info("BOOKING_RECEIPT sent thread_id=%s wamid=%s",
                             ctx.thread.id, wa_message_id)
-                return True
+                return ReceiptOutcome(True, wa_message_id, None)
             except MetaSendError as exc:
                 gate.mark_failed(result.message_id, meta_http_status=exc.http_status,
                                  meta_error_payload=exc.to_payload())
                 logger.error("BOOKING_RECEIPT Meta send failed thread_id=%s: %s",
                              ctx.thread.id, exc)
+                return ReceiptOutcome(False, None, f"META_{exc.http_status}")
             except Exception as exc:
                 gate.mark_failed(result.message_id)
                 logger.error("BOOKING_RECEIPT send failed thread_id=%s: %s",
                              ctx.thread.id, exc)
+                return ReceiptOutcome(False, None, "TRANSPORT_ERROR")
         except Exception as exc:
             # The booking is already committed; nothing here may undo it.
             logger.error("BOOKING_RECEIPT unexpected failure thread_id=%s: %s",
                          ctx.thread.id, exc)
-        return False
+        return ReceiptOutcome(False, None, "UNEXPECTED")
 
 # ── Observability helpers ─────────────────────────────────────────────────────
 

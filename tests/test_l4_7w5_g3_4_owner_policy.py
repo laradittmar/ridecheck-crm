@@ -228,7 +228,9 @@ class E_ConcurrencyPosture(unittest.TestCase):
         locks = inspect.getsource(ba.BookingAuthority._acquire_locks)
         self.assertIn("pg_advisory_xact_lock(:p, :d)", locks)
         run = inspect.getsource(ba.BookingAuthority.execute)
-        self.assertLess(run.index("self._acquire_locks("), run.index("revalidate(self.db, target)"))
+        # SB2A-R2 rewrite: revalidate runs under the enforced callback guard; still after the locks.
+        self.assertLess(run.index("self._acquire_locks("),
+                        run.index('self._run_callback("revalidate", revalidate, target)'))
 
     def test_own_20_a_lost_slot_raises_a_conflict_rather_than_booking_anyway(self):
         body = inspect.getsource(bfs.BookingFlowService.handle_confirm_booking)

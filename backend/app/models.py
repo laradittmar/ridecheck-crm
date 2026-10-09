@@ -348,6 +348,15 @@ class BookingCommandRecord(Base):
         Integer, nullable=False, default=0, server_default=text("0"))
     last_replayed_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True)
+    # SB2A-R2: the acknowledgement claim is a bounded lease with an owner.
+    ack_claim_token: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    ack_claimed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    ack_lease_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    ack_transport_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    ack_last_error: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    ack_duplicate_risk: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false"))
 
 
 class ViaticosZone(Base):
