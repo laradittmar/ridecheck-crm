@@ -5059,7 +5059,9 @@ class ConversationEngine:
 
         from .clarification_router import (clarification_decision, ClarificationRoute,
                                            TurnClarificationDecision)
-        from .clarification_attempt import ClarificationFamily
+        from .clarification_attempt import (ClarificationFamily,
+                                            VEHICLE_CLARIFIABLE_HOLDS)
+        from ..schemas.hybrid_trace import CandidateAction as _CA
 
         if state is not None and getattr(state, "needs_human", False):
             evidence = None
@@ -5086,8 +5088,18 @@ class ConversationEngine:
         # deterministic engine saw. A reconciled proposal that touches the family is itself
         # current-turn evidence, because the reconciler only proposes from this turn.
         required_next = self._required_next_information_authorized(ctx, state, evidence)
+        # G3-7L: `_admitted_vehicle_evidence` returns None for a CONTESTED burst — that is
+        # W1's survivorship guard working. But "we cannot tell which car you mean" is the
+        # strongest possible evidence that the turn IS about vehicles, so relevance must
+        # read the RAW mentions too, or the very turns that need clarification look like
+        # they never mentioned a vehicle. Admission governs WRITING; relevance governs
+        # ASKING. Keeping them distinct is the authority separation this milestone is for.
+        _raw_vehicle_named = any(
+            any(self._evidence_identity(v)) or getattr(v, "year", None)
+            for v in (getattr(evidence, "vehicle_mentions", ()) or ()))
         vehicle_relevant = bool(
             vehicle_mention is not None
+            or _raw_vehicle_named
             or ce_vehicle is not None
             or _r_marca or _r_modelo or _r_tipo)
         location_relevant = bool(
@@ -5124,10 +5136,29 @@ class ConversationEngine:
         # resolved turn, an irrelevant turn and a correction confirmation never consult the
         # store: reading it would make every ordinary message depend on a second database
         # round trip whose answer could not alter the route.
+        # ── G3-7L: decision-level vehicle ambiguity ───────────────────────────────
+        # The reconciler refused a vehicle mutation for a reason the Vehicle Flow can
+        # answer. Read from the turn's own resolution and from NOTHING else: no flag, no
+        # proposed database mutation, no prose. W2's holds emit `action=none` precisely
+        # because they refuse to guess, so a gate keyed on a proposed `update` could never
+        # see them — which is why they were silent.
+        #
+        # Clarification authority and mutation authority stay separate here: this grants
+        # permission to ASK, never permission to write.
+        _res_for_scope = resolution if resolution is not None else getattr(
+            self, "_turn_candidate_resolution", None)
+        _hold_reason = getattr(_res_for_scope, "hold_reason", None)
+        vehicle_decision_unresolved = bool(
+            _res_for_scope is not None
+            and getattr(_res_for_scope, "action", None) == _CA.HOLD
+            and not getattr(_res_for_scope, "mutates", False)
+            and _hold_reason in VEHICLE_CLARIFIABLE_HOLDS)
+
         _vehicle_in_play = vehicle_relevant or required_next
         _location_in_play = location_relevant or required_next
         _could_ask = bool(
             (_vehicle_in_play and not (identity_resolved and category_resolved))
+            or (_vehicle_in_play and vehicle_decision_unresolved)
             or (_location_in_play and not location_resolved))
         cycle = self._clarification_cycle_key(state)
         if _could_ask:
@@ -5157,6 +5188,7 @@ class ConversationEngine:
             correction_values_known=bool(corrected),
             vehicle_domain_relevant=vehicle_relevant,
             vehicle_identity_resolved=identity_resolved,
+            vehicle_decision_unresolved=vehicle_decision_unresolved,
             vehicle_category_resolved=category_resolved,
             vehicle_attempt_spent=ClarificationFamily.VEHICLE in spent,
             vehicle_flow_outstanding=bool(

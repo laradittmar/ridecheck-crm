@@ -37,6 +37,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -50,6 +51,31 @@ logger = logging.getLogger(__name__)
 
 
 # ── typed vocabulary ──────────────────────────────────────────────────────────
+
+#: G3-7L. The reconciler HOLD reasons that a Vehicle clarification Flow may answer.
+#:
+#: This is a DECISION-level question, not an identity-completeness one. W1/W2 made the
+#: reconciler refuse to guess which car a turn is about; the thread's focused candidate
+#: can still be a perfectly complete Ford Focus while the turn itself is unresolvable.
+#: `_turn_clarification_decision` used to ask only "is the identity resolved?", which
+#: canonical completeness answered YES, so every W2 HOLD was silent.
+#:
+#: Membership is explicit and conservative. A reason is eligible only when showing the
+#: customer the vehicle options could actually settle it. Focus-pointer faults, an
+#: unreadable store and an unresolvable CATEGORY are deliberately absent: re-asking an
+#: identity we already hold is not a question, and those route to a person.
+VEHICLE_CLARIFIABLE_HOLDS: frozenset[str] = frozenset({
+    "TARGET_SCOPE_UNRESOLVED",          # which car the correction is about is unproven
+    "TARGET_SCOPE_CONTRADICTED",        # the stated old value contradicts canonical state
+    "EXCLUDED_REFERENT",                # explicitly NOT the car under discussion
+    "CONFLICTING_VEHICLE_ATTRIBUTES",   # one car, two stated values for one field
+    "UNMARKED_MULTI_IDENTITY",          # two distinct cars, no supersession
+    "AMBIGUOUS_MATCH",                  # more than one existing candidate matches
+    "INCOMPLETE_IDENTITY",              # a partial reference that places nowhere
+    "CREATE_UNCONFIRMED",               # the words do not corroborate the proposed car
+    "TARGET_NOT_GROUNDED",              # no admissible ground established the target
+})
+
 
 class ClarificationFamily:
     """Which clarification Flow. Mirrored by a CHECK constraint on the table."""
@@ -240,6 +266,53 @@ class SpentFamiliesResult:
 
 
 # ── the independent session ───────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class ActivationReadiness:
+    """Whether this deployment may have clarification turned on at all.
+
+    G3-7L. The runtime already fails closed — `spent_families` reports
+    `available=False` and the turn goes to a person — but a deployment should never reach
+    that state by accident. This is the explicit gate: the activation step asks before
+    arming anything, and a `False` here means the flags must stay off.
+
+    Read-only by construction: it inspects the catalogue, never the data, and never writes.
+    """
+    ready: bool
+    reason: str                    # "" when ready
+    table_present: bool
+    cycle_uniqueness: bool         # UNIQUE(thread_id, cycle_key, family)
+    idempotency_uniqueness: bool   # UNIQUE(idempotency_key)
+
+
+def clarification_activation_ready(db: Session) -> ActivationReadiness:
+    """May clarification be activated against this database?
+
+    Refuses when the attempts table is absent — that is the whole point — and also when
+    either uniqueness constraint is missing, because without them "one attempt per family
+    per cycle" and duplicate-delivery idempotency are assertions rather than guarantees.
+    A table with no constraints would let a retry ask the customer twice.
+    """
+    from sqlalchemy import inspect as _sa_inspect
+
+    try:
+        insp = _sa_inspect(db.get_bind())
+        table = "whatsapp_clarification_attempts"
+        if table not in set(insp.get_table_names()):
+            return ActivationReadiness(False, "ATTEMPTS_TABLE_ABSENT", False, False, False)
+        cols = {tuple(sorted(u.get("column_names") or ()))
+                for u in (insp.get_unique_constraints(table) or ())}
+        cycle_ok = ("cycle_key", "family", "thread_id") in cols
+        idem_ok = ("idempotency_key",) in cols
+        if not cycle_ok:
+            return ActivationReadiness(False, "CYCLE_UNIQUENESS_MISSING", True, False, idem_ok)
+        if not idem_ok:
+            return ActivationReadiness(False, "IDEMPOTENCY_UNIQUENESS_MISSING", True, True, False)
+        return ActivationReadiness(True, "", True, True, True)
+    except Exception as exc:                       # noqa: BLE001 - absence, not denial
+        return ActivationReadiness(False, f"INSPECTION_FAILED:{type(exc).__name__}",
+                                   False, False, False)
+
 
 class ClarificationAttemptStore:
     """Reservation and lifecycle authority, on its own transaction.

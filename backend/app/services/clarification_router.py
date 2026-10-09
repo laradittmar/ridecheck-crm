@@ -40,6 +40,11 @@ class ClarificationReason:
     HUMAN_OWNS_TURN = "HUMAN_OWNS_TURN"
     CORRECTION_VALUES_KNOWN = "CORRECTION_VALUES_KNOWN"
     VEHICLE_IDENTITY_UNRESOLVED = "VEHICLE_IDENTITY_UNRESOLVED"
+    #: G3-7L. The identity on file is complete, but WHICH car this turn concerns was
+    #: refused by the reconciler for a reason the Flow can settle. Distinct from
+    #: VEHICLE_IDENTITY_UNRESOLVED so the trace never conflates "we don't know the car"
+    #: with "we don't know which of the cars you mean".
+    VEHICLE_TARGET_UNRESOLVED = "VEHICLE_TARGET_UNRESOLVED"
     VEHICLE_ATTEMPT_SPENT = "VEHICLE_ATTEMPT_SPENT"
     VEHICLE_FLOW_OUTSTANDING = "VEHICLE_FLOW_OUTSTANDING"
     VEHICLE_CATEGORY_UNRESOLVED = "VEHICLE_CATEGORY_UNRESOLVED"
@@ -101,6 +106,7 @@ def clarification_decision(*,
                            correction_values_known: bool = False,
                            vehicle_domain_relevant: bool = False,
                            vehicle_identity_resolved: bool = True,
+                           vehicle_decision_unresolved: bool = False,
                            vehicle_category_resolved: bool = True,
                            vehicle_attempt_spent: bool = False,
                            vehicle_flow_outstanding: bool = False,
@@ -134,6 +140,15 @@ def clarification_decision(*,
 
     Defaults are the safe reading — `*_resolved` default True and `*_relevant` default False
     — so a caller that omits an argument gets silence rather than an unasked-for Flow.
+
+    G3-7L adds `vehicle_decision_unresolved`: the reconciler refused a vehicle mutation for
+    a reason the Vehicle Flow can answer. It is a SEPARATE question from
+    `vehicle_identity_resolved`, because a thread can hold a complete, resolved vehicle and
+    still have an unresolvable turn — "no, el otro es del 2016" with one candidate on file.
+    Identity completeness answered YES there, which is why those HOLDs asked nothing. It
+    defaults False and is subject to every rule below it: human ownership still stops the
+    turn, a spent attempt still escalates instead of repeating, an outstanding Flow still
+    waits, and a competing confirmable proposal still silences the Flow.
     """
     if human_owns_turn:
         return (ClarificationRoute.NO_CLARIFICATION_REQUIRED,
@@ -155,7 +170,10 @@ def clarification_decision(*,
     vehicle_in_play = vehicle_domain_relevant or required_next_information_authorized
     location_in_play = location_domain_relevant or required_next_information_authorized
 
-    if vehicle_in_play and not vehicle_identity_resolved:
+    # G3-7L: either the identity is incomplete, or the DECISION about which car this turn
+    # concerns was refused for a reason the Flow can answer. The second is what every W1/W2
+    # HOLD produces, and the first never saw it.
+    if vehicle_in_play and (not vehicle_identity_resolved or vehicle_decision_unresolved):
         if vehicle_flow_outstanding:
             return (ClarificationRoute.NO_CLARIFICATION_REQUIRED,
                     ClarificationReason.VEHICLE_FLOW_OUTSTANDING)
@@ -166,10 +184,13 @@ def clarification_decision(*,
             return (ClarificationRoute.GENERIC_HUMAN_REQUIRED,
                     ClarificationReason.PROPOSAL_WOULD_COEXIST)
         return (ClarificationRoute.VEHICLE_FLOW_REQUIRED,
-                ClarificationReason.VEHICLE_IDENTITY_UNRESOLVED)
+                ClarificationReason.VEHICLE_IDENTITY_UNRESOLVED
+                if not vehicle_identity_resolved
+                else ClarificationReason.VEHICLE_TARGET_UNRESOLVED)
 
     # A known vehicle the catalogue cannot place: the Flow would ask for what we hold.
-    if vehicle_in_play and vehicle_identity_resolved and not vehicle_category_resolved:
+    if (vehicle_in_play and vehicle_identity_resolved
+            and not vehicle_decision_unresolved and not vehicle_category_resolved):
         return (ClarificationRoute.GENERIC_HUMAN_REQUIRED,
                 ClarificationReason.VEHICLE_CATEGORY_UNRESOLVED)
 
