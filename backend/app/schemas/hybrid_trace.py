@@ -60,7 +60,9 @@ import unicodedata
 from dataclasses import dataclass, field, asdict
 from typing import Any, Optional
 
-TRACE_VERSION = "hybrid-decision-trace/1.9"
+TRACE_VERSION = "hybrid-decision-trace/1.10"
+#: G3-7P added the canonical offer identity and status to the snapshot.
+TRACE_VERSION_1_9 = "hybrid-decision-trace/1.9"
 #: 1.8 added the clarification block; 1.9 adds the ATTEMPT LIFECYCLE inside it, so a
 #: dispatch turn, a completion turn and a prevented-second turn can be joined by
 #: `attempt_id` into one lifecycle. Additive: no 1.8 field changed meaning.
@@ -1235,6 +1237,16 @@ class CanonicalSnapshot:
     offered_slots_count: Optional[int] = None
     booking_token_present: Optional[bool] = None
     booking_token_fingerprint: Optional[str] = None
+    #: G3-7P. The canonical offer, which is now the authority a booking rests on —
+    #: `offer_outstanding` above is derived from `offer_status`, not from a non-empty
+    #: string, so a WITHDRAWN or ACCEPTED offer can never be rendered as outstanding.
+    #: `offer_terminal_reason` is why it ended (VEHICLE_CHANGED, LOCATION_CHANGED,
+    #: CYCLE_RESET, OFFER_REJECTED, CONSUMED_BY_BOOKING, …) and
+    #: `offer_refusal` is the classification of a submission this turn refused.
+    offer_id: Optional[int] = None
+    offer_status: Optional[str] = None
+    offer_terminal_reason: Optional[str] = None
+    offer_refusal: Optional[str] = None
 
 
 @dataclass

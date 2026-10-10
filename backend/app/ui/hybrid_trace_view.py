@@ -761,6 +761,7 @@ CONTRACTS_WITH_CANDIDATE_SECTION = frozenset({
     "hybrid-decision-trace/1.7",
     "hybrid-decision-trace/1.8",
     "hybrid-decision-trace/1.9",
+    "hybrid-decision-trace/1.10",
 })
 
 #: G3-7F-OWNER-RESOLUTION. The clarification section needs its own note because the whole

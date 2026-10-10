@@ -643,10 +643,14 @@ class EndpointAuthorization(unittest.TestCase):
             for text in WILD_BURST:
                 self.assertNotIn(text, blob)
             self.assertNotIn("5491133334444", blob)
+        # G3-7P added four offer fields. The point of this assertion is that the snapshot
+        # stays an ALLOWLIST — no secret, no customer text, no raw token — and the new
+        # fields keep that: an id, a status, a terminal reason and a refusal class.
         self.assertEqual(sorted(payload["canonical_before"]), [
             "active_requested_date", "booking_token_fingerprint", "booking_token_present",
             "candidate_id", "lead_estado", "lead_necesita_humano", "needs_human",
-            "offer_outstanding", "offered_slots_count", "revision_id", "stage",
+            "offer_id", "offer_outstanding", "offer_refusal", "offer_status",
+            "offer_terminal_reason", "offered_slots_count", "revision_id", "stage",
             "zone_detail", "zone_group"],
             "the canonical snapshot must stay allowlisted")
 

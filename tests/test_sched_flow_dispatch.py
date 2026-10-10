@@ -356,17 +356,26 @@ class TestSchedF06NoRevisionAtFlowSend(unittest.TestCase):
         ctx = _make_ctx(state=state)
         eng._try_schedule_and_flow(ctx, state, "2026-08-22", "11:00", "")
 
-        self.assertEqual(
-            len(adds), 0,
-            "F06: db.add must not be called during _try_schedule_and_flow — "
-            "revision is created by _process_flow_response after form submission",
-        )
+        # G3-7P narrowed this to its actual invariant, as in F14: dispatch creates no
+        # BOOKING. It does add the booking OFFER — the durable record that we offered
+        # something, without which a later acceptance could not be checked at all.
+        from app.models import Revision, ThreadRevision, WhatsAppBookingOffer
+        self.assertEqual([o for o in adds if isinstance(o, (Revision, ThreadRevision))], [],
+                         "F06: no revision is created at dispatch time — "
+                         "it is created by _process_flow_response after form submission")
+        self.assertEqual(len([o for o in adds if isinstance(o, WhatsAppBookingOffer)]), 1,
+                         "dispatch issues exactly one offer")
 
 
 # ── SCHED-F07 ─────────────────────────────────────────────────────────────────
 
 class TestSchedF07FlowCompletionCreatesBooking(unittest.TestCase):
     """F07: _process_flow_response sets COORDINAR_DISPONIBILIDAD + creates ThreadRevision."""
+
+    def setUp(self):
+        # G3-7P: MagicMock session — see `offer_fixture.start_offer_claim_stub`.
+        from offer_fixture import start_offer_claim_stub
+        start_offer_claim_stub(self)
 
     def _make_engine_for_flow_response(self):
         eng = _make_engine()
@@ -679,11 +688,18 @@ class TestSchedF14NoDuplicateRevision(unittest.TestCase):
         ctx = _make_ctx(state=state)
         eng._try_schedule_and_flow(ctx, state, "2026-08-22", "11:00", "")
 
-        self.assertEqual(
-            len(adds), 0,
-            "F14: _try_schedule_and_flow must not call db.add — "
-            "revision created by _process_flow_response only",
-        )
+        # G3-7P narrowed this to its actual invariant. The contract is that dispatch
+        # creates no BOOKING — no Revision and no ThreadRevision; those belong to
+        # `_process_flow_response`. Dispatch does now add exactly one row: the booking
+        # OFFER, which is the durable record that we offered something and is what makes
+        # a later acceptance checkable at all. Counting every `db.add` conflated "creates
+        # no booking" with "writes nothing".
+        from app.models import Revision, ThreadRevision, WhatsAppBookingOffer
+        self.assertEqual([o for o in adds if isinstance(o, (Revision, ThreadRevision))], [],
+                         "F14: dispatch must not create a revision — "
+                         "that belongs to _process_flow_response")
+        self.assertEqual(len([o for o in adds if isinstance(o, WhatsAppBookingOffer)]), 1,
+                         "dispatch issues exactly one offer")
 
     def test_f14_active_requested_date_cleared_after_valid_slot(self):
         """When slot is valid, active_requested_date is cleared (no stale context)."""

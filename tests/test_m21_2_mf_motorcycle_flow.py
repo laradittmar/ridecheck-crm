@@ -352,6 +352,13 @@ class TestMF03FlowResponse(unittest.TestCase):
 
 class TestMF04OtherCallerUnchanged(unittest.TestCase):
 
+    def setUp(self):
+        # G3-7P: MagicMock session — see `offer_fixture.start_offer_claim_stub`.
+        # This class asserts ROUTING (a booking token must not reach the moto
+        # handler and vice versa), not whether the offer is acceptable.
+        from offer_fixture import start_offer_claim_stub
+        start_offer_claim_stub(self)
+
     def test_mf04_booking_response_routes_to_booking_handler(self):
         """MF04: Booking flow response (no moto-handoff token) routes to booking handler."""
         eng = _make_engine()

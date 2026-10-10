@@ -1013,7 +1013,7 @@ class I_Observability(unittest.TestCase):
 
     def test_or_62c_the_trace_contract_was_bumped(self):
         from app.schemas.hybrid_trace import TRACE_VERSION
-        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.9")
+        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.10")
 
     def test_or_62d_the_inspector_renders_the_clarification_card(self):
         """Requirements 58-61 at the rendering boundary."""

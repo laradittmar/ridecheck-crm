@@ -17,6 +17,7 @@ from sqlalchemy import (
     Time,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -724,6 +725,120 @@ class WhatsAppClarificationAttempt(Base):
     terminal_reason: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False)
+
+
+class WhatsAppBookingOffer(Base):
+    """One row per booking offer ever dispatched. THE authority on whether a submitted
+    Flow may become a booking (G3-7P).
+
+    Before this table, `whatsapp_thread_states.flow_booking_token` was both the offer and
+    the authority, and the G3-7N independent review proved that cannot work. The booking
+    path's check was `if expected and flow_token and flow_token != expected`, so a NULL
+    `expected` short-circuited it — and NULL is the resting state of that column after six
+    different production writes (consumption, cycle reset, rejection handoff, motorcycle
+    handoff, the text-path correction withdrawal, and booking_flow_service's own
+    consumption). Measured consequence: with `expected IS NULL` the path accepted the old
+    consumed token, a fabricated token, an empty token and NO TOKEN AT ALL, each creating a
+    ThreadRevision and a CRM Revision. G3-7N's tombstone guarded one of those six doors.
+
+    A row's EXISTENCE is the evidence that we offered something, and its `status` is the
+    only thing that may authorize a booking. Absence of a row is therefore a refusal, never
+    a permission: `claim()` fails closed.
+
+    Two database-enforced invariants, both of which hold against callers not yet written:
+
+        UNIQUE (token_fingerprint)                      one token -> at most one offer
+        UNIQUE (thread_id) WHERE status = 'ISSUED'      at most one LIVE offer per thread
+
+    The second is what makes "issue supersedes the previous offer" a fact rather than a
+    convention, and it is why two concurrent issues cannot both leave a live offer behind.
+
+    The raw token is NEVER stored. `token_fingerprint` is sha256(token) — enough to match a
+    submission, useless to replay elsewhere, and safe to render in the Inspector.
+
+    The bindings are stored because a booking must be refused when the thing being booked
+    has moved, not merely when someone remembered to withdraw: `candidate_id`, the zone pair
+    and `tipo_vehiculo` are the quote inputs (`PricingService.quote(db, tipo_vehiculo,
+    zone_group, zone_detail)`), and `offered_date` / `offered_time` are what the customer was
+    actually shown.
+    """
+
+    __tablename__ = "whatsapp_booking_offers"
+    __table_args__ = (
+        UniqueConstraint("token_fingerprint", name="uq_booking_offer_token_fingerprint"),
+        CheckConstraint(
+            "status IN ('ISSUED', 'ACCEPTED', 'WITHDRAWN', 'SUPERSEDED', 'EXPIRED')",
+            name="ck_booking_offer_status"),
+        #: A live offer has no terminal timestamp, and a terminal one must have it. This is
+        #: what stops a half-applied transition from reading as "still live".
+        CheckConstraint("(status = 'ISSUED') = (terminal_at IS NULL)",
+                        name="ck_booking_offer_terminal_at"),
+        CheckConstraint("status = 'ACCEPTED' OR accepted_at IS NULL",
+                        name="ck_booking_offer_accepted_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    thread_id: Mapped[int] = mapped_column(
+        ForeignKey("whatsapp_threads.id"), nullable=False, index=True)
+    #: `COALESCE(state.current_cycle_start_message_db_id, 0)` — the same cycle identity the
+    #: clarification ledger uses, so an offer from a closed cycle is recognisable as such.
+    cycle_key: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    # ── what was being booked when the offer was made ────────────────────────
+    candidate_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("whatsapp_thread_candidates.id"), nullable=True)
+    tipo_vehiculo: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    zone_group: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    zone_detail: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    offered_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    offered_time: Mapped[Optional[time]] = mapped_column(Time, nullable=True)
+
+    # ── identity of the offer itself ─────────────────────────────────────────
+    flow_id: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    contract_version: Mapped[str] = mapped_column(String(24), nullable=False)
+    #: sha256(token) hex. The raw token is never persisted here.
+    token_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    # ── lifecycle ────────────────────────────────────────────────────────────
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    #: `issued_at + TOKEN_MAX_AGE_SECONDS`. Expiry is pre-existing policy
+    #: (`booking_flow_service.TOKEN_MAX_AGE_SECONDS`), not a new one.
+    expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    terminal_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    accepted_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    terminal_reason: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
+    #: G3-7P §9. A refusal is a decision an operator must be able to audit, and a Flow turn
+    #: persists no hybrid-trace row, so the classification is recorded HERE against the
+    #: offer it refused. A refusal that matches no offer at all (a fabricated or absent
+    #: token) has no row to carry it and is observable through the human handoff it causes.
+    refused_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0")
+    last_refusal: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    last_refused_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+
+    # ── what the acceptance produced, for audit ──────────────────────────────
+    accepted_revision_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("revisions.id"), nullable=True)
+    accepted_thread_revision_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("thread_revisions.id"), nullable=True)
+
+
+#: At most ONE live offer per thread, enforced by the database. Declared for both dialects:
+#: without the predicate on SQLite this would forbid a thread from ever having a second
+#: offer, which is the opposite of the intent.
+Index("uq_booking_offer_one_live_per_thread", WhatsAppBookingOffer.thread_id,
+      unique=True,
+      postgresql_where=text("status = 'ISSUED'"),
+      sqlite_where=text("status = 'ISSUED'"))
+
+Index("ix_booking_offer_thread_status", WhatsAppBookingOffer.thread_id,
+      WhatsAppBookingOffer.status)
 
 
 Index("ix_dedup_wa_kind_fp_created", WhatsAppOutboundDedup.wa_id, WhatsAppOutboundDedup.message_kind, WhatsAppOutboundDedup.content_fingerprint, WhatsAppOutboundDedup.created_at)

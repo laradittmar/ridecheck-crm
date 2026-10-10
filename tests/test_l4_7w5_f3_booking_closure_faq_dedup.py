@@ -138,7 +138,9 @@ class TestBookingReceipt(unittest.TestCase):
     def test_book_end_05_06_exactly_once_comes_from_the_consumed_token(self):
         """BOOK-END-05/06 — a Meta retry or duplicate confirm cannot reach the send."""
         confirm = _fn(BFS_SOURCE, "handle_confirm_booking")
-        self.assertIn("state.flow_booking_token = None", confirm)
+        # G3-7P: consumption goes through the one lifecycle authority, which records
+        # WHICH revision the accepted offer became instead of only nulling a mirror.
+        self.assertIn("_offers.consume(", confirm)
         resolve = _fn(BFS_SOURCE, "resolve_context")
         self.assertIn("token invalid or already consumed", resolve)
         self.assertIn("raise BookingTokenError", resolve)

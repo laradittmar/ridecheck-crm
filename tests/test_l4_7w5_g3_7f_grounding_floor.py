@@ -422,7 +422,7 @@ class G_CatalogGuard(unittest.TestCase):
 class H_Contracts(unittest.TestCase):
 
     def test_g37f_29_the_trace_contract_is_1_7(self):
-        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.9")
+        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.10")
 
     def test_g37f_30_the_rule_version_moved_past_v2(self):
         """G3-7K W1 moved the reconciler rule set to v3 by adding the proven-survivorship

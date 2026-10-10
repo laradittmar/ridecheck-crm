@@ -49,6 +49,8 @@ from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import sessionmaker
 
 import app.models
+
+from offer_fixture import seed_live_offer  # noqa: E402
 from app.models import (Lead, Revision, ThreadRevision, ViaticosZone, WhatsAppContact,
                         WhatsAppMessage, WhatsAppThread, WhatsAppThreadCandidate,
                         WhatsAppThreadState)
@@ -109,6 +111,10 @@ class _LiveTurn(unittest.TestCase):
             last_visible_slots='["13:00", "13:30", "14:00"]',
             flow_booking_token=f"{self.thread.id}-1788999999-abcdef0123456789")
         self.db.add(self.state); self.db.commit()
+        # G3-7P: a hand-set token is no longer an offer. Authority is
+        # `whatsapp_booking_offers` and an absent row is a refusal, so a fixture that
+        # wants a bookable offer issues one through the authority.
+        seed_live_offer(self.db, self.state)
 
         self.eng = ConversationEngine(db=self.db, settings=MagicMock())
         self.sent: list[str] = []
@@ -298,9 +304,23 @@ class TestAuthorityBoundaries(unittest.TestCase):
         self.assertTrue(writers <= {"handle_confirm_booking", "_create_booking"}, writers)
 
     def test_the_withdrawal_is_one_explicit_transition(self):
+        """G3-7P: still ONE explicit transition, but through the one lifecycle authority.
+
+        The pin on `state.flow_booking_token = None` was a pin on the MECHANISM, and that
+        mechanism was the defect: the G3-7N review proved a NULL mirror revokes nothing
+        because the booking check short-circuits on it. F7A's intent is unchanged — a
+        rejected offer must not be bookable afterwards — and it is now asserted on the
+        authority and, behaviourally, in
+        `test_l4_7w5_g3_7p_offer_authority_pg.py::test_g7p_pg_21`.
+        """
         fn = _fn("_handle_scheduling_escalation")
         self.assertIn("FLOW_OFFER_WITHDRAWN", fn)
-        self.assertEqual(fn.count("state.flow_booking_token = None"), 1)
+        self.assertEqual(fn.count("_withdraw_booking_offer("), 1)
+        self.assertIn("OFFER_REJECTED", fn)
+        # F7A deliberately keeps what the customer said about availability
+        self.assertIn("clear_scheduling=False", fn)
+        self.assertEqual(fn.count("state.flow_booking_token = None"), 0,
+                         "the mirror must not be written by hand any more")
 
     def test_schedule_service_remains_the_availability_authority(self):
         nxt = _fn("_handle_next_available_request")

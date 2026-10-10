@@ -142,6 +142,29 @@ def engine(*, grounding=True, provisional=True, rows=None, catalog=None):
     return e, rows
 
 
+
+def real_db_for(engine_obj, st):
+    """Give a bare test engine a REAL session, and a thread row to own the offer.
+
+    G3-7P moved offer authority into `whatsapp_booking_offers`, so
+    `_withdraw_dependent_proposals` now ends the offer instead of only nulling its mirror —
+    which a `SimpleNamespace` stand-in for a session cannot do. Attaching a real session
+    makes these two tests exercise the actual withdrawal rather than a weaker shadow of it.
+    """
+    from sqlalchemy import create_engine as _ce
+    from sqlalchemy.orm import sessionmaker as _sm
+    from sqlalchemy.pool import StaticPool as _sp
+    import app.models as _M
+    eng = _ce("sqlite://", poolclass=_sp, connect_args={"check_same_thread": False})
+    _M.WhatsAppBookingOffer.metadata.create_all(eng)
+    db = _sm(bind=eng, expire_on_commit=False)()
+    ct = _M.WhatsAppContact(wa_id="x", display_name="x"); db.add(ct); db.flush()
+    th = _M.WhatsAppThread(contact_id=ct.id); db.add(th); db.flush()
+    stt = _M.WhatsAppThreadState(thread_id=th.id); db.add(stt); db.commit()
+    engine_obj.db = db
+    st.thread_id = th.id
+    return db, th.id
+
 def ctx_for(rows, st):
     return SimpleNamespace(state=st, candidates=rows, thread=SimpleNamespace(id=1),
                            contact=SimpleNamespace(wa_id="x"))
@@ -389,8 +412,10 @@ class D_FiniteRecovery(unittest.TestCase):
         e, rows = engine()
         st = state(flow_booking_token="tok", last_visible_slots='[{"d":"x"}]',
                    vehicle_fallback_flow_sent=True)
+        _db, _tid = real_db_for(e, st)
         d = pc.proposal_disposition(st, [("marca", "Honda", "Ford")])
-        e._withdraw_dependent_proposals(ctx_for(rows, st), st, d)
+        _ctx = ctx_for(rows, st); _ctx.thread = SimpleNamespace(id=_tid)
+        e._withdraw_dependent_proposals(_ctx, st, d)
         self.assertIsNone(st.flow_booking_token)
         self.assertIsNone(st.last_visible_slots)
         self.assertIs(st.vehicle_fallback_flow_sent, False,
@@ -494,9 +519,11 @@ class D_FiniteRecovery(unittest.TestCase):
         """The bounded subset: a correction must not reset the conversation."""
         e, rows = engine()
         st = state(flow_booking_token="tok")
+        _db, _tid = real_db_for(e, st)
         before = (st.current_focus_candidate_id, st.home_zone_group, st.home_zone_detail)
         d = pc.proposal_disposition(st, [("marca", "Honda", "Ford")])
-        e._withdraw_dependent_proposals(ctx_for(rows, st), st, d)
+        _ctx = ctx_for(rows, st); _ctx.thread = SimpleNamespace(id=_tid)
+        e._withdraw_dependent_proposals(_ctx, st, d)
         self.assertEqual((st.current_focus_candidate_id, st.home_zone_group,
                           st.home_zone_detail), before)
         self.assertEqual(rows[0].marca, "Honda", "withdrawal writes no candidate field")

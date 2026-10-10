@@ -56,6 +56,8 @@ def _pragmas(conn, _rec):
 
 
 import app.models  # noqa: F401
+
+from offer_fixture import seed_live_offer  # noqa: E402
 from app.models import (
     Lead,
     Revision,
@@ -143,6 +145,10 @@ def _make_world(db: Session) -> tuple[WhatsAppThread, WhatsAppThreadState, Whats
     )
     db.add(state)
     db.commit()
+    # G3-7P: a hand-set token is no longer an offer. Authority is
+    # `whatsapp_booking_offers` and an absent row is a refusal, so a fixture that
+    # wants a bookable offer issues one through the authority.
+    seed_live_offer(db, state)
 
     return thread, state, candidate, lead
 

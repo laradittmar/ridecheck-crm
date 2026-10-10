@@ -88,6 +88,8 @@ for _mod_name in ["resend", "anthropic", "openai", "boto3", "botocore", "botocor
 
 # ── Import ORM models ─────────────────────────────────────────────────────────
 import app.models  # noqa: F401
+
+from offer_fixture import seed_live_offer  # noqa: E402
 from app.models import (
     Lead, ViaticosZone, WhatsAppContact, WhatsAppMessage,
     WhatsAppThread, WhatsAppThreadCandidate, WhatsAppThreadState,
@@ -209,6 +211,10 @@ def _seed_flow_sent(db: Session):
     contact, thread, lead, state, candidate = _seed_scheduling(db)
     state.flow_booking_token = f"{thread.id}-9999999"
     db.commit()
+    # G3-7P: a hand-set token is no longer an offer. Authority is
+    # `whatsapp_booking_offers` and an absent row is a refusal, so a fixture that
+    # wants a bookable offer issues one through the authority.
+    seed_live_offer(db, state)
     return contact, thread, lead, state, candidate
 
 

@@ -675,6 +675,34 @@ class BookingFlowService:
         """
         ctx = self.resolve_context(booking_token)
 
+        # ── G3-7P: the SAME acceptance authority as the conversation-engine path ────
+        # This is the second booking writer in the system; it must not be a second
+        # authority. `resolve_context` already checked the token against the state mirror
+        # and its age, but the mirror is not the authority — the offer row is — and only
+        # the offer row knows whether this offer was withdrawn because the vehicle or the
+        # zone moved. The claim is a conditional UPDATE off 'ISSUED' under a row lock, so
+        # it also makes the two writers mutually exclusive for one offer.
+        #
+        # It belongs HERE and not in `handle_prepare_summary`: acceptance is terminal, and
+        # claiming it while merely rendering the summary screen would consume the offer
+        # before the customer confirmed anything.
+        from .offer_lifecycle import OfferLifecycle
+        _offers = OfferLifecycle(self.db)
+        _claim = _offers.claim(
+            ctx.state, thread_id=ctx.thread.id, token=booking_token,
+            # `ctx.candidate` is the candidate this booking will actually reference, which
+            # is the thing the offer was bound to.
+            candidate_id=getattr(ctx.candidate, "id", None),
+            zone_group=ctx.zone_group, zone_detail=ctx.zone_detail)
+        if not _claim.ok:
+            logger.warning(
+                "BOOKING_OFFER_REFUSED thread_id=%s reason=%s offer_id=%s — no booking",
+                ctx.thread.id, _claim.refusal, _claim.offer_id)
+            _log_event(self.db, ctx.thread.id, "BOOKING_OFFER_REFUSED",
+                       booking_token=booking_token,
+                       extra={"reason": _claim.refusal, "offer_id": _claim.offer_id})
+            raise BookingTokenError(f"offer not acceptable: {_claim.refusal}")
+
         date_str = str(data.get("date", "")).strip()
         time_str = str(data.get("time", "")).strip()
 
@@ -866,12 +894,15 @@ class BookingFlowService:
             lead.nombre = parts[0] if parts else name
             lead.apellido = " ".join(parts[1:]) if len(parts) > 1 else None
 
-        # Thread state — consume token
+        # Thread state — the offer was ACCEPTED above, in this same transaction
         state = ctx.state
         state.current_revision_id = thread_rev.id
         state.last_stage = STAGE_BOOKED
         state.needs_human = True
-        state.flow_booking_token = None  # token consumed
+        # G3-7P: record which revision the accepted offer became, and clear the transport
+        # mirror through the one authority rather than by hand.
+        _offers.consume(state, thread_id=ctx.thread.id, revision_id=crm_rev.id,
+                        thread_revision_id=thread_rev.id)
 
         self.db.commit()
 

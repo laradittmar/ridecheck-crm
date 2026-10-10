@@ -686,7 +686,7 @@ class H_Governance(unittest.TestCase):
 
     def test_cl_57_trace_contract_is_1_9_with_the_lifecycle_fields(self):
         from app.schemas.hybrid_trace import TRACE_VERSION
-        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.9")
+        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.10")
         src = inspect.getsource(E._clarification_for_trace)
         for field in ("attempt_id", "cycle_key", "family", "attempt_status",
                       "reservation", "already_attempted", "outbound_message_id",

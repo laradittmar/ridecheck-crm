@@ -60,7 +60,7 @@ def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
-def snapshot_state(state, lead) -> CanonicalSnapshot:
+def snapshot_state(state, lead, offer=None, refusal=None) -> CanonicalSnapshot:
     """Allowlisted canonical fields. Never serializes the ORM object."""
     def g(obj, name, default=None):
         return getattr(obj, name, default) if obj is not None else default
@@ -75,6 +75,12 @@ def snapshot_state(state, lead) -> CanonicalSnapshot:
             slots_count = None
     token = g(state, "flow_booking_token")
     active_date = g(state, "active_requested_date")
+    # G3-7P: the offer's AUTHORITY decides whether one is outstanding. Before this, the
+    # snapshot said `bool(token or ...)`, and G3-7N's truthy tombstone made that report a
+    # WITHDRAWN offer as live. A terminal status is never outstanding, whatever the mirror
+    # happens to hold.
+    offer_status = g(offer, "status")
+    offer_live = (offer_status == "ISSUED") if offer_status is not None else None
     return CanonicalSnapshot(
         stage=g(state, "last_stage"),
         needs_human=bool(g(state, "needs_human", False)) if state is not None else None,
@@ -85,11 +91,16 @@ def snapshot_state(state, lead) -> CanonicalSnapshot:
         revision_id=g(state, "current_revision_id"),
         zone_group=g(state, "home_zone_group"),
         zone_detail=g(state, "home_zone_detail"),
-        offer_outstanding=bool(token or active_date or slots_count),
+        offer_outstanding=(offer_live if offer_live is not None
+                           else bool(token or active_date or slots_count)),
         active_requested_date=str(active_date) if active_date else None,
         offered_slots_count=slots_count,
         booking_token_present=bool(token),
         booking_token_fingerprint=token_fingerprint(token),
+        offer_id=g(offer, "id"),
+        offer_status=offer_status,
+        offer_terminal_reason=g(offer, "terminal_reason"),
+        offer_refusal=refusal,
     )
 
 

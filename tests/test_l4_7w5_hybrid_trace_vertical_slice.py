@@ -98,7 +98,7 @@ class TraceContract(unittest.TestCase):
         """1.2 since L4.7W5-TRACE-ROW-SEMANTICS-R2. Older contracts stay readable, named."""
         from app.schemas.hybrid_trace import (READABLE_VERSIONS, TRACE_VERSION_1_0,
                                               TRACE_VERSION_1_1, TRACE_VERSION_1_2)
-        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.9")
+        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.10")
         self.assertEqual(TRACE_VERSION_1_2, "hybrid-decision-trace/1.2")
         self.assertEqual(TRACE_VERSION_1_1, "hybrid-decision-trace/1.1")
         self.assertEqual(TRACE_VERSION_1_0, "hybrid-decision-trace/1.0")

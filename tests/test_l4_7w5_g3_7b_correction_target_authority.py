@@ -574,7 +574,7 @@ class F_BoundariesThroughTheHandler(unittest.TestCase):
 class G_TraceTruth(unittest.TestCase):
 
     def test_g37b_56_the_contract_is_1_6(self):
-        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.9")
+        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.10")
 
     def test_g37b_57_the_resolution_reaches_the_persisted_payload(self):
         from app.services.hybrid_trace import build_trace

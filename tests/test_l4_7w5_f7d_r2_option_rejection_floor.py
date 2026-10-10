@@ -341,8 +341,10 @@ class TestGovernance(unittest.TestCase):
 
     def test_r2_30_escalation_remains_the_sole_side_effect_authority(self):
         handler = _code_only("_handle_scheduling_escalation")
-        self.assertIn("flow_booking_token = None", handler,
-                      "token withdrawal stays inside the canonical handler")
+        # G3-7P: withdrawal still happens HERE and nowhere else, but through the one
+        # lifecycle authority — a NULL mirror was never a revocation.
+        self.assertIn("_withdraw_booking_offer(", handler,
+                      "offer withdrawal stays inside the canonical handler")
         tree = ast.parse(CE_SRC)
         callers = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
                    and "_handle_scheduling_escalation" in ast.unparse(n)

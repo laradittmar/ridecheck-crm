@@ -265,7 +265,8 @@ class TestFlowPrefillWithinPublishedLimits(unittest.TestCase):
 
     def test_flow_prefill_10_no_duplicate_booking(self):
         confirm = _fn(BFS_SOURCE, "handle_confirm_booking")
-        self.assertIn("state.flow_booking_token = None", confirm)
+        # G3-7P: see `offer_lifecycle.consume` — the mirror follows the authority.
+        self.assertIn("_offers.consume(", confirm)
 
     def test_flow_prefill_04_05_06_phone_and_name_are_blocked_by_the_published_flow(self):
         """FLOW-PREFILL-04/05/06 — recorded as an external constraint, not silently skipped.

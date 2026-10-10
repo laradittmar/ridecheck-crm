@@ -4063,6 +4063,12 @@ class TestWebsiteFlowResponse(unittest.TestCase):
         ctx.contact.wa_id = "549" + lead_phone
         return ctx, state
 
+    def setUp(self):
+        # G3-7P: this class's session is a MagicMock, so the offer authority cannot be
+        # consulted here. See `offer_fixture.start_offer_claim_stub`.
+        from offer_fixture import start_offer_claim_stub
+        start_offer_claim_stub(self)
+
     def _make_engine_for_flow_response(self):
         from unittest.mock import MagicMock
         eng = _make_engine()

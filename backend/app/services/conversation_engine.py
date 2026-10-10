@@ -268,14 +268,6 @@ _MOTORCYCLE_ADVISOR_REPLY = (
 # BEFORE the booking-flow handler.  Must not clash with booking tokens (no prefix there).
 _MOTO_HANDOFF_TOKEN_PREFIX = "moto-handoff-"
 
-#: G3-7N. A withdrawn scheduling offer leaves a TOMBSTONE in `flow_booking_token` rather
-#: than simply clearing it. Clearing is not revocation: the booking path's token check is
-#: `if expected and flow_token and flow_token != expected`, so a NULL `expected`
-#: short-circuits and a late tap sails through. The tombstone keeps `expected` non-null and
-#: unmatchable, which is what makes the refusal durable — it survives process restart,
-#: duplicate delivery, delayed submission and the issuing of a later offer, because a new
-#: offer simply overwrites the same column. Only a hash of the superseded token is kept.
-_WITHDRAWN_OFFER_TOKEN_PREFIX = "withdrawn-offer-"
 
 # Candidate type-safety: tipo_vehiculo values that represent motorcycles.
 # A MOTO candidate must never be repurposed as an automotive candidate and vice versa.
@@ -3355,6 +3347,13 @@ class ConversationEngine:
         self._reply_admission_state = None
         self._reply_contract = ReplyContract.NOT_INVOKED
         self._turn_candidate_resolution = None
+        # G3-7P: the turn's offer decisions. Both are READ — `_turn_offer_claim` by the
+        # canonical snapshot (`offer_refusal`) and `_turn_offer_withdrawal` by the
+        # withdrawal decision row — so neither is another write-only `_turn_*` field, and
+        # both are reset here for the reason the G3-7G audit established: a reused engine
+        # instance must never report a previous turn's decision as this turn's.
+        self._turn_offer_claim = None
+        self._turn_offer_withdrawal = None
         self._turn_service_question = False
         self._turn_correction_echo = ()          # G3-7F: Tier 1 must echo what it changed
         self._turn_correction_moto = False       # G3-7F-R2: corrected category is a MOTO
@@ -3607,57 +3606,45 @@ class ConversationEngine:
         if "zona_general" in flow_data:
             return self._process_location_fallback_response(ctx, state, flow_data)
 
-        # ── G3-7N: a WITHDRAWN offer is refused before anything is written ────────
-        # The check below this one is deliberately warn-only for clock skew, and that is
-        # exactly why clearing the token could not revoke an offer: a NULL `expected`
-        # short-circuits it. A tombstone cannot be matched by any real token, so a late tap
-        # on the superseded Flow stops here — before any Revision, ThreadRevision, booking,
-        # agenda occupancy or lead-state change.
+        # ── G3-7P: FAIL-CLOSED ACCEPTANCE ────────────────────────────────────────
+        # Authority is `whatsapp_booking_offers`, not this column. G3-7N's review proved
+        # why: the old check was `if expected and flow_token and flow_token != expected`,
+        # so a NULL `expected` short-circuited it, and NULL is the resting state of
+        # `flow_booking_token` after six production writes. Measured there: with
+        # `expected IS NULL` this path accepted the old consumed token, a fabricated token,
+        # an empty token and NO TOKEN AT ALL, each creating a ThreadRevision and a Revision.
+        #
+        # `claim()` starts from "there is no offer" and only an ISSUED row bound to THIS
+        # thread, THIS candidate and THIS location, matching the submitted token's
+        # fingerprint, un-expired and never accepted, can move it. The row is locked FOR
+        # UPDATE and the transition is a conditional UPDATE off 'ISSUED', so a concurrent
+        # withdrawal or a duplicate delivery serialises and exactly one caller can accept.
+        # It does not commit: the single `commit()` further down couples the acceptance to
+        # the booking it authorizes.
+        from .offer_lifecycle import OfferLifecycle as _OfferLifecycle
         expected = state.flow_booking_token
         self._flow_token_expected = expected
-        if (expected or "").startswith(_WITHDRAWN_OFFER_TOKEN_PREFIX):
-            self._turn_booking_refusal = "OFFER_WITHDRAWN"
-            self._decision_log(ctx, "booking_offer_withdrawn",
-                               reason="OFFER_WITHDRAWN", had_token=bool(flow_token))
-            logger.info("G3-7N refused a withdrawn scheduling offer thread_id=%s — "
-                        "no revision, no booking", ctx.thread.id)
+        _offers = _OfferLifecycle(self.db)
+        _zone_group, _zone_detail = self._get_active_inspection_location(ctx, state)
+        _claim = _offers.claim(
+            state, thread_id=ctx.thread.id, token=flow_token,
+            candidate_id=getattr(self._focus_candidate(ctx, repair=False), "id", None),
+            zone_group=_zone_group, zone_detail=_zone_detail)
+        self._turn_offer_claim = _claim
+        if not _claim.ok:
+            # An honest terminal answer, and zero writes to anything that can book.
+            self._decision_log(ctx, "booking_offer_refused", reason=_claim.refusal,
+                               offer_id=_claim.offer_id, offer_status=_claim.status,
+                               had_token=bool(flow_token))
+            logger.info("G3-7P refused a booking submission thread_id=%s reason=%s "
+                        "offer_id=%s — no revision, no booking",
+                        ctx.thread.id, _claim.refusal, _claim.offer_id)
             state.needs_human = True
             lead.necesita_humano = True
             self.db.commit()
             sent_id = self._send_text_to_wa(ctx, _FALLBACK_WARM_HANDOFF)
             self._send_fallback_human_review_notification(
-                ctx, state, reason="stale_vehicle_scheduling_offer")
-            return _out("replied", wa_message_id=sent_id)
-
-        # ── G3-7N: a token for another thread, or a superseded one, is refused ────
-        # These were previously one warn-only comparison, justified by clock skew. The
-        # token is an opaque `{thread_id}-{unix_ts}` string WE mint and Meta echoes back
-        # verbatim, so skew cannot alter it — and warn-only left two live holes the G3-7N
-        # late-tap matrix found: an old token regained authority as soon as a NEW offer
-        # overwrote the tombstone, and a token carried to a different thread was accepted
-        # there because that thread had no expected value to compare against.
-        _refusal = None
-        if flow_token:
-            _tok_thread = None
-            try:
-                _tok_thread = int(str(flow_token).split("-", 1)[0])
-            except (ValueError, TypeError, IndexError):
-                _tok_thread = None
-            if _tok_thread is not None and _tok_thread != ctx.thread.id:
-                _refusal = "FOREIGN_OFFER"
-            elif expected and flow_token != expected:
-                _refusal = "SUPERSEDED_OFFER"
-        if _refusal:
-            self._turn_booking_refusal = _refusal
-            self._decision_log(ctx, "booking_offer_refused", reason=_refusal)
-            logger.info("G3-7N refused a booking submission thread_id=%s reason=%s — "
-                        "no revision, no booking", ctx.thread.id, _refusal)
-            state.needs_human = True
-            lead.necesita_humano = True
-            self.db.commit()
-            sent_id = self._send_text_to_wa(ctx, _FALLBACK_WARM_HANDOFF)
-            self._send_fallback_human_review_notification(
-                ctx, state, reason="stale_or_foreign_scheduling_offer")
+                ctx, state, reason=f"booking_offer_refused:{_claim.refusal}"[:60])
             return _out("replied", wa_message_id=sent_id)
 
         # Determine lead source so we can fill missing fields from context.
@@ -3777,7 +3764,11 @@ class ConversationEngine:
         state.current_revision_id = thread_rev.id
         state.last_stage = STAGE_BOOKED
         state.needs_human = True
-        state.flow_booking_token = None  # consumed
+        # G3-7P: the offer was ACCEPTED by `claim()` above, in this same transaction.
+        # Record WHICH revision it became and clear the transport mirror through the one
+        # authority, so an operator can read a booking back to the offer that authorized it.
+        _offers.consume(state, thread_id=ctx.thread.id, revision_id=crm_rev.id,
+                        thread_revision_id=thread_rev.id)
 
         self.db.commit()
         logger.info(
@@ -4804,6 +4795,17 @@ class ConversationEngine:
         from . import pending_correction as pc
         touched = tuple(disposition.get("resolved", ())) + \
             tuple(disposition.get("invalidated", ()))
+        # ── G3-7P (review B-02): withdraw the OFFER, do not merely clear its mirror ──
+        # This is the project's own canonical withdrawal for these proposals, and until
+        # G3-7P it wrote `flow_booking_token = None` — exactly the write the G3-7N review
+        # proved is not a revocation. Measured there: after this path ran, a late tap on the
+        # old token returned `booking_created` with a ThreadRevision and a CRM Revision.
+        # Authority is the offer row now, so the clearing below is safe AND the offer is
+        # explicitly ended with a reason an operator can read.
+        if "flow_booking_token" in touched:
+            from .offer_lifecycle import WithdrawReason as _TxtWR
+            self._withdraw_booking_offer(ctx, state, reason=_TxtWR.TEXT_CORRECTION,
+                                         clear_scheduling=False)
         for field in touched:
             current = getattr(state, field, None)
             setattr(state, field, False if current is True else None)
@@ -6988,53 +6990,31 @@ class ConversationEngine:
             _T.UNRESOLVED_TARGET, None, considered, compat_ids, submitted, None,
             "MULTIPLE_COMPATIBLE_CANDIDATES")
 
-    def _withdraw_vehicle_dependent_scheduling_state(self, ctx, state, *, reason: str):
-        """Withdraw every scheduling fact whose validity depended on the previous vehicle.
+    def _withdraw_booking_offer(self, ctx, state, *, reason: str,
+                                clear_scheduling: bool = True) -> int:
+        """Invalidate this thread's live booking offer through the ONE authority.
 
-        G3-7N. One canonical operation, called only when an accepted vehicle completion
-        actually changes what is being scheduled. The G3-7M review proved that resetting
-        the stage and the lead flag is not enough: the booking token, the offered and
-        visible slots and the requested date all survived a vehicle change, and a late tap
-        on the superseded Flow created a Revision for a car the customer no longer had.
+        G3-7P. G3-7N wrote a TRUTHY TOMBSTONE into `flow_booking_token` because clearing it
+        could not revoke anything — a NULL `expected` short-circuited the booking check. Its
+        independent review then measured the cost of that choice: the tombstone is a
+        non-empty string, and eight production sites read that column for truthiness, so a
+        withdrawn offer reported as OUTSTANDING in `_offer_outstanding`, in
+        `proposal_is_active`, in the hybrid trace, and — the regression that mattered — it
+        re-armed L4.7W5-F7A by closing the deterministic scheduling gates
+        (`not state.flow_booking_token`) that F7A exists to keep open.
 
-        WITHDRAW (their validity is vehicle- or quote-dependent):
-          `flow_booking_token`   — replaced by a tombstone, see below
-          `last_offered_slots`   — slots offered for the old vehicle's service duration
-          `last_visible_slots`   — what the customer was shown for that offer
-          `active_requested_date`, `last_requested_time` — the request that produced it
-          `preferred_day`, `preferred_time` — the accepted slot of the withdrawn offer
-
-        PRESERVE (not vehicle-dependent, and losing them would discard real evidence):
-          the candidate rows themselves, conversation and message history, contact and
-          lead identity, locality/zone facts, `current_cycle_*` identity, clarification
-          attempt history, `needs_human`.
-
-        RECOMPUTE elsewhere: `last_stage` and `lead.flag`, which the existing re-quote
-        guard already resets; the quote itself, which the caller recomputes when it can.
-
-        IRRELEVANT: `current_revision_id` — a booked revision is history, not an offer, and
-        this path never books. It is deliberately left alone rather than nulled.
-
-        The tombstone is the durable half. Clearing the token would leave `expected` NULL,
-        and the booking path's comparison short-circuits on NULL — so clearing alone is not
-        revocation. Keeping a non-null, unmatchable value is.
+        Authority now lives in `whatsapp_booking_offers`, so the column can go back to
+        meaning exactly one thing — "an offer is outstanding" — and clearing it is both safe
+        and correct. The scheduling field list lives in `offer_lifecycle`, once, which is why
+        the location handler can no longer be given a partial copy of it (review B-01).
         """
-        import hashlib
-
-        previous = state.flow_booking_token or ""
-        if previous and not previous.startswith(_WITHDRAWN_OFFER_TOKEN_PREFIX):
-            digest = hashlib.sha256(previous.encode("utf-8")).hexdigest()[:32]
-            state.flow_booking_token = f"{_WITHDRAWN_OFFER_TOKEN_PREFIX}{digest}"
-        for field in ("last_offered_slots", "last_visible_slots", "active_requested_date",
-                      "last_requested_time", "preferred_day", "preferred_time"):
-            if getattr(state, field, None) is not None:
-                setattr(state, field, None)
-        self._turn_scheduling_withdrawn = reason
-        self._decision_log(ctx, "scheduling_offer_withdrawn", reason=reason,
-                           had_offer=bool(previous))
-        logger.info("G3-7N withdrew vehicle-dependent scheduling state thread_id=%s "
-                    "reason=%s had_offer=%s", getattr(ctx.thread, "id", None), reason,
-                    bool(previous))
+        from .offer_lifecycle import OfferLifecycle
+        n = OfferLifecycle(self.db).withdraw(
+            state, thread_id=ctx.thread.id, reason=reason,
+            clear_scheduling=clear_scheduling)
+        self._turn_offer_withdrawal = (reason, n)
+        self._decision_log(ctx, "booking_offer_withdrawn", reason=reason, offers=n)
+        return n
 
     def _process_vehicle_fallback_response(
         self,
@@ -7178,8 +7158,8 @@ class ConversationEngine:
             or _focus_after_completion != _focus_before_completion
             or (_applied and _target.outcome == _T.MATCH_EXISTING_CANDIDATE))
         if _material:
-            self._withdraw_vehicle_dependent_scheduling_state(
-                ctx, state, reason="VEHICLE_CLARIFICATION_COMPLETED")
+            from .offer_lifecycle import WithdrawReason as _WR
+            self._withdraw_booking_offer(ctx, state, reason=_WR.VEHICLE_CHANGED)
         if _created and not any(getattr(c, "id", None) == _created
                                 for c in (ctx.candidates or ())):
             from app.models import WhatsAppThreadCandidate as _WTC
@@ -7285,11 +7265,25 @@ class ConversationEngine:
             return _out("replied", wa_message_id=sent_id)
 
         # Try to resolve localidad to a DB-validated zone_detail.
+        _zone_before = (state.home_zone_group, state.home_zone_detail)
         db_zone = self._extract_zone_from_text(localidad) if localidad else None
         state.home_zone_group = db_zone.zone_group if db_zone else canonical_group
         state.home_zone_detail = db_zone.zone_detail if db_zone else (localidad or None)
         if referencia and not state.home_zone_detail:
             state.home_zone_detail = referencia
+
+        # ── G3-7P (review B-01): an accepted LOCATION change invalidates the offer ───
+        # The zone pair is a pricing input — `PricingService.quote(db, tipo_vehiculo,
+        # zone_group, zone_detail)` — and it is in `PROPOSAL_INVALIDATED_BY[BOOKING_FLOW]`.
+        # G3-7N instrumented only the vehicle handler, and the review measured what that
+        # left behind: moving CABA/Palermo -> Norte/San Isidro kept the token and all six
+        # scheduling facts live, and the late tap returned `booking_created` — a booking at
+        # the old zone's price. Owner policy names "an accepted vehicle OR LOCATION change".
+        # The quote is recomputed below from the NEW canonical location, so a new offer can
+        # only be issued after that recalculation.
+        if (state.home_zone_group, state.home_zone_detail) != _zone_before:
+            from .offer_lifecycle import WithdrawReason as _WR
+            self._withdraw_booking_offer(ctx, state, reason=_WR.LOCATION_CHANGED)
 
         logger.info(
             "M18 location_fallback resolved zone_group=%s zone_detail=%s thread_id=%s",
@@ -9244,6 +9238,12 @@ class ConversationEngine:
 
         # Token signals pending motorcycle contact Flow — keeps _process_flow_response
         # routing working without setting needs_human prematurely.
+        # G3-7P: this token belongs to a DIFFERENT family (routed by prefix before the
+        # booking handler), so it is not a booking offer — but writing it over the mirror
+        # would orphan a live booking offer, so that offer is superseded explicitly.
+        from .offer_lifecycle import OfferLifecycle as _MotoOffers, WithdrawReason as _MotoWR
+        _MotoOffers(self.db).supersede(state, thread_id=ctx.thread.id,
+                                       reason=_MotoWR.MOTO_HANDOFF)
         flow_token = f"{_MOTO_HANDOFF_TOKEN_PREFIX}{ctx.thread.id}-{int(_time.time())}"
         state.flow_booking_token = flow_token
         self.db.commit()
@@ -9483,6 +9483,25 @@ class ConversationEngine:
             return _out("location_contradiction_blocked", detail="outbound_disabled")
 
     # ── L4.6 Phase F — structured CE decision logging ────────────────────────
+
+    def _turn_offer_for_trace(self, ctx):
+        """The thread's most recent booking offer, for the canonical snapshot.
+
+        G3-7P. The snapshot used to derive `offer_outstanding` from
+        `bool(flow_booking_token or ...)`, which is exactly how G3-7N's truthy tombstone
+        came to report a WITHDRAWN offer as a live one. The authority answers instead, and
+        the LATEST offer (not only a live one) is returned so a refusal can name what it
+        refused rather than rendering an empty row.
+        """
+        try:
+            from .offer_lifecycle import OfferLifecycle
+            thread_id = getattr(getattr(ctx, "thread", None), "id", None)
+            if thread_id is None:
+                return None
+            return OfferLifecycle(self.db).latest_offer(thread_id)
+        except Exception:                      # the trace never breaks a conversation turn
+            logger.debug("G3-7P offer snapshot unavailable", exc_info=True)
+            return None
 
     def _decision_log(self, ctx: "_Context", event: str, **fields) -> None:
         """One structured, secret-free line per CE decision.
@@ -10064,7 +10083,8 @@ class ConversationEngine:
         try:
             from .hybrid_trace import snapshot_state
             self._turn_trace_ctx = ctx
-            self._turn_trace_before = snapshot_state(state, getattr(ctx, "lead", None))
+            self._turn_trace_before = snapshot_state(
+                state, getattr(ctx, "lead", None), offer=self._turn_offer_for_trace(ctx))
         except Exception:
             self._turn_trace_before = None
 
@@ -10359,7 +10379,13 @@ class ConversationEngine:
             thread_id = getattr(getattr(ctx, "thread", None), "id", None) or event.thread_id
             lead = getattr(ctx, "lead", None)
             before = self._turn_trace_before or CanonicalSnapshot()
-            after = snapshot_state(getattr(ctx, "state", None), lead)
+            _claim_for_trace = getattr(self, "_turn_offer_claim", None)
+            after = snapshot_state(
+                getattr(ctx, "state", None), lead,
+                offer=self._turn_offer_for_trace(ctx),
+                refusal=(_claim_for_trace.refusal
+                         if _claim_for_trace is not None and not _claim_for_trace.ok
+                         else None))
 
             # ── G3-5B (audit G5A-01): the envelope describes ONE boundary ───────────
             #
@@ -11810,9 +11836,11 @@ class ConversationEngine:
             state.last_requested_time = None
             state.last_offered_slots = None
             state.last_visible_slots = None
-            flow_token = f"{ctx.thread.id}-{int(_time.time())}"
-            state.flow_booking_token = flow_token
-            # last_stage stays SCHEDULING — flow_booking_token signals the form was sent.
+            # G3-7P: the OFFER is issued by whichever Flow actually gets dispatched —
+            # the published Booking Flow below, or the legacy data-collection Flow in the
+            # fallback branch. Minting here as well would issue two offers (and two
+            # tokens) for one dispatch, immediately superseding the first.
+            # last_stage stays SCHEDULING — the live offer signals the form was sent.
             # Stage only advances to BOOKED when the form response arrives.
             self.db.commit()
 
@@ -11871,6 +11899,28 @@ class ConversationEngine:
             if body_prefix:
                 body = f"{body_prefix} {body}"
             screen = "WEBSITE_FINAL_DATA" if is_website else "MAIN"
+            # G3-7P: this legacy data-collection Flow's token IS accepted by
+            # `_process_flow_response`, so it is a booking offer and must be issued through
+            # the one authority — otherwise acceptance would find no record and fail
+            # closed. The token comes from `make_booking_token` because
+            # `whatsapp_booking_offers` enforces one offer per token and the old
+            # `f"{thread}-{seconds}"` shape collides for two dispatches in the same second.
+            from .offer_lifecycle import OfferLifecycle as _OfferLifecycle
+            from .booking_flow_service import make_booking_token as _mk_token
+            _legacy_offers = _OfferLifecycle(self.db)
+            flow_token = _mk_token(ctx.thread.id)
+            _lz_group, _lz_detail = self._get_active_inspection_location(ctx, state)
+            _lz_focus = self._focus_candidate(ctx)
+            _legacy_offers.issue(
+                state, thread_id=ctx.thread.id, token=flow_token,
+                cycle_key=self._clarification_cycle_key(state),
+                candidate_id=getattr(_lz_focus, "id", None),
+                tipo_vehiculo=(getattr(_lz_focus, "tipo_vehiculo", None)
+                               if _lz_focus is not None else None),
+                zone_group=_lz_group, zone_detail=_lz_detail,
+                offered_date=state.preferred_day, offered_time=state.preferred_time,
+                flow_id=flow_id)
+            self.db.commit()
             try:
                 sent_id = self._send_flow_button(
                     ctx, body, flow_token, flow_id=flow_id, initial_screen=screen
@@ -11878,7 +11928,8 @@ class ConversationEngine:
                 return _out("flow_button_sent", wa_message_id=sent_id)
             except Exception as exc:
                 logger.error("M18 flow button send failed thread_id=%s: %s", ctx.thread.id, exc)
-                state.flow_booking_token = None
+                _legacy_offers.withdraw(state, thread_id=ctx.thread.id,
+                                        reason="DISPATCH_FAILED", clear_scheduling=False)
                 state.last_stage = STAGE_SCHEDULING
                 self.db.commit()
                 return None
@@ -11986,9 +12037,30 @@ class ConversationEngine:
             )
             return None
 
+        # ── G3-7P: ISSUE through the one authority ────────────────────────────────
+        # The offer row records what is being booked — candidate, pricing zone pair,
+        # category, the slot the customer was shown — so acceptance can refuse when any of
+        # them has since moved, instead of trusting that every handler remembered to
+        # withdraw. `issue()` supersedes whatever it replaces, and the database enforces
+        # that a thread never holds two live offers.
+        from .offer_lifecycle import OfferLifecycle as _OfferLifecycle
+        _offers = _OfferLifecycle(self.db)
         previous_token = state.flow_booking_token
         flow_token = make_booking_token(ctx.thread.id)  # minted exactly once per dispatch
-        state.flow_booking_token = flow_token
+        _focus_for_offer = self._focus_candidate(ctx)
+        _offer_row = _offers.issue(
+            state, thread_id=ctx.thread.id, token=flow_token,
+            cycle_key=self._clarification_cycle_key(state),
+            # The offer is bound to the candidate it is FOR — the resolved focus, which
+            # has a documented single-candidate fallback — not to the raw pointer, so the
+            # binding matches what acceptance resolves on the other side.
+            candidate_id=getattr(_focus_for_offer, "id", None),
+            tipo_vehiculo=(getattr(_focus_for_offer, "tipo_vehiculo", None)
+                           if _focus_for_offer is not None else None),
+            zone_group=zone_group, zone_detail=_zone_detail,
+            offered_date=getattr(state, "preferred_day", None),
+            offered_time=getattr(state, "preferred_time", None),
+            flow_id=booking_flow_id)
         self.db.commit()
 
         # Reuse the Flow's own contract validation — never duplicated inside CE.
@@ -11999,6 +12071,8 @@ class ConversationEngine:
                 "L4.3 booking flow prerequisites unsatisfied thread_id=%s: %s",
                 ctx.thread.id, exc,
             )
+            _offers.withdraw(state, thread_id=ctx.thread.id,
+                              reason="DISPATCH_PREREQUISITES", clear_scheduling=False)
             state.flow_booking_token = previous_token
             self.db.commit()
             return None
@@ -12024,11 +12098,15 @@ class ConversationEngine:
             )
             return _out("flow_button_sent", wa_message_id=sent_id)
         except OutboundBlockedError:
+            _offers.withdraw(state, thread_id=ctx.thread.id,
+                              reason="DISPATCH_BLOCKED", clear_scheduling=False)
             state.flow_booking_token = previous_token
             self.db.commit()
             raise
         except Exception as exc:
             logger.error("L4.3 booking flow send failed thread_id=%s: %s", ctx.thread.id, exc)
+            _offers.withdraw(state, thread_id=ctx.thread.id,
+                              reason="DISPATCH_FAILED", clear_scheduling=False)
             state.flow_booking_token = previous_token
             self.db.commit()
             self._booking_flow_send_failed = True
@@ -12590,11 +12668,17 @@ class ConversationEngine:
         # submission fail token validation in resolve_context rather than create that
         # booking. Bookings already confirmed are untouched: this only invalidates an
         # OUTSTANDING offer.
-        if state.flow_booking_token:
+        # G3-7P: through the one authority. F7A's reasoning is unchanged — the customer
+        # said this offer does not work, so a late tap must not book the very slot they
+        # rejected — but the offer row now records WHY it ended, and the scheduling facts
+        # are deliberately preserved here: F7A hands the thread to a person, it does not
+        # discard what the customer told us about when they are available.
+        from .offer_lifecycle import WithdrawReason as _F7AWR
+        if self._withdraw_booking_offer(ctx, state, reason=_F7AWR.OFFER_REJECTED,
+                                        clear_scheduling=False):
             logger.info(
-                "L4.7W5-F7A FLOW_OFFER_WITHDRAWN thread_id=%s — rejected offer's token "
-                "consumed at handoff", ctx.thread.id)
-            state.flow_booking_token = None
+                "L4.7W5-F7A FLOW_OFFER_WITHDRAWN thread_id=%s — rejected offer withdrawn "
+                "at handoff", ctx.thread.id)
 
         thread_rev_id: int | None = state.current_revision_id
 
@@ -13426,7 +13510,12 @@ Respondé SOLO con JSON válido:
         state.last_requested_time = None
         state.last_offered_slots = None
         state.last_visible_slots = None
-        state.flow_booking_token = None
+        # G3-7P: a new cycle invalidates the previous cycle's offer through the one
+        # authority, so a token from the closed cycle cannot book into this one. The field
+        # assignments around it are the cycle reset's own; only the OFFER moves here.
+        from .offer_lifecycle import OfferLifecycle as _ResetOffers, WithdrawReason as _ResetWR
+        _ResetOffers(self.db).withdraw(state, thread_id=ctx.thread.id,
+                                       reason=_ResetWR.CYCLE_RESET, clear_scheduling=False)
         state.vehicle_clarification_sent = False
         state.location_clarification_sent = False
         state.vehicle_fallback_flow_sent = False

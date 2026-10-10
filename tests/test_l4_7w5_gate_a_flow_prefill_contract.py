@@ -40,6 +40,8 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
 import app.models
+
+from offer_fixture import seed_live_offer  # noqa: E402
 from app.models import (Lead, ThreadRevision, ViaticosZone, WhatsAppContact, WhatsAppThread,
                         WhatsAppThreadCandidate, WhatsAppThreadState)
 from app.schemas.schedule import ScheduleCheckOut, ScheduleSlotOut, ScheduleSlotsOut
@@ -107,6 +109,10 @@ class _World(unittest.TestCase):
         self.state = WhatsAppThreadState(thread_id=self.thread.id,
                                          flow_booking_token=self.token, needs_human=False)
         self.db.add(self.state); self.db.commit()
+        # G3-7P: a hand-set token is no longer an offer. Authority is
+        # `whatsapp_booking_offers` and an absent row is a refusal, so a fixture that
+        # wants a bookable offer issues one through the authority.
+        seed_live_offer(self.db, self.state)
         self.svc = BookingFlowService(self.db)
         self._mock_schedule()
 

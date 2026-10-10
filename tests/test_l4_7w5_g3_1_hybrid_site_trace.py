@@ -599,7 +599,7 @@ class PrivacyHistoryContract(unittest.TestCase):
         from app.schemas.hybrid_trace import (READABLE_VERSIONS, TRACE_VERSION_1_0,
                                               TRACE_VERSION_1_1, TRACE_VERSION_1_2,
                                               TRACE_VERSION_1_3, TRACE_VERSION_1_4)
-        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.9")
+        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.10")
         for older in (TRACE_VERSION_1_0, TRACE_VERSION_1_1, TRACE_VERSION_1_2,
                       TRACE_VERSION_1_3, TRACE_VERSION_1_4):
             self.assertIn(older, READABLE_VERSIONS)
@@ -629,10 +629,14 @@ class PrivacyHistoryContract(unittest.TestCase):
         the assertion now names its own scope instead of freezing a global total."""
         versions = sorted(p.name for p in
                           (ROOT / "backend" / "migrations" / "versions").glob("*.py"))
-        self.assertEqual(len(versions), 47)
+        # +1 again: G3-7P added one additive table (`whatsapp_booking_offers`), which §3
+        # of that milestone authorises explicitly. This assertion is about G3-1's own
+        # scope, which still introduced none.
+        self.assertEqual(len(versions), 48)
         self.assertIn("20260918_hybrid_decision_traces.py", versions)  # G3-1's table
         self.assertIn("20261005_pending_correction.py", versions)  # G3-7F Commit 3
         self.assertIn("20261006_clarification_attempts.py", versions)  # G3-7F sequencing
+        self.assertIn("20261010_offer_lifecycle.py", versions)  # G3-7P offer authority
 
     def test_site_42_no_pii_in_the_new_row_fields(self):
         h = HandoffSite()
