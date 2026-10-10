@@ -109,7 +109,7 @@ class TestBookingReceipt(unittest.TestCase):
         self.assertLess(fn.index("if result.outcome is not BookingOutcome.COMMITTED"), i_send)
         import inspect
         from app.services.booking_authority import BookingAuthority
-        auth = inspect.getsource(BookingAuthority.execute)
+        auth = inspect.getsource(BookingAuthority._execute_snapshot)  # SB2A-R5: execute() captures, then runs _execute_snapshot()
         self.assertLess(auth.index("self.db.commit()"),
                         auth.index("return _result(BookingOutcome.COMMITTED"))
 

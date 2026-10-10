@@ -399,7 +399,7 @@ class R3_DefenceInDepth(unittest.TestCase):
                                  'forbid_external_io("outbound_gate")'])
 
     def test_r3_21_verification_runs_after_attachments_and_before_commit(self):
-        src = inspect.getsource(BookingAuthority.execute)
+        src = inspect.getsource(BookingAuthority._execute_snapshot)  # SB2A-R5: execute() captures, then runs _execute_snapshot()
         i_att = src.index("self._apply_attachments(")
         i_rec = src.index("self._record(")
         i_ver = src.index("self._verify_before_commit(")

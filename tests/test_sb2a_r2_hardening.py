@@ -469,7 +469,7 @@ class R07PreflightUncached(unittest.TestCase):
         sql = ba._preflight_sql(ba._required_columns())       # SB2A-R3: column set expanded
         self.assertIn("tgenabled IN ('O', 'A')", sql)
         self.assertIn("session_replication_role", sql)
-        run = inspect.getsource(BookingAuthority.execute)
+        run = inspect.getsource(BookingAuthority._execute_snapshot)  # SB2A-R5: execute() captures, then runs _execute_snapshot()
         self.assertIn("verify_booking_schema(self.db)", run)
 
 

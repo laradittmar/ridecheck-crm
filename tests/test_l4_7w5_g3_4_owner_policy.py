@@ -229,7 +229,7 @@ class E_ConcurrencyPosture(unittest.TestCase):
         from app.services import booking_authority as ba
         locks = inspect.getsource(ba.BookingAuthority._acquire_locks)
         self.assertIn("pg_advisory_xact_lock(:p, :d)", locks)
-        run = inspect.getsource(ba.BookingAuthority.execute)
+        run = inspect.getsource(ba.BookingAuthority._execute_snapshot)  # SB2A-R5: execute() captures, then runs _execute_snapshot()
         # SB2A-R3 rewrite: the authority's own revalidation, still after the locks.
         self.assertLess(run.index("self._acquire_locks("),
                         run.index("self._revalidate_availability("))

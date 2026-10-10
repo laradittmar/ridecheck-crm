@@ -109,25 +109,31 @@ _REQUEST_SCHEMA = {
 }
 
 
-def _request_is_data(req, cls) -> bool:
-    """Exact type admission of a CE request; only type() identity is consulted."""
-    from .booking_authority import BookingAttachmentPlan
-    if type(req) is not cls:
-        return False
-    values = object.__getattribute__(req, "__dict__")
+def _capture_request(req, cls) -> Optional[dict]:
+    """SB2A-R5: capture the CE request ONCE into authority-owned values, then validate the
+    capture. Returns a plain dict (revision_fields a NEW dict, attachments a REBUILT plan) or
+    None. After this, the adapter never reads `req` again."""
+    from . import booking_authority as ba
+    vals = ba._owned_fields(req, cls)                    # one atomic dict.copy, exact type only
     schema = _REQUEST_SCHEMA[cls.__name__]
-    if set(values) != set(schema):
-        return False
+    if vals is None or set(vals) != set(schema):
+        return None
+    rf = vals["revision_fields"]
+    vals["revision_fields"] = dict.copy(rf) if type(rf) is dict else None
+    att = ba.snapshot_attachment_plan(vals["attachments"])
+    if att is ba._CAPTURE_FAILED:
+        return None
+    vals["attachments"] = att
     exact = {"int": int, "str": str, "date": date, "time": time, "dict": dict,
-             "plan": BookingAttachmentPlan}
-    for name, (kind, nullable) in schema.items():
-        v = values[name]
+             "plan": ba.BookingAttachmentPlan}
+    for name, (kind, nullable) in schema.items():       # validate the CAPTURE
+        v = vals[name]
         if v is None:
             if not nullable:
-                return False
+                return None
         elif type(v) is not exact[kind] or (kind == "int" and v < 0):
-            return False
-    return True
+            return None
+    return vals
 
 
 def _nonblank(value: Optional[str]) -> Optional[str]:
@@ -139,28 +145,39 @@ def _key(prefix: str, thread_id: int, kind: str, identity: str) -> str:
     return f"{prefix}:" + hashlib.sha256(f"{int(thread_id)}|{kind}|{identity}".encode()).hexdigest()[:48]
 
 
-def ce_flow_booking_key(req: CeFlowBookingRequest) -> Optional[str]:
-    """Flow token, else inbound message id — both thread-scoped. None if neither exists."""
-    token = _nonblank(req.flow_token)
+def _flow_key(v: dict) -> Optional[str]:
+    token = _nonblank(v["flow_token"])
     if token:
-        return _key("ce-flow-response", req.thread_id, "token", token)
-    msg = _nonblank(req.inbound_event_id)
+        return _key("ce-flow-response", v["thread_id"], "token", token)
+    msg = _nonblank(v["inbound_event_id"])
     if msg:
-        return _key("ce-flow-response", req.thread_id, "msg", msg)
+        return _key("ce-flow-response", v["thread_id"], "msg", msg)
     return None
+
+
+def _escalation_key(v: dict) -> Optional[str]:
+    explicit = _nonblank(v["escalation_id"])
+    if explicit:
+        return _key("ce-escalation", v["thread_id"], "esc", explicit)
+    if v["cycle_key"] is not None:
+        return _key("ce-escalation", v["thread_id"], "cycle", str(int(v["cycle_key"])))
+    msg = _nonblank(v["inbound_event_id"])
+    if msg:
+        return _key("ce-escalation", v["thread_id"], "msg", msg)
+    return None
+
+
+def ce_flow_booking_key(req: CeFlowBookingRequest) -> Optional[str]:
+    """Flow token, else inbound message id — both thread-scoped. None if neither exists (or
+    the request is not exactly data)."""
+    v = _capture_request(req, CeFlowBookingRequest)
+    return None if v is None else _flow_key(v)
 
 
 def ce_escalation_key(req: CeSchedulingEscalationRequest) -> Optional[str]:
     """Explicit escalation id, else the cycle, else the inbound message — thread-scoped."""
-    explicit = _nonblank(req.escalation_id)
-    if explicit:
-        return _key("ce-escalation", req.thread_id, "esc", explicit)
-    if req.cycle_key is not None:
-        return _key("ce-escalation", req.thread_id, "cycle", str(int(req.cycle_key)))
-    msg = _nonblank(req.inbound_event_id)
-    if msg:
-        return _key("ce-escalation", req.thread_id, "msg", msg)
-    return None
+    v = _capture_request(req, CeSchedulingEscalationRequest)
+    return None if v is None else _escalation_key(v)
 
 
 @contextmanager
@@ -194,21 +211,23 @@ def book_from_flow_response(
     A response without a complete agreed slot cannot be a booking: it is recorded as a
     non-occupying manual-scheduling request with whatever part of the slot is known.
     """
-    if not _request_is_data(req, CeFlowBookingRequest):
+    v = _capture_request(req, CeFlowBookingRequest)
+    del req                                              # caller reference ends here (R5)
+    if v is None:
         return refuse(BookingOutcome.VALIDATION_FAILED, "REQUEST_NOT_DATA")
-    key = ce_flow_booking_key(req)
+    key = _flow_key(v)
     if key is None:
         return _no_identity()
-    complete = req.requested_date is not None and req.requested_time is not None
+    complete = v["requested_date"] is not None and v["requested_time"] is not None
     command = BookingCommand(
         operation=BookingOperation.CREATE if complete else BookingOperation.REQUEST_MANUAL_SCHEDULING,
-        source=BookingSource.CONVERSATION_ENGINE, idempotency_key=key, lead_id=req.lead_id,
-        thread_id=req.thread_id, requested_date=req.requested_date,
-        requested_time=req.requested_time, revision_fields=dict(req.revision_fields),
+        source=BookingSource.CONVERSATION_ENGINE, idempotency_key=key, lead_id=v["lead_id"],
+        thread_id=v["thread_id"], requested_date=v["requested_date"],
+        requested_time=v["requested_time"], revision_fields=v["revision_fields"],
         tracks_acknowledgement=complete)
     with isolated_session(db) as session:
         return BookingAuthority(session, lock_timeout_ms=lock_timeout_ms).execute(
-            command, attachments=req.attachments)
+            command, attachments=v["attachments"])
 
 
 def request_manual_scheduling(
@@ -220,16 +239,18 @@ def request_manual_scheduling(
     lost to an overlap or to an incomplete slot. `req.attachments` may add CE's provisional
     ThreadRevision (non-occupying status) in the same transaction.
     """
-    if not _request_is_data(req, CeSchedulingEscalationRequest):
+    v = _capture_request(req, CeSchedulingEscalationRequest)
+    del req                                              # caller reference ends here (R5)
+    if v is None:
         return refuse(BookingOutcome.VALIDATION_FAILED, "REQUEST_NOT_DATA")
-    key = ce_escalation_key(req)
+    key = _escalation_key(v)
     if key is None:
         return _no_identity()
     command = BookingCommand(
         operation=BookingOperation.REQUEST_MANUAL_SCHEDULING,
-        source=BookingSource.CONVERSATION_ENGINE, idempotency_key=key, lead_id=req.lead_id,
-        thread_id=req.thread_id, requested_date=req.requested_date,
-        requested_time=req.requested_time, revision_fields=dict(req.revision_fields))
+        source=BookingSource.CONVERSATION_ENGINE, idempotency_key=key, lead_id=v["lead_id"],
+        thread_id=v["thread_id"], requested_date=v["requested_date"],
+        requested_time=v["requested_time"], revision_fields=v["revision_fields"])
     with isolated_session(db) as session:
         return BookingAuthority(session, lock_timeout_ms=lock_timeout_ms).execute(
-            command, attachments=req.attachments)
+            command, attachments=v["attachments"])

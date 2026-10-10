@@ -204,7 +204,8 @@ class R4_HostileObjects(unittest.TestCase):
 
     def test_r4_07_validation_uses_type_identity_not_isinstance(self):
         for fn in (ba._plan_is_data, ba._field_ok, ba._ok_str, ba._revision_field_ok,
-                   BookingAuthority._validate, ce._request_is_data):
+                   BookingAuthority._validate, ce._capture_request,   # SB2A-R5: capture replaces _request_is_data
+                   ba._owned_fields, ba._capture_plan, ba._capture_command):
             self.assertNotIn("isinstance(", inspect.getsource(fn), fn.__name__)
         self.assertNotIn("getattr(cmd", inspect.getsource(BookingAuthority.execute))
 
@@ -342,7 +343,7 @@ class R4_LockOrderDoc(unittest.TestCase):
         doc = ba.__doc__
         for step in ("L1", "L2", "L3", "L4", "L5", "L6", "L7", "L8"):
             self.assertIn(step, doc)
-        src = inspect.getsource(BookingAuthority.execute)
+        src = inspect.getsource(BookingAuthority._execute_snapshot)  # SB2A-R5: execute() captures, then runs _execute_snapshot()
         order = [src.index(m) for m in ("self._acquire_locks(", "self._lock_revision(",
                                          "self._lock_overlapping(", "self._apply_attachments(",
                                          "self._sync_thread_revision(", "self._record(")]

@@ -253,7 +253,7 @@ class TestAtomicity(_Base):
         self.assertIn("attachments=attachments", fn)
         import inspect
         from app.services.booking_authority import BookingAuthority
-        auth = inspect.getsource(BookingAuthority.execute)
+        auth = inspect.getsource(BookingAuthority._execute_snapshot)  # SB2A-R5: execute() captures, then runs _execute_snapshot()
         self.assertLess(auth.index("self._apply_attachments("), auth.index("self.db.commit()"),
                         "the price must be stamped before the commit")
         rev = self.book()

@@ -628,6 +628,82 @@ _PLAN_CLASSES.update({c.__name__: c for c in (
     ThreadStateUpdate, PriceRecalculation, BookingAttachmentPlan)})
 
 
+# ── SB2A-R5: capture first, validate the capture, execute only the capture ──
+#
+# INVARIANT (R3A-T1). Caller objects are read exactly ONCE, at entry, into authority-owned
+# values; validation and execution see only those values; the caller's command, plans and
+# containers are never read again (`execute` deletes its references). Per object, the capture
+# is one `dict.copy` of an exact `dict` — a single C call that runs no Python code (no hashing,
+# no comparisons, no hooks) and therefore cannot interleave with another thread under the
+# CPython GIL. A snapshot spanning several caller objects is a sequence of such atomic
+# per-object copies: whatever combination is captured is then validated as a whole, so
+# nothing unvalidated can execute — but objects mutated concurrently WHILE `execute` is being
+# entered may be captured at different instants (see the R5 closeout).
+
+_CAPTURE_FAILED = object()      # sentinel: a structurally invalid caller object
+_UNADMITTED = object()          # sentinel: a container that was not an exact built-in dict
+
+
+def _owned_fields(obj, cls) -> Optional[dict]:
+    """A NEW dict holding obj's fields, or None. Only type() identity and one atomic dict.copy;
+    keys must be exact str before anything hashes or compares them."""
+    if type(obj) is not cls:
+        return None
+    raw = object.__getattribute__(obj, "__dict__")
+    if type(raw) is not dict:
+        return None
+    vals = dict.copy(raw)
+    for k in vals:                       # iterating our own copy runs no caller code
+        if type(k) is not str:
+            return None
+    return vals
+
+
+def _capture_plan(obj, cls):
+    """A NEW authority-owned instance of `cls` rebuilt from a one-shot copy of obj's fields
+    (nested plans captured the same way), or None. Values are NOT validated here."""
+    vals = _owned_fields(obj, cls)
+    if vals is None or set(vals) != set(_PLAN_SCHEMA[cls.__name__]):
+        return None
+    for name, (kind, _nullable, extra) in _PLAN_SCHEMA[cls.__name__].items():
+        if kind == "plan" and vals[name] is not None:
+            nested = _capture_plan(vals[name], _PLAN_CLASSES[extra])
+            if nested is None:
+                return None
+            vals[name] = nested
+    return cls(**vals)                   # our dataclass __init__: plain assignment, no hooks
+
+
+def _capture_optional(obj, cls):
+    if obj is None:
+        return None
+    captured = _capture_plan(obj, cls)
+    return _CAPTURE_FAILED if captured is None else captured
+
+
+def snapshot_attachment_plan(obj):
+    """Public for the CE adapter: an authority-owned rebuild of a BookingAttachmentPlan, None
+    for None, or the module sentinel when it is not exactly that plan."""
+    return _capture_optional(obj, BookingAttachmentPlan)
+
+
+_COMMAND_FIELDS = None
+
+
+def _capture_command(cmd) -> Optional["BookingCommand"]:
+    """A NEW BookingCommand rebuilt from a one-shot copy of cmd's fields, with a NEW copy of
+    revision_fields, or None. Values are validated afterwards, on this capture."""
+    global _COMMAND_FIELDS
+    if _COMMAND_FIELDS is None:
+        _COMMAND_FIELDS = frozenset(f.name for f in dataclasses.fields(BookingCommand))
+    vals = _owned_fields(cmd, BookingCommand)
+    if vals is None or set(vals) != _COMMAND_FIELDS:
+        return None
+    rf = vals["revision_fields"]
+    vals["revision_fields"] = dict.copy(rf) if type(rf) is dict else _UNADMITTED
+    return BookingCommand(**vals)
+
+
 class _InvariantBreach(Exception):
     def __init__(self, kind: str):
         super().__init__(kind)
@@ -821,10 +897,21 @@ class BookingAuthority:
                 attachments: Optional[BookingAttachmentPlan] = None) -> BookingResult:
         """Run one booking command in ONE authority-owned transaction.
 
-        `availability` and `attachments` are typed DATA. No caller code runs inside the
-        transaction; the authority performs every read and write itself. Locks are taken in
-        the documented order (module docstring).
+        `availability` and `attachments` are typed DATA. SB2A-R5: they and the command are
+        captured into authority-owned copies FIRST; only the copies are validated and
+        executed, and the caller's objects are never read again — mutating them afterwards
+        (even while this call waits on a lock) cannot influence the booking.
         """
+        command = _capture_command(cmd)
+        plans = (_capture_optional(availability, AvailabilityRevalidation),
+                 _capture_optional(attachments, BookingAttachmentPlan))
+        del cmd, availability, attachments          # caller references end here
+        if command is None:
+            return _result(BookingOutcome.VALIDATION_FAILED, "COMMAND_NOT_DATA")
+        return self._execute_snapshot(command, *plans)
+
+    def _execute_snapshot(self, cmd: BookingCommand, availability, attachments) -> BookingResult:
+        """The transaction, over authority-owned captured values only (see `execute`)."""
         lock_mode: Optional[str] = None
         fingerprint = ""
         identity_outcome: Optional[str] = None
@@ -833,6 +920,10 @@ class BookingAuthority:
         token = _TXN_SCOPE.set(_TxnScope("BOOKING"))
         try:
             spec = self._validate(cmd)
+            if availability is _CAPTURE_FAILED:
+                raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, "PLAN_NOT_DATA:availability"))
+            if attachments is _CAPTURE_FAILED:
+                raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, "PLAN_NOT_DATA:attachments"))
             fingerprint = request_fingerprint(cmd)
             self._validate_plans(cmd, availability, attachments)
             txid = None
