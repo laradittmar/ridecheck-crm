@@ -70,11 +70,14 @@ import hashlib
 import json
 import logging
 import secrets
+import threading
 import uuid
+import weakref
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
+from types import MappingProxyType
 from typing import Any, Mapping, Optional
 
 from sqlalchemy import and_, case, func, literal_column, or_, select, text, update
@@ -613,7 +616,9 @@ def _revision_field_ok(name: str, value) -> bool:
     if value is None:
         return bool(col.nullable)
     allowed = _COLUMN_PY.get(type(col.type).__name__)
-    if allowed is None or type(value) not in allowed:
+    # SB2A-R6 (F-01): identity only. `type(value) in allowed` falls back to `==` after the
+    # identity test, so a metaclass `__eq__` would run here and could admit a subclass.
+    if allowed is None or not any(type(value) is t for t in allowed):
         return False
     if type(value) is str:
         return _ok_str(value, ("Revision", name))
@@ -700,8 +705,61 @@ def _capture_command(cmd) -> Optional["BookingCommand"]:
     if vals is None or set(vals) != _COMMAND_FIELDS:
         return None
     rf = vals["revision_fields"]
-    vals["revision_fields"] = dict.copy(rf) if type(rf) is dict else _UNADMITTED
+    # SB2A-R6: a READ-ONLY view of a private copy. Nothing else references the copy, so after
+    # capture no caller and no later step can add, change or remove a field.
+    vals["revision_fields"] = MappingProxyType(dict.copy(rf)) if type(rf) is dict else _UNADMITTED
     return BookingCommand(**vals)
+
+
+# ── SB2A-R6 (F-02): the capture is a capability, not a convention ───────────
+#
+# `_execute_snapshot` runs ONLY a `_CapturedCall` minted by `_capture_call` in this module and
+# not yet run. A raw command, a hand-built or copied `_CapturedCall`, or one already executed
+# is refused (VALIDATION_FAILED / UNCAPTURED_EXECUTION) before any lock, read or write. A
+# leading underscore is not the boundary; this registry is.
+
+class _CapturedCall:
+    """Authority-owned capture of ONE `execute` call: the rebuilt command and plans. Immutable;
+    holds no reference to any caller object."""
+    __slots__ = ("command", "availability", "attachments", "__weakref__")
+
+    def __init__(self, *args, **kwargs):
+        raise TypeError("_CapturedCall is minted only by _capture_call")
+
+    def __setattr__(self, name, value):
+        raise AttributeError("_CapturedCall is immutable")
+
+    def __reduce__(self):                     # no pickling/copying into a second capability
+        raise TypeError("_CapturedCall cannot be copied")
+
+
+_MINTED: "weakref.WeakSet[_CapturedCall]" = weakref.WeakSet()
+_MINTED_LOCK = threading.Lock()
+
+
+def _capture_call(cmd, availability, attachments) -> _CapturedCall:
+    """Capture first (before ANY validation): the command and both plans are rebuilt from
+    one-shot copies. A structurally invalid command is captured as None, a plan as the
+    `_CAPTURE_FAILED` sentinel; the executor refuses them."""
+    call = object.__new__(_CapturedCall)
+    object.__setattr__(call, "command", _capture_command(cmd))
+    object.__setattr__(call, "availability", _capture_optional(availability, AvailabilityRevalidation))
+    object.__setattr__(call, "attachments", _capture_optional(attachments, BookingAttachmentPlan))
+    with _MINTED_LOCK:
+        _MINTED.add(call)
+    return call
+
+
+def _redeem(call) -> bool:
+    """True exactly once for a minted, unexecuted capture; False for anything else. Only
+    `type()` identity is consulted before the registry lookup (our class: identity hash/eq)."""
+    if type(call) is not _CapturedCall:
+        return False
+    with _MINTED_LOCK:
+        if call not in _MINTED:
+            return False
+        _MINTED.discard(call)
+    return True
 
 
 class _InvariantBreach(Exception):
@@ -900,18 +958,22 @@ class BookingAuthority:
         `availability` and `attachments` are typed DATA. SB2A-R5: they and the command are
         captured into authority-owned copies FIRST; only the copies are validated and
         executed, and the caller's objects are never read again — mutating them afterwards
-        (even while this call waits on a lock) cannot influence the booking.
+        (even while this call waits on a lock) cannot influence the booking. SB2A-R6: the
+        capture is a one-shot capability; this is the only place one is minted for execution.
         """
-        command = _capture_command(cmd)
-        plans = (_capture_optional(availability, AvailabilityRevalidation),
-                 _capture_optional(attachments, BookingAttachmentPlan))
+        call = _capture_call(cmd, availability, attachments)
         del cmd, availability, attachments          # caller references end here
-        if command is None:
-            return _result(BookingOutcome.VALIDATION_FAILED, "COMMAND_NOT_DATA")
-        return self._execute_snapshot(command, *plans)
+        return self._execute_snapshot(call)
 
-    def _execute_snapshot(self, cmd: BookingCommand, availability, attachments) -> BookingResult:
-        """The transaction, over authority-owned captured values only (see `execute`)."""
+    def _execute_snapshot(self, call: _CapturedCall) -> BookingResult:
+        """The transaction, over a minted capture only (see `execute`). Anything else — a raw
+        command, a forged or replayed capture — is refused before any lock, read or write."""
+        if not _redeem(call):
+            return _result(BookingOutcome.VALIDATION_FAILED, "UNCAPTURED_EXECUTION")
+        cmd, availability, attachments = call.command, call.availability, call.attachments
+        del call
+        if cmd is None:
+            return _result(BookingOutcome.VALIDATION_FAILED, "COMMAND_NOT_DATA")
         lock_mode: Optional[str] = None
         fingerprint = ""
         identity_outcome: Optional[str] = None
@@ -1310,7 +1372,7 @@ class BookingAuthority:
         values = object.__getattribute__(cmd, "__dict__")
         if type(values.get("operation")) is not BookingOperation \
                 or type(values.get("source")) is not BookingSource \
-                or type(values.get("revision_fields")) is not dict:
+                or type(values.get("revision_fields")) is not MappingProxyType:
             raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, "COMMAND_NOT_DATA"))
         for name, (kind, nullable, extra) in _COMMAND_SCHEMA.items():
             if not _field_ok(kind, nullable, extra, values.get(name)):

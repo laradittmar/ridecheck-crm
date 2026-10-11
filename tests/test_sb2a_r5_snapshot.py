@@ -12,6 +12,7 @@ import os
 import sys
 import threading
 import time as _time
+import types
 import unittest
 from datetime import date, time
 from unittest import mock
@@ -53,9 +54,9 @@ class _Spy:
         real = BookingAuthority._execute_snapshot
         spy = self
 
-        def wrapped(inner, cmd, availability, attachments):
-            spy.args = (cmd, availability, attachments)
-            return real(inner, cmd, availability, attachments)
+        def wrapped(inner, call):                 # SB2A-R6: execution receives one minted capture
+            spy.args = (call.command, call.availability, call.attachments)
+            return real(inner, call)
         self._p = mock.patch.object(BookingAuthority, "_execute_snapshot", wrapped)
         self._p.start()
         return self
@@ -80,13 +81,17 @@ class R5_Ownership(unittest.TestCase):
             r = BookingAuthority(db).execute(c, availability=av, attachments=plan)
         self.assertEqual(r.outcome, Out.COMMITTED, r.reason)
         cmd_s, av_s, plan_s = spy.args
-        for original, captured in ((c, cmd_s), (rf, cmd_s.revision_fields), (av, av_s), (plan, plan_s),
+        self.assertIsNot(rf, cmd_s.revision_fields)       # type checked below (SB2A-R6: read-only view)
+        for original, captured in ((c, cmd_s), (av, av_s), (plan, plan_s),
                                    (tr, plan_s.thread_revision), (lu, plan_s.lead),
                                    (ident, plan_s.lead.identity), (st, plan_s.thread_state)):
             self.assertIsNot(original, captured)
             self.assertIs(type(original), type(captured))
         self.assertEqual(cmd_s.revision_fields, rf)
-        self.assertIs(type(cmd_s.revision_fields), dict)
+        # SB2A-R6: a read-only view of a private copy — not the caller's dict, not writable
+        self.assertIs(type(cmd_s.revision_fields), types.MappingProxyType)
+        with self.assertRaises(TypeError):
+            cmd_s.revision_fields["marca"] = "X"
 
     def test_r5_02_mutation_after_return_changes_nothing(self):
         db, lead, tid = r3._world()
