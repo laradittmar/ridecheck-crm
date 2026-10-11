@@ -51,6 +51,7 @@ from ..models import (
 from ..repositories.pricing_repository import PricingRepository
 from ..schemas.conversation import (
     ACTION_NO_REPLY_PRODUCED,
+    ACTION_THREAD_CONTENDED,
     HANDLED_ACTIONS,
     ConversationHandleIn,
     ConversationHandleOut,
@@ -3187,7 +3188,11 @@ class ConversationEngine:
         self._turn_dispatch_path = None
         self._turn_dispatch_result = None
         self._turn_flow_dispatched = False
+        # R3/D: `_turn_flow_dispatched` is set BEFORE the gate, so it is true for a
+        # Flow the kill switch refused. This one is set only once the gate ALLOWED.
+        self._turn_flow_delivered = False
         self._turn_text_dispatches = 0
+        self._turn_slot_claim_before = None     # R3/D: set once the state row is held
         self._turn_response_plan = None
         # L4.7W5 Gate 1/2 — hybrid decision trace collection. Observational only.
         self._turn_trace_ctx = None
@@ -3406,7 +3411,11 @@ class ConversationEngine:
         self._turn_dispatch_path = None
         self._turn_dispatch_result = None
         self._turn_flow_dispatched = False
+        # R3/D: `_turn_flow_dispatched` is set BEFORE the gate, so it is true for a
+        # Flow the kill switch refused. This one is set only once the gate ALLOWED.
+        self._turn_flow_delivered = False
         self._turn_text_dispatches = 0
+        self._turn_slot_claim_before = None     # R3/D: set once the state row is held
         self._turn_response_plan = None
         # G3-5F §5/§6: the LIVE plan. Constructed before anything can dispatch, so the
         # propositions a turn registers are decided by a plan rather than by which handler
@@ -3457,6 +3466,13 @@ class ConversationEngine:
             except Exception:
                 pass
             out = _out("error", detail="internal_error")
+        # ── R3/D: one place decides whether the customer saw this turn's slots ───
+        # Every branch above converges here, including the kill switch (which refused the
+        # send) and the crash path (whose rollback cannot undo the slot list, because the
+        # day-slots path committed it BEFORE dispatching). The helper itself checks what
+        # the outbound gate allowed and whether this turn claimed anything, so it is a
+        # no-op on every turn that really did display its slots.
+        self._revoke_undelivered_slot_claim(event, out)
         out.latency_ce_ms = int((_time.perf_counter() - _ce_t0) * 1000)
         _ai_inv = getattr(self, "_ai_invoked", False)
         out.ai_invoked = _ai_inv
@@ -3524,6 +3540,37 @@ class ConversationEngine:
         # Mark as processing — committed atomically with the final successful action,
         # so a failure mid-flight does not leave the message appearing processed.
         state = self._get_or_create_state(ctx)
+
+        # ── R3/A4: STEP 1 of the canonical offer lock order, for the whole turn ───
+        # `whatsapp_thread_states` is the first resource in `offer_lifecycle.
+        # OFFER_LOCK_ORDER`, and this turn's real step-1 acquisition is the dedup-cursor
+        # write a few lines below — not the claim site deep inside
+        # `_process_flow_response`. Setting the bound there was therefore too late to bound
+        # anything: a measured interleaving in which the Data Exchange writer held the
+        # thread showed this writer waiting with NO timeout at all, because its first write
+        # to the row happens before any `SET LOCAL lock_timeout` had been issued.
+        #
+        # Taking the row here, explicitly, does three things: it makes the canonical order
+        # observable instead of incidental; it bounds the wait (`SET LOCAL` lasts for the
+        # rest of this transaction, so every later lock wait in the turn is bounded too);
+        # and it gives the LOSER a typed outcome instead of `internal_error`. Nothing is
+        # retried — a retry here is how one customer action becomes two bookings.
+        #
+        # The cursor is deliberately NOT written before this point, so a contended turn
+        # consumes nothing and a redelivery is free to try again.
+        _contended = self._begin_thread_transaction(ctx)
+        if _contended is not None:
+            logger.warning(
+                "G3-7P-R3 thread_id=%s contended by the other booking writer (%s) — turn "
+                "declined, cursor not consumed, nothing booked",
+                event.thread_id, _contended)
+            return _out(ACTION_THREAD_CONTENDED, detail=_contended)
+
+        # R3/D: the slot-visibility claim as it stood BEFORE this turn. The day-slots path
+        # commits `last_visible_slots` before it dispatches, so a turn that ends up
+        # delivering nothing must put back what was there — not blank the field, which
+        # would destroy a true claim left by an earlier successful turn.
+        self._turn_slot_claim_before = (state.last_visible_slots, state.last_offered_slots)
 
         # L4.7W5 Gate 1 — the canonical state as it stood BEFORE this turn touched it.
         # Taken here because `state` now exists and nothing has yet mutated it; taken later
@@ -3625,6 +3672,33 @@ class ConversationEngine:
         expected = state.flow_booking_token
         self._flow_token_expected = expected
         _offers = _OfferLifecycle(self.db)
+
+        # ── R3/A4: enter the offer transaction in the ONE canonical lock order ───
+        # The G3-7P review measured a deadlock here: this writer held
+        # `whatsapp_thread_states` (the dedup cursor, written uncommitted in `_handle`) and
+        # then asked for the offer row, while the Data Exchange writer took the offer row
+        # first and wrote the state afterwards. Both writers now take the state row first,
+        # under a bounded `lock_timeout`, so contention is a WAIT with a typed answer
+        # instead of a deadlock surfaced as `internal_error`. Nothing is retried here.
+        _contended = _offers.begin_offer_transaction(ctx.thread.id)
+        if _contended is not None:
+            # The aborted transaction was rolled back, which also discarded this turn's
+            # dedup cursor — correct, because the turn did not complete and a redelivery
+            # should be free to try again against the offer's then-current state.
+            _offers.record_refusal_out_of_band(flow_token, _contended)
+            self._turn_offer_claim = None
+            self._decision_log(ctx, "booking_offer_refused", reason=_contended,
+                               had_token=bool(flow_token))
+            logger.info("G3-7P-R3 refused a contended booking submission thread_id=%s "
+                        "reason=%s — no revision, no booking", ctx.thread.id, _contended)
+            state.needs_human = True
+            lead.necesita_humano = True
+            self.db.commit()
+            sent_id = self._send_text_to_wa(ctx, _FALLBACK_WARM_HANDOFF)
+            self._send_fallback_human_review_notification(
+                ctx, state, reason=f"booking_offer_refused:{_contended}"[:60])
+            return _out("replied", wa_message_id=sent_id)
+
         _zone_group, _zone_detail = self._get_active_inspection_location(ctx, state)
         # R2: the pricing context is bound too, and it is read from the SAME resolved
         # candidate the candidate binding uses — one authority, one answer.
@@ -12381,6 +12455,11 @@ class ConversationEngine:
         try:
             out = self._send_booking_flow(ctx, state, booking_flow_id, body_prefix=prefix)
         except OutboundBlockedError:
+            # R3/D: do NOT decide here whether the customer saw these slots. This function
+            # has three callers and every one of them recites `slots` in a TEXT reply when
+            # the Flow does not open — so a cleared field here would be the opposite lie on
+            # the far more common path. Delivery is a property of the TURN, and the turn
+            # decides it in `handle()`.
             raise
         except Exception as exc:
             logger.warning("L4.7W3-F1 booking flow dispatch failed thread_id=%s: %s",
@@ -12393,6 +12472,77 @@ class ConversationEngine:
                 "L4.7W3-F1 FLOW-FIRST thread_id=%s day=%s period=%s slots=%d dispatched",
                 getattr(ctx.thread, "id", None), day_iso, period_label or "-", len(slots))
         return out
+
+    #: R3/D. The turn outcomes that mean NOTHING was displayed to the customer. Every one
+    #: of them is a terminal verdict on the whole turn: the gate refused the send
+    #: (`blocked_dispatch`), the turn crashed (`error`), or it never started because the
+    #: other booking writer held the thread (`thread_contended`). Judging delivery by the
+    #: ACTION — not by an internal send helper — is deliberate: those helpers are the seam
+    #: the test suite replaces, so a marker set inside them would make every stubbed
+    #: successful turn look undelivered and revoke a claim that was perfectly true.
+    _NO_DELIVERY_ACTIONS = frozenset({"blocked_dispatch", "error", ACTION_THREAD_CONTENDED})
+
+    def _revoke_undelivered_slot_claim(self, event, out) -> None:
+        """Undo a slot-visibility claim written by a turn that delivered nothing.
+
+        R3/D. `last_visible_slots` means "the exact slots displayed to the user" — that is
+        how the acceptance machinery and `_offer_outstanding` read it, and
+        `_offer_outstanding` exists precisely so that rejecting options nobody was shown is
+        not treated as a rejection. The day-slots path COMMITS that field before it
+        dispatches, so when the turn then delivers nothing — the kill switch refused the
+        send, or the turn crashed before any transport succeeded — the committed field
+        asserts a delivery that never happened. The R2 review measured the consequence:
+        `_offer_outstanding` returned True for options the customer had never seen.
+
+        Two things this deliberately does NOT do.
+
+        It does not blank the field. It RESTORES the value the thread had before this turn,
+        because a slot list from an earlier, successful turn is still true and erasing it
+        would destroy real scheduling evidence to make one Boolean false.
+
+        It does not touch `active_requested_date` or `last_offered_slots`. The first records
+        the day the customer ASKED about, which they really did. The second is
+        ScheduleService's own answer — the slots it approved for this candidate, location
+        and cycle — and it carries NO delivery claim; M20.6D2's RC29 guarantee that no
+        available slot is ever hidden is asserted on exactly that field. Discarding either
+        would throw away true evidence to make one Boolean false, which is the mistake
+        L4.7W5-F7A exists to prevent.
+
+        Delivery is judged by the TURN'S OUTCOME first (`_NO_DELIVERY_ACTIONS`) and then by
+        what the outbound gate actually allowed, so a turn that sent a text and crashed
+        afterwards keeps the claim it earned.
+        """
+        if getattr(out, "action", None) not in self._NO_DELIVERY_ACTIONS:
+            return                                  # the turn reached the customer
+        if getattr(self, "_turn_text_dispatches", 0) or getattr(
+                self, "_turn_flow_delivered", False):
+            return               # it crashed, but not before something really was sent
+        before = getattr(self, "_turn_slot_claim_before", None)
+        if before is None:
+            return                                  # this turn never claimed a slot list
+        visible_before, _offered_before = before
+        db = self.db
+        try:
+            from ..models import WhatsAppThreadState as _TS
+            row = db.query(_TS).filter(_TS.thread_id == int(event.thread_id)).first()
+            if row is None:
+                return
+            if row.last_visible_slots == visible_before:
+                return                              # nothing was claimed after all
+            row.last_visible_slots = visible_before
+            db.commit()
+        except Exception:                           # pragma: no cover - defensive
+            logger.exception("R3 could not revoke an undelivered slot claim thread_id=%s",
+                             getattr(event, "thread_id", None))
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            return
+        logger.info(
+            "G3-7P-R3 revoked an undelivered slot claim thread_id=%s — restored the "
+            "pre-turn slot list; the requested day is kept",
+            getattr(event, "thread_id", None))
 
     # ── Day-only request: user gives a day but no time ────────────────────
 
@@ -13227,6 +13377,20 @@ Respondé SOLO con JSON válido:
         return payload["choices"][0]["message"]["content"]
 
     # ── Context helpers ───────────────────────────────────────────────────
+
+    def _begin_thread_transaction(self, ctx) -> str | None:
+        """Take step 1 of `offer_lifecycle.OFFER_LOCK_ORDER` under a bounded wait.
+
+        R3/A4. One authority owns the lock order and the timeout, and both booking writers
+        call into it, so the order cannot drift apart again. Returns None to proceed, or a
+        typed `OfferRefusal` when another writer holds this thread. A no-op on SQLite,
+        which has no row locks to take.
+        """
+        from .offer_lifecycle import OfferLifecycle as _OfferLifecycle
+        thread_id = getattr(getattr(ctx, "thread", None), "id", None)
+        if thread_id is None:
+            return None
+        return _OfferLifecycle(self.db).begin_offer_transaction(int(thread_id))
 
     def _load_context(self, thread_id: int) -> _Context | None:
         thread = self.db.get(WhatsAppThread, thread_id)
@@ -14926,6 +15090,10 @@ Respondé SOLO con JSON válido:
                 thread_id=ctx.thread.id,
                 gate_outcome=result.outcome.value,
             )
+        # R3/D: the gate allowed it. From here the Flow — whose body IS the slot list —
+        # really does go to the customer, which is what makes a `last_visible_slots` claim
+        # true. Set after the gate, never before it.
+        self._turn_flow_delivered = True
 
         try:
             wa_message_id, _ = _send_whatsapp_cloud_flow(

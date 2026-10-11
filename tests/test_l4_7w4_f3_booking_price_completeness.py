@@ -253,7 +253,15 @@ class TestAtomicity(_Base):
         fn = next(ast.unparse(n) for n in ast.walk(ast.parse(BFS_SOURCE))
                   if isinstance(n, ast.FunctionDef) and n.name == "handle_confirm_booking")
         i_price = fn.index("recalculate_revision_if_possible")
-        i_commit = fn.index("self.db.commit()")
+        # `rindex`, not `index`. G3-7P-R3 gave this function a SECOND, earlier commit: a
+        # refused offer must persist its refusal instead of returning an error screen with
+        # the side effects rolled back behind it. That commit creates no booking, so it is
+        # not the one this invariant is about. The booking commit is the last one, and
+        # BOOKPRICE-10 is the claim that the price is stamped before IT.
+        i_commit = fn.rindex("self.db.commit()")
+        self.assertEqual(fn.count("self.db.commit()"), 2,
+                         "a new commit appeared in handle_confirm_booking — check which "
+                         "one commits the booking before trusting rindex")
         self.assertLess(i_price, i_commit, "the price must be stamped before the commit")
         rev = self.book()
         tr = self.db.query(ThreadRevision).one()

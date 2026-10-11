@@ -689,6 +689,20 @@ class BookingFlowService:
         from .offer_lifecycle import OfferLifecycle
         _offers = OfferLifecycle(self.db)
         from .clarification_attempt import cycle_key as _cycle_key
+
+        # ── R3/A4: the SAME canonical lock order as the conversation engine ──────
+        # This writer used to take the offer row first and the thread state afterwards —
+        # the opposite order — which deadlocked the two writers. It now takes the thread
+        # state first, under a bounded `lock_timeout`.
+        _contended = _offers.begin_offer_transaction(ctx.thread.id)
+        if _contended is not None:
+            _offers.record_refusal_out_of_band(booking_token, _contended)
+            logger.warning("BOOKING_OFFER_REFUSED thread_id=%s reason=%s — contended",
+                           ctx.thread.id, _contended)
+            _log_event(self.db, ctx.thread.id, "BOOKING_OFFER_REFUSED",
+                       booking_token=booking_token, extra={"reason": _contended})
+            raise BookingTokenError(f"offer not acceptable: {_contended}")
+
         _claim = _offers.claim(
             ctx.state, thread_id=ctx.thread.id, token=booking_token,
             # `ctx.candidate` is the candidate this booking will actually reference, which
@@ -699,12 +713,33 @@ class BookingFlowService:
             cycle_key=_cycle_key(ctx.state),
             zone_group=ctx.zone_group, zone_detail=ctx.zone_detail)
         if not _claim.ok:
+            # ── R3/A: the refusal is DURABLE, not a screen with a rollback behind it ──
+            # The R2 review measured the defect this closes. `claim()` terminalises the
+            # stale offer, clears the transport mirror and records the refusal — and this
+            # path raised `BookingTokenError` straight away, so the route returned an error
+            # screen WITHOUT committing and every one of those side effects was rolled
+            # back. The offer stayed ISSUED, `last_refusal` stayed NULL, the mirror stayed
+            # truthy, and the L4.7W5-F7A scheduling gate stayed CLOSED on a thread whose
+            # offer could never be accepted again.
+            #
+            # Committing here makes the canonical offer outcome identical to the
+            # ConversationEngine path for the same refusal. The transport responses still
+            # differ — this one owes the Flow an error screen — but the offer, the mirror
+            # and the audit trail do not depend on which writer heard the submission.
             logger.warning(
                 "BOOKING_OFFER_REFUSED thread_id=%s reason=%s offer_id=%s — no booking",
                 ctx.thread.id, _claim.refusal, _claim.offer_id)
             _log_event(self.db, ctx.thread.id, "BOOKING_OFFER_REFUSED",
                        booking_token=booking_token,
                        extra={"reason": _claim.refusal, "offer_id": _claim.offer_id})
+            try:
+                self.db.commit()
+            except Exception:                       # pragma: no cover - defensive
+                logger.exception(
+                    "BOOKING_OFFER_REFUSED thread_id=%s — the refusal could not be "
+                    "committed; falling back to an out-of-band record", ctx.thread.id)
+                self.db.rollback()
+                _offers.record_refusal_out_of_band(booking_token, _claim.refusal)
             raise BookingTokenError(f"offer not acceptable: {_claim.refusal}")
 
         date_str = str(data.get("date", "")).strip()

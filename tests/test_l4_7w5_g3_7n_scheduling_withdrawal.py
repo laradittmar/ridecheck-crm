@@ -324,7 +324,13 @@ class G7N_Acknowledgement(unittest.TestCase):
 
     def test_g7n_25_the_ack_is_not_used_for_a_refused_submission(self):
         src = inspect.getsource(CE._process_flow_response)
-        refusal = src[src.index("if not _claim.ok:"):src.index("return _out(\"replied\"")]
+        # The slice must START at the refusal branch and END at the first `replied` return
+        # AFTER it. G3-7P-R3 added an earlier `replied` return — the typed outcome for a
+        # submission that lost the lock race — and an unanchored `index` picked that one up,
+        # producing an EMPTY slice that asserted nothing at all.
+        start = src.index("if not _claim.ok:")
+        refusal = src[start:src.index('return _out("replied"', start)]
+        self.assertTrue(refusal.strip(), "the refusal branch slice is empty")
         self.assertNotIn("_FLOW_COMPLETION_ACK", refusal)
         self.assertIn("_FALLBACK_WARM_HANDOFF", refusal)
 

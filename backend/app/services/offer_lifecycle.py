@@ -85,13 +85,33 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
 
 #: Bump when the stored payload's meaning or structure changes.
 OFFER_CONTRACT_VERSION = "offer/1.0"
+
+#: R3/A4. THE canonical lock order for every writer that can accept an offer. The G3-7P
+#: review measured a deadlock between the two booking writers because they took these two
+#: resources in opposite orders: the ConversationEngine writes the thread's dedup cursor
+#: (locking `whatsapp_thread_states`) and then asks for the offer row FOR UPDATE, while the
+#: Data Exchange writer took the offer row first and wrote the thread state afterwards.
+#: PostgreSQL detected it and the data stayed safe, but the loser surfaced as an
+#: uncontrolled internal error. The order below is now enforced on BOTH writers through
+#: `begin_offer_transaction()`, so contention becomes a bounded WAIT instead of a deadlock.
+OFFER_LOCK_ORDER = ("whatsapp_thread_states", "whatsapp_booking_offers")
+
+#: A bounded wait, so a contended acceptance fails as a typed domain outcome rather than
+#: blocking a conversation turn indefinitely. The ConversationEngine previously set no
+#: timeout at all.
+DEFAULT_OFFER_LOCK_TIMEOUT_MS = 4000
+
+#: SQLSTATEs that mean "another transaction holds what we need, right now" — a contention
+#: fact, never an internal failure. 55P03 lock_not_available, 40P01 deadlock_detected
+#: (retained as a backstop; the lock order is what prevents it), 40001 serialization_failure.
+_CONTENTION_SQLSTATES = frozenset({"55P03", "40P01", "40001"})
 
 #: Expiry is PRE-EXISTING policy, not a new one: `booking_flow_service.TOKEN_MAX_AGE_SECONDS`
 #: already refused a token older than this on the data-exchange path. Imported lazily to
@@ -135,6 +155,10 @@ class OfferRefusal:
     OFFER_VEHICLE_CATEGORY_UNRESOLVED = "OFFER_VEHICLE_CATEGORY_UNRESOLVED"
     #: R2/A3. The offer belongs to a conversation cycle that has closed.
     OFFER_CYCLE_CHANGED = "OFFER_CYCLE_CHANGED"
+    #: R3/A4. Another writer holds this thread's offer transaction. A contention FACT, and
+    #: a deterministic domain outcome — never `internal_error`, and never retried here: a
+    #: retry loop at this boundary is how duplicate work gets created.
+    OFFER_CONTENDED = "OFFER_CONTENDED"
 
 
 #: Why an offer was invalidated. Stored in `terminal_reason`, so an operator can tell a
@@ -362,6 +386,55 @@ class OfferLifecycle:
                     thread_id, offer.id, candidate_id, zone_group, zone_detail)
         return offer
 
+    # ── the canonical lock order (R3/A4) ─────────────────────────────────────
+
+    @staticmethod
+    def contention_sqlstate(exc) -> Optional[str]:
+        """The SQLSTATE if `exc` means "another transaction holds it", else None."""
+        state = getattr(getattr(exc, "orig", None), "sqlstate", None)
+        if state is None:
+            state = getattr(exc, "sqlstate", None)
+        return state if state in _CONTENTION_SQLSTATES else None
+
+    def begin_offer_transaction(self, thread_id: int, *,
+                                lock_timeout_ms: int = DEFAULT_OFFER_LOCK_TIMEOUT_MS
+                                ) -> Optional[str]:
+        """Enter the offer-acceptance transaction in the ONE canonical lock order.
+
+        R3/A4. Step 1 is the thread's own state row; step 2 is the offer row, taken inside
+        `claim()`. Both booking writers call this first, so they can no longer take the two
+        resources in opposite orders — which is what deadlocked them. `lock_timeout` makes
+        the wait bounded, so a contended turn gets a typed answer instead of blocking.
+
+        Returns None when the transaction may proceed, or a typed `OfferRefusal` when the
+        thread is contended. On contention the aborted transaction is rolled back first, so
+        the caller is handed a usable session.
+        """
+        if not self._postgres():
+            return None
+        try:
+            # `SET LOCAL` takes no bind parameter; the value is coerced to int here, so
+            # nothing caller-supplied reaches the statement as text.
+            self.db.execute(text("SET LOCAL lock_timeout = %d" % int(lock_timeout_ms)))
+            # Step 1 of OFFER_LOCK_ORDER. FOR NO KEY UPDATE: it conflicts with itself and
+            # with the UPDATE the engine performs on the same row, which is exactly the
+            # mutual exclusion we want, without blocking readers.
+            self.db.execute(
+                text("SELECT 1 FROM whatsapp_thread_states WHERE thread_id = :t "
+                     "FOR NO KEY UPDATE").bindparams(t=int(thread_id)))
+            return None
+        except Exception as exc:
+            sqlstate = self.contention_sqlstate(exc)
+            try:
+                self.db.rollback()
+            except Exception:                       # pragma: no cover - defensive
+                logger.exception("OFFER rollback after contention failed")
+            if sqlstate is None:
+                raise
+            logger.info("OFFER_CONTENDED thread_id=%s sqlstate=%s — typed refusal, no retry",
+                        thread_id, sqlstate)
+            return OfferRefusal.OFFER_CONTENDED
+
     # ── acceptance ───────────────────────────────────────────────────────────
 
     def claim(self, state, *, thread_id: int, token: Optional[str],
@@ -390,7 +463,22 @@ class OfferLifecycle:
             populate_existing=True)
         if self._postgres():
             stmt = stmt.with_for_update()
-        offer = self.db.execute(stmt).scalars().first()
+        try:
+            offer = self.db.execute(stmt).scalars().first()
+        except Exception as exc:
+            # Step 2 of OFFER_LOCK_ORDER. With the order enforced this is a bounded WAIT
+            # that timed out, not a deadlock — and it is a contention fact, so it answers
+            # with a typed refusal rather than escaping as an internal failure.
+            sqlstate = self.contention_sqlstate(exc)
+            if sqlstate is None:
+                raise
+            try:
+                self.db.rollback()
+            except Exception:                       # pragma: no cover - defensive
+                logger.exception("OFFER rollback after claim contention failed")
+            logger.info("OFFER_CONTENDED thread_id=%s sqlstate=%s at the offer row",
+                        thread_id, sqlstate)
+            return OfferClaim(False, OfferRefusal.OFFER_CONTENDED, fingerprint=fp)
         if offer is None:
             # No authority row for this token. Either fabricated/tampered, or a mirror left
             # by an application older than this table. Both are refusals: the only thing a
@@ -500,6 +588,33 @@ class OfferLifecycle:
             logger.warning("OFFER refusal not recorded offer_id=%s", offer.id, exc_info=True)
         return OfferClaim(False, refusal, offer_id=offer.id, fingerprint=fingerprint,
                           status=status or offer.status)
+
+    def record_refusal_out_of_band(self, token: Optional[str], refusal: str) -> bool:
+        """Record a refusal on its offer in its OWN transaction.
+
+        R3. A contended claim leaves the transaction aborted, so the in-transaction counters
+        in `_refuse()` cannot be written. This records the fact afterwards, so a contention
+        refusal is still durably visible instead of existing only in a log line.
+        """
+        from ..models import WhatsAppBookingOffer as O
+        fp = token_fingerprint(token)
+        if fp is None:
+            return False
+        try:
+            res = self.db.execute(
+                update(O).where(O.token_fingerprint == fp)
+                .values(refused_count=(O.refused_count + 1), last_refusal=refusal[:64],
+                        last_refused_at=self._now())
+                .execution_options(synchronize_session="fetch"))
+            self.db.commit()
+            return bool(res.rowcount)
+        except Exception:
+            logger.warning("OFFER out-of-band refusal not recorded", exc_info=True)
+            try:
+                self.db.rollback()
+            except Exception:                       # pragma: no cover - defensive
+                pass
+            return False
 
     # ── state mirror ─────────────────────────────────────────────────────────
 

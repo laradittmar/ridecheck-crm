@@ -2592,8 +2592,17 @@ class TestRC29FullSlotVisibility(unittest.TestCase):
         # the slot picker instead of reciting the times in prose. RC29 exists to prove
         # that NO SLOT IS HIDDEN, and that is still asserted — on the slot set handed to
         # the customer, which is now carried by the Flow rather than by the sentence.
+        # L4.7W5-GATE3-G3-7P-R3 §D — read the OFFERED set, not the VISIBILITY claim.
+        # RC29's guarantee is "no available slot is hidden", and that is a property of what
+        # ScheduleService approved and the engine handed to the dispatcher:
+        # `last_offered_slots`. `last_visible_slots` means something narrower — "these exact
+        # slots were displayed to the customer" — and in this test the outbound gate BLOCKED
+        # the send (`_get_blocked` is what the reply is read from), so nothing was displayed.
+        # R3 stopped that field from claiming otherwise. The guarantee itself is unchanged
+        # and still asserted on all nine slots, twice: once here and once as an exact list
+        # at the end of this test.
         import json as _json
-        visible = _json.loads(self.state.last_visible_slots or "[]")
+        visible = _json.loads(self.state.last_offered_slots or "[]")
 
         # All 9 slots must be offered — none should be hidden
         for slot in _SATURDAY_SLOTS:

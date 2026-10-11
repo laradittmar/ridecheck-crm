@@ -22,7 +22,7 @@ import sys
 import threading
 import time as _t
 import unittest
-from datetime import date, time
+from datetime import date, time, timedelta
 from pathlib import Path
 
 _BACKEND = str(Path(__file__).resolve().parents[1] / "backend")
@@ -166,6 +166,21 @@ class G7POfferAuthorityPG(unittest.TestCase):
         return dict(zip(("token", "focus", "zone_group", "zone_detail", "preferred_day",
                          "preferred_time", "active_requested_date", "last_requested_time",
                          "last_offered_slots", "last_visible_slots"), row))
+
+    def _svc(self, db):
+        from app.services.booking_flow_service import BookingFlowService
+        svc = BookingFlowService(db)
+        svc._send_booking_receipt = lambda *a, **k: None
+        return svc
+
+    def _offer_full(self):
+        db = self.SF()
+        row = db.execute(text(
+            "SELECT status, accepted_at, accepted_revision_id, accepted_thread_revision_id "
+            "FROM whatsapp_booking_offers WHERE thread_id=:t ORDER BY id DESC LIMIT 1"),
+            {"t": self.thread_id}).one()
+        db.close()
+        return tuple(row)
 
     # ── 1. the happy path, exactly once ──────────────────────────────────────
 
@@ -862,21 +877,6 @@ class G7PR2BindingCompleteness(G7POfferAuthorityPG):
 
     # ── §8 the summary screen never consumes ─────────────────────────────────
 
-    def _svc(self, db):
-        from app.services.booking_flow_service import BookingFlowService
-        svc = BookingFlowService(db)
-        svc._send_booking_receipt = lambda *a, **k: None
-        return svc
-
-    def _offer_full(self):
-        db = self.SF()
-        row = db.execute(text(
-            "SELECT status, accepted_at, accepted_revision_id, accepted_thread_revision_id "
-            "FROM whatsapp_booking_offers WHERE thread_id=:t ORDER BY id DESC LIMIT 1"),
-            {"t": self.thread_id}).one()
-        db.close()
-        return tuple(row)
-
     def _assert_not_consumed(self, where, session=None):
         """Nothing before confirm_booking may claim the offer.
 
@@ -940,33 +940,596 @@ class G7PR2BindingCompleteness(G7POfferAuthorityPG):
         db.close()
 
     def test_g7p_r2_12_confirmation_is_what_claims_and_consumes(self):
+        """R3/F3 corrected this test. It used to accept EITHER outcome — booked or
+        refused — because its hard-coded 2026-11-10 10:00 might not be open in the
+        fixture. That tolerance made it blind to the defect it was supposed to guard:
+        deleting the Data Exchange booking left it green. The slot now comes from
+        ScheduleService, so the booking is REQUIRED.
+        """
+        from app.schemas.schedule import ScheduleCheckIn
+        from app.services.schedule import ScheduleService
+        day_iso = hhmm = None
         db = self.SF()
-        db.execute(text("UPDATE whatsapp_thread_states SET preferred_day='2026-11-10', "
-                        "preferred_time='10:00' WHERE thread_id=:t"), {"t": self.thread_id})
+        try:
+            sched = ScheduleService(db)
+            for offset in range(2, 24):
+                day = date.today() + timedelta(days=offset)
+                slots = sched.list_slots(ScheduleCheckIn(
+                    address="Palermo, CABA", preferred_day=day,
+                    preferred_time=time(11, 0), zone_group="CABA",
+                    zone_detail="Palermo")).slots
+                if slots:
+                    day_iso, hhmm = day.isoformat(), str(slots[0])[:5]
+                    break
+        finally:
+            db.close()
+        self.assertIsNotNone(day_iso, "ScheduleService offered no open slot")
+        db = self.SF()
+        db.execute(text("UPDATE whatsapp_thread_states SET preferred_day=:d, "
+                        "preferred_time=:t, active_requested_date=:d, "
+                        "last_requested_time=:t WHERE thread_id=:th"),
+                   {"d": day_iso, "t": hhmm, "th": self.thread_id})
         db.commit(); db.close()
         token = self._issue()
-        db = self.SF(); svc = self._svc(db)
-        try:
-            svc.handle_confirm_booking(token, {
-                "date": "2026-11-10", "time": "10:00", "name": "P C", "email": "p@e.t",
-                "inspection_address": "Palermo, CABA"})
-            booked = True
-        except Exception:
-            booked = False                   # the slot may be unavailable in this fixture
+        db = self.SF()
+        self._svc(db).handle_confirm_booking(token, {
+            "date": day_iso, "time": hhmm, "name": "P C", "email": "p@e.t",
+            "inspection_address": "Palermo, CABA"})
         db.close()
         status, accepted_at, rev, tr = self._offer_full()
-        if booked:
-            self.assertEqual(status, "ACCEPTED")
-            self.assertIsNotNone(accepted_at)
-            self.assertIsNotNone(rev)
-            self.assertIsNotNone(tr)
-            self.assertEqual(self._counts(), (1, 1))
-        else:
-            # a refusal must leave the offer exactly as it was — never half-accepted
-            self.assertEqual(status, "ISSUED")
-            self.assertIsNone(accepted_at)
-            self.assertEqual(self._counts(), (0, 0))
+        self.assertEqual(status, "ACCEPTED")
+        self.assertIsNotNone(accepted_at)
+        self.assertIsNotNone(rev, "no CRM Revision was linked to the accepted offer")
+        self.assertIsNotNone(tr, "no ThreadRevision was linked to the accepted offer")
+        self.assertEqual(self._counts(), (1, 1))
 
 
 if __name__ == "__main__":                       # pragma: no cover
     unittest.main()
+
+
+@unittest.skipUnless(PG_URL, "G7P_PG_URL not set — no disposable PostgreSQL; nothing proven")
+class G7PR3TransactionDurability(G7POfferAuthorityPG):
+    """R3 — a Data Exchange refusal is DURABLE, the two writers share ONE lock order, and a
+    failed slot dispatch stops claiming the customer saw anything.
+
+    Three measured defects, one milestone.
+
+    §A. `handle_confirm_booking` raised `BookingTokenError` the instant `claim()` refused —
+    without committing. `claim()` had already terminalised the stale offer, cleared the
+    transport mirror and recorded the refusal, and every one of those side effects was
+    rolled back with the request. The customer got an error screen; the database kept an
+    offer that read ISSUED, a truthy mirror that held the L4.7W5-F7A scheduling gate shut,
+    and no record that anything had been refused. The same refusal through the
+    ConversationEngine was durable, so the canonical outcome depended on which writer heard
+    the submission.
+
+    §B (A4). The two writers took `whatsapp_thread_states` and `whatsapp_booking_offers` in
+    OPPOSITE orders. PostgreSQL's deadlock detector kept the data safe — and surfaced the
+    loser as `internal_error`, which tells an operator to hunt a bug that does not exist.
+    The order is now canonical (`offer_lifecycle.OFFER_LOCK_ORDER`) and enforced on both
+    writers, the wait is bounded, and the loser is typed. Nothing is retried: a retry is how
+    one customer action becomes two bookings.
+
+    §D. The day-slots path COMMITS `last_visible_slots` before it dispatches. When the
+    dispatch delivered nothing the field still asserted that those slots were displayed, and
+    `_offer_outstanding` — which exists so that rejecting options nobody was shown is not a
+    rejection — believed it.
+
+    Nothing here asserts on source text. Every test drives a real writer against real rows
+    and reads the committed result.
+    """
+
+    # ── a slot that is genuinely open, asked of the authority that decides ────
+
+    def _open_slot(self):
+        """(day_iso, 'HH:MM') for a real opening, from ScheduleService itself.
+
+        Never a literal date. The suite already carries one Sunday-dependent family whose
+        failures appear and disappear with the day of the week; a hard-coded day would add a
+        second, and would start failing the moment it drifted into the past.
+        """
+        from app.schemas.schedule import ScheduleCheckIn
+        from app.services.schedule import ScheduleService
+        db = self.SF()
+        try:
+            svc = ScheduleService(db)
+            for offset in range(2, 24):
+                day = date.today() + timedelta(days=offset)
+                out = svc.list_slots(ScheduleCheckIn(
+                    address="Palermo, CABA", preferred_day=day, preferred_time=time(11, 0),
+                    zone_group="CABA", zone_detail="Palermo"))
+                if out.slots:
+                    return day.isoformat(), str(out.slots[0])[:5]
+        finally:
+            db.close()
+        self.fail("ScheduleService offered no open slot in the next 24 days")
+
+    def _arm_preference(self, day_iso, hhmm):
+        db = self.SF()
+        db.execute(text("UPDATE whatsapp_thread_states SET preferred_day=:d, "
+                        "preferred_time=:t, active_requested_date=:d, "
+                        "last_requested_time=:t, needs_human=false WHERE thread_id=:th"),
+                   {"d": day_iso, "t": hhmm, "th": self.thread_id})
+        db.commit(); db.close()
+
+    def _dx_payload(self, day_iso, hhmm):
+        return {"date": day_iso, "time": hhmm, "name": "Probe Cliente",
+                "email": "p@example.test", "inspection_address": "Palermo, CABA",
+                "seller_name": "Vendedor", "seller_phone": "1122334455"}
+
+    def _dx_confirm(self, token, day_iso, hhmm):
+        """The real Data Exchange writer. Returns ('ok', screen) or ('exc', type, text)."""
+        db = self.SF()
+        try:
+            out = self._svc(db).handle_confirm_booking(
+                token, self._dx_payload(day_iso, hhmm))
+            return ("ok", out.get("screen"))
+        except Exception as exc:
+            return ("exc", type(exc).__name__, str(exc)[:120])
+        finally:
+            db.close()
+
+    def _offer_row(self):
+        db = self.SF()
+        row = db.execute(text(
+            "SELECT status, terminal_reason, last_refusal, refused_count, accepted_at "
+            "FROM whatsapp_booking_offers WHERE thread_id=:t ORDER BY id DESC LIMIT 1"),
+            {"t": self.thread_id}).one()
+        db.close()
+        return dict(zip(("status", "terminal_reason", "last_refusal", "refused_count",
+                         "accepted_at"), row))
+
+    def _f7a_open(self):
+        """True when the deterministic SCHEDULING block is reachable — the gate is
+        `not state.flow_booking_token`, read from committed state."""
+        return not self._state()["token"]
+
+    def _change_category_to(self, cat):
+        db = self.SF()
+        db.execute(text("UPDATE whatsapp_thread_candidates SET tipo_vehiculo=:c WHERE id=:i"),
+                   {"c": cat, "i": self.cand_a})
+        db.commit(); db.close()
+
+    # ── §A every terminal Data Exchange refusal is DURABLE ───────────────────
+
+    def _assert_durable_refusal(self, token, expect_status, expect_reason):
+        row = self._offer_row()
+        self.assertEqual(row["status"], expect_status,
+                         "the refusal was rolled back with the error screen")
+        self.assertEqual(row["terminal_reason"], expect_reason)
+        self.assertEqual(row["last_refusal"], expect_reason,
+                         "the refusal classification was not persisted")
+        self.assertGreaterEqual(row["refused_count"], 1)
+        self.assertIsNone(row["accepted_at"])
+        self.assertIsNone(self._state()["token"],
+                          "the transport mirror survived a terminal refusal")
+        self.assertTrue(self._f7a_open(),
+                        "L4.7W5-F7A stayed shut behind an offer that can never be accepted")
+        self.assertEqual(self._counts(), (0, 0), "a refused submission produced a booking")
+
+    def test_g7p_r3_01_a_category_change_refusal_is_durable_on_the_dx_path(self):
+        day, hhmm = self._open_slot(); self._arm_preference(day, hhmm)
+        token = self._issue()
+        self._change_category_to("PICKUP")
+        res = self._dx_confirm(token, day, hhmm)
+        self.assertEqual(res[0], "exc")
+        self.assertEqual(res[1], "BookingTokenError")
+        self._assert_durable_refusal(token, "WITHDRAWN",
+                                     "OFFER_VEHICLE_CATEGORY_CHANGED")
+
+    def test_g7p_r3_02_a_cycle_change_refusal_is_durable_on_the_dx_path(self):
+        day, hhmm = self._open_slot(); self._arm_preference(day, hhmm)
+        token = self._issue()
+        db = self.SF()
+        db.execute(text("UPDATE whatsapp_thread_states SET "
+                        "current_cycle_start_message_db_id=99999 WHERE thread_id=:t"),
+                   {"t": self.thread_id})
+        db.commit(); db.close()
+        self.assertEqual(self._dx_confirm(token, day, hhmm)[0], "exc")
+        self._assert_durable_refusal(token, "WITHDRAWN", "OFFER_CYCLE_CHANGED")
+
+    def test_g7p_r3_03_an_expiry_refusal_is_durable_on_the_dx_path(self):
+        day, hhmm = self._open_slot(); self._arm_preference(day, hhmm)
+        token = self._issue()
+        db = self.SF()
+        db.execute(text("UPDATE whatsapp_booking_offers SET expires_at = now() - "
+                        "interval '1 second' WHERE thread_id=:t"), {"t": self.thread_id})
+        db.commit(); db.close()
+        self.assertEqual(self._dx_confirm(token, day, hhmm)[0], "exc")
+        self._assert_durable_refusal(token, "EXPIRED", "OFFER_EXPIRED")
+
+    def test_g7p_r3_04_both_writers_reach_the_same_canonical_offer_outcome(self):
+        """The transport responses differ — one owes the Flow an error screen, the other a
+        WhatsApp message — but the offer, the mirror and the audit trail must not depend on
+        which writer heard the submission."""
+        seen = {}
+        for writer in ("DX", "CE"):
+            self.setUp()
+            day, hhmm = self._open_slot(); self._arm_preference(day, hhmm)
+            token = self._issue()
+            self._change_category_to("PICKUP")
+            if writer == "DX":
+                self._dx_confirm(token, day, hhmm)
+            else:
+                self._submit(token, tag="eq")
+            row = self._offer_row()
+            seen[writer] = (row["status"], row["terminal_reason"], row["last_refusal"],
+                            self._state()["token"] is None, self._f7a_open(),
+                            self._counts())
+        self.assertEqual(seen["DX"], seen["CE"],
+                         f"the two writers disagree about the same refusal: {seen}")
+        self.assertEqual(seen["DX"][0], "WITHDRAWN")
+
+    def test_g7p_r3_05_a_durable_refusal_is_idempotent_and_the_thread_recovers(self):
+        day, hhmm = self._open_slot(); self._arm_preference(day, hhmm)
+        token = self._issue()
+        self._change_category_to("PICKUP")
+        self._dx_confirm(token, day, hhmm)
+        first = self._offer_row()["status"]
+        for _ in range(3):
+            self.assertEqual(self._dx_confirm(token, day, hhmm)[0], "exc")
+        self.assertEqual(self._offer_row()["status"], first)
+        self.assertEqual(self._counts(), (0, 0), "a replayed refusal created a booking")
+        # and the conversation is not dead: the right vehicle gets a new offer that books
+        self._change_category_to("AUTO")
+        self._arm_preference(day, hhmm)
+        token2 = self._issue()
+        self.assertIsNotNone(token2, "no new offer could be issued after the refusal")
+        self.assertNotEqual(token2, token)
+        self.assertEqual(self._dx_confirm(token2, day, hhmm)[0], "ok")
+        self.assertEqual(self._counts(), (1, 1))
+
+    # ── §C the Data Exchange writer can really book, and only once ───────────
+
+    def test_g7p_r3_06_the_dx_writer_books_exactly_once(self):
+        """F3. The R2 suite could not tell a working Data Exchange booking from a broken
+        one: its confirmation test accepted EITHER outcome, so deleting the booking left it
+        green. This test requires the booking."""
+        day, hhmm = self._open_slot(); self._arm_preference(day, hhmm)
+        token = self._issue()
+        res = self._dx_confirm(token, day, hhmm)
+        self.assertEqual(res[0], "ok", f"the Data Exchange writer could not book: {res}")
+        self.assertEqual(self._counts(), (1, 1),
+                         "confirmation produced no ThreadRevision and CRM Revision")
+        row = self._offer_row()
+        self.assertEqual(row["status"], "ACCEPTED")
+        self.assertIsNotNone(row["accepted_at"])
+        status, accepted_at, rev, tr = self._offer_full()
+        self.assertIsNotNone(rev, "the accepted CRM Revision was not linked to the offer")
+        self.assertIsNotNone(tr, "the accepted ThreadRevision was not linked to the offer")
+
+    def test_g7p_r3_07_a_replayed_dx_confirmation_books_nothing_more(self):
+        day, hhmm = self._open_slot(); self._arm_preference(day, hhmm)
+        token = self._issue()
+        self.assertEqual(self._dx_confirm(token, day, hhmm)[0], "ok")
+        for _ in range(3):
+            self.assertEqual(self._dx_confirm(token, day, hhmm)[0], "exc")
+        self.assertEqual(self._counts(), (1, 1), "a replay booked a second time")
+
+    def test_g7p_r3_08_each_dx_binding_is_enforced_at_confirmation(self):
+        """One binding broken at a time, so a single over-broad guard cannot stand in for
+        all of them."""
+        from app.services.offer_lifecycle import OfferRefusal
+        cases = (
+            ("category", "UPDATE whatsapp_thread_candidates SET tipo_vehiculo='PICKUP' "
+                         "WHERE id=:cand", OfferRefusal.OFFER_VEHICLE_CATEGORY_CHANGED),
+            ("cycle", "UPDATE whatsapp_thread_states SET "
+                      "current_cycle_start_message_db_id=4242 WHERE thread_id=:th",
+             OfferRefusal.OFFER_CYCLE_CHANGED),
+            ("expiry", "UPDATE whatsapp_booking_offers SET expires_at=now()-"
+                       "interval '1 second' WHERE thread_id=:th",
+             OfferRefusal.OFFER_EXPIRED),
+            ("zone", "UPDATE whatsapp_thread_states SET home_zone_detail='Tigre', "
+                     "home_zone_group='GBA_NORTE' WHERE thread_id=:th",
+             OfferRefusal.OFFER_LOCATION_CHANGED),
+        )
+        for name, sql, expected in cases:
+            with self.subTest(binding=name):
+                self.setUp()
+                day, hhmm = self._open_slot(); self._arm_preference(day, hhmm)
+                token = self._issue()
+                db = self.SF()
+                db.execute(text(sql), {"cand": self.cand_a, "th": self.thread_id})
+                db.commit(); db.close()
+                res = self._dx_confirm(token, day, hhmm)
+                self.assertEqual(res[0], "exc", f"{name}: the submission was accepted")
+                self.assertEqual(self._counts(), (0, 0), f"{name}: it booked anyway")
+                self.assertEqual(self._offer_row()["last_refusal"], expected,
+                                 f"{name}: wrong or missing refusal classification")
+
+    # ── §B one canonical lock order, bounded, typed, no deadlock ─────────────
+
+    def _gate_one_writer(self):
+        """Hold ONE writer inside its transaction between step 1 and step 2 of the lock
+        order, so the interleaving is chosen rather than hoped for."""
+        import app.services.offer_lifecycle as OL
+        state = {"name": None, "entered": threading.Event(), "hold": threading.Event(),
+                 "sqlstates": []}
+        original = OL.OfferLifecycle.claim
+        original_cs = OL.OfferLifecycle.contention_sqlstate
+
+        def gated(inner_self, *a, **kw):
+            if threading.current_thread().name == state["name"]:
+                state["entered"].set()
+                state["hold"].wait(timeout=40)
+            return original(inner_self, *a, **kw)
+
+        def spy(exc):
+            sqlstate = (getattr(getattr(exc, "orig", None), "sqlstate", None)
+                        or getattr(exc, "sqlstate", None))
+            if sqlstate:
+                state["sqlstates"].append(sqlstate)
+            return original_cs(exc)
+
+        OL.OfferLifecycle.claim = gated
+        OL.OfferLifecycle.contention_sqlstate = staticmethod(spy)
+        self.addCleanup(setattr, OL.OfferLifecycle, "claim", original)
+        self.addCleanup(setattr, OL.OfferLifecycle, "contention_sqlstate",
+                        staticmethod(original_cs))
+        return state
+
+    def _writers(self, token, day, hhmm):
+        def ce(out, key):
+            try:
+                out[key] = self._submit_raw(token, key)
+            except Exception as exc:
+                out[key] = f"EXC:{type(exc).__name__}"
+
+        def dx(out, key):
+            res = self._dx_confirm(token, day, hhmm)
+            out[key] = res[1] if res[0] == "ok" else f"EXC:{res[1]}"
+        return ce, dx
+
+    def _run_contended(self, holder):
+        """`holder` is 'CE' or 'DX' — the writer that gets the thread first and wins."""
+        day, hhmm = self._open_slot(); self._arm_preference(day, hhmm)
+        token = self._issue()
+        self._clear_human()
+        gate = self._gate_one_writer()
+        ce, dx = self._writers(token, day, hhmm)
+        first, second = (ce, dx) if holder == "CE" else (dx, ce)
+        out = {}
+        gate["name"] = "OFFER_WRITER_A"
+        t_a = threading.Thread(target=first, args=(out, "A"), name="OFFER_WRITER_A")
+        t_a.start()
+        self.assertTrue(gate["entered"].wait(timeout=30),
+                        "the holding writer never reached the offer row")
+        t0 = _t.time()
+        t_b = threading.Thread(target=second, args=(out, "B"), name="OFFER_WRITER_B")
+        t_b.start(); t_b.join(timeout=40)
+        waited = _t.time() - t0
+        gate["hold"].set(); t_a.join(timeout=40)
+        self.assertFalse(t_b.is_alive(), "the losing writer never returned")
+        return dict(out=out, waited=waited, sqlstates=sorted(set(gate["sqlstates"])),
+                    token=token, day=day, hhmm=hhmm)
+
+    def test_g7p_r3_09_the_ce_winner_leaves_the_dx_writer_a_typed_refusal(self):
+        r = self._run_contended("CE")
+        self.assertEqual(self._counts(), (1, 1),
+                         f"not exactly one booking: {r['out']}")
+        self.assertNotIn("40P01", r["sqlstates"],
+                         "the writers still deadlock — the lock order is not canonical")
+        self.assertEqual(r["out"]["B"], "EXC:BookingTokenError",
+                         "the loser did not get a typed domain outcome")
+        self.assertEqual(self._offer_row()["last_refusal"], "OFFER_CONTENDED",
+                         "the contention refusal was not recorded durably")
+        self.assertEqual(self._offer_row()["status"], "ACCEPTED")
+
+    def test_g7p_r3_10_the_dx_winner_leaves_the_ce_turn_a_typed_outcome(self):
+        """The interleaving the G3-7P review surfaced as `internal_error`."""
+        from app.schemas.conversation import ACTION_THREAD_CONTENDED, HANDLED_ACTIONS
+        r = self._run_contended("DX")
+        self.assertEqual(self._counts(), (1, 1),
+                         f"not exactly one booking: {r['out']}")
+        self.assertNotIn("40P01", r["sqlstates"], "the writers still deadlock")
+        self.assertEqual(r["out"]["B"], ACTION_THREAD_CONTENDED,
+                         "the losing conversation turn did not get a typed outcome")
+        self.assertNotIn(r["out"]["B"], ("error", "internal_error"))
+        self.assertIn(ACTION_THREAD_CONTENDED, HANDLED_ACTIONS,
+                      "an unhandled action hands the turn to n8n's legacy booking chain")
+
+    def test_g7p_r3_11_the_losing_writer_waits_a_bounded_time(self):
+        """Not 'it finished eventually'. The G3-7P review measured the ConversationEngine
+        waiting with no timeout at all, because its real step-1 acquisition happens at the
+        start of the turn and the bound was being set much later, at the claim site."""
+        from app.services.offer_lifecycle import DEFAULT_OFFER_LOCK_TIMEOUT_MS
+        bound = (DEFAULT_OFFER_LOCK_TIMEOUT_MS / 1000.0)
+        for holder in ("CE", "DX"):
+            with self.subTest(holder=holder):
+                self.setUp()
+                r = self._run_contended(holder)
+                self.assertLess(r["waited"], bound * 2.5,
+                                f"the loser waited {r['waited']:.2f}s with a "
+                                f"{bound:.1f}s bound — the wait is not bounded")
+                self.assertGreater(r["waited"], bound * 0.5,
+                                   "the loser did not actually wait for the lock; this "
+                                   "interleaving proves nothing")
+                self.assertIn("55P03", r["sqlstates"],
+                              "the bound was never reached by a real lock wait")
+
+    def test_g7p_r3_12_simultaneous_writers_never_deadlock_and_book_once(self):
+        """No gate, no chosen winner — both writers released together, repeatedly."""
+        import app.services.offer_lifecycle as OL
+        original_cs = OL.OfferLifecycle.contention_sqlstate
+        seen = []
+
+        def spy(exc):
+            sqlstate = (getattr(getattr(exc, "orig", None), "sqlstate", None)
+                        or getattr(exc, "sqlstate", None))
+            if sqlstate:
+                seen.append(sqlstate)
+            return original_cs(exc)
+        OL.OfferLifecycle.contention_sqlstate = staticmethod(spy)
+        self.addCleanup(setattr, OL.OfferLifecycle, "contention_sqlstate",
+                        staticmethod(original_cs))
+        for trial in range(4):
+            with self.subTest(trial=trial):
+                self.setUp()
+                day, hhmm = self._open_slot(); self._arm_preference(day, hhmm)
+                token = self._issue()
+                self._clear_human()
+                ce, dx = self._writers(token, day, hhmm)
+                barrier = threading.Barrier(2)
+                out = {}
+
+                def a():
+                    barrier.wait(); ce(out, "A")
+
+                def b():
+                    barrier.wait(); dx(out, "B")
+                t1 = threading.Thread(target=a); t2 = threading.Thread(target=b)
+                t1.start(); t2.start(); t1.join(60); t2.join(60)
+                self.assertEqual(self._counts(), (1, 1),
+                                 f"trial {trial}: not exactly one booking: {out}")
+                self.assertEqual(self._offer_row()["status"], "ACCEPTED")
+        self.assertNotIn("40P01", seen,
+                         "PostgreSQL's deadlock detector fired — it is not control flow")
+
+    def test_g7p_r3_13_a_contended_turn_does_not_consume_the_inbound(self):
+        """A dropped turn that swallowed its dedup cursor would lose the customer's message
+        for good. The cursor is written AFTER step 1 precisely so that cannot happen."""
+        from app.schemas.conversation import ACTION_THREAD_CONTENDED
+        day, hhmm = self._open_slot(); self._arm_preference(day, hhmm)
+        token = self._issue()
+        self._clear_human()
+        gate = self._gate_one_writer()
+        _, dx = self._writers(token, day, hhmm)
+        out = {}
+        gate["name"] = "OFFER_WRITER_A"
+        t_a = threading.Thread(target=dx, args=(out, "A"), name="OFFER_WRITER_A")
+        t_a.start()
+        self.assertTrue(gate["entered"].wait(timeout=30))
+        wamid = "wamid.contended.once"
+        db, eng = self._engine()
+        from app.schemas.conversation import ConversationHandleIn
+        first = eng.handle(ConversationHandleIn(
+            thread_id=self.thread_id, wa_message_id=wamid, wa_id=WA,
+            message_type="flow_response", flow_response=dict(BOOKING_PAYLOAD),
+            flow_token=token))
+        db.close()
+        gate["hold"].set(); t_a.join(timeout=40)
+        self.assertEqual(first.action, ACTION_THREAD_CONTENDED)
+        db = self.SF()
+        cursor = db.execute(text("SELECT last_processed_inbound_wa_message_id FROM "
+                                 "whatsapp_thread_states WHERE thread_id=:t"),
+                            {"t": self.thread_id}).scalar()
+        db.close()
+        self.assertNotEqual(cursor, wamid,
+                            "the contended turn consumed the inbound it never processed")
+        # the redelivery is processed on its merits, not discarded as a duplicate
+        again = self._submit(token, tag="redelivery")
+        self.assertNotEqual(again.action, "skipped_dedup",
+                            "the redelivered message was discarded as already processed")
+
+    # ── §D a failed dispatch stops claiming the customer saw the slots ───────
+
+    _MONTHS_ES = ("enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
+                  "agosto", "septiembre", "octubre", "noviembre", "diciembre")
+
+    @classmethod
+    def _day_in_spanish(cls, day_iso):
+        """"13 de octubre" — the engine's day parser reads customer Spanish, not ISO."""
+        d = date.fromisoformat(day_iso)
+        return f"{d.day} de {cls._MONTHS_ES[d.month - 1]}"
+
+    def _park_in_scheduling(self, *, prior_claim=None):
+        db = self.SF()
+        db.execute(text(
+            "UPDATE whatsapp_thread_states SET preferred_day=NULL, preferred_time=NULL, "
+            "active_requested_date=NULL, last_requested_time=NULL, "
+            "last_offered_slots=:p, last_visible_slots=:p, needs_human=false, "
+            "last_stage='SCHEDULING' WHERE thread_id=:t"),
+            {"p": prior_claim, "t": self.thread_id})
+        db.commit(); db.close()
+
+    def _day_request(self, *, flow_raises=None, text_raises=None, tag="day"):
+        from app.schemas.conversation import ConversationHandleIn
+        db, eng = self._engine()
+        if flow_raises is not None:
+            def _flow(ctx, body, token, **kw):
+                raise flow_raises
+            eng._send_flow_button = _flow
+        if text_raises is not None:
+            def _text(ctx, body):
+                raise text_raises
+            eng._send_text_to_wa = _text
+        day_iso, _ = self._open_slot()
+        question = f"¿qué horarios tenés el {self._day_in_spanish(day_iso)}?"
+        try:
+            return eng.handle(ConversationHandleIn(
+                thread_id=self.thread_id, wa_message_id=f"wamid.{tag}.{_t.time()}",
+                wa_id=WA, message_type="text", text=question,
+                recent_user_messages=[question],
+                unanswered_recent_user_messages=[question])).action
+        except Exception as exc:
+            return f"EXC:{type(exc).__name__}"
+        finally:
+            db.close()
+
+    @staticmethod
+    def _blocked():
+        from app.services.outbound_guard import OutboundBlockedError
+        return OutboundBlockedError(sender_path="test", kind="flow", to_wa_id=WA,
+                                    thread_id=0, gate_outcome="BLOCKED_KILL_SWITCH")
+
+    def test_g7p_r3_14_a_delivered_slot_list_keeps_its_claim(self):
+        """The control. Without it, 'the claim is cleared' could be satisfied by clearing
+        it always, which would destroy the evidence instead of correcting it."""
+        self._park_in_scheduling()
+        action = self._day_request(tag="ok")
+        st = self._state()
+        self.assertIn(action, ("flow_button_sent", "replied"), f"unexpected: {action}")
+        self.assertIsNotNone(st["last_visible_slots"],
+                             "a delivered slot list lost its claim")
+        self.assertIsNotNone(st["active_requested_date"])
+
+    def test_g7p_r3_15_a_blocked_dispatch_stops_claiming_the_slots_were_seen(self):
+        self._park_in_scheduling()
+        action = self._day_request(flow_raises=self._blocked(),
+                                   text_raises=self._blocked(), tag="blk")
+        st = self._state()
+        self.assertEqual(action, "blocked_dispatch")
+        self.assertIsNone(st["last_visible_slots"],
+                          "the slot list still claims the customer saw it")
+        self.assertIsNotNone(st["active_requested_date"],
+                             "the day the customer ASKED about was discarded")
+
+    def test_g7p_r3_16_a_prior_true_claim_is_restored_not_erased(self):
+        """§7 of the R2 review: do not erase useful scheduling evidence merely to make one
+        Boolean false. An earlier successful turn's slot list is still true."""
+        prior = '["09:00", "09:30"]'
+        self._park_in_scheduling(prior_claim=prior)
+        self._day_request(flow_raises=self._blocked(), text_raises=self._blocked(),
+                          tag="prior")
+        st = self._state()
+        self.assertEqual(st["last_visible_slots"], prior,
+                         "the previous turn's TRUE slot claim was destroyed")
+        # `last_offered_slots` is NOT restored, and must not be: it is ScheduleService's
+        # answer about availability, it carries no claim that anyone saw it, and M20.6D2's
+        # RC29 guarantee that no available slot is ever hidden is asserted on exactly this
+        # field. Rolling it back would delete true evidence.
+        self.assertIsNotNone(st["last_offered_slots"])
+        self.assertNotEqual(st["last_offered_slots"], prior,
+                            "the availability evidence from this turn was discarded")
+
+    def test_g7p_r3_17_a_text_fallback_that_delivered_keeps_the_claim(self):
+        """When the Flow will not open, every caller recites the slots in a TEXT reply — so
+        the customer really did see them, and clearing the field there would be the opposite
+        lie on the more common path."""
+        self._park_in_scheduling()
+        action = self._day_request(flow_raises=RuntimeError("meta 500"), tag="txt")
+        st = self._state()
+        self.assertEqual(action, "replied")
+        self.assertIsNotNone(st["last_visible_slots"],
+                             "slots recited in text were recorded as never shown")
+
+    def test_g7p_r3_18_the_next_message_is_processable_after_a_failed_dispatch(self):
+        self._park_in_scheduling()
+        self._day_request(flow_raises=self._blocked(), text_raises=self._blocked(),
+                          tag="fail")
+        self.assertIsNone(self._state()["last_visible_slots"])
+        action = self._day_request(tag="recover")
+        self.assertIn(action, ("flow_button_sent", "replied"))
+        self.assertIsNotNone(self._state()["last_visible_slots"],
+                             "the thread could not offer slots again")

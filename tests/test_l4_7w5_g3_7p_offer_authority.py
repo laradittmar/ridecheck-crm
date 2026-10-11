@@ -427,3 +427,104 @@ class OwnerPolicyPreserved(unittest.TestCase):
 
 if __name__ == "__main__":                       # pragma: no cover
     unittest.main()
+
+
+class R3DurabilityContract(OfferLifecycleRows):
+    """R3 — the parts of the durability work that hold on any engine.
+
+    The lock behaviour itself cannot be proven here: SQLite has no row locks, so the
+    interleaving tests live in `test_l4_7w5_g3_7p_offer_authority_pg.py` and run against
+    real PostgreSQL or not at all. What this suite pins down is everything that must be
+    true regardless of engine — the out-of-band refusal record, the no-op on an engine
+    with nothing to lock, and the action vocabulary a contended turn resolves to.
+
+    The last one matters more than its size suggests. If the contended action were absent
+    from `HANDLED_ACTIONS`, n8n's `IF - Engine Handled?` false branch would hand the turn
+    to its LEGACY booking chain — a second booking authority, reached at the exact moment
+    the first one is mid-booking.
+    """
+
+    def test_r3_01_an_out_of_band_refusal_is_recorded_and_committed(self):
+        """A contended claim leaves the transaction aborted, so the in-transaction counters
+        cannot be written. The refusal must still become durable, or a contention outcome
+        would exist only in a container log — the dependence CLAUDE.md forbids."""
+        self._issue()
+        ok = self.offers.record_refusal_out_of_band(TOKEN, OfferRefusal.OFFER_CONTENDED)
+        self.assertTrue(ok)
+        fresh = self.SF()                       # a DIFFERENT session: it was committed
+        try:
+            row = fresh.execute(select(M.WhatsAppBookingOffer)).scalars().one()
+            self.assertEqual(row.last_refusal, OfferRefusal.OFFER_CONTENDED)
+            self.assertEqual(row.refused_count, 1)
+            self.assertIsNotNone(row.last_refused_at)
+            self.assertEqual(row.status, OfferStatus.ISSUED,
+                             "recording a refusal must not terminalise the offer")
+        finally:
+            fresh.close()
+
+    def test_r3_02_an_out_of_band_refusal_for_an_unknown_token_changes_nothing(self):
+        self._issue()
+        self.assertFalse(
+            self.offers.record_refusal_out_of_band("not-a-real-token", "X"))
+        self.assertFalse(self.offers.record_refusal_out_of_band(None, "X"))
+        row = self.db.execute(select(M.WhatsAppBookingOffer)).scalars().one()
+        self.assertEqual(row.refused_count, 0)
+        self.assertIsNone(row.last_refusal)
+
+    def test_r3_03_entering_the_offer_transaction_never_refuses_without_row_locks(self):
+        """SQLite has nothing to take, so the guard must be a no-op — never a refusal that
+        would make every booking on this engine fail closed for the wrong reason."""
+        self.assertIsNone(self.offers.begin_offer_transaction(self.thread_id))
+        self._issue()
+        claim = self._claim(TOKEN)
+        self.assertTrue(claim.ok, "the no-op guard blocked an otherwise valid acceptance")
+
+    def test_r3_04_the_lock_order_is_one_declared_order_starting_at_the_thread(self):
+        """Both writers call `begin_offer_transaction`, which takes step 1; `claim()` takes
+        step 2. The order below is what makes those two steps the same two steps for both
+        of them — the PostgreSQL suite proves the consequence."""
+        from app.services.offer_lifecycle import (DEFAULT_OFFER_LOCK_TIMEOUT_MS,
+                                                  OFFER_LOCK_ORDER)
+        self.assertEqual(OFFER_LOCK_ORDER,
+                         ("whatsapp_thread_states", "whatsapp_booking_offers"))
+        self.assertGreater(DEFAULT_OFFER_LOCK_TIMEOUT_MS, 0,
+                           "a zero timeout means PostgreSQL waits forever")
+
+    def test_r3_05_a_contended_turn_is_an_owned_turn(self):
+        from app.schemas.conversation import ACTION_THREAD_CONTENDED, HANDLED_ACTIONS
+        from app.services.conversation_engine import (_NO_REPLY_REQUIRED_ACTIONS,
+                                                      _REPLY_PRODUCED_ACTIONS, _out)
+        self.assertIn(ACTION_THREAD_CONTENDED, HANDLED_ACTIONS,
+                      "an unhandled action hands the turn to n8n's legacy booking chain")
+        self.assertNotIn(ACTION_THREAD_CONTENDED, _REPLY_PRODUCED_ACTIONS)
+        self.assertNotIn(ACTION_THREAD_CONTENDED, _NO_REPLY_REQUIRED_ACTIONS,
+                         "a dropped turn must stay visible to the no-reply rescue")
+        out = _out(ACTION_THREAD_CONTENDED, detail=OfferRefusal.OFFER_CONTENDED)
+        self.assertTrue(out.handled)
+        self.assertTrue(out.reply_required)
+        self.assertFalse(out.reply_produced)
+        self.assertTrue(out.alert_eligible)
+        self.assertNotEqual(out.action, "error")
+
+    def test_r3_06_contention_is_a_typed_refusal_in_the_one_refusal_vocabulary(self):
+        """Not a free string invented at a call site: the losing writer's reason has to be
+        the same named value on both writers, and short enough for the column that stores
+        it (`last_refusal`, String(64))."""
+        self.assertEqual(OfferRefusal.OFFER_CONTENDED, "OFFER_CONTENDED")
+        self.assertLessEqual(len(OfferRefusal.OFFER_CONTENDED), 64)
+
+    def test_r3_07_a_contention_sqlstate_is_told_apart_from_a_real_failure(self):
+        """Classifying an ordinary programming error as contention would turn a bug into a
+        silent refusal, which is how a defect hides for a release."""
+        class _Orig:
+            def __init__(self, sqlstate): self.sqlstate = sqlstate
+
+        class _Exc(Exception):
+            def __init__(self, sqlstate): self.orig = _Orig(sqlstate)
+
+        for sqlstate in ("55P03", "40P01", "40001"):
+            self.assertEqual(self.offers.contention_sqlstate(_Exc(sqlstate)), sqlstate)
+        for sqlstate in ("42P01", "23505", "22P02", None):
+            self.assertIsNone(self.offers.contention_sqlstate(_Exc(sqlstate)),
+                              f"{sqlstate} was misread as contention")
+        self.assertIsNone(self.offers.contention_sqlstate(ValueError("plain")))

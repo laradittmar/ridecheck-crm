@@ -17,6 +17,25 @@ from pydantic import BaseModel, Field
 #: enum change.
 ACTION_NO_REPLY_PRODUCED = "no_reply_produced"
 
+#: L4.7W5-GATE3-G3-7P-R3 — the thread is held by the OTHER booking writer, right now.
+#:
+#: The two writers that can accept a booking offer — `ConversationEngine` and the Meta Data
+#: Exchange handler — now take `whatsapp_thread_states` before `whatsapp_booking_offers`
+#: (`offer_lifecycle.OFFER_LOCK_ORDER`). The order removes the deadlock the G3-7P review
+#: measured, but it does not remove contention: one of two simultaneous writers must lose.
+#:
+#: The loser needs an outcome that is TYPED and DETERMINISTIC. `error` was what it used to
+#: get, and `error` asserts a crash: it tells an operator to go looking for a bug that is
+#: not there, and it cannot be distinguished from a real failure in `ai_events`. This value
+#: says what actually happened — another writer held the thread and this turn declined to
+#: queue behind it indefinitely.
+#:
+#: `reply_required` stays TRUE for it, deliberately. The customer said something and
+#: received nothing, and this turn does NOT consume the dedup cursor, so the no-reply
+#: rescue must still see it. A contended turn is a dropped turn, and an operator should
+#: hear about it.
+ACTION_THREAD_CONTENDED = "thread_contended"
+
 # Actions that mean the engine fully owned the turn (n8n should stop)
 HANDLED_ACTIONS = frozenset({
     "replied", "flow_button_sent", "booking_created",
@@ -63,6 +82,11 @@ HANDLED_ACTIONS = frozenset({
     # the turn to n8n's legacy booking chain, which is the hole `blocked_dispatch` closed.
     "skipped_clarification_outstanding",
     "skipped_duplicate_completion",
+    # G3-7P-R3: losing a lock race is a CE DECISION about a thread CE still owns. Left
+    # unhandled it would hand the turn to n8n's legacy booking chain — a SECOND booking
+    # authority, reached at the exact moment the first one is mid-booking. That is the one
+    # outcome worse than dropping the turn.
+    ACTION_THREAD_CONTENDED,
 })
 # NOT included, deliberately: "no_lead". M21.2.8 certified it as genuine non-ownership
 # (the thread has no lead, so CE could not act), the text-path false branch is empty, and
