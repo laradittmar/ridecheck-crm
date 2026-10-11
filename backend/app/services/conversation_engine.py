@@ -3626,9 +3626,14 @@ class ConversationEngine:
         self._flow_token_expected = expected
         _offers = _OfferLifecycle(self.db)
         _zone_group, _zone_detail = self._get_active_inspection_location(ctx, state)
+        # R2: the pricing context is bound too, and it is read from the SAME resolved
+        # candidate the candidate binding uses — one authority, one answer.
+        _focus_for_claim = self._focus_candidate(ctx, repair=False)
         _claim = _offers.claim(
             state, thread_id=ctx.thread.id, token=flow_token,
-            candidate_id=getattr(self._focus_candidate(ctx, repair=False), "id", None),
+            candidate_id=getattr(_focus_for_claim, "id", None),
+            tipo_vehiculo=getattr(_focus_for_claim, "tipo_vehiculo", None),
+            cycle_key=self._clarification_cycle_key(state),
             zone_group=_zone_group, zone_detail=_zone_detail)
         self._turn_offer_claim = _claim
         if not _claim.ok:
@@ -11930,6 +11935,8 @@ class ConversationEngine:
                 logger.error("M18 flow button send failed thread_id=%s: %s", ctx.thread.id, exc)
                 _legacy_offers.withdraw(state, thread_id=ctx.thread.id,
                                         reason="DISPATCH_FAILED", clear_scheduling=False)
+                # R2/A1: no live offer -> no truthy mirror. `withdraw()` cleared it and
+                # nothing restores a dead token.
                 state.last_stage = STAGE_SCHEDULING
                 self.db.commit()
                 return None
@@ -12009,6 +12016,27 @@ class ConversationEngine:
 
     # ── L4.3 Phase C — Booking Flow dispatch (authoritative booking UX) ──────
 
+
+    def _restore_non_booking_mirror(self, state, previous_token) -> None:
+        """After a failed booking dispatch, put back ONLY a non-booking mirror value.
+
+        R2/A1. The invariant is: `flow_booking_token` may be truthy only when it mirrors
+        the one current ISSUED booking offer for that thread. The old code restored
+        `previous_token` unconditionally, and `issue()` had already SUPERSEDED the offer
+        that token named — so a dispatch failure left a truthy mirror with NO live offer.
+        The G3-7P review measured the consequence: `_offer_outstanding` True,
+        `proposal_is_active` True, and the L4.7W5-F7A deterministic scheduling gate CLOSED,
+        which is the very defect F7A exists to prevent. It could not book, but the customer
+        could no longer be heard by the scheduler.
+
+        A superseded booking token is therefore never restored. The MOTORCYCLE handoff
+        token is a different family that legitimately shares this column — it is routed by
+        prefix before the booking handler and is not a booking offer — so it, and only it,
+        is put back.
+        """
+        if previous_token and str(previous_token).startswith(_MOTO_HANDOFF_TOKEN_PREFIX):
+            state.flow_booking_token = previous_token
+
     def _send_booking_flow(
         self,
         ctx: _Context,
@@ -12073,7 +12101,7 @@ class ConversationEngine:
             )
             _offers.withdraw(state, thread_id=ctx.thread.id,
                               reason="DISPATCH_PREREQUISITES", clear_scheduling=False)
-            state.flow_booking_token = previous_token
+            self._restore_non_booking_mirror(state, previous_token)
             self.db.commit()
             return None
 
@@ -12100,14 +12128,14 @@ class ConversationEngine:
         except OutboundBlockedError:
             _offers.withdraw(state, thread_id=ctx.thread.id,
                               reason="DISPATCH_BLOCKED", clear_scheduling=False)
-            state.flow_booking_token = previous_token
+            self._restore_non_booking_mirror(state, previous_token)
             self.db.commit()
             raise
         except Exception as exc:
             logger.error("L4.3 booking flow send failed thread_id=%s: %s", ctx.thread.id, exc)
             _offers.withdraw(state, thread_id=ctx.thread.id,
                               reason="DISPATCH_FAILED", clear_scheduling=False)
-            state.flow_booking_token = previous_token
+            self._restore_non_booking_mirror(state, previous_token)
             self.db.commit()
             self._booking_flow_send_failed = True
             return None

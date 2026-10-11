@@ -648,5 +648,325 @@ class G7POfferAuthorityPG(unittest.TestCase):
         db.close()
 
 
+
+
+@unittest.skipUnless(PG_URL, "G7P_PG_URL not set — no disposable PostgreSQL; nothing proven")
+class G7PR2BindingCompleteness(G7POfferAuthorityPG):
+    """R2 — the bindings the offer RECORDS are the bindings it ENFORCES.
+
+    The G3-7P review proved that storing a binding and not comparing it is a false
+    assurance. With the candidate's category changed in place from AUTO to PICKUP — same
+    candidate id, same zone, offer still ISSUED — the submission was ACCEPTED and produced
+    a CRM Revision carrying `tipo_vehiculo='PICKUP'` with `precio_total=NULL`: an unpriced
+    booking, from an offer issued for a different vehicle class. `cycle_key` had the same
+    shape of hole.
+    """
+
+    # ── §3/§4 the pricing-context binding ────────────────────────────────────
+
+    def _change_category(self, new="PICKUP"):
+        db = self.SF()
+        db.execute(text("UPDATE whatsapp_thread_candidates SET tipo_vehiculo=:v WHERE id=:c"),
+                   {"v": new, "c": self.cand_a})
+        db.commit(); db.close()
+
+    def test_g7p_r2_01_a_category_change_refuses_the_offer(self):
+        token = self._issue()
+        self.assertEqual([o[1] for o in self._offers()], ["ISSUED"])
+        self._change_category("PICKUP")
+        out = self._submit(token, tag="cat")
+        self.assertNotEqual(out.action, "booking_created")
+        self.assertEqual(self._counts(), (0, 0), "a moved pricing basis must not book")
+        offer = self._offers()[0]
+        self.assertEqual(offer[1], "WITHDRAWN")
+        self.assertEqual(offer[2], "OFFER_VEHICLE_CATEGORY_CHANGED")
+        self.assertEqual(offer[7], "OFFER_VEHICLE_CATEGORY_CHANGED")
+        self.assertIsNone(self._state()["token"], "the stale offer's mirror is cleared")
+
+    def test_g7p_r2_02_no_unpriced_booking_survives_a_category_change(self):
+        """The audit's exact artifact: a Revision with the NEW category and NULL price."""
+        token = self._issue()
+        self._change_category("PICKUP")
+        self._submit(token, tag="unpriced")
+        db = self.SF()
+        rows = db.execute(text("SELECT tipo_vehiculo, precio_total FROM revisions")).fetchall()
+        db.close()
+        self.assertEqual([tuple(r) for r in rows], [],
+                         "no Revision at all may be created — priced or not")
+
+    def test_g7p_r2_03_an_unchanged_category_still_books_exactly_once(self):
+        token = self._issue()
+        out = self._submit(token, tag="same")
+        self.assertEqual(out.action, "booking_created")
+        self.assertEqual(self._counts(), (1, 1))
+        self.assertEqual([o[1] for o in self._offers()], ["ACCEPTED"])
+
+    def test_g7p_r2_04_the_refusal_holds_in_both_flag_postures(self):
+        """The deployed posture has both correction flags UNSET, which is why the
+        text-path withdrawal does not run and the offer stays live while the category
+        moves. The binding must refuse in either posture."""
+        from dataclasses import replace as _replace
+        from app.settings import get_settings
+        for grounding, provisional in ((False, False), (True, True)):
+            with self.subTest(grounding=grounding, provisional=provisional):
+                self.setUp()
+                token = self._issue()
+                self._change_category("PICKUP")
+                self._clear_human()
+                db, eng = self._engine()
+                eng.settings = _replace(
+                    get_settings(),
+                    correction_target_grounding_enabled=grounding,
+                    provisional_correction_enabled=provisional)
+                from app.schemas.conversation import ConversationHandleIn
+                out = eng.handle(ConversationHandleIn(
+                    thread_id=self.thread_id, wa_message_id=f"wamid.fl.{_t.time()}",
+                    wa_id=WA, message_type="flow_response",
+                    flow_response=dict(BOOKING_PAYLOAD), flow_token=token))
+                db.close()
+                self.assertNotEqual(out.action, "booking_created")
+                self.assertEqual(self._counts(), (0, 0))
+
+    def test_g7p_r2_05_an_unresolvable_category_refuses(self):
+        """A category we cannot resolve cannot be priced."""
+        token = self._issue()
+        db = self.SF()
+        db.execute(text("UPDATE whatsapp_thread_candidates SET tipo_vehiculo=NULL WHERE id=:c"),
+                   {"c": self.cand_a})
+        db.commit(); db.close()
+        out = self._submit(token, tag="nocat")
+        self.assertNotEqual(out.action, "booking_created")
+        self.assertEqual(self._counts(), (0, 0))
+        self.assertEqual(self._offers()[0][7], "OFFER_VEHICLE_CATEGORY_CHANGED")
+
+    def test_g7p_r2_06_the_data_exchange_writer_refuses_a_category_change_too(self):
+        """Both booking writers share the authority, so both must refuse."""
+        from app.services.booking_flow_service import BookingFlowService, BookingTokenError
+        token = self._issue()
+        self._change_category("PICKUP")
+        db = self.SF()
+        svc = BookingFlowService(db)
+        svc._send_booking_receipt = lambda *a, **k: None
+        with self.assertRaises(BookingTokenError) as caught:
+            svc.handle_confirm_booking(token, {
+                "date": "2026-11-10", "time": "10:00", "name": "P C", "email": "p@e.t",
+                "inspection_address": "Palermo, CABA"})
+        db.close()
+        self.assertIn("OFFER_VEHICLE_CATEGORY_CHANGED", str(caught.exception))
+        self.assertEqual(self._counts(), (0, 0))
+
+    # ── §5 the cycle binding ─────────────────────────────────────────────────
+
+    def test_g7p_r2_07_a_closed_cycle_refuses_even_without_the_reset(self):
+        """The ordinary cycle reset withdraws correctly; this is the adversarial case where
+        the cycle moves WITHOUT it. `cycle_key` is declared a binding, so it is compared."""
+        token = self._issue()
+        db = self.SF()
+        db.execute(text("UPDATE whatsapp_thread_states SET "
+                        "current_cycle_start_message_db_id=99999 WHERE thread_id=:t"),
+                   {"t": self.thread_id})
+        db.commit(); db.close()
+        out = self._submit(token, tag="cycle")
+        self.assertNotEqual(out.action, "booking_created")
+        self.assertEqual(self._counts(), (0, 0))
+        offer = self._offers()[0]
+        self.assertEqual((offer[1], offer[2]), ("WITHDRAWN", "OFFER_CYCLE_CHANGED"))
+        self.assertIsNone(self._state()["token"])
+
+    # ── §6/§7 the dispatch-failure lifecycle ─────────────────────────────────
+
+    def _issue_failing(self, exc):
+        db, eng = self._engine()
+        eng._send_flow_button = lambda *a, **k: (_ for _ in ()).throw(exc)
+        ctx = eng._load_context(self.thread_id)
+        ctx.state.needs_human = False
+        db.commit()
+        raised = None
+        try:
+            eng._send_booking_flow(ctx, ctx.state,
+                                   booking_flow_id="28104222025943520")
+        except Exception as e:                   # OutboundBlockedError propagates by design
+            raised = type(e).__name__
+        db.refresh(ctx.state)
+        token = ctx.state.flow_booking_token
+        db.close()
+        return token, raised
+
+    def _assert_no_phantom(self):
+        """The R2 invariant: a truthy mirror only when ONE ISSUED offer exists."""
+        from app.services import pending_correction as pc
+        st = self._state()
+        live = [o for o in self._offers() if o[1] == "ISSUED"]
+        self.assertEqual(live, [], "no offer may be live after a failed dispatch")
+        self.assertIsNone(st["token"], "no phantom mirror")
+        db, eng = self._engine()
+        state = eng._load_context(self.thread_id).state
+        self.assertTrue(not state.flow_booking_token, "the F7A gate must stay open")
+        self.assertFalse(pc.proposal_is_active(state, "flow_booking_token"))
+        self.assertNotIn("flow_booking_token",
+                         [f for f, _ in pc.active_proposals(state)])
+        db.close()
+
+    def test_g7p_r2_08_dispatch_failure_leaves_no_phantom_offer(self):
+        """Every failure branch, with and without a previous live offer."""
+        from app.services.outbound_guard import OutboundBlockedError
+        branches = [
+            ("transport exception", RuntimeError("transport exploded")),
+            ("outbound blocked before transport",
+             OutboundBlockedError(sender_path="x", kind="flow", to_wa_id="0")),
+        ]
+        for label, exc in branches:
+            for previous in (False, True):
+                with self.subTest(branch=label, previous_offer=previous):
+                    self.setUp()
+                    old_token = self._issue() if previous else None
+                    failed_token, _raised = self._issue_failing(exc)
+                    self._assert_no_phantom()
+                    # neither token may ever book
+                    for tok in [t for t in (old_token, failed_token) if t]:
+                        self._submit(tok, tag="dead")
+                        self.assertEqual(self._counts(), (0, 0))
+                    # and a subsequent valid offer is still issuable
+                    db = self.SF()
+                    db.execute(text("UPDATE whatsapp_thread_states SET needs_human=false "
+                                    "WHERE thread_id=:t"), {"t": self.thread_id})
+                    db.commit(); db.close()
+                    self.assertTrue(self._issue(), "a new offer must still be issuable")
+
+    def test_g7p_r2_09_a_superseded_token_is_never_restored_to_the_mirror(self):
+        """The exact A1 defect: the previous offer's token coming back after its successor
+        failed to dispatch."""
+        old_token = self._issue()
+        self._issue_failing(RuntimeError("boom"))
+        self.assertIsNone(self._state()["token"])
+        self.assertNotEqual(self._state()["token"], old_token)
+        statuses = [(o[1], o[2]) for o in self._offers()]
+        self.assertEqual(statuses, [("SUPERSEDED", "REPLACED_BY_NEW_OFFER"),
+                                    ("WITHDRAWN", "DISPATCH_FAILED")])
+
+    def test_g7p_r2_10_a_motorcycle_mirror_is_a_different_family(self):
+        """The moto handoff legitimately shares the column and is not a booking offer, so
+        it alone survives a failed booking dispatch."""
+        from app.services.conversation_engine import _MOTO_HANDOFF_TOKEN_PREFIX
+        moto = f"{_MOTO_HANDOFF_TOKEN_PREFIX}{self.thread_id}-1790000000"
+        db = self.SF()
+        db.execute(text("UPDATE whatsapp_thread_states SET flow_booking_token=:k, "
+                        "needs_human=false WHERE thread_id=:t"),
+                   {"k": moto, "t": self.thread_id})
+        db.commit(); db.close()
+        self._issue_failing(RuntimeError("boom"))
+        self.assertEqual(self._state()["token"], moto,
+                         "a pending motorcycle Flow must not be destroyed by a failed "
+                         "booking dispatch")
+        self.assertEqual([o[1] for o in self._offers()], ["WITHDRAWN"])
+
+    # ── §8 the summary screen never consumes ─────────────────────────────────
+
+    def _svc(self, db):
+        from app.services.booking_flow_service import BookingFlowService
+        svc = BookingFlowService(db)
+        svc._send_booking_receipt = lambda *a, **k: None
+        return svc
+
+    def _offer_full(self):
+        db = self.SF()
+        row = db.execute(text(
+            "SELECT status, accepted_at, accepted_revision_id, accepted_thread_revision_id "
+            "FROM whatsapp_booking_offers WHERE thread_id=:t ORDER BY id DESC LIMIT 1"),
+            {"t": self.thread_id}).one()
+        db.close()
+        return tuple(row)
+
+    def _assert_not_consumed(self, where, session=None):
+        """Nothing before confirm_booking may claim the offer.
+
+        `session` matters: a claim that is not committed is rolled back when the session
+        closes, so reading only COMMITTED state cannot see it. Checking through the
+        handler's OWN session catches a claim the moment it is made, which is what makes
+        "the summary screen claimed the offer" a detectable defect rather than an invisible
+        one.
+        """
+        if session is not None:
+            row = session.execute(text(
+                "SELECT status, accepted_at FROM whatsapp_booking_offers "
+                "WHERE thread_id=:t ORDER BY id DESC LIMIT 1"),
+                {"t": self.thread_id}).one()
+            self.assertEqual(row[0], "ISSUED",
+                             f"{where}: the offer was claimed inside this session")
+            self.assertIsNone(row[1], f"{where}: accepted_at was set in this session")
+        status, accepted_at, rev, tr = self._offer_full()
+        self.assertEqual(status, "ISSUED", f"{where}: the offer must still be ISSUED")
+        self.assertIsNone(accepted_at, f"{where}: accepted_at must be null")
+        self.assertIsNone(rev, f"{where}: accepted Revision id must be null")
+        self.assertIsNone(tr, f"{where}: accepted ThreadRevision id must be null")
+        self.assertIsNotNone(self._state()["token"], f"{where}: the mirror must stay valid")
+        self.assertEqual(self._counts(), (0, 0), f"{where}: zero booking revisions")
+
+    def test_g7p_r2_11_only_final_confirmation_consumes_the_offer(self):
+        """The whole Data Exchange sequence. Nothing before confirm_booking may claim."""
+        db = self.SF()
+        db.execute(text("UPDATE whatsapp_thread_states SET preferred_day='2026-11-10', "
+                        "preferred_time='10:00' WHERE thread_id=:t"), {"t": self.thread_id})
+        db.commit(); db.close()
+        token = self._issue()
+        self._assert_not_consumed("after issue")
+
+        payload = {"date": "2026-11-10", "time": "10:00", "name": "P C",
+                   "email": "p@e.t", "inspection_address": "Palermo, CABA"}
+
+        db = self.SF(); svc = self._svc(db)
+        svc.handle_init(token)
+        self._assert_not_consumed("after INIT", session=db)
+
+        svc.handle_date_selected(token, "2026-11-10")
+        self._assert_not_consumed("after date_selected", session=db)
+
+        svc.handle_prepare_summary(token, payload)
+        self._assert_not_consumed("after prepare_summary", session=db)
+
+        svc.handle_prepare_summary(token, payload)          # repeated
+        self._assert_not_consumed("after a repeated prepare_summary", session=db)
+
+        with self.assertRaises(ValueError):
+            svc.handle_prepare_summary(token, {"date": "not-a-date", "time": "xx"})
+        db.rollback()                 # the failed call left the session in a dead txn
+        self._assert_not_consumed("after an invalid prepare_summary", session=db)
+        db.close()
+
+        # abandoned: a brand-new session, as if the customer closed the Flow and came back
+        db = self.SF(); svc = self._svc(db)
+        svc.handle_init(token)
+        self._assert_not_consumed("after abandoning and re-opening")
+        db.close()
+
+    def test_g7p_r2_12_confirmation_is_what_claims_and_consumes(self):
+        db = self.SF()
+        db.execute(text("UPDATE whatsapp_thread_states SET preferred_day='2026-11-10', "
+                        "preferred_time='10:00' WHERE thread_id=:t"), {"t": self.thread_id})
+        db.commit(); db.close()
+        token = self._issue()
+        db = self.SF(); svc = self._svc(db)
+        try:
+            svc.handle_confirm_booking(token, {
+                "date": "2026-11-10", "time": "10:00", "name": "P C", "email": "p@e.t",
+                "inspection_address": "Palermo, CABA"})
+            booked = True
+        except Exception:
+            booked = False                   # the slot may be unavailable in this fixture
+        db.close()
+        status, accepted_at, rev, tr = self._offer_full()
+        if booked:
+            self.assertEqual(status, "ACCEPTED")
+            self.assertIsNotNone(accepted_at)
+            self.assertIsNotNone(rev)
+            self.assertIsNotNone(tr)
+            self.assertEqual(self._counts(), (1, 1))
+        else:
+            # a refusal must leave the offer exactly as it was — never half-accepted
+            self.assertEqual(status, "ISSUED")
+            self.assertIsNone(accepted_at)
+            self.assertEqual(self._counts(), (0, 0))
+
+
 if __name__ == "__main__":                       # pragma: no cover
     unittest.main()

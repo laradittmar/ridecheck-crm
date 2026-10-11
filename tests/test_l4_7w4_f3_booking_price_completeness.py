@@ -182,11 +182,29 @@ class TestPricePreserved(_Base):
 
 class TestPriceIntegrity(_Base):
 
-    def test_bookprice_06_a_candidate_without_a_type_yields_no_invented_price(self):
-        """BOOKPRICE-06 — an unpriceable vehicle must leave the price empty, not guessed."""
-        rev = self.book(tipo=None)
-        self.assertIsNone(rev.precio_total)
-        self.assertIsNone(rev.precio_base)
+    def test_bookprice_06_a_candidate_without_a_type_cannot_be_booked_at_all(self):
+        """BOOKPRICE-06, strengthened by G3-7P-R2.
+
+        This used to book an untyped vehicle and assert the price came out EMPTY rather
+        than guessed. R2 goes further and refuses the booking: the category is a
+        `PricingService.quote()` input and an offer whose pricing basis cannot be resolved
+        is not acceptable, because the G3-7P review measured what the weaker rule allowed —
+        a committed Revision carrying a changed category with `precio_total=NULL`. An
+        unpriced booking is no longer something to leave empty; it is something that does
+        not happen.
+
+        The original guarantee is preserved and tightened: no invented price, and no row.
+        """
+        from app.services.booking_flow_service import BookingTokenError
+        self.thread, self.state, self.cand, self.lead, self.token = _world(
+            self.db, tipo=None)
+        svc = BookingFlowService(self.db)
+        _sched_ok(svc)
+        with self.assertRaises(BookingTokenError) as caught:
+            svc.handle_confirm_booking(self.token, _confirm(self.token))
+        self.assertIn("CATEGORY", str(caught.exception))
+        self.assertEqual(self.db.query(Revision).count(), 0,
+                         "an unpriceable vehicle must produce no Revision at all")
 
     def test_bookprice_07_an_unknown_zone_yields_no_invented_total(self):
         """BOOKPRICE-07 — no viaticos row means no total; a base price alone is not a quote."""

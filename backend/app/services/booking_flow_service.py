@@ -688,11 +688,15 @@ class BookingFlowService:
         # before the customer confirmed anything.
         from .offer_lifecycle import OfferLifecycle
         _offers = OfferLifecycle(self.db)
+        from .clarification_attempt import cycle_key as _cycle_key
         _claim = _offers.claim(
             ctx.state, thread_id=ctx.thread.id, token=booking_token,
             # `ctx.candidate` is the candidate this booking will actually reference, which
-            # is the thing the offer was bound to.
+            # is the thing the offer was bound to — and R2 binds its CATEGORY too, because
+            # that category is what `PricingService.quote()` prices the booking with.
             candidate_id=getattr(ctx.candidate, "id", None),
+            tipo_vehiculo=getattr(ctx.candidate, "tipo_vehiculo", None),
+            cycle_key=_cycle_key(ctx.state),
             zone_group=ctx.zone_group, zone_detail=ctx.zone_detail)
         if not _claim.ok:
             logger.warning(

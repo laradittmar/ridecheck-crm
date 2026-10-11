@@ -23,9 +23,46 @@ So authority moved out of the column entirely:
     `flow_booking_token`       is a transport mirror, written only through here
 
 ABSENCE IS A REFUSAL. `claim()` starts from "there is no offer" and only an ISSUED row,
-bound to this thread, this candidate and this location, matching the submitted token's
-fingerprint, un-expired and never previously accepted, can move it. Missing evidence is
-never permission.
+bound to this thread, this cycle, this candidate, this candidate's CATEGORY and this
+location, matching the submitted token's fingerprint, un-expired and never previously
+accepted, can move it. Missing evidence is never permission.
+
+THE BINDING CONTRACT (R2). Every stored field is exactly one of two things, and the
+distinction is enforced rather than described — the R2 audit found `tipo_vehiculo` and
+`cycle_key` recorded as if they were guards and never compared, which is a false assurance:
+
+    ACCEPTANCE BINDINGS — compared on every claim, a mismatch refuses
+        token_fingerprint   the lookup key, and UNIQUE in the schema
+        thread_id           an offer belongs to one conversation
+        cycle_key           a closed cycle's offer cannot book into the next one
+        candidate_id        resolved through the SAME authority the caller books with
+        tipo_vehiculo       a `PricingService.quote()` input — see A2 below
+        zone_group          a `PricingService.quote()` input
+        zone_detail         a `PricingService.quote()` input
+        expires_at          pre-existing token-age policy
+        status              only ISSUED may move
+
+    HISTORICAL METADATA — recorded for audit, never an acceptance guard, and deliberately
+    NOT compared, because the customer legitimately chooses inside the Flow:
+        offered_date        the slot the customer was SHOWN. The submitted date/time is
+        offered_time        what gets booked, revalidated by `ScheduleService` at
+                            confirmation; comparing these would refuse a customer who
+                            picked a different offered slot on the APPOINTMENT screen.
+        flow_id             which Flow asset was dispatched
+        contract_version    the payload version this row was written at
+        refused_count       audit counters
+        last_refusal
+        last_refused_at
+        accepted_revision_id        what the acceptance produced
+        accepted_thread_revision_id
+        terminal_at / accepted_at / terminal_reason   lifecycle timestamps and cause
+
+A2 (R2). The G3-7P review measured the cost of storing a binding and not comparing it:
+with the candidate's category changed in place from AUTO to PICKUP — same candidate id,
+same zone, offer still ISSUED — the submission was ACCEPTED and produced a CRM Revision
+carrying `tipo_vehiculo='PICKUP'` with `precio_total=NULL`. An unpriced booking, from an
+offer issued for a different vehicle class. A changed pricing basis now requires a NEW
+quote and a NEW offer; confirmation never silently recomputes one.
 
 The raw token is never persisted: `token_fingerprint` is sha256(token).
 
@@ -89,6 +126,15 @@ class OfferRefusal:
     OFFER_EXPIRED = "OFFER_EXPIRED"
     OFFER_CANDIDATE_CHANGED = "OFFER_CANDIDATE_CHANGED"
     OFFER_LOCATION_CHANGED = "OFFER_LOCATION_CHANGED"
+    #: R2/A2. The candidate's category moved after the offer was issued. Category is a
+    #: `PricingService.quote()` input, so the quote the customer accepted no longer
+    #: describes what would be booked — a new quote is required, never a silent recompute.
+    OFFER_VEHICLE_CATEGORY_CHANGED = "OFFER_VEHICLE_CATEGORY_CHANGED"
+    #: R2/A2. A category we cannot resolve cannot be priced, and an unpriced booking is
+    #: the harm this refusal exists to prevent.
+    OFFER_VEHICLE_CATEGORY_UNRESOLVED = "OFFER_VEHICLE_CATEGORY_UNRESOLVED"
+    #: R2/A3. The offer belongs to a conversation cycle that has closed.
+    OFFER_CYCLE_CHANGED = "OFFER_CYCLE_CHANGED"
 
 
 #: Why an offer was invalidated. Stored in `terminal_reason`, so an operator can tell a
@@ -319,7 +365,8 @@ class OfferLifecycle:
     # ── acceptance ───────────────────────────────────────────────────────────
 
     def claim(self, state, *, thread_id: int, token: Optional[str],
-              candidate_id=None, zone_group=None, zone_detail=None) -> OfferClaim:
+              candidate_id=None, tipo_vehiculo=None, zone_group=None, zone_detail=None,
+              cycle_key=None) -> OfferClaim:
         """May this submission become a booking? Fails closed, and never commits.
 
         Every check is a reason to refuse; nothing here can widen authority. The row is
@@ -378,6 +425,39 @@ class OfferLifecycle:
         # the one that holds when a path forgot to withdraw.
         if offer.candidate_id != candidate_id:
             return self._refuse(offer, OfferRefusal.OFFER_CANDIDATE_CHANGED, fp)
+
+        # ── R2/A3: the cycle this offer belongs to ────────────────────────────────
+        # The ordinary cycle reset already withdraws, so this is the guard for a cycle
+        # that moved without it. Compared because it is declared a binding; a recorded
+        # binding that is never evaluated is a false assurance.
+        if cycle_key is not None and int(offer.cycle_key or 0) != int(cycle_key):
+            self._terminalise(thread_id, status=OfferStatus.WITHDRAWN,
+                              reason=OfferRefusal.OFFER_CYCLE_CHANGED)
+            self._clear_mirror(state)
+            return self._refuse(offer, OfferRefusal.OFFER_CYCLE_CHANGED, fp,
+                                status=OfferStatus.WITHDRAWN)
+
+        # ── R2/A2: the PRICING CONTEXT, not merely the candidate's identity ───────
+        # `PricingService.quote(db, tipo_vehiculo, zone_group, zone_detail)` takes the
+        # category, so an offer whose category has moved describes a quote that no longer
+        # applies — even though the candidate id and the zone are untouched. The value
+        # compared is the canonical column on the candidate the CALLER resolved through its
+        # own authority; nothing here reads customer prose, model wording or an alias.
+        if offer.tipo_vehiculo != tipo_vehiculo:
+            self._terminalise(thread_id, status=OfferStatus.WITHDRAWN,
+                              reason=OfferRefusal.OFFER_VEHICLE_CATEGORY_CHANGED)
+            self._clear_mirror(state)
+            return self._refuse(offer, OfferRefusal.OFFER_VEHICLE_CATEGORY_CHANGED, fp,
+                                status=OfferStatus.WITHDRAWN)
+        # A category we cannot resolve cannot be priced, and an unpriced booking is exactly
+        # the harm A2 produced. Refuse rather than book something with no price basis.
+        if tipo_vehiculo is None:
+            self._terminalise(thread_id, status=OfferStatus.WITHDRAWN,
+                              reason=OfferRefusal.OFFER_VEHICLE_CATEGORY_UNRESOLVED)
+            self._clear_mirror(state)
+            return self._refuse(offer, OfferRefusal.OFFER_VEHICLE_CATEGORY_UNRESOLVED, fp,
+                                status=OfferStatus.WITHDRAWN)
+
         if (offer.zone_group, offer.zone_detail) != (zone_group, zone_detail):
             return self._refuse(offer, OfferRefusal.OFFER_LOCATION_CHANGED, fp)
 

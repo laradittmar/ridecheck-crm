@@ -51,7 +51,10 @@ def seed_live_offer(db, state, *, thread_id=None, token=None, candidate_id=None,
         state, thread_id=thread_id, token=token,
         cycle_key=getattr(state, "current_cycle_start_message_db_id", None) or 0,
         candidate_id=candidate_id if candidate_id is not None else _resolved[0],
-        tipo_vehiculo=tipo_vehiculo,
+        # R2: the offer carries the pricing context, and acceptance compares it against
+        # the SAME resolved candidate. A fixture that issued an offer with no category
+        # would be issuing one that can never be accepted.
+        tipo_vehiculo=(tipo_vehiculo if tipo_vehiculo is not None else _resolved[2]),
         zone_group=zone_group if zone_group is not None else _zone[0],
         zone_detail=zone_detail if zone_detail is not None else _zone[1],
         offered_date=(offered_date if offered_date is not None
@@ -65,7 +68,7 @@ def seed_live_offer(db, state, *, thread_id=None, token=None, candidate_id=None,
 
 
 def _active_candidate_and_zone(db, state):
-    """(candidate_id, (zone_group, zone_detail)) exactly as ACCEPTANCE will resolve them.
+    """(candidate_id, (zone_group, zone_detail), tipo_vehiculo) as ACCEPTANCE resolves them.
 
     Both consumers now share one rule (`_get_active_inspection_location` /
     `_location_from_candidate`): the focused candidate is authoritative only when it
@@ -97,7 +100,8 @@ def _active_candidate_and_zone(db, state):
         cand_detail = focus.zone_detail or None
         if cand_group or cand_detail:
             zone = (cand_group or home_group, cand_detail or home_detail)
-    return getattr(focus, "id", None), zone
+    return (getattr(focus, "id", None), zone,
+            getattr(focus, "tipo_vehiculo", None))
 
 
 def start_offer_claim_stub(test_case):

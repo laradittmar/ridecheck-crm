@@ -70,6 +70,10 @@ class OfferLifecycleRows(unittest.TestCase):
 
     def _issue(self, token=TOKEN, **kw):
         kw.setdefault("candidate_id", self.cand_id)
+        # R2: an offer carries the pricing context it was quoted from, and an offer with no
+        # category cannot be accepted at all — a booking with no price basis is the harm the
+        # category binding exists to prevent. The fixture's candidate is an AUTO.
+        kw.setdefault("tipo_vehiculo", "AUTO")
         kw.setdefault("zone_group", "CABA")
         kw.setdefault("zone_detail", "Palermo")
         offer = self.offers.issue(self.state, thread_id=self.thread_id, token=token,
@@ -161,8 +165,10 @@ class OfferLifecycleRows(unittest.TestCase):
 
     def _claim(self, token, **kw):
         kw.setdefault("candidate_id", self.cand_id)
+        kw.setdefault("tipo_vehiculo", "AUTO")      # R2: the pricing context is bound
         kw.setdefault("zone_group", "CABA")
         kw.setdefault("zone_detail", "Palermo")
+        kw.setdefault("cycle_key", 0)
         return self.offers.claim(self.state, thread_id=self.thread_id, token=token, **kw)
 
     def test_g7p_09_a_live_bound_offer_is_claimed_once(self):
@@ -298,6 +304,95 @@ class OfferLifecycleRows(unittest.TestCase):
         self.assertIsNone(token_fingerprint(None))
         self.assertIsNone(token_fingerprint(""))
         self.assertNotIn(TOKEN, token_fingerprint(TOKEN))
+
+
+class R2BindingContract(OfferLifecycleRows):
+    """R2 — the binding contract is enforced, not merely described.
+
+    The G3-7P review found `tipo_vehiculo` and `cycle_key` stored as if they guarded
+    acceptance and never compared. These tests assert the contract in both directions: an
+    ACCEPTANCE BINDING refuses on mismatch, and HISTORICAL METADATA does not.
+    """
+
+    def _claim_r2(self, token=TOKEN, **over):
+        kw = dict(candidate_id=self.cand_id, tipo_vehiculo="AUTO",
+                  zone_group="CABA", zone_detail="Palermo", cycle_key=0)
+        kw.update(over)
+        return self.offers.claim(self.state, thread_id=self.thread_id, token=token, **kw)
+
+    def _issue_r2(self, **over):
+        kw = dict(tipo_vehiculo="AUTO")
+        kw.update(over)
+        return self._issue(**kw)
+
+    # ── acceptance bindings: each one refuses on mismatch ────────────────────
+
+    def test_r2_01_the_category_is_an_enforced_binding(self):
+        self._issue_r2()
+        claim = self._claim_r2(tipo_vehiculo="PICKUP")
+        self.db.commit()
+        self.assertFalse(claim.ok)
+        self.assertEqual(claim.refusal, OfferRefusal.OFFER_VEHICLE_CATEGORY_CHANGED)
+        self.assertEqual(self._rows()[0][1], OfferStatus.WITHDRAWN)
+        self.assertIsNone(self.state.flow_booking_token)
+
+    def test_r2_02_an_unresolvable_category_refuses(self):
+        self._issue_r2()
+        claim = self._claim_r2(tipo_vehiculo=None)
+        self.assertFalse(claim.ok)
+        self.assertIn(claim.refusal, (OfferRefusal.OFFER_VEHICLE_CATEGORY_CHANGED,
+                                      OfferRefusal.OFFER_VEHICLE_CATEGORY_UNRESOLVED))
+
+    def test_r2_03_an_offer_with_no_category_cannot_be_accepted(self):
+        """An offer that never had a pricing basis must not become a priced booking."""
+        self._issue_r2(tipo_vehiculo=None)
+        claim = self._claim_r2(tipo_vehiculo=None)
+        self.assertFalse(claim.ok)
+        self.assertEqual(claim.refusal, OfferRefusal.OFFER_VEHICLE_CATEGORY_UNRESOLVED)
+
+    def test_r2_04_the_cycle_is_an_enforced_binding(self):
+        self._issue_r2()
+        claim = self._claim_r2(cycle_key=99999)
+        self.db.commit()
+        self.assertFalse(claim.ok)
+        self.assertEqual(claim.refusal, OfferRefusal.OFFER_CYCLE_CHANGED)
+        self.assertEqual(self._rows()[0][1], OfferStatus.WITHDRAWN)
+        self.assertIsNone(self.state.flow_booking_token)
+
+    def test_r2_05_a_matching_bundle_is_accepted(self):
+        self._issue_r2()
+        claim = self._claim_r2()
+        self.assertTrue(claim.ok, claim.refusal)
+
+    # ── historical metadata: changing it must NOT refuse ─────────────────────
+
+    def test_r2_06_the_offered_slot_is_metadata_not_a_binding(self):
+        """The customer picks a slot inside the Flow and `ScheduleService` revalidates it,
+        so comparing the slot the offer was issued for would refuse a legitimate choice."""
+        import datetime as _dt
+        offer = self._issue_r2(offered_date="2026-11-10", offered_time="10:00")
+        self.assertEqual(offer.offered_date, _dt.date(2026, 11, 10))
+        self.assertEqual(offer.offered_time, _dt.time(10, 0))
+        self.state.preferred_day = "2026-12-25"       # the customer chose another slot
+        self.state.preferred_time = "16:30"
+        self.db.commit()
+        self.assertTrue(self._claim_r2().ok, "a different chosen slot must still book")
+
+    def test_r2_07_flow_id_and_contract_version_are_metadata(self):
+        self._issue_r2(flow_id="28104222025943520")
+        row = self.db.execute(select(M.WhatsAppBookingOffer)).scalars().one()
+        self.assertEqual(row.flow_id, "28104222025943520")
+        self.assertEqual(row.contract_version, OFFER_CONTRACT_VERSION)
+        self.assertTrue(self._claim_r2().ok,
+                        "neither is an acceptance binding, so neither may refuse")
+
+    def test_r2_08_every_declared_binding_appears_in_the_claim_signature(self):
+        """The contract and the signature cannot drift apart silently."""
+        import inspect as _inspect
+        params = set(_inspect.signature(OfferLifecycle.claim).parameters)
+        for binding in ("token", "thread_id", "candidate_id", "tipo_vehiculo",
+                        "zone_group", "zone_detail", "cycle_key"):
+            self.assertIn(binding, params, binding)
 
 
 class OwnerPolicyPreserved(unittest.TestCase):
