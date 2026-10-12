@@ -182,6 +182,71 @@ class G7POfferAuthorityPG(unittest.TestCase):
         db.close()
         return tuple(row)
 
+    # ── a slot that is genuinely open, asked of the authority that decides ────
+
+    def _open_slot(self):
+        """(day_iso, 'HH:MM') for a real opening, from ScheduleService itself.
+
+        Never a literal date. The suite already carries one Sunday-dependent family whose
+        failures appear and disappear with the day of the week; a hard-coded day would add a
+        second, and would start failing the moment it drifted into the past.
+        """
+        from app.schemas.schedule import ScheduleCheckIn
+        from app.services.schedule import ScheduleService
+        db = self.SF()
+        try:
+            svc = ScheduleService(db)
+            for offset in range(2, 24):
+                day = date.today() + timedelta(days=offset)
+                out = svc.list_slots(ScheduleCheckIn(
+                    address="Palermo, CABA", preferred_day=day, preferred_time=time(11, 0),
+                    zone_group="CABA", zone_detail="Palermo"))
+                if out.slots:
+                    return day.isoformat(), str(out.slots[0])[:5]
+        finally:
+            db.close()
+        self.fail("ScheduleService offered no open slot in the next 24 days")
+
+    def _arm_preference(self, day_iso, hhmm):
+        db = self.SF()
+        db.execute(text("UPDATE whatsapp_thread_states SET preferred_day=:d, "
+                        "preferred_time=:t, active_requested_date=:d, "
+                        "last_requested_time=:t, needs_human=false WHERE thread_id=:th"),
+                   {"d": day_iso, "t": hhmm, "th": self.thread_id})
+        db.commit(); db.close()
+
+    def _dx_payload(self, day_iso, hhmm):
+        return {"date": day_iso, "time": hhmm, "name": "Probe Cliente",
+                "email": "p@example.test", "inspection_address": "Palermo, CABA",
+                "seller_name": "Vendedor", "seller_phone": "1122334455"}
+
+    def _dx_confirm(self, token, day_iso, hhmm):
+        """The real Data Exchange writer. Returns ('ok', screen) or ('exc', type, text)."""
+        db = self.SF()
+        try:
+            out = self._svc(db).handle_confirm_booking(
+                token, self._dx_payload(day_iso, hhmm))
+            return ("ok", out.get("screen"))
+        except Exception as exc:
+            return ("exc", type(exc).__name__, str(exc)[:120])
+        finally:
+            db.close()
+
+    def _offer_row(self):
+        db = self.SF()
+        row = db.execute(text(
+            "SELECT status, terminal_reason, last_refusal, refused_count, accepted_at "
+            "FROM whatsapp_booking_offers WHERE thread_id=:t ORDER BY id DESC LIMIT 1"),
+            {"t": self.thread_id}).one()
+        db.close()
+        return dict(zip(("status", "terminal_reason", "last_refusal", "refused_count",
+                         "accepted_at"), row))
+
+    def _f7a_open(self):
+        """True when the deterministic SCHEDULING block is reachable — the gate is
+        `not state.flow_booking_token`, read from committed state."""
+        return not self._state()["token"]
+
     # ── 1. the happy path, exactly once ──────────────────────────────────────
 
     def test_g7p_pg_01_a_valid_offer_is_accepted_exactly_once(self):
@@ -1020,71 +1085,6 @@ class G7PR3TransactionDurability(G7POfferAuthorityPG):
     and reads the committed result.
     """
 
-    # ── a slot that is genuinely open, asked of the authority that decides ────
-
-    def _open_slot(self):
-        """(day_iso, 'HH:MM') for a real opening, from ScheduleService itself.
-
-        Never a literal date. The suite already carries one Sunday-dependent family whose
-        failures appear and disappear with the day of the week; a hard-coded day would add a
-        second, and would start failing the moment it drifted into the past.
-        """
-        from app.schemas.schedule import ScheduleCheckIn
-        from app.services.schedule import ScheduleService
-        db = self.SF()
-        try:
-            svc = ScheduleService(db)
-            for offset in range(2, 24):
-                day = date.today() + timedelta(days=offset)
-                out = svc.list_slots(ScheduleCheckIn(
-                    address="Palermo, CABA", preferred_day=day, preferred_time=time(11, 0),
-                    zone_group="CABA", zone_detail="Palermo"))
-                if out.slots:
-                    return day.isoformat(), str(out.slots[0])[:5]
-        finally:
-            db.close()
-        self.fail("ScheduleService offered no open slot in the next 24 days")
-
-    def _arm_preference(self, day_iso, hhmm):
-        db = self.SF()
-        db.execute(text("UPDATE whatsapp_thread_states SET preferred_day=:d, "
-                        "preferred_time=:t, active_requested_date=:d, "
-                        "last_requested_time=:t, needs_human=false WHERE thread_id=:th"),
-                   {"d": day_iso, "t": hhmm, "th": self.thread_id})
-        db.commit(); db.close()
-
-    def _dx_payload(self, day_iso, hhmm):
-        return {"date": day_iso, "time": hhmm, "name": "Probe Cliente",
-                "email": "p@example.test", "inspection_address": "Palermo, CABA",
-                "seller_name": "Vendedor", "seller_phone": "1122334455"}
-
-    def _dx_confirm(self, token, day_iso, hhmm):
-        """The real Data Exchange writer. Returns ('ok', screen) or ('exc', type, text)."""
-        db = self.SF()
-        try:
-            out = self._svc(db).handle_confirm_booking(
-                token, self._dx_payload(day_iso, hhmm))
-            return ("ok", out.get("screen"))
-        except Exception as exc:
-            return ("exc", type(exc).__name__, str(exc)[:120])
-        finally:
-            db.close()
-
-    def _offer_row(self):
-        db = self.SF()
-        row = db.execute(text(
-            "SELECT status, terminal_reason, last_refusal, refused_count, accepted_at "
-            "FROM whatsapp_booking_offers WHERE thread_id=:t ORDER BY id DESC LIMIT 1"),
-            {"t": self.thread_id}).one()
-        db.close()
-        return dict(zip(("status", "terminal_reason", "last_refusal", "refused_count",
-                         "accepted_at"), row))
-
-    def _f7a_open(self):
-        """True when the deterministic SCHEDULING block is reachable — the gate is
-        `not state.flow_booking_token`, read from committed state."""
-        return not self._state()["token"]
-
     def _change_category_to(self, cat):
         db = self.SF()
         db.execute(text("UPDATE whatsapp_thread_candidates SET tipo_vehiculo=:c WHERE id=:i"),
@@ -1533,3 +1533,428 @@ class G7PR3TransactionDurability(G7POfferAuthorityPG):
         self.assertIn(action, ("flow_button_sent", "replied"))
         self.assertIsNotNone(self._state()["last_visible_slots"],
                              "the thread could not offer slots again")
+
+
+@unittest.skipUnless(PG_URL, "G7P_PG_URL not set — no disposable PostgreSQL; nothing proven")
+class G7PR3AConversationScope(G7POfferAuthorityPG):
+    """R3A — only a booking writer enters the booking lock order.
+
+    R3 took `whatsapp_thread_states` at the start of EVERY turn under a 4-second bound. The
+    independent review measured the cost against the parent: a second conversation turn on
+    the same thread completed in 0.05–0.20s even while the first held the thread for twelve
+    seconds, and with the unconditional acquisition that same turn was DECLINED after 4.05s
+    with `thread_contended`. The contention surface was not two booking writers — it was any
+    conversation turn against any Data Exchange confirmation, which a customer produces by
+    tapping Confirm while typing. The declined turn got no reply, was never retried, and its
+    operator alert was suppressed by the winning booking's own outbound.
+
+    These tests hold the first turn open and require the second to behave like the parent.
+    They assert on OUTCOMES and on `pg_locks`, never on source text.
+    """
+
+    ORDINARY = "hola, tengo una consulta general"
+
+    # ── observation helpers ──────────────────────────────────────────────────
+
+    #: `FOR NO KEY UPDATE` and `UPDATE` take these on the relation; a plain SELECT takes
+    #: only AccessShareLock, which every turn legitimately has.
+    _WRITE_MODES = ("RowShareLock", "RowExclusiveLock", "ExclusiveLock",
+                    "AccessExclusiveLock")
+
+    def _session_locks(self, db):
+        """What THIS backend holds on the two booking resources, and its current bound."""
+        bound = db.execute(text("SHOW lock_timeout")).scalar()
+        rows = db.execute(text(
+            "SELECT c.relname, l.mode FROM pg_locks l JOIN pg_class c ON c.oid = l.relation "
+            "WHERE l.pid = pg_backend_pid() AND c.relname IN "
+            "('whatsapp_thread_states','whatsapp_booking_offers') ORDER BY 1, 2")).fetchall()
+        return bound, [(r[0], r[1]) for r in rows]
+
+    def _booking_locks(self, rows):
+        return [(t, m) for t, m in rows if m in self._WRITE_MODES]
+
+    def _text_turn(self, out, key, *, hold=0.0, wamid=None, thread_id=None, wa=None,
+                   observe=None):
+        """An ordinary text turn, optionally held open where a model call would sit."""
+        from app.schemas.conversation import ConversationHandleIn
+        from app.services.conversation_engine import ConversationEngine
+        original = ConversationEngine._maybe_set_attribution
+
+        def slowed(engine_self, ctx, state):
+            if threading.current_thread().name.startswith("HOLD"):
+                if observe is not None:
+                    observe.update(zip(("bound", "locks"),
+                                       self._session_locks(engine_self.db)))
+                if hold:
+                    _t.sleep(hold)
+            return original(engine_self, ctx, state)
+
+        ConversationEngine._maybe_set_attribution = slowed
+        try:
+            db, eng = self._engine()
+            try:
+                out[key] = eng.handle(ConversationHandleIn(
+                    thread_id=thread_id or self.thread_id,
+                    wa_message_id=wamid or f"wamid.{key}.{_t.time()}",
+                    wa_id=wa or WA, message_type="text", text=self.ORDINARY,
+                    recent_user_messages=[self.ORDINARY],
+                    unanswered_recent_user_messages=[self.ORDINARY])).action
+            except Exception as exc:
+                out[key] = f"EXC:{type(exc).__name__}"
+            finally:
+                db.close()
+        finally:
+            ConversationEngine._maybe_set_attribution = original
+
+    def _ce_booking_turn(self, token, out, key):
+        try:
+            out[key] = self._submit_raw(token, key)
+        except Exception as exc:
+            out[key] = f"EXC:{type(exc).__name__}"
+
+    def _dx_turn(self, token, day, hhmm, out, key):
+        res = self._dx_confirm(token, day, hhmm)
+        out[key] = res[1] if res[0] == "ok" else f"EXC:{res[1]}"
+
+    def _hold_at_claim(self, thread_name):
+        """Suspend ONE writer between step 1 and step 2 of the lock order."""
+        import app.services.offer_lifecycle as lifecycle_module
+        original = lifecycle_module.OfferLifecycle.claim
+        entered, release = threading.Event(), threading.Event()
+
+        def gated(inner_self, *a, **kw):
+            if threading.current_thread().name == thread_name:
+                entered.set()
+                release.wait(timeout=60)
+            return original(inner_self, *a, **kw)
+
+        lifecycle_module.OfferLifecycle.claim = gated
+        self.addCleanup(setattr, lifecycle_module.OfferLifecycle, "claim", original)
+        return entered, release
+
+    def _armed_offer(self):
+        day, hhmm = self._open_slot()
+        self._arm_preference(day, hhmm)
+        token = self._issue()
+        self._clear_human()
+        return token, day, hhmm
+
+    # ── §A an ordinary turn does not serialise the next one ──────────────────
+
+    def test_g7p_r3a_01_an_ordinary_turn_does_not_decline_the_next_one(self):
+        """The regression, stated as a test. Each hold is longer than the booking bound, so
+        before R3A the second turn came back `thread_contended`."""
+        from app.schemas.conversation import ACTION_THREAD_CONTENDED
+        for hold in (1.0, 6.0, 12.0):
+            with self.subTest(holder_busy_seconds=hold):
+                self.setUp()
+                out, observed = {}, {}
+                first = threading.Thread(
+                    target=self._text_turn, args=(out, "first"),
+                    kwargs={"hold": hold, "wamid": f"wamid.hold.{hold}",
+                            "observe": observed}, name="HOLD_FIRST")
+                first.start()
+                _t.sleep(0.7)
+                started = _t.time()
+                second = threading.Thread(
+                    target=self._text_turn, args=(out, "second"),
+                    kwargs={"wamid": f"wamid.second.{hold}"}, name="SECOND")
+                second.start(); second.join(timeout=90)
+                waited = _t.time() - started
+                first.join(timeout=90)
+
+                self.assertFalse(second.is_alive(), "the second turn never returned")
+                self.assertNotEqual(out.get("second"), ACTION_THREAD_CONTENDED,
+                                    "an ordinary customer message was declined")
+                self.assertEqual(out.get("second"), "replied",
+                                 f"the second turn did not complete: {out}")
+                self.assertEqual(out.get("first"), "replied")
+                self.assertLess(waited, 4.0,
+                                f"the second turn waited {waited:.2f}s — it is being "
+                                f"serialised behind the first")
+                self.assertEqual(self._booking_locks(observed.get("locks", [])), [],
+                                 "an ordinary turn is holding a booking lock")
+
+    def test_g7p_r3a_02_an_ordinary_turn_inherits_no_booking_timeout(self):
+        from app.services.offer_lifecycle import DEFAULT_OFFER_LOCK_TIMEOUT_MS
+        observed = {}
+        out = {}
+        turn = threading.Thread(target=self._text_turn, args=(out, "only"),
+                                kwargs={"hold": 0.2, "observe": observed},
+                                name="HOLD_ONLY")
+        turn.start(); turn.join(timeout=90)
+        self.assertEqual(out.get("only"), "replied")
+        bound = str(observed.get("bound", "")).strip()
+        self.assertNotIn(bound, (f"{DEFAULT_OFFER_LOCK_TIMEOUT_MS}ms", "4s", "4000ms",
+                                 str(DEFAULT_OFFER_LOCK_TIMEOUT_MS)),
+                         f"an ordinary turn is running under the booking bound ({bound})")
+
+    def test_g7p_r3a_03_simultaneous_ordinary_messages_are_both_answered(self):
+        for trial in range(3):
+            with self.subTest(trial=trial):
+                self.setUp()
+                out = {}
+                barrier = threading.Barrier(2)
+
+                def one():
+                    barrier.wait()
+                    self._text_turn(out, "a", wamid=f"wamid.sim.a.{trial}")
+
+                def two():
+                    barrier.wait()
+                    self._text_turn(out, "b", wamid=f"wamid.sim.b.{trial}")
+
+                t1 = threading.Thread(target=one); t2 = threading.Thread(target=two)
+                t1.start(); t2.start(); t1.join(90); t2.join(90)
+                self.assertEqual([out.get("a"), out.get("b")], ["replied", "replied"],
+                                 f"a simultaneous message was lost: {out}")
+
+    # ── §B/§D the cross-transport cases ─────────────────────────────────────
+
+    def test_g7p_r3a_04_an_ordinary_message_survives_a_data_exchange_booking(self):
+        """R3-F2's customer scenario: Confirm tapped in the Flow while a message is typed.
+        The booking must succeed AND the message must be answered — not declined, not
+        handled-without-a-reply, and not left to an operator email."""
+        from app.schemas.conversation import ACTION_THREAD_CONTENDED
+        token, day, hhmm = self._armed_offer()
+        entered, release = self._hold_at_claim("HOLD_DX")
+        out = {}
+        booking = threading.Thread(target=self._dx_turn,
+                                   args=(token, day, hhmm, out, "booking"), name="HOLD_DX")
+        booking.start()
+        self.assertTrue(entered.wait(timeout=45), "the booking never reached the claim")
+        started = _t.time()
+        message = threading.Thread(target=self._text_turn, args=(out, "message"),
+                                   kwargs={"wamid": "wamid.alongside"}, name="MESSAGE")
+        message.start(); message.join(timeout=90)
+        waited = _t.time() - started
+        release.set(); booking.join(timeout=90)
+
+        self.assertEqual(out.get("message"), "replied",
+                         f"the ordinary message was not answered: {out}")
+        self.assertNotEqual(out.get("message"), ACTION_THREAD_CONTENDED)
+        self.assertLess(waited, 4.0, f"the message waited {waited:.2f}s behind the booking")
+        self.assertEqual(self._counts(), (1, 1), "the booking did not survive")
+        self.assertEqual(self._offer_row()["status"], "ACCEPTED")
+
+    def test_g7p_r3a_05_a_booking_survives_an_ordinary_turn_in_flight(self):
+        token, day, hhmm = self._armed_offer()
+        out = {}
+        holder = threading.Thread(target=self._text_turn, args=(out, "message"),
+                                  kwargs={"hold": 6.0, "wamid": "wamid.inflight"},
+                                  name="HOLD_TEXT")
+        holder.start(); _t.sleep(0.8)
+        started = _t.time()
+        booking = threading.Thread(target=self._dx_turn,
+                                   args=(token, day, hhmm, out, "booking"))
+        booking.start(); booking.join(timeout=90)
+        waited = _t.time() - started
+        holder.join(timeout=90)
+        self.assertEqual(out.get("booking"), "SUCCESS", f"the booking failed: {out}")
+        self.assertEqual(out.get("message"), "replied")
+        self.assertEqual(self._counts(), (1, 1))
+        self.assertLess(waited, 4.0,
+                        "the booking waited on an ordinary turn's bound")
+
+    def test_g7p_r3a_06_different_threads_do_not_interfere(self):
+        """The lock is per thread row. A slow conversation on one thread must not delay
+        another customer at all."""
+        db = self.SF()
+        other_contact = self.M.WhatsAppContact(wa_id="549110555777", display_name="Otro")
+        db.add(other_contact); db.flush()
+        other_lead = self.M.Lead(nombre="Otro", apellido="Cliente",
+                                 telefono="549110555777", estado="CONSULTA_NUEVA",
+                                 flag="ACEPTADO"); db.add(other_lead); db.flush()
+        other_thread = self.M.WhatsAppThread(contact_id=other_contact.id,
+                                             lead_id=other_lead.id)
+        db.add(other_thread); db.flush()
+        db.add(self.M.WhatsAppThreadState(thread_id=other_thread.id))
+        db.commit()
+        other_id = other_thread.id
+        db.close()
+
+        out = {}
+        holder = threading.Thread(target=self._text_turn, args=(out, "slow"),
+                                  kwargs={"hold": 5.0, "wamid": "wamid.sl"},
+                                  name="HOLD_SLOW")
+        holder.start(); _t.sleep(0.7)
+        started = _t.time()
+        other = threading.Thread(target=self._text_turn, args=(out, "other"),
+                                 kwargs={"wamid": "wamid.other",
+                                         "thread_id": other_id, "wa": "549110555777"})
+        other.start(); other.join(timeout=90)
+        waited = _t.time() - started
+        holder.join(timeout=90)
+        self.assertEqual(out.get("other"), "replied")
+        self.assertLess(waited, 3.0,
+                        f"an unrelated thread waited {waited:.2f}s — the lock is too broad")
+
+    # ── §C the model boundaries ─────────────────────────────────────────────
+
+    def test_g7p_r3a_07_no_booking_lock_is_held_across_a_model_call(self):
+        """Both model boundaries, observed from the engine's OWN session. No external call
+        is made: the two transports are replaced, so this cannot reach a provider."""
+        from app.schemas.conversation import ConversationHandleIn
+        from app.services.conversation_engine import ConversationEngine
+        import app.services.semantic_interpreter as interpreter_module
+
+        observations = []
+        holder = {}
+        original_semantic = interpreter_module.SemanticTurnInterpreter._call_openai
+        original_reply = ConversationEngine._call_openai
+
+        def semantic_stub(inner_self, messages, model):
+            observations.append(("semantic",) + self._session_locks(holder["db"]))
+            return ('{"stance": "OTHER"}', {})
+
+        def reply_stub(inner_self, messages, *, role=None):
+            observations.append(("reply",) + self._session_locks(inner_self.db))
+            return '{"reply": "hola"}'
+
+        interpreter_module.SemanticTurnInterpreter._call_openai = semantic_stub
+        ConversationEngine._call_openai = reply_stub
+        self.addCleanup(setattr, interpreter_module.SemanticTurnInterpreter,
+                        "_call_openai", original_semantic)
+        self.addCleanup(setattr, ConversationEngine, "_call_openai", original_reply)
+
+        db, eng = self._engine()
+        holder["db"] = db
+        try:
+            eng.handle(ConversationHandleIn(
+                thread_id=self.thread_id, wa_message_id="wamid.model", wa_id=WA,
+                message_type="text", text="me explicas como funciona la revision?",
+                recent_user_messages=["me explicas como funciona la revision?"],
+                unanswered_recent_user_messages=[
+                    "me explicas como funciona la revision?"]))
+        finally:
+            db.close()
+
+        self.assertTrue(observations,
+                        "no model boundary was reached; this test would prove nothing")
+        for where, bound, rows in observations:
+            self.assertEqual(self._booking_locks(rows), [],
+                             f"a booking lock is held across the {where} model call: {rows}")
+            self.assertNotIn(str(bound).strip(), ("4s", "4000ms", "4000"),
+                             f"the booking bound governs the {where} model call")
+
+    def test_g7p_r3a_08_a_booking_turn_still_takes_the_lock_and_calls_no_model(self):
+        """The other half of the narrowing: the turn that CAN race must still serialise.
+        It is also the proof that no model call happens while that lock is held — the
+        booking path is deterministic and reaches no model boundary at all."""
+        from app.services.conversation_engine import ConversationEngine
+        import app.services.offer_lifecycle as lifecycle_module
+        import app.services.semantic_interpreter as interpreter_module
+
+        at_claim = {}
+        model_calls = []
+        original_claim = lifecycle_module.OfferLifecycle.claim
+        original_semantic = interpreter_module.SemanticTurnInterpreter._call_openai
+        original_reply = ConversationEngine._call_openai
+
+        def observing_claim(inner_self, *a, **kw):
+            at_claim.update(zip(("bound", "locks"),
+                                self._session_locks(inner_self.db)))
+            return original_claim(inner_self, *a, **kw)
+
+        def forbid_semantic(inner_self, messages, model):
+            model_calls.append("semantic")
+            return ('{"stance": "OTHER"}', {})
+
+        def forbid_reply(inner_self, messages, *, role=None):
+            model_calls.append("reply")
+            return '{"reply": "hola"}'
+
+        lifecycle_module.OfferLifecycle.claim = observing_claim
+        interpreter_module.SemanticTurnInterpreter._call_openai = forbid_semantic
+        ConversationEngine._call_openai = forbid_reply
+        self.addCleanup(setattr, lifecycle_module.OfferLifecycle, "claim", original_claim)
+        self.addCleanup(setattr, interpreter_module.SemanticTurnInterpreter,
+                        "_call_openai", original_semantic)
+        self.addCleanup(setattr, ConversationEngine, "_call_openai", original_reply)
+
+        token, _day, _hhmm = self._armed_offer()
+        out = self._submit(token, tag="scoped")
+        self.assertEqual(out.action, "booking_created")
+        self.assertEqual(self._counts(), (1, 1))
+        self.assertTrue(self._booking_locks(at_claim.get("locks", [])),
+                        "the booking turn did NOT take step 1 of the lock order")
+        self.assertEqual(model_calls, [],
+                         f"a booking turn reached a model boundary: {model_calls}")
+
+    # ── §B the actual booking writers still race safely ─────────────────────
+
+    def test_g7p_r3a_09_the_two_booking_writers_still_resolve_to_one_booking(self):
+        """R3A must not loosen the case it was never about. Both winner orders, bounded,
+        typed, exactly one booking, and no deadlock."""
+        from app.schemas.conversation import ACTION_THREAD_CONTENDED
+        from app.services.offer_lifecycle import DEFAULT_OFFER_LOCK_TIMEOUT_MS
+        bound = DEFAULT_OFFER_LOCK_TIMEOUT_MS / 1000.0
+        import app.services.offer_lifecycle as lifecycle_module
+        original_sqlstate = lifecycle_module.OfferLifecycle.contention_sqlstate
+
+        for holder in ("CE", "DX"):
+            with self.subTest(holder=holder):
+                self.setUp()
+                seen = []
+
+                def spy(exc):
+                    sqlstate = (getattr(getattr(exc, "orig", None), "sqlstate", None)
+                                or getattr(exc, "sqlstate", None))
+                    if sqlstate:
+                        seen.append(sqlstate)
+                    return original_sqlstate(exc)
+
+                lifecycle_module.OfferLifecycle.contention_sqlstate = staticmethod(spy)
+                try:
+                    token, day, hhmm = self._armed_offer()
+                    entered, release = self._hold_at_claim("HOLD")
+                    out = {}
+                    if holder == "CE":
+                        first = lambda o, k: self._ce_booking_turn(token, o, k)
+                        second = lambda o, k: self._dx_turn(token, day, hhmm, o, k)
+                    else:
+                        first = lambda o, k: self._dx_turn(token, day, hhmm, o, k)
+                        second = lambda o, k: self._ce_booking_turn(token, o, k)
+                    winner = threading.Thread(target=first, args=(out, "winner"),
+                                              name="HOLD")
+                    winner.start()
+                    self.assertTrue(entered.wait(timeout=45))
+                    started = _t.time()
+                    loser = threading.Thread(target=second, args=(out, "loser"),
+                                             name="LOSER")
+                    loser.start(); loser.join(timeout=90)
+                    waited = _t.time() - started
+                    release.set(); winner.join(timeout=90)
+                finally:
+                    lifecycle_module.OfferLifecycle.contention_sqlstate = staticmethod(
+                        original_sqlstate)
+
+                self.assertEqual(self._counts(), (1, 1), f"not one booking: {out}")
+                self.assertEqual(self._offer_row()["status"], "ACCEPTED")
+                self.assertNotIn("40P01", seen, "the writers deadlock again")
+                self.assertIn(out.get("loser"),
+                              (ACTION_THREAD_CONTENDED, "EXC:BookingTokenError"),
+                              f"the losing booking writer was not typed: {out}")
+                self.assertLess(waited, bound * 2.5,
+                                f"the losing booking writer waited {waited:.2f}s")
+                self.assertGreater(waited, bound * 0.5,
+                                   "this interleaving did not actually contend")
+
+    def test_g7p_r3a_10_two_booking_responses_for_one_offer_book_once(self):
+        for trial in range(3):
+            with self.subTest(trial=trial):
+                self.setUp()
+                token, _day, _hhmm = self._armed_offer()
+                out = {}
+                barrier = threading.Barrier(2)
+
+                def one():
+                    barrier.wait(); self._ce_booking_turn(token, out, "a")
+
+                def two():
+                    barrier.wait(); self._ce_booking_turn(token, out, "b")
+
+                t1 = threading.Thread(target=one); t2 = threading.Thread(target=two)
+                t1.start(); t2.start(); t1.join(90); t2.join(90)
+                self.assertEqual(self._counts(), (1, 1), f"not one booking: {out}")
+                self.assertEqual([o[1] for o in self._offers()], ["ACCEPTED"])

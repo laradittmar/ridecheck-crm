@@ -3541,28 +3541,32 @@ class ConversationEngine:
         # so a failure mid-flight does not leave the message appearing processed.
         state = self._get_or_create_state(ctx)
 
-        # ── R3/A4: STEP 1 of the canonical offer lock order, for the whole turn ───
-        # `whatsapp_thread_states` is the first resource in `offer_lifecycle.
-        # OFFER_LOCK_ORDER`, and this turn's real step-1 acquisition is the dedup-cursor
-        # write a few lines below — not the claim site deep inside
-        # `_process_flow_response`. Setting the bound there was therefore too late to bound
-        # anything: a measured interleaving in which the Data Exchange writer held the
-        # thread showed this writer waiting with NO timeout at all, because its first write
-        # to the row happens before any `SET LOCAL lock_timeout` had been issued.
+        # ── R3/A4 + R3A: STEP 1 of the canonical offer lock order ────────────────
+        # `whatsapp_thread_states` is the first resource in
+        # `offer_lifecycle.OFFER_LOCK_ORDER`, and a booking turn's real step-1 acquisition
+        # is the dedup-cursor write a few lines below — not the claim site deep inside
+        # `_process_flow_response`. Setting the bound there was too late to bound anything:
+        # R3 measured this writer waiting with NO timeout at all, because its first write to
+        # the row happens before any `SET LOCAL lock_timeout` had been issued. So the
+        # acquisition belongs here, ahead of the cursor.
         #
-        # Taking the row here, explicitly, does three things: it makes the canonical order
-        # observable instead of incidental; it bounds the wait (`SET LOCAL` lasts for the
-        # rest of this transaction, so every later lock wait in the turn is bounded too);
-        # and it gives the LOSER a typed outcome instead of `internal_error`. Nothing is
-        # retried — a retry here is how one customer action becomes two bookings.
+        # R3A NARROWS IT TO THE TURNS THAT ACTUALLY PARTICIPATE. R3 took the row on EVERY
+        # turn, and the independent review measured what that cost: on the parent a second
+        # conversation turn on the same thread completed in 0.05–0.20s even while the first
+        # held the thread for twelve seconds; with the unconditional acquisition the second
+        # turn was DECLINED after 4.05s. An ordinary message is not a booking writer and has
+        # no business in the booking lock order — it never calls `claim()`, so serialising it
+        # bought nothing and lost customer turns.
         #
-        # The cursor is deliberately NOT written before this point, so a contended turn
-        # consumes nothing and a redelivery is free to try again.
-        _contended = self._begin_thread_transaction(ctx)
+        # The cursor is deliberately NOT written before this point, so a contended booking
+        # turn consumes nothing and a redelivery is free to try again.
+        _contended = None
+        if self._is_offer_acceptance_turn(event, state):
+            _contended = self._begin_thread_transaction(ctx)
         if _contended is not None:
             logger.warning(
-                "G3-7P-R3 thread_id=%s contended by the other booking writer (%s) — turn "
-                "declined, cursor not consumed, nothing booked",
+                "G3-7P-R3 thread_id=%s contended by the other booking writer (%s) — "
+                "booking turn declined, cursor not consumed, nothing booked",
                 event.thread_id, _contended)
             return _out(ACTION_THREAD_CONTENDED, detail=_contended)
 
@@ -13377,6 +13381,42 @@ Respondé SOLO con JSON válido:
         return payload["choices"][0]["message"]["content"]
 
     # ── Context helpers ───────────────────────────────────────────────────
+
+    def _is_offer_acceptance_turn(self, event, state) -> bool:
+        """Is THIS turn about to act as a booking-offer acceptance writer?
+
+        R3A. Only such a turn may enter the canonical offer lock order. The question is
+        answered from the SAME typed discriminators `_process_flow_response` itself routes
+        on, in the same order, so the answer cannot disagree with where the turn actually
+        goes:
+
+            * `message_type == "flow_response"` with a payload — anything else is routed to
+              `_process_text`, which never calls `claim()`;
+            * NOT a vehicle-clarification payload (`tipo_vehiculo` present);
+            * NOT a location-clarification payload (`zona_general` present);
+            * NOT the motorcycle contact Flow (its own token prefix on the mirror).
+
+        Nothing here reads customer prose, and no phrase, alias or keyword list is involved
+        — these are the payload keys the Flow definitions themselves declare and the token
+        prefix this engine mints. A turn this returns False for takes no booking lock and
+        inherits no booking timeout; it behaves exactly as it did before R3.
+
+        Fail-closed in the direction that matters: when it cannot tell, it answers True, so
+        a turn that might claim an offer is serialised rather than racing. The cost of a
+        false True is one bounded wait; the cost of a false False would be two writers in
+        the offer row with no agreed order.
+        """
+        if (getattr(event, "message_type", None) or "") != "flow_response":
+            return False
+        payload = getattr(event, "flow_response", None)
+        if not isinstance(payload, dict) or not payload:
+            return False
+        if "tipo_vehiculo" in payload or "zona_general" in payload:
+            return False
+        mirror = getattr(state, "flow_booking_token", None) or ""
+        if mirror.startswith(_MOTO_HANDOFF_TOKEN_PREFIX):
+            return False
+        return True
 
     def _begin_thread_transaction(self, ctx) -> str | None:
         """Take step 1 of `offer_lifecycle.OFFER_LOCK_ORDER` under a bounded wait.

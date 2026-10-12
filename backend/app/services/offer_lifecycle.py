@@ -81,6 +81,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -396,6 +397,35 @@ class OfferLifecycle:
             state = getattr(exc, "sqlstate", None)
         return state if state in _CONTENTION_SQLSTATES else None
 
+    @contextmanager
+    def _bounded_lock_wait(self, lock_timeout_ms: int):
+        """Bound ONE lock acquisition, then put the session back as it was.
+
+        R3A. `SET LOCAL lock_timeout` lasts for the rest of the transaction, so setting it
+        once at the start of a booking turn made it govern every later statement in that
+        turn. The R3 independent review measured the consequence on the conversation path;
+        this scopes it to the acquisition it was chosen for.
+
+        The RESET does not release anything: a row lock taken with FOR NO KEY UPDATE is held
+        until the transaction ends, whatever `lock_timeout` says afterwards. The timeout
+        governs how long a statement WAITS for a lock, never how long a lock is kept.
+        """
+        if not self._postgres():
+            yield
+            return
+        # `SET LOCAL` takes no bind parameter; the value is coerced to int here, so nothing
+        # caller-supplied reaches the statement as text.
+        self.db.execute(text("SET LOCAL lock_timeout = %d" % int(lock_timeout_ms)))
+        try:
+            yield
+        finally:
+            # On the failure path the transaction is about to be rolled back anyway, which
+            # discards the setting too; this keeps the success path honest.
+            try:
+                self.db.execute(text("SET LOCAL lock_timeout = DEFAULT"))
+            except Exception:                       # pragma: no cover - defensive
+                logger.debug("OFFER could not restore lock_timeout", exc_info=True)
+
     def begin_offer_transaction(self, thread_id: int, *,
                                 lock_timeout_ms: int = DEFAULT_OFFER_LOCK_TIMEOUT_MS
                                 ) -> Optional[str]:
@@ -413,15 +443,13 @@ class OfferLifecycle:
         if not self._postgres():
             return None
         try:
-            # `SET LOCAL` takes no bind parameter; the value is coerced to int here, so
-            # nothing caller-supplied reaches the statement as text.
-            self.db.execute(text("SET LOCAL lock_timeout = %d" % int(lock_timeout_ms)))
-            # Step 1 of OFFER_LOCK_ORDER. FOR NO KEY UPDATE: it conflicts with itself and
-            # with the UPDATE the engine performs on the same row, which is exactly the
-            # mutual exclusion we want, without blocking readers.
-            self.db.execute(
-                text("SELECT 1 FROM whatsapp_thread_states WHERE thread_id = :t "
-                     "FOR NO KEY UPDATE").bindparams(t=int(thread_id)))
+            with self._bounded_lock_wait(lock_timeout_ms):
+                # Step 1 of OFFER_LOCK_ORDER. FOR NO KEY UPDATE: it conflicts with itself
+                # and with the UPDATE the engine performs on the same row, which is exactly
+                # the mutual exclusion we want, without blocking readers.
+                self.db.execute(
+                    text("SELECT 1 FROM whatsapp_thread_states WHERE thread_id = :t "
+                         "FOR NO KEY UPDATE").bindparams(t=int(thread_id)))
             return None
         except Exception as exc:
             sqlstate = self.contention_sqlstate(exc)
@@ -464,7 +492,10 @@ class OfferLifecycle:
         if self._postgres():
             stmt = stmt.with_for_update()
         try:
-            offer = self.db.execute(stmt).scalars().first()
+            # R3A: step 2 carries its OWN bound, because step 1 no longer leaves one
+            # standing for the rest of the transaction.
+            with self._bounded_lock_wait(DEFAULT_OFFER_LOCK_TIMEOUT_MS):
+                offer = self.db.execute(stmt).scalars().first()
         except Exception as exc:
             # Step 2 of OFFER_LOCK_ORDER. With the order enforced this is a bounded WAIT
             # that timed out, not a deadlock — and it is a contention fact, so it answers

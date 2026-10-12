@@ -528,3 +528,187 @@ class R3DurabilityContract(OfferLifecycleRows):
             self.assertIsNone(self.offers.contention_sqlstate(_Exc(sqlstate)),
                               f"{sqlstate} was misread as contention")
         self.assertIsNone(self.offers.contention_sqlstate(ValueError("plain")))
+
+
+class R3AContentionScope(unittest.TestCase):
+    """R3A — WHICH turns may enter the booking lock order, decided without a database.
+
+    The R3 independent review measured what an unconditional acquisition cost: on the parent
+    a second conversation turn on the same thread completed in 0.05–0.20s while the first
+    held the thread for twelve seconds; with R3's turn-entry lock on every turn, that second
+    turn was DECLINED after 4.05s with `thread_contended`. An ordinary message never calls
+    `claim()`, so serialising it protected nothing and lost customer turns.
+
+    This suite lives here, not only in the PostgreSQL file, deliberately. The review's
+    MUT-D showed the sealed gate could not see R3's §D mechanism being deleted — all of its
+    coverage sat behind `G7P_PG_URL` and skipped. The PREDICATE is pure logic, so it is
+    tested where the default regression gate will actually run it.
+    """
+
+    def setUp(self):
+        from app.services.conversation_engine import ConversationEngine
+        self.CE = ConversationEngine
+
+    class _Ev:
+        def __init__(self, message_type="text", flow_response=None):
+            self.message_type = message_type
+            self.flow_response = flow_response
+
+    class _St:
+        def __init__(self, token=None):
+            self.flow_booking_token = token
+
+    def _is(self, event, state=None):
+        return self.CE._is_offer_acceptance_turn(
+            self.CE.__new__(self.CE), event, state or self._St())
+
+    BOOKING_PAYLOAD = {"nombre_apellido": "P C", "email": "p@e.t", "telefono": "5491100",
+                       "como_llego": "IG", "direccion": "Palermo 1",
+                       "tipo_vendedor": "particular"}
+
+    # ── the turns that must NOT take the booking lock ─────────────────────────
+
+    def test_r3a_01_ordinary_transports_never_enter_the_lock_order(self):
+        for kind in ("text", "audio", "image", "interactive", "button", "list", ""):
+            with self.subTest(message_type=kind):
+                self.assertFalse(self._is(self._Ev(kind)),
+                                 f"{kind!r} is not a booking writer and must not serialise")
+
+    def test_r3a_02_a_text_turn_carrying_a_payload_is_still_not_a_booking_turn(self):
+        """Only `message_type == "flow_response"` routes to `_process_flow_response`; a
+        payload on any other transport never reaches `claim()`."""
+        self.assertFalse(self._is(self._Ev("text", dict(self.BOOKING_PAYLOAD))))
+
+    def test_r3a_03_the_vehicle_clarification_flow_is_not_a_booking_turn(self):
+        self.assertFalse(self._is(self._Ev("flow_response", {"tipo_vehiculo": "AUTO"})))
+        self.assertFalse(self._is(self._Ev(
+            "flow_response", {"tipo_vehiculo": "MOTO", "marca": "Honda"})))
+
+    def test_r3a_04_the_location_clarification_flow_is_not_a_booking_turn(self):
+        self.assertFalse(self._is(self._Ev("flow_response", {"zona_general": "CABA"})))
+        self.assertFalse(self._is(self._Ev(
+            "flow_response", {"zona_general": "GBA_NORTE", "zona_detalle": "Tigre"})))
+
+    def test_r3a_05_the_motorcycle_contact_flow_is_not_a_booking_turn(self):
+        from app.services.conversation_engine import _MOTO_HANDOFF_TOKEN_PREFIX
+        state = self._St(_MOTO_HANDOFF_TOKEN_PREFIX + "abc123")
+        self.assertFalse(self._is(self._Ev(
+            "flow_response", dict(self.BOOKING_PAYLOAD)), state))
+
+    def test_r3a_06_an_empty_or_malformed_payload_is_not_a_booking_turn(self):
+        for payload in (None, {}, [], "", 0, "nombre_apellido"):
+            with self.subTest(payload=payload):
+                self.assertFalse(self._is(self._Ev("flow_response", payload)))
+
+    # ── the turns that MUST take it ───────────────────────────────────────────
+
+    def test_r3a_07_a_booking_flow_response_does_enter_the_lock_order(self):
+        """The one turn that can reach `claim()` and race the Data Exchange writer."""
+        self.assertTrue(self._is(self._Ev("flow_response", dict(self.BOOKING_PAYLOAD))))
+
+    def test_r3a_08_a_booking_response_with_an_unrelated_live_token_still_qualifies(self):
+        """A booking mirror that is NOT the motorcycle family is a booking turn, and so is
+        one with no mirror at all — the latter still calls `claim()`, which fails closed."""
+        for token in (None, "", "bk-1234567890-abcdef"):
+            with self.subTest(mirror=token):
+                self.assertTrue(self._is(
+                    self._Ev("flow_response", dict(self.BOOKING_PAYLOAD)),
+                    self._St(token)))
+
+    def test_r3a_09_the_predicate_agrees_with_the_engine_s_own_routing_order(self):
+        """The discriminators and their ORDER are the same ones `_process_flow_response`
+        routes on. If that routing is ever reordered, this test is the thing that notices
+        the predicate no longer describes where the turn goes."""
+        import inspect
+        src = inspect.getsource(self.CE._process_flow_response)
+        head = src[:src.index("G3-7P: FAIL-CLOSED ACCEPTANCE")]
+        self.assertLess(head.index("_MOTO_HANDOFF_TOKEN_PREFIX"),
+                        head.index('"tipo_vehiculo" in flow_data'))
+        self.assertLess(head.index('"tipo_vehiculo" in flow_data'),
+                        head.index('"zona_general" in flow_data'))
+        pred = inspect.getsource(self.CE._is_offer_acceptance_turn)
+        for token in ('"flow_response"', '"tipo_vehiculo"', '"zona_general"',
+                      "_MOTO_HANDOFF_TOKEN_PREFIX"):
+            self.assertIn(token, pred)
+        self.assertNotIn("lower()", pred, "the predicate must not read customer prose")
+
+    # ── the bound is scoped to an acquisition, not to a turn ──────────────────
+
+    def test_r3a_10_the_bounded_wait_is_a_no_op_without_row_locks(self):
+        """SQLite has nothing to bound, so the context manager must not touch the session —
+        and must still yield, or every booking on this engine would break."""
+        from app.services.offer_lifecycle import (DEFAULT_OFFER_LOCK_TIMEOUT_MS,
+                                                  OfferLifecycle)
+        executed = []
+
+        class _Db:
+            def execute(self, *a, **k):
+                executed.append(a)
+                raise AssertionError("the no-op path must issue no SQL")
+
+            def get_bind(self):
+                class _B:
+                    class dialect:
+                        name = "sqlite"
+                return _B()
+
+        lifecycle = OfferLifecycle(_Db())
+        entered = []
+        with lifecycle._bounded_lock_wait(DEFAULT_OFFER_LOCK_TIMEOUT_MS):
+            entered.append(True)
+        self.assertEqual(entered, [True])
+        self.assertEqual(executed, [])
+
+    def test_r3a_11_the_bound_is_set_then_restored_around_the_acquisition(self):
+        """R3 left `SET LOCAL lock_timeout` standing for the rest of the transaction, so a
+        booking turn's bound governed every later statement in it. The set/restore pair is
+        what keeps it on the acquisition it was chosen for."""
+        from app.services.offer_lifecycle import OfferLifecycle
+        issued = []
+
+        class _Db:
+            def execute(self, stmt, *a, **k):
+                issued.append(str(stmt))
+
+            def get_bind(self):
+                class _B:
+                    class dialect:
+                        name = "postgresql"
+                return _B()
+
+        with OfferLifecycle(_Db())._bounded_lock_wait(4000):
+            self.assertEqual(len(issued), 1)
+            self.assertIn("SET LOCAL lock_timeout = 4000", issued[0])
+        self.assertEqual(len(issued), 2)
+        self.assertIn("SET LOCAL lock_timeout = DEFAULT", issued[1])
+
+    def test_r3a_12_the_bound_is_restored_even_when_the_acquisition_fails(self):
+        from app.services.offer_lifecycle import OfferLifecycle
+        issued = []
+
+        class _Db:
+            def execute(self, stmt, *a, **k):
+                issued.append(str(stmt))
+
+            def get_bind(self):
+                class _B:
+                    class dialect:
+                        name = "postgresql"
+                return _B()
+
+        with self.assertRaises(RuntimeError):
+            with OfferLifecycle(_Db())._bounded_lock_wait(4000):
+                raise RuntimeError("the acquisition timed out")
+        self.assertIn("SET LOCAL lock_timeout = DEFAULT", issued[-1])
+
+    def test_r3a_13_a_contended_booking_turn_is_still_an_owned_turn(self):
+        """R3A narrows WHO contends; it must not change what a real contention means. An
+        unhandled action takes n8n's legacy booking chain."""
+        from app.schemas.conversation import ACTION_THREAD_CONTENDED, HANDLED_ACTIONS
+        from app.services.conversation_engine import _out
+        self.assertIn(ACTION_THREAD_CONTENDED, HANDLED_ACTIONS)
+        out = _out(ACTION_THREAD_CONTENDED, detail="OFFER_CONTENDED")
+        self.assertTrue(out.handled)
+        self.assertTrue(out.reply_required)
+        self.assertFalse(out.reply_produced)
+        self.assertNotEqual(out.action, "error")
