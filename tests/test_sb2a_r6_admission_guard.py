@@ -141,12 +141,15 @@ class _Truthy:
 
 
 def _columns_by_type():
-    """One real Revision data column per SQL type name the admission table covers."""
+    """One real Revision data column per SQL type name the admission table covers.
+    SB2A-R7: `timestamptz` columns admit no booking-command value at all (test_sb2a_r7 r7_07),
+    so the DateTime representative is a `timestamp without time zone` column."""
     from app.models import Revision as R
     out = {}
     for name in sorted(ba._revision_data_columns()):
-        tname = type(R.__table__.c[name].type).__name__
-        if tname in ba._COLUMN_PY:
+        col_type = R.__table__.c[name].type
+        tname = type(col_type).__name__
+        if tname in ba._COLUMN_PY and not getattr(col_type, "timezone", False):
             out.setdefault(tname, name)
     return out
 

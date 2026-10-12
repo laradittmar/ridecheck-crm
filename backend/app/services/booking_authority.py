@@ -620,6 +620,13 @@ def _revision_field_ok(name: str, value) -> bool:
     # identity test, so a metaclass `__eq__` would run here and could admit a subclass.
     if allowed is None or not any(type(value) is t for t in allowed):
         return False
+    if (type(value) is time or type(value) is datetime) and value.tzinfo is not None:
+        return False                                                   # SB2A-R7: naive only
+    if type(value) is datetime and getattr(col.type, "timezone", False):
+        # SB2A-R7: a timestamptz column holds an absolute instant. An aware value is refused
+        # above and a naive one would be read in the database session's timezone, so no
+        # booking command may set one (they belong to the appointment-approval workflow).
+        return False
     if type(value) is str:
         return _ok_str(value, ("Revision", name))
     return True
@@ -647,6 +654,7 @@ _PLAN_CLASSES.update({c.__name__: c for c in (
 
 _CAPTURE_FAILED = object()      # sentinel: a structurally invalid caller object
 _UNADMITTED = object()          # sentinel: a container that was not an exact built-in dict
+_NON_STR_KEYS = object()        # sentinel: an exact dict with a key that was not an exact str
 
 
 def _owned_fields(obj, cls) -> Optional[dict]:
@@ -707,8 +715,67 @@ def _capture_command(cmd) -> Optional["BookingCommand"]:
     rf = vals["revision_fields"]
     # SB2A-R6: a READ-ONLY view of a private copy. Nothing else references the copy, so after
     # capture no caller and no later step can add, change or remove a field.
-    vals["revision_fields"] = MappingProxyType(dict.copy(rf)) if type(rf) is dict else _UNADMITTED
+    # SB2A-R7: values are rebuilt by `_capture_temporal`. Writing them back hashes the keys, so
+    # that only happens once every key is an exact `str` (C hash, no caller code); any other
+    # key makes the whole mapping unadmitted, as `_validate` would refuse it anyway.
+    if type(rf) is dict:
+        rf = dict.copy(rf)
+        if all(type(k) is str for k in rf):
+            for k in rf:
+                rf[k] = _capture_temporal(rf[k])
+            vals["revision_fields"] = MappingProxyType(rf)
+        else:
+            vals["revision_fields"] = _NON_STR_KEYS
+    else:
+        vals["revision_fields"] = _UNADMITTED
+    for name in _COMMAND_TEMPORALS:
+        vals[name] = _capture_temporal(vals[name])
     return BookingCommand(**vals)
+
+
+# ── SB2A-R7: temporal values are rebuilt, never shared ──────────────────────
+#
+# An exact `time`/`datetime` still carries a `tzinfo`, which is any object the caller chose and
+# whose methods are caller code. Every booking date and time is a LOCAL CIVIL value, and no
+# authority caller supplies an aware value, so the rule is representational: a temporal value
+# is accepted only when naive, and it is REBUILT from its components at capture. An aware value
+# is replaced by `_AWARE_TEMPORAL` and refused before the transaction scope. Only C-level
+# component getters are read (`tzinfo` included); no `tzinfo` method is ever called.
+
+_AWARE_TEMPORAL = object()      # sentinel: a time/datetime that arrived with a tzinfo
+_COMMAND_TEMPORALS = ("requested_date", "requested_time")
+
+
+def _capture_temporal(value):
+    t = type(value)
+    if t is date:
+        return date(value.year, value.month, value.day)
+    if t is time:
+        if value.tzinfo is not None:
+            return _AWARE_TEMPORAL
+        return time(value.hour, value.minute, value.second, value.microsecond, fold=value.fold)
+    if t is datetime:
+        if value.tzinfo is not None:
+            return _AWARE_TEMPORAL
+        return datetime(value.year, value.month, value.day, value.hour, value.minute,
+                        value.second, value.microsecond, fold=value.fold)
+    return value
+
+
+def _temporal_refusal(cmd: "BookingCommand") -> Optional[str]:
+    """The refusal reason if the CAPTURED command holds an aware temporal value, else None.
+    Reads only the authority's own captured objects, by identity."""
+    values = object.__getattribute__(cmd, "__dict__")
+    for name in _COMMAND_TEMPORALS:
+        if values.get(name) is _AWARE_TEMPORAL:
+            return f"TEMPORAL_NOT_NAIVE:{name}"
+    rf = values.get("revision_fields")
+    if type(rf) is MappingProxyType:
+        for k, v in rf.items():
+            if v is _AWARE_TEMPORAL:
+                return f"TEMPORAL_NOT_NAIVE:revision_fields.{k}" if type(k) is str \
+                    else "TEMPORAL_NOT_NAIVE:revision_fields"
+    return None
 
 
 # ── SB2A-R6 (F-02): the capture is a capability, not a convention ───────────
@@ -727,6 +794,9 @@ class _CapturedCall:
         raise TypeError("_CapturedCall is minted only by _capture_call")
 
     def __setattr__(self, name, value):
+        raise AttributeError("_CapturedCall is immutable")
+
+    def __delattr__(self, name):
         raise AttributeError("_CapturedCall is immutable")
 
     def __reduce__(self):                     # no pickling/copying into a second capability
@@ -974,6 +1044,10 @@ class BookingAuthority:
         del call
         if cmd is None:
             return _result(BookingOutcome.VALIDATION_FAILED, "COMMAND_NOT_DATA")
+        temporal = _temporal_refusal(cmd)           # SB2A-R7: before the transaction scope
+        if temporal:
+            return _result(BookingOutcome.VALIDATION_FAILED, temporal,
+                           idempotency_key=_safe_key(cmd))
         lock_mode: Optional[str] = None
         fingerprint = ""
         identity_outcome: Optional[str] = None
@@ -1370,6 +1444,8 @@ class BookingAuthority:
         if type(cmd) is not BookingCommand:
             raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, "COMMAND_NOT_DATA"))
         values = object.__getattribute__(cmd, "__dict__")
+        if values.get("revision_fields") is _NON_STR_KEYS:
+            raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, "COMMAND_NOT_DATA:revision_fields"))
         if type(values.get("operation")) is not BookingOperation \
                 or type(values.get("source")) is not BookingSource \
                 or type(values.get("revision_fields")) is not MappingProxyType:
@@ -1378,7 +1454,8 @@ class BookingAuthority:
             if not _field_ok(kind, nullable, extra, values.get(name)):
                 raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, f"COMMAND_NOT_DATA:{name}"))
         for name, kind in (("requested_date", date), ("requested_time", time)):
-            if values.get(name) is not None and type(values[name]) is not kind:
+            if values.get(name) is not None and (type(values[name]) is not kind or (
+                    kind is time and values[name].tzinfo is not None)):
                 raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, f"COMMAND_NOT_DATA:{name}"))
         allowed = _revision_data_columns()
         for k, v in values["revision_fields"].items():
