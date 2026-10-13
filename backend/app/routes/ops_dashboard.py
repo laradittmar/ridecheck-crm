@@ -880,17 +880,27 @@ def get_turns(
 
 
 #: G3-7R/S9. The columns an operator may read off an offer, and the ONLY ones. The raw
-#: token does not exist in the database to be selected; `token_fingerprint` is included
-#: because the page renders a short prefix of it, which identifies an offer among a
-#: thread's handful without being usable as a key against anything else.
+#: token does not exist in the database to be selected.
+#:
+#: R2/RV-05. `token_fingerprint` is NOT on this list any more. The HTML page truncated it
+#: to twelve characters with a stated rationale — a fingerprint is a matching key, not
+#: something an operator reads in full — and the JSON endpoint returned all 64, so the
+#: surface that shares this accessor contradicted the rationale that justified including
+#: the column. The prefix is derived below instead, so neither surface can emit the whole
+#: value and a future reader cannot reintroduce it by reading the field list alone.
 _OFFER_FIELDS = (
     "id", "thread_id", "cycle_key", "candidate_id", "tipo_vehiculo", "zone_group",
     "zone_detail", "offered_date", "offered_time", "flow_id", "contract_version",
-    "token_fingerprint", "status", "issued_at", "expires_at", "terminal_at", "accepted_at",
+    "status", "issued_at", "expires_at", "terminal_at", "accepted_at",
     "terminal_reason", "refused_count", "last_refusal", "last_refused_at",
     "replay_count", "last_replay_at", "accepted_revision_id",
     "accepted_thread_revision_id",
 )
+
+#: How much of `sha256(token)` an operator needs: enough to tell a thread's handful of
+#: offers apart and to match a log line, and no more. Twelve hex characters is what the
+#: page already rendered.
+OFFER_FINGERPRINT_PREFIX_LEN = 12
 
 
 def _offer_dict(row) -> dict:
@@ -899,8 +909,15 @@ def _offer_dict(row) -> dict:
     Explicit rather than reflective on purpose: a column added to the table later must be
     chosen for this surface, not inherited by it. That is what keeps a future column
     carrying something private from appearing on an operator page by default.
+
+    The token fingerprint appears only as `token_fingerprint_prefix` — the minimum needed
+    for correlation (R2/RV-05).
     """
-    return {name: getattr(row, name, None) for name in _OFFER_FIELDS}
+    out = {name: getattr(row, name, None) for name in _OFFER_FIELDS}
+    raw = getattr(row, "token_fingerprint", None)
+    out["token_fingerprint_prefix"] = (
+        str(raw)[:OFFER_FINGERPRINT_PREFIX_LEN] if raw else None)
+    return out
 
 
 def read_offers(db: Session, *, thread_id: Optional[int] = None,

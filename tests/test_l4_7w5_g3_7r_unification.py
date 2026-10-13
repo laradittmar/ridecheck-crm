@@ -377,6 +377,152 @@ class OneLockOrderForEveryWriter(unittest.TestCase):
                         "no external I/O may happen inside the booking transaction")
 
 
+# ══ R2 — the bound covers every exit, and the writer list is complete ════════
+
+class R2BoundsCoverEveryExit(unittest.TestCase):
+    """The sealed half of the R2 correction. The bounds themselves are measured on real
+    PostgreSQL in `test_l4_7w5_g3_7r_r2_refusal_bounds_pg.py`; these assert the STRUCTURE
+    that made the measurement come out right, so a future edit that reopens the defect
+    fails here even where no disposable database is available.
+    """
+
+    def test_r2_01_every_DECLARED_offer_writer_requires_resource_1(self):
+        """MUTATION ORACLE for required mutations 6 and 7 (RV-02), structural half.
+
+        G3-7R's docstring said "every writer". The independent review inventoried four that
+        did not: `record_replay`, `_refuse`, `record_refusal` and
+        `record_refusal_out_of_band`, and reproduced `40P01` on demand in the inverse order.
+        `OFFER_WRITERS` now NAMES them all, and this walks the list — so a tenth writer
+        added without the acquisition fails the gate instead of silently widening it.
+        """
+        from app.services.offer_lifecycle import OFFER_WRITERS, OfferLifecycle
+        for name in OFFER_WRITERS:
+            with self.subTest(writer=name):
+                src = _code(getattr(OfferLifecycle, name))
+                acquires = ("_require_thread_state(" in src
+                            or "_acquire_thread_state(" in src
+                            # `claim` enters through `_claim_checks`, which is itself in
+                            # this list and is therefore checked directly. One delegation,
+                            # named, and no other.
+                            or (name == "claim" and "_claim_checks(" in src))
+                self.assertTrue(
+                    acquires,
+                    f"{name} writes whatsapp_booking_offers without entering "
+                    f"OFFER_LOCK_ORDER — the inverse order deadlocks 40P01")
+
+    def test_r2_02_the_declared_writer_list_is_the_actual_writer_list(self):
+        """A declaration that drifts from the code is worse than no declaration."""
+        import re
+        from app.services import offer_lifecycle as mod
+        from app.services.offer_lifecycle import OFFER_WRITERS, OfferLifecycle
+        source = _code(OfferLifecycle)
+        # Every method that issues an UPDATE or INSERT against the offer table.
+        found = set()
+        for name, fn in vars(OfferLifecycle).items():
+            if not callable(fn) or name.startswith("__"):
+                continue
+            try:
+                body = _code(fn)
+            except (OSError, TypeError):            # pragma: no cover - defensive
+                continue
+            if re.search(r"\b(update|insert)\(\s*O\b", body) or "db.add(" in body:
+                found.add(name)
+        self.assertEqual(found - set(OFFER_WRITERS), set(),
+                         "an offer-table writer is missing from OFFER_WRITERS")
+        self.assertEqual(len(OFFER_WRITERS), len(set(OFFER_WRITERS)))
+
+    def test_r2_03_the_bounded_entry_precedes_EVERY_admission_outcome(self):
+        """MUTATION ORACLE for required mutation 3 (RV-01).
+
+        All three answers persist something — a refusal counter, a replay counter or a
+        booking — so all three are writers. G3-7R entered the order only for the granted
+        one, and the review measured the other two at 42s against a 12s hold.
+        """
+        from app.services.conversation_engine import ConversationEngine
+        src = _code(ConversationEngine._process_flow_response)
+        entry = src.index("begin_offer_transaction(")
+        for branch in ("if _adm.replay:", "if not _adm.granted:"):
+            with self.subTest(branch=branch):
+                self.assertLess(entry, src.index(branch),
+                                f"{branch} is reached before the bounded entry — its "
+                                f"first write would wait with no bound in force")
+
+    def test_r2_04_a_contended_turn_mutates_nothing(self):
+        """Contention is not a refusal: no counter moves, and the cursor is not consumed."""
+        from app.services.conversation_engine import ConversationEngine
+        src = _code(ConversationEngine._process_flow_response)
+        head, _sep, tail = src.partition("if _contended is not None:")
+        contended_block = tail.split("if _adm.replay:")[0]
+        self.assertTrue(_sep, "the contended branch disappeared")
+        for forbidden in ("record_refusal", "record_replay", "finalise_admission_refusal",
+                          "needs_human"):
+            self.assertNotIn(forbidden, contended_block,
+                             f"a contended turn must not {forbidden}")
+        self.assertIn("ACTION_THREAD_CONTENDED", contended_block)
+
+    def test_r2_05_the_data_exchange_command_enters_the_order_before_refusing(self):
+        """MUTATION ORACLE for required mutation 4. Both transports, or only half a fix."""
+        from app.services.booking_flow_service import BookingFlowService
+        src = _code(BookingFlowService.handle_confirm_booking)
+        self.assertLess(src.index("begin_offer_transaction("),
+                        src.index("if not _adm.granted:"),
+                        "the DX refusal path writes before the bound is in force")
+
+    def test_r2_06_resolution_is_READ_ONLY(self):
+        """MUTATION ORACLE for required mutation 9 (RV-07).
+
+        `resolve_context` is reached from `handle_init`, `handle_date_selected` and
+        `handle_prepare_summary`, none of which is a command. G3-7R had it count the replay
+        and COMMIT, so resolving a context could commit whatever the caller had pending.
+        """
+        from app.services.booking_flow_service import BookingFlowService
+        src = _code(BookingFlowService.resolve_context)
+        for forbidden in ("self.db.commit()", "record_replay("):
+            self.assertNotIn(forbidden, src,
+                             f"resolve_context must not {forbidden} — it resolves, it does "
+                             f"not command")
+        self.assertIn("BookingAlreadyCompletedError", src, "it must still DETECT the replay")
+
+    def test_r2_07_the_command_boundary_is_where_the_replay_is_counted(self):
+        """The other half of RV-07: moved, not dropped."""
+        from app.services.booking_flow_service import BookingFlowService
+        self.assertIn("_count_replay_at_command_boundary(",
+                      _code(BookingFlowService.handle_confirm_booking))
+        src = _code(BookingFlowService._count_replay_at_command_boundary)
+        self.assertIn("record_replay(", src)
+        self.assertIn("begin_offer_transaction(", src,
+                      "the counter must be written inside the canonical bounded order")
+        self.assertIn("thread_id", src)
+
+    def test_r2_08_the_replay_carries_its_thread_so_the_boundary_can_enter_the_order(self):
+        from app.services.booking_flow_service import BookingAlreadyCompletedError
+        exc = BookingAlreadyCompletedError(offer_id=7, thread_revision_id=8, revision_id=9,
+                                          thread_id=11)
+        self.assertEqual((exc.offer_id, exc.thread_id), (7, 11))
+        # Defaults stay None so an older raiser cannot silently acquire a wrong thread.
+        self.assertIsNone(BookingAlreadyCompletedError().thread_id)
+
+    def test_r2_09_the_preparatory_statements_do_not_flush_the_callers_writes(self):
+        """MUTATION ORACLES for required mutations 1 and 2, structural half.
+
+        The whole RV-01 defect in one ordering: `SHOW lock_timeout` autoflushed the turn's
+        pending dedup-cursor UPDATE before `SET LOCAL lock_timeout` existed.
+        """
+        from app.services.offer_lifecycle import OfferLifecycle
+        src = _code(OfferLifecycle._bounded_lock_wait)
+        self.assertIn("with self.db.no_autoflush:", src)
+        self.assertLess(src.index("with self.db.no_autoflush:"),
+                        src.index('SHOW lock_timeout'),
+                        "the SHOW must sit INSIDE the autoflush suppression")
+        self.assertLess(src.index("SET LOCAL lock_timeout = %d"),
+                        src.index("self.db.flush()"),
+                        "the caller's writes must flush AFTER the bound is set")
+        # The LAST `yield` is the guarded one; the first belongs to the non-PostgreSQL
+        # early return, which has no bound to be inside of.
+        self.assertLess(src.index("self.db.flush()"), src.rindex("yield"),
+                        "and before the guarded statement runs")
+
+
 # ══ S6 — replay is not a refusal ═════════════════════════════════════════════
 
 class ReplayIsNotARefusal(unittest.TestCase):
@@ -461,7 +607,10 @@ class OperatorSurface(unittest.TestCase):
         row = dict(id=7, thread_id=3, cycle_key=0, candidate_id=11, tipo_vehiculo="AUTO",
                    zone_group="CABA", zone_detail="Palermo", offered_date="2026-11-10",
                    offered_time="10:00", flow_id="28104222025943520",
-                   contract_version="offer/1.0", token_fingerprint="f" * 64,
+                   contract_version="offer/1.0",
+                   # R2/RV-05: the accessor emits only the prefix, so the row the view
+                   # receives never carries the full value in the first place.
+                   token_fingerprint_prefix="f" * 12,
                    status="ISSUED", issued_at="2026-11-01T10:00:00Z", expires_at=None,
                    terminal_at=None, accepted_at=None, terminal_reason=None,
                    refused_count=0, last_refusal=None, last_refused_at=None,
@@ -484,13 +633,40 @@ class OperatorSurface(unittest.TestCase):
     def test_g37r_view_02_no_raw_token_no_secret_no_full_fingerprint(self):
         from app.ui.offer_authority_view import (fingerprint_prefix,
                                                  render_offer_detail_page)
-        page = render_offer_detail_page(self._row(token_fingerprint="f" * 64))
+        page = render_offer_detail_page(self._row())
         self.assertNotIn("f" * 64, page, "the full fingerprint must not be rendered")
         self.assertIn("f" * 12, page, "a short prefix is still useful to an operator")
+        # Defensive even when handed too much, because the page is the last line.
         self.assertEqual(fingerprint_prefix("a" * 64), "a" * 12 + "⋯")
         self.assertEqual(fingerprint_prefix(None), "—")
         for forbidden in ("wamid.", "-----BEGIN", "sk-", "549"):
             self.assertNotIn(forbidden, page, forbidden)
+
+    def test_g37r_view_02b_the_ACCESSOR_minimises_so_the_API_cannot_leak(self):
+        """MUTATION ORACLE for required mutation 8 (R2/RV-05).
+
+        The independent review found the page truncating the fingerprint to twelve
+        characters with a stated rationale while `/api/ops/offers`, which shares the same
+        accessor, returned all sixty-four. Minimisation now happens in the accessor, so the
+        field list itself no longer carries the full value and neither surface can emit it.
+        """
+        from app.routes.ops_dashboard import (OFFER_FINGERPRINT_PREFIX_LEN, _OFFER_FIELDS,
+                                              _offer_dict)
+        import types
+        self.assertNotIn("token_fingerprint", _OFFER_FIELDS,
+                         "the full fingerprint must not be a selectable operator field")
+        full = "e" * 64
+        row = types.SimpleNamespace(token_fingerprint=full)
+        for name in _OFFER_FIELDS:
+            setattr(row, name, None)
+        row.token_fingerprint = full
+        emitted = _offer_dict(row)
+        self.assertNotIn("token_fingerprint", emitted)
+        self.assertEqual(emitted["token_fingerprint_prefix"],
+                         full[:OFFER_FINGERPRINT_PREFIX_LEN])
+        self.assertNotIn(full, str(emitted), "no surface may carry the whole fingerprint")
+        row.token_fingerprint = None
+        self.assertIsNone(_offer_dict(row)["token_fingerprint_prefix"])
 
     def test_g37r_view_03_the_six_lifecycle_states_are_distinguishable(self):
         from app.ui.offer_authority_view import STATUS_LABELS, outcome_of

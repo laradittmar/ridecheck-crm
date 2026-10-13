@@ -151,13 +151,18 @@ def _page(title: str, body: str) -> str:
 
 
 def fingerprint_prefix(value: Optional[str]) -> str:
-    """The first 12 hex characters of `sha256(token)`, and never more.
+    """Render the already-minimised fingerprint prefix, and never more.
 
     The raw token is not in the database to leak, and the full fingerprint is not needed to
     read a page: twelve characters identify an offer among a thread's handful of them and
     let an operator match a log line, while being useless as a matching key against anything
     else. The suffix is elided visibly, so nothing on this page can be mistaken for a
     complete credential.
+
+    R2/RV-05. The truncation now happens in the ACCESSOR, so the JSON endpoint that shares
+    it cannot emit the full value either. This function renders what it is handed and
+    re-truncates defensively, rather than being the only place minimisation happens — the
+    independent review found the page truncating and the API not.
     """
     if not value:
         return "—"
@@ -241,7 +246,8 @@ def _offer_card(row: dict, *, booking_flow_id=None) -> str:
                               'elegido otro horario en el Flow)</span>'),
         ("Ciclo", _e(row.get("cycle_key"))),
         ("Huella del token", f'<span class="mono">'
-                             f'{fingerprint_prefix(row.get("token_fingerprint"))}</span>'),
+                             f'{fingerprint_prefix(row.get("token_fingerprint_prefix"))}'
+                             f'</span>'),
         ("Rechazos", f'{_e(row.get("refused_count"))}'
                      + (f' · último: {html.escape(REFUSAL_LABELS.get(str(refusal), str(refusal)))}'
                         if refusal else "")),

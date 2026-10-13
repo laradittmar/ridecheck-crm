@@ -416,6 +416,11 @@ class WhatsAppThreadCandidate(Base):
     )
 
 
+#: R2/RV-04. The ONE name for the booking projection's foreign key. Declared beside the
+#: model and imported by the migration, so the two cannot drift again.
+BOOKING_PROJECTION_FK = "fk_thread_revisions_offer_id"
+
+
 class ThreadRevision(Base):
     __tablename__ = "thread_revisions"
     __table_args__ = (
@@ -444,8 +449,14 @@ class ThreadRevision(Base):
     #: partial so any number of those may coexist. `ondelete` is deliberately absent: an
     #: offer row is history and is never deleted, and if one ever were, losing the link
     #: silently would destroy the audit trail the whole table exists for.
+    #: R2/RV-04. The constraint is NAMED, and named the same thing the migration names it.
+    #: Left implicit, SQLAlchemy generated `thread_revisions_offer_id_fkey` while the
+    #: migration created `fk_thread_revisions_offer_id`, so a database built by
+    #: `create_all` and one built by Alembic disagreed about the identifier — and
+    #: `downgrade()` drops by the migration's name. Same defect class as SAA-F10.
     offer_id: Mapped[Optional[int]] = mapped_column(
-        ForeignKey("whatsapp_booking_offers.id"), nullable=True)
+        ForeignKey("whatsapp_booking_offers.id", name=BOOKING_PROJECTION_FK),
+        nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="collecting_data", server_default="collecting_data")
     buyer_name: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
     buyer_phone: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)

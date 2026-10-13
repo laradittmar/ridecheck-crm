@@ -117,11 +117,35 @@ OFFER_CONTRACT_VERSION = "offer/1.0"
 #: `whatsapp_thread_states` AT COMMIT — so ISSUE took the two resources in the opposite
 #: order and the acceptance writer was the victim every time, reported as OFFER_CONTENDED.
 #:
-#: So the order is acquired by `_acquire_thread_state()` at the top of every transition
-#: below — issue, supersede, withdraw, expire, claim, consume and refusal bookkeeping —
-#: and a `40P01` is now a PROTOCOL BUG rather than a contention fact, which is why it
-#: carries its own typed refusal (`OFFER_DEADLOCK`) and logs at ERROR.
+#: So the order is acquired by `_acquire_thread_state()` / `_require_thread_state()` at the
+#: top of EVERY persisted mutation of this table, and a `40P01` is now a PROTOCOL BUG
+#: rather than a contention fact — which is why it carries its own typed refusal
+#: (`OFFER_DEADLOCK`) and logs at ERROR.
+#:
+#: R2/RV-02 MADE THAT SENTENCE TRUE. G3-7R declared it for "every writer" and enforced it
+#: for five: `issue`, `_terminalise` (withdraw / supersede / expire), `consume`,
+#: `refine_terminal_reason` and `claim`. The independent review inventoried four more that
+#: wrote the offer table without entering the order at all — `record_replay`, `_refuse`,
+#: `record_refusal` and `record_refusal_out_of_band` — and showed that the inverse order
+#: deadlocks `40P01` on demand. They were safe only because no call site happened to follow
+#: them with a thread-state write, which is a property of today's callers rather than of
+#: the protocol. All nine now take resource 1 first.
+#:
+#: The list below is therefore executable, not aspirational: `OFFER_WRITERS` names every
+#: persisted mutation of `whatsapp_booking_offers`, and the suite asserts that each one
+#: acquires resource 1 — so a tenth writer added without it fails the gate instead of
+#: silently widening the surface.
 OFFER_LOCK_ORDER = ("whatsapp_thread_states", "whatsapp_booking_offers")
+
+#: Every method on `OfferLifecycle` that persists a mutation of `whatsapp_booking_offers`.
+#: Declared here so the invariant above has a subject the tests can enumerate.
+#: `claim` is listed because it issues the ACCEPTED transition itself; it enters the order
+#: through `_claim_checks`, which is listed in its own right because `_refuse` writes from
+#: inside it. The test that walks this list accepts that one delegation and no other.
+OFFER_WRITERS = (
+    "issue", "_terminalise", "consume", "refine_terminal_reason", "claim", "_claim_checks",
+    "_refuse", "record_refusal", "record_replay", "record_refusal_out_of_band",
+)
 
 #: S1. The name of the partial unique index that IS the one-offer/one-booking guarantee.
 #: Declared here, beside the authority, so the model, the migration and the one function
@@ -663,33 +687,51 @@ class OfferLifecycle:
             yield
             return
         prior = None
-        try:
-            raw = self.db.execute(text("SHOW lock_timeout")).scalar()
-            candidate = str(raw).strip() if raw is not None else ""
-            # Only a value that IS a PostgreSQL timeout literal may be re-inlined. `SET`
-            # takes no bind parameter, so this check is what keeps the statement closed.
-            if _PG_TIMEOUT_LITERAL.match(candidate):
-                prior = candidate
-            elif candidate:                         # pragma: no cover - defensive
-                logger.warning("OFFER lock_timeout %r is not a recognised literal — the "
-                               "bound will be restored as DEFAULT", candidate)
-        except Exception:                           # pragma: no cover - defensive
-            logger.debug("OFFER could not read lock_timeout", exc_info=True)
-        # The value is coerced to int here, so nothing caller-supplied reaches the
-        # statement as text.
-        self.db.execute(text("SET LOCAL lock_timeout = %d" % int(lock_timeout_ms)))
+        # ── R2/RV-01: THIS BLOCK'S OWN STATEMENTS MUST NOT FLUSH THE CALLER'S ──────
+        # `Session.execute` autoflushes, so reading `SHOW lock_timeout` could push out
+        # whatever the caller had pending — on a booking turn that is the dedup-cursor
+        # UPDATE on `whatsapp_thread_states` — BEFORE the bound exists. Measured on the
+        # granted path it happened not to; on the refusal paths it did, and the G3-7R
+        # independent review measured the result at 42s against a 12s hold where the
+        # parent answered in 4s.
+        #
+        # "Happened not to" is not a guarantee. Suppressing autoflush here makes the
+        # ordering structural: nothing of the caller's reaches the database until the
+        # bound is in force, whatever SQLAlchemy decides to flush on.
+        with self.db.no_autoflush:
+            try:
+                raw = self.db.execute(text("SHOW lock_timeout")).scalar()
+                candidate = str(raw).strip() if raw is not None else ""
+                # Only a value that IS a PostgreSQL timeout literal may be re-inlined.
+                # `SET` takes no bind parameter, so this check is what keeps the
+                # statement closed.
+                if _PG_TIMEOUT_LITERAL.match(candidate):
+                    prior = candidate
+                elif candidate:                     # pragma: no cover - defensive
+                    logger.warning("OFFER lock_timeout %r is not a recognised literal — "
+                                   "the bound will be restored as DEFAULT", candidate)
+            except Exception:                       # pragma: no cover - defensive
+                logger.debug("OFFER could not read lock_timeout", exc_info=True)
+            # The value is coerced to int here, so nothing caller-supplied reaches the
+            # statement as text.
+            self.db.execute(text("SET LOCAL lock_timeout = %d" % int(lock_timeout_ms)))
+        # The bound is now in force. The caller's pending writes are flushed DELIBERATELY,
+        # inside it, so a contended cursor write is a bounded 55P03 the caller's handler
+        # classifies as contention — never an open-ended wait.
+        self.db.flush()
         try:
             yield
         finally:
-            try:
-                if prior is None:
-                    self.db.execute(text("SET LOCAL lock_timeout = DEFAULT"))
-                else:
-                    self.db.execute(text("SET LOCAL lock_timeout = '%s'" % prior))
-            except Exception:
-                # The transaction is aborted or gone. Whatever the caller is about to see
-                # must be the ORIGINAL exception, never this one.
-                logger.debug("OFFER could not restore lock_timeout", exc_info=True)
+            with self.db.no_autoflush:
+                try:
+                    if prior is None:
+                        self.db.execute(text("SET LOCAL lock_timeout = DEFAULT"))
+                    else:
+                        self.db.execute(text("SET LOCAL lock_timeout = '%s'" % prior))
+                except Exception:
+                    # The transaction is aborted or gone. Whatever the caller is about to
+                    # see must be the ORIGINAL exception, never this one.
+                    logger.debug("OFFER could not restore lock_timeout", exc_info=True)
 
     # ── step 1 of OFFER_LOCK_ORDER, for every writer (S1) ────────────────────
 
@@ -848,7 +890,7 @@ class OfferLifecycle:
             zone_detail=offer.zone_detail, cycle_key=offer.cycle_key,
             offered_date=offer.offered_date, offered_time=offer.offered_time)
 
-    def record_replay(self, offer_id: int) -> None:
+    def record_replay(self, offer_id: int, *, thread_id: int) -> None:
         """Count a replay against its offer, so an operator can tell one from an acceptance.
 
         S6. A replay is NOT a refusal: it never touches `refused_count` or `last_refusal`,
@@ -856,13 +898,21 @@ class OfferLifecycle:
         arriving after the booking committed left the offer reading
         `ACCEPTED, refused_count=1, last_refusal='OFFER_ALREADY_ACCEPTED'`, the shape of a
         rejected submission on the happy path.
+
+        R2/RV-02. `thread_id` is now required, and resource 1 is taken before the write.
+        This was one of four bookkeeping writers that mutated the offer table without
+        entering the declared lock order at all; the independent review showed the inverse
+        order deadlocks `40P01` on demand, so "no writer currently follows this with a
+        thread-state write" was a property of today's call sites, not of the protocol.
         """
         from ..models import WhatsAppBookingOffer as O
+        self._require_thread_state(int(thread_id))
         try:
-            self.db.execute(
-                update(O).where(O.id == int(offer_id))
-                .values(replay_count=(O.replay_count + 1), last_replay_at=self._now())
-                .execution_options(synchronize_session="fetch"))
+            with self._bounded_lock_wait(DEFAULT_OFFER_LOCK_TIMEOUT_MS):
+                self.db.execute(
+                    update(O).where(O.id == int(offer_id))
+                    .values(replay_count=(O.replay_count + 1), last_replay_at=self._now())
+                    .execution_options(synchronize_session="fetch"))
         except Exception:                      # auditing must never widen authority
             logger.warning("OFFER replay not recorded offer_id=%s", offer_id, exc_info=True)
 
@@ -1088,12 +1138,17 @@ class OfferLifecycle:
         the offer because that is the thing the submission was refused against.
         """
         from ..models import WhatsAppBookingOffer as O
+        # R2/RV-02. Resource 1 first. Free here in practice — every caller reaches this
+        # through `_claim_checks`, which has already taken it — and the point is that the
+        # order is now enforced by the writer rather than inferred from its callers.
+        self._require_thread_state(int(offer.thread_id))
         try:
-            self.db.execute(
-                update(O).where(O.id == offer.id)
-                .values(refused_count=(O.refused_count + 1), last_refusal=refusal[:64],
-                        last_refused_at=self._now())
-                .execution_options(synchronize_session="fetch"))
+            with self._bounded_lock_wait(DEFAULT_OFFER_LOCK_TIMEOUT_MS):
+                self.db.execute(
+                    update(O).where(O.id == offer.id)
+                    .values(refused_count=(O.refused_count + 1), last_refusal=refusal[:64],
+                            last_refused_at=self._now())
+                    .execution_options(synchronize_session="fetch"))
         except Exception:                      # auditing must never widen authority
             logger.warning("OFFER refusal not recorded offer_id=%s", offer.id, exc_info=True)
         return OfferClaim(False, refusal, offer_id=offer.id, fingerprint=fingerprint,
@@ -1170,9 +1225,10 @@ class OfferLifecycle:
             self._terminalise(thread_id, status=OfferStatus.EXPIRED,
                               reason=OfferRefusal.OFFER_EXPIRED)
             self._clear_mirror(state)
-        self.record_refusal(getattr(admission, "offer_id", None), refusal)
+        self.record_refusal(getattr(admission, "offer_id", None), refusal,
+                            thread_id=thread_id)
 
-    def record_refusal(self, offer_id, refusal: str) -> None:
+    def record_refusal(self, offer_id, refusal: str, *, thread_id: int) -> None:
         """Record a refusal against the offer it refused, IN the caller's transaction.
 
         S2. `_refuse()` does this for the refusals `claim()` decides; admission and the
@@ -1186,32 +1242,63 @@ class OfferLifecycle:
         from ..models import WhatsAppBookingOffer as O
         if offer_id is None or not refusal:
             return
+        # R2/RV-02: resource 1 before the offer row, like every other writer.
+        self._require_thread_state(int(thread_id))
         try:
-            self.db.execute(
-                update(O).where(O.id == int(offer_id))
-                .values(refused_count=(O.refused_count + 1), last_refusal=refusal[:64],
-                        last_refused_at=self._now())
-                .execution_options(synchronize_session="fetch"))
+            with self._bounded_lock_wait(DEFAULT_OFFER_LOCK_TIMEOUT_MS):
+                self.db.execute(
+                    update(O).where(O.id == int(offer_id))
+                    .values(refused_count=(O.refused_count + 1), last_refusal=refusal[:64],
+                            last_refused_at=self._now())
+                    .execution_options(synchronize_session="fetch"))
         except Exception:
             logger.warning("OFFER refusal not recorded offer_id=%s", offer_id, exc_info=True)
 
     def record_refusal_out_of_band(self, token: Optional[str], refusal: str) -> bool:
-        """Record a refusal on its offer in its OWN transaction.
+        """Record a refusal on its offer in its OWN CLEAN, BOUNDED transaction.
 
-        R3. A contended claim leaves the transaction aborted, so the in-transaction counters
-        in `_refuse()` cannot be written. This records the fact afterwards, so a contention
-        refusal is still durably visible instead of existing only in a log line.
+        R3. A caller whose transaction aborted cannot write the in-transaction counters in
+        `_refuse()`, so this records the fact afterwards — a durable refusal rather than a
+        log line.
+
+        R2/RV-02 made the transaction clean and ordered rather than merely separate. It now:
+
+          1. rolls back first, so it never inherits a caller's aborted or half-built
+             transaction — the previous version issued its UPDATE into whatever state the
+             caller left behind;
+          2. reads the offer to learn its thread, under `no_autoflush`, so nothing of the
+             caller's is dragged out;
+          3. takes resource 1 through the bounded helper, like every other writer;
+          4. writes and commits, or on contention writes NOTHING and answers False.
+
+        Returns True only when a row was actually recorded.
         """
         from ..models import WhatsAppBookingOffer as O
         fp = token_fingerprint(token)
         if fp is None:
             return False
         try:
-            res = self.db.execute(
-                update(O).where(O.token_fingerprint == fp)
-                .values(refused_count=(O.refused_count + 1), last_refusal=refusal[:64],
-                        last_refused_at=self._now())
-                .execution_options(synchronize_session="fetch"))
+            self.db.rollback()                      # (1) start clean
+        except Exception:                           # pragma: no cover - defensive
+            logger.debug("OFFER out-of-band rollback failed", exc_info=True)
+        offer = self.offer_by_token(token)          # (2) no_autoflush read
+        if offer is None:
+            return False
+        if self._acquire_thread_state(int(offer.thread_id)) is not None:   # (3)
+            logger.info("OFFER out-of-band refusal not recorded thread_id=%s — contended; "
+                        "nothing written", offer.thread_id)
+            try:
+                self.db.rollback()
+            except Exception:                       # pragma: no cover - defensive
+                pass
+            return False
+        try:
+            with self._bounded_lock_wait(DEFAULT_OFFER_LOCK_TIMEOUT_MS):   # (4)
+                res = self.db.execute(
+                    update(O).where(O.id == offer.id)
+                    .values(refused_count=(O.refused_count + 1), last_refusal=refusal[:64],
+                            last_refused_at=self._now())
+                    .execution_options(synchronize_session="fetch"))
             self.db.commit()
             return bool(res.rowcount)
         except Exception:

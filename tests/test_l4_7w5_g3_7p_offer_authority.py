@@ -748,6 +748,11 @@ class G37RAdmissionScope(unittest.TestCase):
         def __init__(self, initial="0"):
             self.value = initial
             self.issued = []
+            #: R2/RV-01. The `lock_timeout` in force when the CALLER's pending writes were
+            #: flushed. This is the whole point of the correction: the flush must happen
+            #: inside the bound, never before it. `None` means it never happened.
+            self.flushed_under = None
+            self.autoflush_suppressed = 0
 
         class _Res:
             def __init__(self, v):
@@ -755,6 +760,21 @@ class G37RAdmissionScope(unittest.TestCase):
 
             def scalar(self):
                 return self._v
+
+        @property
+        def no_autoflush(self):
+            import contextlib
+            outer = self
+
+            @contextlib.contextmanager
+            def _ctx():
+                outer.autoflush_suppressed += 1
+                yield
+
+            return _ctx()
+
+        def flush(self):
+            self.flushed_under = self.value
 
         def execute(self, stmt, *a, **k):
             sql = str(stmt)
@@ -811,6 +831,20 @@ class G37RAdmissionScope(unittest.TestCase):
                          "the caller's own stricter bound must be restored, not DEFAULT")
         self.assertNotIn("SET LOCAL lock_timeout = DEFAULT", db.issued,
                          "DEFAULT would widen a stricter caller to unlimited")
+        # ── R2/RV-01, the sealed half ─────────────────────────────────────────
+        # MUTATION ORACLE for required mutations 1 and 2. The caller's pending writes must
+        # be flushed INSIDE the bound. G3-7R let SQLAlchemy's autoflush decide when, and on
+        # the refusal paths it decided "at the first write, before any bound" — measured at
+        # 42s and 72s against a 12s hold, where the parent answered in 4s.
+        self.assertEqual(db.flushed_under, "4000",
+                         "the caller's pending writes must flush under the bound, not "
+                         "before it")
+        # TWO suppressions, not one: the preparatory `SHOW`/`SET` pair and the restore.
+        # `>= 1` passed with the preparatory suppression removed, because the restore
+        # still entered one — the count has to pin the half that matters.
+        self.assertGreaterEqual(db.autoflush_suppressed, 2,
+                                "this block's own statements must not autoflush the "
+                                "caller's pending writes — before the bound OR after it")
 
     def test_g37r_14_nested_bounds_compose(self):
         """The inner block restores the OUTER block's bound, not the session's."""

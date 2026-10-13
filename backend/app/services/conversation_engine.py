@@ -3685,55 +3685,67 @@ class ConversationEngine:
         _adm = _offers.admit(thread_id=ctx.thread.id, token=flow_token)
         self._turn_offer_admission = _adm
 
+        # ── R2/RV-01: ONE BOUNDED ENTRY, BEFORE ANY OF THE THREE OUTCOMES WRITES ──
+        #
+        # G3-7R put this below the replay and refusal branches, on the reasoning that only
+        # the granted path needed the lock order. The independent review measured what that
+        # cost: a submission refused at admission — an unknown token, a withdrawn offer, a
+        # superseded offer — reached its first write with no bound in scope and waited on
+        # `whatsapp_thread_states` for as long as the other writer held it. 42s against a
+        # 12s hold, where the parent answered `thread_contended` in 4s. This milestone
+        # measured it again at 72s against the same hold, and found the replay path does it
+        # too, and that all of them CONSUMED the dedup cursor on the way out.
+        #
+        # The error was treating admission's three answers as three paths. All three
+        # PERSIST something — a refusal counter, a replay counter, or a booking — so all
+        # three are writers, and a writer enters the order before it writes. One
+        # acquisition, here, serves all of them; contention answers before anything is
+        # touched.
+        #
+        # This is NOT the deleted turn-entry lock. That one was taken for every turn on a
+        # prediction about what the turn might become; this one is taken at the acceptance
+        # boundary, after the submitted token has already been matched against an offer
+        # row, and an ordinary conversation turn never reaches it.
+        _contended = _offers.begin_offer_transaction(ctx.thread.id)
+        if _contended is not None:
+            # CONTENTION IS NOT A REFUSAL AND MUST WRITE NOTHING.
+            # `begin_offer_transaction` already rolled the aborted transaction back, which
+            # also discarded this turn's dedup cursor — correct, because the turn did not
+            # complete and a redelivery must be free to try again against the offer's
+            # then-current state.
+            #
+            # Nothing is recorded against the offer either, not even out of band: the
+            # review's contract is explicit that a contended turn mutates no offer and
+            # moves no counter. The evidence is the decision log plus the typed action,
+            # which stays `reply_required` so the no-reply rescue still sees the dropped
+            # turn. And it deliberately does not take the warm-handoff path: declaring a
+            # human handoff for a submission nobody has judged would be a false statement,
+            # and that path's own `needs_human` commit would itself block on the row the
+            # other writer is holding.
+            self._turn_offer_claim = None
+            self._decision_log(ctx, "booking_offer_contended", reason=_contended,
+                               offer_id=_adm.offer_id, had_token=bool(flow_token))
+            logger.warning(
+                "G3-7R-R2 thread_id=%s contended by the other booking writer (%s) — "
+                "booking turn declined inside the bound, cursor not consumed, offer "
+                "untouched, nothing sent", ctx.thread.id, _contended)
+            return _out(ACTION_THREAD_CONTENDED, detail=_contended)
+
         if _adm.replay:
             return self._booking_replay_outcome(ctx, state, _adm, flow_token)
 
         if not _adm.granted:
             # An honest terminal answer, and zero writes to anything that can book. The
             # refusal is recorded against the offer it refused, in this transaction, so it
-            # survives as operator evidence rather than as a log line.
-            # Durable where the refusal invalidates the offer — an expired offer must end
-            # as EXPIRED with the mirror cleared, or the thread keeps a truthy mirror for
-            # an offer that can never be accepted.
+            # survives as operator evidence rather than as a log line — and it is durable
+            # where the refusal invalidates the offer, because an expired offer must end as
+            # EXPIRED with the mirror cleared or the thread keeps a truthy mirror for an
+            # offer that can never be accepted. Resource 1 is already held.
             _offers.finalise_admission_refusal(state, thread_id=ctx.thread.id,
                                                admission=_adm)
             return self._refuse_booking_submission(
                 ctx, state, lead, refusal=_adm.refusal, offer_id=_adm.offer_id,
                 offer_status=_adm.status, flow_token=flow_token)
-
-        # ── R3/A4 + S1: enter the offer transaction in the ONE canonical lock order ──
-        # Resource 1 (`whatsapp_thread_states`) then resource 2 (`whatsapp_booking_offers`).
-        # Every writer of the offer table now follows this, ISSUE included, which is what
-        # removed the `40P01` the architecture audit measured in 3/3 trials. Nothing is
-        # retried here: a retry loop at an acceptance boundary is how duplicate work is made.
-        _contended = _offers.begin_offer_transaction(ctx.thread.id)
-        if _contended is not None:
-            # ── CONTENTION IS NOT A REFUSAL, AND MUST WRITE NOTHING ──────────────────
-            # The aborted transaction was rolled back, which also discarded this turn's
-            # dedup cursor — correct, because the turn did not complete and a redelivery
-            # should be free to try again against the offer's then-current state. So the
-            # refusal is recorded in its OWN transaction, and this turn returns the typed
-            # contended outcome that `ACTION_THREAD_CONTENDED` was defined for.
-            #
-            # It deliberately does NOT take the warm-handoff path. Two reasons, and the
-            # second was measured:
-            #
-            #   * a contended turn did not complete, so declaring a human handoff for it
-            #     would be a false statement about a submission nobody has judged;
-            #   * that path writes `needs_human` and commits, and the UPDATE it commits
-            #     needs the very row the other writer is holding — with no bound, because
-            #     `begin_offer_transaction` has already abandoned its bounded attempt.
-            #     Measured on PostgreSQL: 21s and climbing, against R3's own requirement
-            #     that the losing writer waits a bounded ~4s.
-            _offers.record_refusal_out_of_band(flow_token, _contended)
-            self._turn_offer_claim = None
-            self._decision_log(ctx, "booking_offer_refused", reason=_contended,
-                               offer_id=_adm.offer_id, had_token=bool(flow_token))
-            logger.warning(
-                "G3-7R thread_id=%s contended by the other booking writer (%s) — booking "
-                "turn declined, cursor not consumed, nothing booked",
-                ctx.thread.id, _contended)
-            return _out(ACTION_THREAD_CONTENDED, detail=_contended)
 
         # Determine lead source so we can fill missing fields from context.
         is_website = getattr(state, "is_website_lead", False)
@@ -3824,7 +3836,7 @@ class ConversationEngine:
             zone_group=zone_group, zone_detail=zone_detail, address=direccion)
         if _reval is not None:
             if _adm.offer_id is not None:
-                _offers.record_refusal(_adm.offer_id, _reval)
+                _offers.record_refusal(_adm.offer_id, _reval, thread_id=ctx.thread.id)
             logger.warning(
                 "G3-7R thread_id=%s booking refused by final revalidation (%s) — the offer "
                 "stays ISSUED and no occupying booking was created",
@@ -4211,7 +4223,7 @@ class ConversationEngine:
         from .offer_lifecycle import OfferLifecycle as _OfferLifecycle
         _offers = _OfferLifecycle(self.db)
         if admission.offer_id is not None:
-            _offers.record_replay(admission.offer_id)
+            _offers.record_replay(admission.offer_id, thread_id=ctx.thread.id)
         self._decision_log(ctx, "booking_offer_replay", offer_id=admission.offer_id,
                            thread_revision_id=admission.thread_revision_id,
                            revision_id=admission.revision_id,
@@ -4238,9 +4250,21 @@ class ConversationEngine:
         self.db.rollback()
         _offers = _OfferLifecycle(self.db)
         thread_revision_id, revision_id = _offers.authoritative_booking(offer_id)
+        # R2/RV-01+RV-02. The rollback above released resource 1, so it is re-entered
+        # through the bounded helper before the replay counter is touched. On contention
+        # the counter is SKIPPED and the authoritative booking is still returned: the
+        # booking is the fact the customer depends on, the counter is bookkeeping, and
+        # waiting for it would reintroduce exactly the unbounded wait this milestone closes.
+        _counted = False
         if offer_id is not None:
-            _offers.record_replay(offer_id)
-        self._decision_log(ctx, "booking_offer_replay", offer_id=offer_id,
+            if _offers.begin_offer_transaction(ctx.thread.id) is None:
+                _offers.record_replay(offer_id, thread_id=ctx.thread.id)
+                _counted = True
+            else:
+                logger.warning(
+                    "G3-7R-R2 thread_id=%s replay not counted — contended; the "
+                    "authoritative booking is still returned", ctx.thread.id)
+        self._decision_log(ctx, "booking_offer_replay", counted=_counted, offer_id=offer_id,
                            thread_revision_id=thread_revision_id,
                            revision_id=revision_id, had_token=bool(flow_token),
                            source="booking_projection")

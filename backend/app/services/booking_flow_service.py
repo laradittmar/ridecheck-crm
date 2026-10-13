@@ -108,11 +108,16 @@ class BookingAlreadyCompletedError(Exception):
     completion screen from it: no second booking, no refusal counter, no false expiry, and
     no duplicate acknowledgement — the transport that created the booking already sent one.
     """
-    def __init__(self, *, offer_id=None, thread_revision_id=None, revision_id=None):
+    def __init__(self, *, offer_id=None, thread_revision_id=None, revision_id=None,
+                 thread_id=None):
         super().__init__("offer already produced a committed booking")
         self.offer_id = offer_id
         self.thread_revision_id = thread_revision_id
         self.revision_id = revision_id
+        #: R2/RV-07. Carried so the COMMAND boundary can enter the canonical lock order
+        #: and count the replay. `resolve_context` no longer does it: a resolver that
+        #: commits can commit a caller's unrelated pending work.
+        self.thread_id = thread_id
 
 
 # ── Crypto helpers (Meta Flows Data Exchange, Data API 3.0) ───────────────────
@@ -313,22 +318,23 @@ class BookingFlowService:
         # mirror — so the comparison cannot tell a replay from a tampered token, and it
         # reported both as an expired session. The offer row can tell them apart: ACCEPTED
         # with a recorded ThreadRevision is a replay and nothing else is.
+        # R2/RV-07. `admit()` is a read and this method stays one: it DETECTS the replay
+        # and reports it, and the bookkeeping happens at the command boundary
+        # (`handle_confirm_booking`) where a transaction may legitimately be committed.
+        # G3-7R counted and committed here, which meant resolving a context could commit
+        # whatever the caller had pending — a durable side effect in a method named for
+        # resolution, reachable from `handle_init`, `handle_date_selected` and
+        # `handle_prepare_summary`, none of which is a command.
         from .offer_lifecycle import OfferLifecycle as _OfferLifecycle
-        _offers_probe = _OfferLifecycle(self.db)
-        _adm = _offers_probe.admit(thread_id=thread_id, token=booking_token)
+        _adm = _OfferLifecycle(self.db).admit(thread_id=thread_id, token=booking_token)
         if _adm.replay:
-            _offers_probe.record_replay(_adm.offer_id)
-            try:
-                self.db.commit()                # the replay must be durable evidence
-            except Exception:                   # pragma: no cover - defensive
-                self.db.rollback()
             logger.info(
                 "BOOKING_REPLAY thread_id=%s offer_id=%s thread_rev=%s — returning the "
                 "authoritative booking; nothing created, nothing refused",
                 thread_id, _adm.offer_id, _adm.thread_revision_id)
             raise BookingAlreadyCompletedError(
                 offer_id=_adm.offer_id, thread_revision_id=_adm.thread_revision_id,
-                revision_id=_adm.revision_id)
+                revision_id=_adm.revision_id, thread_id=thread_id)
 
         # Load thread state and verify token matches
         state = self.db.execute(
@@ -754,7 +760,17 @@ class BookingFlowService:
 
         Raises BookingSlotConflictError with refreshed data if slot is gone.
         """
-        ctx = self.resolve_context(booking_token)
+        # ── R2/RV-07: the replay is COUNTED here, at the command boundary ─────────
+        # `resolve_context` detects it and stays read-only. This is the only caller that
+        # is a command, so this is the only place a transaction may be committed for it.
+        # On contention the counter is skipped and the replay is still reported: the
+        # booking is the fact the Flow needs, the counter is bookkeeping, and waiting for
+        # it would reintroduce the unbounded wait this milestone closes.
+        try:
+            ctx = self.resolve_context(booking_token)
+        except BookingAlreadyCompletedError as _replay:
+            self._count_replay_at_command_boundary(_replay, booking_token)
+            raise
 
         # ── G3-7R/S2: DATABASE-FIRST ADMISSION, the same question the engine asks ──
         # `resolve_context` has checked the token's shape, its age and the transport
@@ -766,6 +782,20 @@ class BookingFlowService:
         from .offer_lifecycle import OfferLifecycle, OfferRefusal
 
         _offers = OfferLifecycle(self.db)
+
+        # ── R2/RV-01: the bounded entry comes BEFORE any refusal writes ───────────
+        # Same correction as the conversation engine: a refusal persists a counter, so it
+        # is a writer, and a writer enters the canonical order before it writes. Entering
+        # here also means the typed contention answer is reached without touching the
+        # offer at all.
+        _contended = _offers.begin_offer_transaction(ctx.thread.id)
+        if _contended is not None:
+            logger.warning("BOOKING_OFFER_CONTENDED thread_id=%s reason=%s — nothing "
+                           "written", ctx.thread.id, _contended)
+            _log_event(self.db, ctx.thread.id, "BOOKING_OFFER_CONTENDED",
+                       booking_token=booking_token, extra={"reason": _contended})
+            raise BookingTokenError(f"offer not acceptable: {_contended}")
+
         _adm = _offers.admit(thread_id=ctx.thread.id, token=booking_token)
         if not _adm.granted:
             # Durable, not a screen with a rollback behind it. The R2 review measured the
@@ -793,19 +823,10 @@ class BookingFlowService:
                 _offers.record_refusal_out_of_band(booking_token, _adm.refusal)
             raise BookingTokenError(f"offer not acceptable: {_adm.refusal}")
 
-        # ── R3/A4 + S1: the SAME canonical lock order as the conversation engine ──
-        # This writer used to take the offer row first and the thread state afterwards —
-        # the opposite order — which deadlocked the two writers. Resource 1 first, under a
-        # bounded `lock_timeout`; and since S1 every writer of the offer table takes it,
-        # ISSUE included, which is what removed the last measured `40P01`.
-        _contended = _offers.begin_offer_transaction(ctx.thread.id)
-        if _contended is not None:
-            _offers.record_refusal_out_of_band(booking_token, _contended)
-            logger.warning("BOOKING_OFFER_REFUSED thread_id=%s reason=%s — contended",
-                           ctx.thread.id, _contended)
-            _log_event(self.db, ctx.thread.id, "BOOKING_OFFER_REFUSED",
-                       booking_token=booking_token, extra={"reason": _contended})
-            raise BookingTokenError(f"offer not acceptable: {_contended}")
+        # R3/A4 + S1 + R2/RV-01: resource 1 is already held — the bounded entry moved
+        # above admission so that a refusal, which persists a counter, could not reach its
+        # first write outside the bound. Taking it twice in one transaction is free; it is
+        # not taken twice, because this is the one acquisition and it happens up there.
 
         date_str = str(data.get("date", "")).strip()
         time_str = str(data.get("time", "")).strip()
@@ -1013,11 +1034,18 @@ class BookingFlowService:
                 raise
             self.db.rollback()
             _tr_id, _rv_id = _offers.authoritative_booking(_claim.offer_id)
-            _offers.record_replay(_claim.offer_id)
-            try:
-                self.db.commit()
-            except Exception:                       # pragma: no cover - defensive
-                self.db.rollback()
+            # R2/RV-01+RV-02: the rollback released resource 1, so it is re-entered
+            # through the bounded helper before the counter is touched; on contention the
+            # counter is skipped and the authoritative booking is still returned.
+            if _offers.begin_offer_transaction(ctx.thread.id) is None:
+                _offers.record_replay(_claim.offer_id, thread_id=ctx.thread.id)
+                try:
+                    self.db.commit()
+                except Exception:                   # pragma: no cover - defensive
+                    self.db.rollback()
+            else:
+                logger.warning("BOOKING_REPLAY thread_id=%s replay not counted — "
+                               "contended; the booking is still returned", ctx.thread.id)
             logger.warning(
                 "BOOKING_REPLAY thread_id=%s the booking projection refused a second "
                 "booking for offer_id=%s — returning thread_rev=%s",
@@ -1145,6 +1173,45 @@ class BookingFlowService:
                 }
             },
         }
+
+    def _count_replay_at_command_boundary(self, replay, booking_token: str) -> None:
+        """Count a detected replay, at the one caller that is a command (R2/RV-07).
+
+        `resolve_context` detects the replay and stays read-only; this runs only from
+        `handle_confirm_booking`, where committing a transaction is legitimate. The screen
+        handlers — `handle_init`, `handle_date_selected`, `handle_prepare_summary` — are
+        resolutions, not commands, and deliberately count nothing: a customer reopening a
+        completed Flow should not move an operator-facing counter.
+
+        Enters the canonical lock order first, bounded. On contention it records nothing and
+        returns: the replay is still reported to the Flow, because the committed booking is
+        the fact that matters and the counter is bookkeeping.
+        """
+        from .offer_lifecycle import OfferLifecycle
+
+        offer_id = getattr(replay, "offer_id", None)
+        thread_id = getattr(replay, "thread_id", None)
+        if offer_id is None or thread_id is None:
+            return
+        offers = OfferLifecycle(self.db)
+        if offers.begin_offer_transaction(int(thread_id)) is not None:
+            logger.warning("BOOKING_REPLAY thread_id=%s not counted — contended; nothing "
+                           "written, the booking is still returned", thread_id)
+            return
+        offers.record_replay(offer_id, thread_id=int(thread_id))
+        try:
+            self.db.commit()
+        except Exception:                           # pragma: no cover - defensive
+            logger.warning("BOOKING_REPLAY thread_id=%s counter not committed",
+                           thread_id, exc_info=True)
+            try:
+                self.db.rollback()
+            except Exception:
+                pass
+        _log_event(self.db, int(thread_id), "BOOKING_REPLAY",
+                   booking_token=booking_token,
+                   extra={"offer_id": offer_id,
+                          "thread_rev_id": getattr(replay, "thread_revision_id", None)})
 
     def _send_booking_receipt(
         self, ctx: BookingContext, *, name: str, selected_date: date, selected_time: time

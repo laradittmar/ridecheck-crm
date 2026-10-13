@@ -51,13 +51,19 @@ depends_on = None
 #: name is part of the contract and not a cosmetic choice.
 _PROJECTION_INDEX = "uq_thread_revision_one_booking_per_offer"
 
+#: R2/RV-04. Imported from the model rather than repeated, so an Alembic-built schema and a
+#: `metadata.create_all()` schema cannot disagree about the constraint's identifier. They
+#: did: `fk_thread_revisions_offer_id` here against SQLAlchemy's implicit
+#: `thread_revisions_offer_id_fkey`, while `downgrade()` drops by this one.
+from app.models import BOOKING_PROJECTION_FK as _PROJECTION_FK
+
 
 def upgrade() -> None:
     # ── the booking projection ───────────────────────────────────────────────
     op.add_column("thread_revisions",
                   sa.Column("offer_id", sa.Integer(), nullable=True))
     op.create_foreign_key(
-        "fk_thread_revisions_offer_id", "thread_revisions",
+        _PROJECTION_FK, "thread_revisions",
         "whatsapp_booking_offers", ["offer_id"], ["id"])
     # THE guarantee. Partial, so historical and operator-written bookings keep NULL.
     op.create_index(_PROJECTION_INDEX, "thread_revisions", ["offer_id"], unique=True,
@@ -76,6 +82,5 @@ def downgrade() -> None:
     op.drop_column("whatsapp_booking_offers", "last_replay_at")
     op.drop_column("whatsapp_booking_offers", "replay_count")
     op.drop_index(_PROJECTION_INDEX, table_name="thread_revisions")
-    op.drop_constraint("fk_thread_revisions_offer_id", "thread_revisions",
-                       type_="foreignkey")
+    op.drop_constraint(_PROJECTION_FK, "thread_revisions", type_="foreignkey")
     op.drop_column("thread_revisions", "offer_id")
