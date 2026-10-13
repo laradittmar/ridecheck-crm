@@ -917,3 +917,121 @@ def read_turn(turn_id: str, db: Session) -> dict:
 def get_turn(turn_id: str, db: Session = Depends(get_db),
              _operator: str = Depends(require_crm_session)) -> dict:
     return read_turn(turn_id, db)
+
+
+# ---------------------------------------------------------------------------
+# SB2B Option B — booking ledger rows that need a person (D1-05, §8.5)
+# ---------------------------------------------------------------------------
+
+#: How far back the CE-synchronization check looks. Older rows have long been triaged.
+BOOKING_SYNC_LOOKBACK_DAYS = 7
+#: The recovery each reason calls for. Never automatic: an operator performs it.
+_BOOKING_RECOVERY = {
+    "CE_SYNC_INCOMPLETE": "STORED_INBOUND_REPLAY",
+    "ACK_PENDING_STALE": "LEDGER_ACK_RECOVERY",
+    "ACK_FAILED": "LEDGER_ACK_RECOVERY",
+    "ACK_LEASE_GONE": "LEDGER_ACK_RECOVERY",
+    "ACK_AMBIGUOUS": "OPERATOR_REVIEW",
+    "ACK_DUPLICATE_RISK": "OPERATOR_REVIEW",
+    "IDENTITY_CONFLICT": "OPERATOR_REVIEW",
+}
+_RECOVERY_RANK = ("OPERATOR_REVIEW", "STORED_INBOUND_REPLAY", "LEDGER_ACK_RECOVERY")
+
+
+def _inbound_correlation(wamid: str) -> str:
+    import hashlib
+    return "in:" + hashlib.sha256(wamid.encode()).hexdigest()[:32]
+
+
+def booking_attention(db: Session, *, now: Optional[datetime] = None,
+                      pending_older_than_seconds: Optional[int] = None) -> list[dict]:
+    """Ledger rows needing attention, reduced to what an operator may see.
+
+    Shown: the key's NAMESPACE and an 8-hex prefix of its hash (a key never contains a Flow
+    token), ids that find the thread, ack state and error CATEGORY, the last 6 characters of
+    the acknowledgement's WAMID, the identity outcome and the reasons. Never shown: raw
+    tokens, full WAMIDs, names, phones, e-mails or message text.
+
+    `CE_SYNC_INCOMPLETE` is detectable for Conversation-Engine rows only: their
+    `correlation_id` names the causal inbound (`in:<sha256>`), so the inbound's `ai_event`
+    tells whether CE finished the turn. A Data Exchange row's CE synchronization happens when
+    its Flow reply reaches CE and is not linkable from the ledger.
+    """
+    from ..models import BookingCommandRecord as R
+    from ..services.booking_authority import ACK_PENDING_ATTENTION_SECONDS, BookingAuthority
+
+    now = now or datetime.now(timezone.utc)
+    age = (ACK_PENDING_ATTENTION_SECONDS if pending_older_than_seconds is None
+           else int(pending_older_than_seconds))
+    rows = {r["id"]: r for r in BookingAuthority(db).ledger_rows_needing_attention(
+        pending_older_than_seconds=age)}
+
+    ce_rows = db.execute(
+        select(R.id, R.idempotency_key, R.source, R.operation, R.revision_id,
+               R.thread_revision_id, R.thread_id, R.lead_id, R.occupying, R.committed_at,
+               R.correlation_id, R.ack_status, R.ack_attempts, R.ack_duplicate_risk,
+               R.ack_last_error, R.ack_transport_id, R.identity_outcome)
+        .where(R.source == "CONVERSATION_ENGINE", R.correlation_id.like("in:%"),
+               R.committed_at >= now - timedelta(days=BOOKING_SYNC_LOOKBACK_DAYS))
+    ).all()
+    settled = now - timedelta(seconds=age)
+    threads = {r.thread_id for r in ce_rows if r.thread_id is not None}
+    events: dict[str, tuple] = {}
+    if threads:
+        for ev in db.execute(select(AiEvent.wa_message_id, AiEvent.status, AiEvent.action)
+                             .where(AiEvent.thread_id.in_(threads))).all():
+            events[_inbound_correlation(ev.wa_message_id)] = (ev.status, ev.action)
+    for r in ce_rows:
+        committed = r.committed_at
+        if committed is not None and committed.tzinfo is None:
+            committed = committed.replace(tzinfo=timezone.utc)
+        if committed is not None and committed > settled:
+            continue                                   # the turn may still be running
+        status, action = events.get(r.correlation_id, (None, None))
+        if status == "processed" and action != "error":
+            continue
+        row = rows.setdefault(r.id, {**dict(r._mapping), "reasons": []})
+        row["reasons"].append("CE_SYNC_INCOMPLETE")
+
+    out = []
+    for r in sorted(rows.values(), key=lambda x: x["id"]):
+        kind, _, digest = (r.get("idempotency_key") or "").partition(":")
+        recoveries = {_BOOKING_RECOVERY.get(x, "OPERATOR_REVIEW") for x in r["reasons"]}
+        transport = r.get("ack_transport_id") or ""
+        committed = r.get("committed_at")
+        out.append({
+            "id": r["id"],
+            "key_kind": kind or None,
+            "key_hash_prefix": digest[:8] or None,
+            "source": r.get("source"),
+            "operation": r.get("operation"),
+            "revision_id": r.get("revision_id"),
+            "thread_revision_id": r.get("thread_revision_id"),
+            "thread_id": r.get("thread_id"),
+            "lead_id": r.get("lead_id"),
+            "occupying": r.get("occupying"),
+            "committed_at": committed.isoformat() if committed else None,
+            "ack_status": r.get("ack_status"),
+            "ack_attempts": r.get("ack_attempts"),
+            "ack_duplicate_risk": bool(r.get("ack_duplicate_risk")),
+            "ack_error_category": r.get("ack_last_error"),
+            "ack_transport_tail": transport[-6:] if transport else None,
+            "identity_outcome": r.get("identity_outcome"),
+            "reasons": list(r["reasons"]),
+            "recovery": next(x for x in _RECOVERY_RANK if x in recoveries),
+            "thread_url": (f"/whatsapp/thread/{r['thread_id']}"
+                           if r.get("thread_id") is not None else None),
+        })
+    return out
+
+
+@router.get("/booking-attention")
+def get_booking_attention(
+    db: Session = Depends(get_db),
+    _operator: str = Depends(require_crm_session),
+) -> dict:
+    """Booking ledger rows needing a person: stale or failed acknowledgements, ambiguous
+    transport, duplicate risk, identity conflicts and CE synchronizations that never
+    finished. Read-only, behind the same signed CRM session as `/control`."""
+    rows = booking_attention(db)
+    return {"count": len(rows), "rows": rows}

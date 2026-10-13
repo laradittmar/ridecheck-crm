@@ -204,7 +204,8 @@ class R5_Adapter(unittest.TestCase):
         rf = {"marca": "Fiat"}
         plan = Plan(thread_revision=TRA(thread_id=tid))
         req = ce.CeFlowBookingRequest(thread_id=tid, lead_id=lead.id, inbound_event_id="w.r5", flow_token=None,
-                                      requested_date=D, requested_time=time(10), revision_fields=rf, attachments=plan)
+                                      requested_date=D, requested_time=time(10), revision_fields=rf, attachments=plan,
+                                      availability=ce.AvailabilityRevalidation())  # SB2B B-7
         seen = {}
         real = BookingAuthority.execute
 

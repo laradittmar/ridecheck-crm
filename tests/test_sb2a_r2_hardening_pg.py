@@ -181,7 +181,8 @@ class R2Postgres(unittest.TestCase):
         caller = self.caller_session()
         r = self.ce.book_from_flow_response(caller, self.ce.CeFlowBookingRequest(
             thread_id=self.thread(), lead_id=self.lead, inbound_event_id="wamid.R2-03",
-            flow_token=None, requested_date=self.day, requested_time=time(10, 15)))
+            flow_token=None, requested_date=self.day, requested_time=time(10, 15),
+            availability=self.ce.AvailabilityRevalidation()))             # SB2B B-7
         self.assertEqual(r.outcome.value, "SLOT_CONFLICT")
         caller.commit(); caller.close()                           # the caller still owns its work
         self.assertEqual(self.caller_work_visible(), 1)
@@ -199,8 +200,10 @@ class R2Postgres(unittest.TestCase):
                                side_effect=RuntimeError("attachment failure")):
             r = self.ce.book_from_flow_response(caller, self.ce.CeFlowBookingRequest(
                 thread_id=tid, lead_id=self.lead, inbound_event_id="wamid.R2-04",
-                flow_token=None, requested_date=self.day, requested_time=time(11),
-                attachments=plan))
+                flow_token=None, requested_date=self.day, requested_time=time(13, 30),
+                attachments=plan, availability=self.ce.AvailabilityRevalidation()))
+        # SB2B B-7: CE-W1 now revalidates availability; a Monday slot must be one the real
+        # ScheduleService accepts (from 13:00), so this case still reaches the attachments.
         self.assertEqual(r.outcome.value, "INTERNAL_FAILURE")
         self.assertEqual(self.engine.pool.checkedout(), before)  # adapter connection returned
         caller.commit(); caller.close()
@@ -231,9 +234,10 @@ class R2Postgres(unittest.TestCase):
         t0 = datetime.now()
         r = self.ce.book_from_flow_response(caller, self.ce.CeFlowBookingRequest(
             thread_id=self.thread(), lead_id=self.lead, inbound_event_id="wamid.R2-06",
-            flow_token=None, requested_date=self.day, requested_time=time(12),
+            flow_token=None, requested_date=self.day, requested_time=time(14),
             attachments=self.ba.BookingAttachmentPlan(
-                lead=self.ba.LeadUpdate(necesita_humano=True))), lock_timeout_ms=400)
+                lead=self.ba.LeadUpdate(necesita_humano=True)),
+            availability=self.ce.AvailabilityRevalidation()), lock_timeout_ms=400)  # SB2B B-7
         self.assertEqual((r.outcome.value, r.reason), ("RETRYABLE_FAILURE", "LOCK_TIMEOUT"))
         self.assertLess((datetime.now() - t0).total_seconds(), 10)
         caller.commit(); caller.close()
@@ -250,7 +254,8 @@ class R2Postgres(unittest.TestCase):
             caller = self.caller_session()
             r = self.ce.book_from_flow_response(caller, self.ce.CeFlowBookingRequest(
                 thread_id=self.thread(), lead_id=self.lead, inbound_event_id="wamid.R2-07",
-                flow_token=None, requested_date=self.day, requested_time=time(13)),
+                flow_token=None, requested_date=self.day, requested_time=time(13),
+                availability=self.ce.AvailabilityRevalidation()),             # SB2B B-7
                 lock_timeout_ms=300)
             holder.rollback()
         self.assertEqual(r.outcome.value, "RETRYABLE_FAILURE")

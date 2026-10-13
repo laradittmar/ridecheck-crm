@@ -381,7 +381,8 @@ class R7_Callers(unittest.TestCase):
         self.assertEqual((bad.outcome, bad.reason), (Out.VALIDATION_FAILED, "TEMPORAL_NOT_NAIVE:requested_time"))
         self.assertEqual(TZ_CALLS, [])
         req = ce.CeFlowBookingRequest(thread_id=tid, lead_id=lead.id, inbound_event_id="w.r7",
-                                      flow_token="tok-1", requested_date=D, requested_time=time(10))
+                                      flow_token="tok-1", requested_date=D, requested_time=time(10),
+                                      availability=ce.AvailabilityRevalidation())  # SB2B B-7
         ok = ce.book_from_flow_response(db, req)
         self.assertEqual(ok.outcome, Out.COMMITTED, ok.reason)
         self.assertEqual(ok.idempotency_key, ce.ce_flow_booking_key(req))

@@ -487,7 +487,8 @@ class CeContract(unittest.TestCase):
         plan = lambda t: ba.BookingAttachmentPlan(thread_revision=ba.ThreadRevisionAttachment(thread_id=t))
         req = ce.CeFlowBookingRequest(thread_id=t7, lead_id=lead.id, inbound_event_id="wamid.X",
                                       flow_token="7-1-abc", requested_date=D,
-                                      requested_time=time(10), attachments=plan(t7))
+                                      requested_time=time(10), attachments=plan(t7),
+                                      availability=ce.AvailabilityRevalidation())  # SB2B B-7
         r = ce.book_from_flow_response(db, req)
         self.assertEqual(r.outcome, Out.COMMITTED)
         made = [t.id for t in db.query(ThreadRevision).all()]
@@ -496,7 +497,7 @@ class CeContract(unittest.TestCase):
         self.assertEqual((again.outcome, again.revision_id), (Out.IDEMPOTENT_REPLAY, r.revision_id))
         clash = ce.book_from_flow_response(db, ce.CeFlowBookingRequest(
             thread_id=t8, lead_id=lead.id, inbound_event_id="wamid.Y", flow_token="8-1-x",
-            requested_date=D, requested_time=time(10, 30), attachments=plan(t8)))
+            requested_date=D, requested_time=time(10, 30), attachments=plan(t8), availability=ce.AvailabilityRevalidation()))
         self.assertIn(clash.outcome, ce.CE_W1_FALLBACK_TO_MANUAL)
 
     def test_sb2a_30_manual_scheduling_preserves_escalation_on_unavailable_slot(self):
@@ -516,11 +517,22 @@ class CeContract(unittest.TestCase):
 
 class Scope(unittest.TestCase):
 
-    def test_sb2a_31_conversation_engine_unchanged(self):
-        import hashlib
-        data = open(os.path.join(_BACKEND, "app/services/conversation_engine.py"), "rb").read()
-        blob = hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
-        self.assertEqual(blob, "ec0571bd740bec678fd7dea63d80a0ac998973c2")
+    def test_sb2a_31_conversation_engine_wiring_is_flag_gated(self):
+        """SB2A left CE byte-identical (blob ec0571bd…). SB2B is the milestone that wires it,
+        so the pin now guards what SB2B promised instead: every entry into the Option B path
+        is behind `_smart_booking_ce_on()` — the ledger entry before the human gate, the
+        CE-W1 branch and the CE-W2 branch, and nothing else — and the legacy writers the
+        manifest anchors still exist for the flag-off path (sb2a_28)."""
+        import ast
+        src = open(os.path.join(_BACKEND, "app/services/conversation_engine.py")).read()
+        gated = {}
+        for fn in ast.walk(ast.parse(src)):
+            if isinstance(fn, ast.FunctionDef):
+                for node in ast.walk(fn):
+                    if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "_smart_booking_ce_on":
+                        gated[fn.name] = gated.get(fn.name, 0) + 1
+        self.assertEqual(gated, {"_handle": 1, "_process_flow_response": 1,
+                                 "_handle_scheduling_escalation": 1})
 
     def test_sb2a_32_sqlite_is_not_concurrency_evidence(self):
         db = _db()

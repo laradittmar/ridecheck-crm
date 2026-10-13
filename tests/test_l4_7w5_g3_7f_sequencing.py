@@ -540,7 +540,7 @@ class H_Trace(unittest.TestCase):
 
     def test_seq_57_the_contract_is_1_9_and_1_8_stays_readable(self):
         from app.schemas.hybrid_trace import TRACE_VERSION, READABLE_VERSIONS
-        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.9")
+        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.10")
         self.assertIn("hybrid-decision-trace/1.8", READABLE_VERSIONS)
 
     def test_seq_58_the_lifecycle_fields_let_turns_be_joined(self):

@@ -167,6 +167,10 @@ ACK_EXHAUSTED_PREFIX = "ACK_EXHAUSTED"
 ACK_LEGACY_NO_LEASE = "LEGACY_SENDING_NO_LEASE"
 #: Transport outcome categories that leave the delivery unknown (SB2A-R3, R2A-06).
 ACK_AMBIGUOUS_PREFIX = "AMBIGUOUS"
+#: SB2B (D1-05): an acknowledgement still PENDING this long after its booking committed is
+#: listed for an operator. Five minutes = the existing unanswered-message CRITICAL threshold
+#: (`ops_dashboard.UNANSWERED_CRITICAL_SECONDS`); a live turn acknowledges within seconds.
+ACK_PENDING_ATTENTION_SECONDS = 300
 
 
 def _app_now() -> datetime:
@@ -860,7 +864,7 @@ class BookingAuthority:
                        profesional_id=rec.profesional_id, slot_start=rec.slot_start,
                        slot_end=rec.slot_end, occupying=rec.occupying,
                        booking_version=rec.booking_version, idempotency_key=rec.idempotency_key,
-                       ack_status=rec.ack_status)
+                       ack_status=rec.ack_status, identity_outcome=rec.identity_outcome)
 
     # ── acknowledgement (separate from commit) ───────────────────────────
 
@@ -1001,6 +1005,52 @@ class BookingAuthority:
             rows = self.db.execute(query).all()
         return [dict(r._mapping) for r in rows]
 
+    def ledger_rows_needing_attention(
+            self, *, pending_older_than_seconds: int = ACK_PENDING_ATTENTION_SECONDS) -> list[dict]:
+        """READ-ONLY operator view of ledger rows that need a person (SB2B, D1-05).
+
+        A row is listed with every reason that applies:
+          ACK_PENDING_STALE   the acknowledgement is still PENDING longer than the approved age
+          ACK_FAILED          the last attempt failed (retryable or exhausted)
+          ACK_AMBIGUOUS       the transport outcome is unknown (`AMBIGUOUS_*`)
+          ACK_DUPLICATE_RISK  a reclaimed lease may have sent twice
+          ACK_LEASE_GONE      SENDING with no live lease (its sender died)
+          IDENTITY_CONFLICT   the submitted identity disagreed and was NOT applied
+        Performs no write and no commit. Rows carry the raw key: callers that DISPLAY them
+        must reduce it to its namespace and a hash prefix (the key never contains a token).
+        """
+        from ..models import BookingCommandRecord as R
+        now = self._clock()
+        cutoff = self._clock_plus(-int(pending_older_than_seconds))
+        lease_gone = and_(R.ack_status == AckStatus.SENDING.value,
+                          or_(R.ack_lease_expires_at.is_(None), R.ack_lease_expires_at < now))
+        conds = {
+            "ACK_PENDING_STALE": and_(R.ack_status == AckStatus.PENDING.value,
+                                      R.committed_at < cutoff),
+            "ACK_FAILED": R.ack_status == AckStatus.FAILED.value,
+            "ACK_AMBIGUOUS": and_(R.ack_status == AckStatus.FAILED.value,
+                                  R.ack_last_error.like(f"%{ACK_AMBIGUOUS_PREFIX}%")),
+            "ACK_DUPLICATE_RISK": R.ack_duplicate_risk.is_(True),
+            "ACK_LEASE_GONE": lease_gone,
+            "IDENTITY_CONFLICT": R.identity_outcome == "CONFLICT",
+        }
+        query = (select(R.id, R.idempotency_key, R.source, R.operation, R.revision_id,
+                        R.thread_revision_id, R.thread_id, R.lead_id, R.occupying,
+                        R.committed_at, R.correlation_id, R.ack_status, R.ack_attempts,
+                        R.ack_duplicate_risk, R.ack_last_error, R.ack_transport_id,
+                        R.identity_outcome,
+                        *[case((c, True), else_=False).label(name) for name, c in conds.items()])
+                 .where(or_(*conds.values()))
+                 .order_by(R.id))
+        with self.db.no_autoflush:                      # a read never flushes anything
+            rows = self.db.execute(query).all()
+        out = []
+        for r in rows:
+            m = dict(r._mapping)
+            m["reasons"] = [name for name in conds if m.pop(name)]
+            out.append(m)
+        return out
+
     def terminalize_exhausted_acknowledgements(self) -> int:
         """EXPLICIT write: move every exhausted SENDING row whose lease is gone to terminal
         FAILED (ACK_EXHAUSTED_AFTER_CRASH, duplicate risk). Idempotent — a second call, or a
@@ -1132,7 +1182,7 @@ class BookingAuthority:
             version = revision.booking_version
             if cmd.idempotency_key:
                 self._record(cmd, fingerprint, revision, thread_revision_id or linked_id,
-                             target, version)
+                             target, version, identity_outcome)
             self._verify_before_commit(txid, revision, expected_row, target, window, before,
                                        allowed_tr={i for i in (thread_revision_id, linked_id) if i},
                                        deletes_at_start=deletes_at_start)
@@ -1753,7 +1803,8 @@ class BookingAuthority:
             tr.status = "reschedule_pending"
         return linked
 
-    def _record(self, cmd, fingerprint, revision, linked, target, version) -> None:
+    def _record(self, cmd, fingerprint, revision, linked, target, version,
+                identity_outcome: Optional[str] = None) -> None:
         from ..models import BookingCommandRecord
         self.db.add(BookingCommandRecord(
             idempotency_key=cmd.idempotency_key, source=cmd.source.value,
@@ -1762,6 +1813,8 @@ class BookingAuthority:
             thread_id=cmd.thread_id, profesional_id=revision.profesional_id,
             slot_start=target.start, slot_end=target.end, occupying=target.occupying,
             booking_version=version, correlation_id=cmd.correlation_id, actor=cmd.actor,
+            # SB2B: the identity decision is persisted WITH the booking, in this transaction
+            identity_outcome=identity_outcome,
             ack_status=(AckStatus.PENDING if cmd.tracks_acknowledgement
                         else AckStatus.NOT_APPLICABLE).value))
         self.db.flush()

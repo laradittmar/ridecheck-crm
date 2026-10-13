@@ -23,6 +23,7 @@ import secrets
 import time as _time
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
+from types import SimpleNamespace
 from typing import Optional
 
 from sqlalchemy import select, text
@@ -71,6 +72,11 @@ STAGE_BOOKED = "BOOKED"
 BOOKING_FLOW_RECEIPT_TEXT = (
     "Gracias por completarlo. Un representante de RideCheck se estará comunicando con vos."
 )
+
+#: SB2B (B-6): what CE-W1 tells a customer whose Flow submission was NOT booked — a refused,
+#: retryable or failed booking. It never claims a booking: it is the Data Exchange path's own
+#: refusal copy for the outcomes a person must resolve (`_FLOW_REFUSAL_MESSAGES` below).
+BOOKING_HANDOFF_TEXT = "No pudimos confirmar el turno. Un asesor se contacta a la brevedad."
 
 FLOW_VERSION = "3.0"
 
@@ -888,6 +894,17 @@ class BookingFlowService:
             return self._success_response(booking_token)
 
         if result.outcome is not BookingOutcome.COMMITTED:
+            # SB2B B-1: the Conversation Engine books this same Flow submission under this
+            # same key. If it committed while this request was in flight (the refusal is then
+            # IDEMPOTENCY_KEY_REUSED or a lost race), the committed booking wins: return its
+            # success and recover its acknowledgement, never a refusal screen.
+            raced = self._authority.lookup(key)
+            if raced is not None:
+                _log_event(self.db, ctx.thread.id, "BOOKING_IDEMPOTENT_REPLAY",
+                           booking_token=booking_token,
+                           extra={"crm_rev_id": raced.revision_id, "after": result.reason})
+                self._recover_acknowledgement(key, raced)
+                return self._success_response(booking_token)
             _log_event(
                 self.db, ctx.thread.id, "BOOKING_REFUSED",
                 booking_token=booking_token,
@@ -1003,7 +1020,9 @@ class BookingFlowService:
             self._authority.record_acknowledgement(claim, sent=False, error="CONTEXT_MISSING")
 
     def _send_booking_receipt(
-        self, ctx: BookingContext, *, name: str, selected_date: date, selected_time: time
+        self, ctx: BookingContext, *, name: str, selected_date: date, selected_time: time,
+        correlation_id: Optional[str] = None,
+        causal_inbound_wa_message_id: Optional[str] = None,
     ) -> "ReceiptOutcome":
         """Send the single canonical booking acknowledgement.
 
@@ -1024,6 +1043,11 @@ class BookingFlowService:
         Routed through OutboundSafetyGate on the registered BOOKING_FLOW path — the same
         path that dispatched the Flow — so the acknowledgement is attributed to the booking
         that caused it and can never appear as MANUAL_CRM or unattributed.
+
+        SB2B: CE-W1 sends this same acknowledgement through `send_booking_acknowledgement`,
+        passing its turn's `correlation_id` and the causal inbound WAMID so the gate's causal
+        dedup and the turn's trace see the send. The Data Exchange path passes neither, so
+        its gate call is exactly what it was.
         """
         from datetime import datetime as _dt
         from zoneinfo import ZoneInfo
@@ -1047,6 +1071,10 @@ class BookingFlowService:
                 now=_dt.now(ZoneInfo("America/Argentina/Buenos_Aires")),
                 path_id=OutboundPathId.BOOKING_FLOW.value,
                 deployment_id=get_deployment_id(),
+                **{k: v for k, v in (
+                    ("correlation_id", correlation_id),
+                    ("causal_inbound_wa_message_id", causal_inbound_wa_message_id))
+                   if v is not None},
             )
             if result.outcome != GateOutcome.ALLOWED:
                 logger.warning(
@@ -1097,6 +1125,25 @@ class BookingFlowService:
             logger.error("BOOKING_RECEIPT failed before dispatch thread_id=%s: %s",
                          ctx.thread.id, exc)
         return ReceiptOutcome(False, None, "PRE_SEND_FAILURE")
+
+
+def send_booking_acknowledgement(
+    db: Session, *, wa_id, thread_id: int, correlation_id: Optional[str] = None,
+    causal_inbound_wa_message_id: Optional[str] = None,
+) -> "ReceiptOutcome":
+    """SB2B (D1 B-5): the booking acknowledgement for callers that hold no BookingContext —
+    CE-W1 and the operator's ledger-driven recovery. It IS the Data Exchange path's
+    `_send_booking_receipt` (owner text, BOOKING_FLOW path, gate, outcome classification),
+    never a second copy of it. The caller must already hold the ledger's acknowledgement
+    claim: this function sends, it does not decide whether to."""
+    ctx = BookingContext(thread=SimpleNamespace(id=thread_id),
+                         contact=SimpleNamespace(wa_id=wa_id), lead=None, state=None,
+                         candidate=None, vehicle_summary="", location_summary="",
+                         zone_group=None, zone_detail=None, booking_token="")
+    return BookingFlowService(db)._send_booking_receipt(
+        ctx, name="", selected_date=None, selected_time=None, correlation_id=correlation_id,
+        causal_inbound_wa_message_id=causal_inbound_wa_message_id)
+
 
 def _receipt_pre_dispatch_error(ctx) -> Optional[str]:
     """Local transport configuration that would make the send fail BEFORE the network

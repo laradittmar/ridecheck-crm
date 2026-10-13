@@ -357,6 +357,10 @@ class BookingCommandRecord(Base):
     ack_last_error: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     ack_duplicate_risk: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("false"))
+    # SB2B: what happened to the submitted person identity (ADMITTED | FILLED | UNCHANGED |
+    # CONFLICT), written in the booking's own transaction; NULL when none was submitted or
+    # for rows committed before SB2B.
+    identity_outcome: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
 
 
 class ViaticosZone(Base):

@@ -704,15 +704,18 @@ class NothingElseMoved(unittest.TestCase):
                             (ROOT / "backend" / "migrations" / "versions").glob("*.py"))
         # +1: the single additive clarification-attempt migration (G3-7F sequencing).
         # +1 again: SB1's booking-representation migration, then SB2A's booking authority
-        # (Smart Booking Track B); +1 SB2A-R2's acknowledgement lease.
-        self.assertEqual(len(migrations), 50)
+        # (Smart Booking Track B); +1 SB2A-R2's acknowledgement lease; +1 SB2B's identity
+        # outcome column.
+        self.assertEqual(len(migrations), 51)
         # G3-7F sequencing added one more, so pending_correction is no longer last; SB1
         # then added its own after it.
-        self.assertEqual(migrations[-4:], ["20261006_clarification_attempts.py",
+        self.assertEqual(migrations[-5:], ["20261006_clarification_attempts.py",
                                            "20261007_sb1_booking_representation.py",
                                            "20261008_sb2a_booking_authority.py",
-                                           "20261009_sb2a_r2_ack_lease.py"],
-                         "the clarification attempt table immediately precedes SB1, SB2A, SB2A-R2")
+                                           "20261009_sb2a_r2_ack_lease.py",
+                                           "20261013_sb2b_identity_outcome.py"],
+                         "the clarification attempt table immediately precedes SB1, SB2A, "
+                         "SB2A-R2, SB2B")
         source = (ROOT / "backend" / "app" / "services"
                   / "hybrid_trace.py").read_text(encoding="utf-8-sig")
         for forbidden in ("UPDATE hybrid_decision_traces", "update(HybridDecisionTraceRow",
@@ -809,7 +812,7 @@ class FuzzyAdmissibilityRepair(unittest.TestCase):
                              "a raising observer is caught, and acceptance is never assumed")
 
     def test_row_33b_the_contract_version_is_current(self):
-        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.9")
+        self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.10")
 
 
 if __name__ == "__main__":       # pragma: no cover

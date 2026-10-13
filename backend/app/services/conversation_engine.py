@@ -3409,6 +3409,7 @@ class ConversationEngine:
         self._turn_trace_before = None
         self._turn_trace_rows = []
         self._turn_trace_reconciliations = []
+        self._sb_trace = None                    # SB2B: this turn's booking facts
         _trace_started_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
         _ce_t0 = _time.perf_counter()
         try:
@@ -3522,6 +3523,16 @@ class ConversationEngine:
         # it would describe the outcome and could no longer explain the decision.
         self._capture_trace_before(ctx, state)
 
+        # ── SB2B Option B, B-1 + B-2 (flag-gated): the booking ledger speaks first ──────
+        # Before the cursor, the cycle reset and the `needs_human` gate: a Flow submission
+        # that is already booked is replayed and acknowledged, never swallowed as
+        # `skipped_human`. A miss changes nothing below.
+        if self._smart_booking_ce_on() and event.message_type == "flow_response" \
+                and event.flow_response:
+            replayed = self._sb_flow_ledger_entry(ctx, state, event)
+            if replayed is not None:
+                return replayed
+
         # WILD-04R: capture previous cursor BEFORE overwrite (burst start discovery)
         previous_cursor = state.last_processed_inbound_wa_message_id
         ctx.previous_processed_cursor = previous_cursor
@@ -3597,6 +3608,10 @@ class ConversationEngine:
             return self._process_vehicle_fallback_response(ctx, state, flow_data)
         if "zona_general" in flow_data:
             return self._process_location_fallback_response(ctx, state, flow_data)
+
+        # SB2B Option B (flag-gated): the booking authority books; nothing below runs.
+        if self._smart_booking_ce_on():
+            return self._sb_flow_book(ctx, state, flow_data, flow_token)
 
         # Token validation (warn only — don't hard-block in case of token mismatch due to clock skew)
         expected = state.flow_booking_token
@@ -3904,6 +3919,554 @@ class ConversationEngine:
                 policy=ResponsePolicy.P5_FLOW_COMPLETION_ACK, priority=20))
         self._note_fact_source(FactSource.FLOW_TRANSACTION)
         return True
+
+    # ── SB2B Option B — adapter first, authoritative commit first, CE second ─────────
+    #
+    # D1 §8.2 (binding rules B-1..B-8). Everything here runs only when
+    # `SMART_BOOKING_CE_ENABLED` is exactly True; with it off CE-W1/CE-W2 are the legacy code
+    # above and below, untouched. The booking authority owns the booking, its ledger row and
+    # the acknowledgement; CE reads the ledger first, calls the adapter while it holds no
+    # write, and only then commits its own state from the committed rows.
+
+    #: Booking actions recorded in `ai_events.action`. Every one is in HANDLED_ACTIONS:
+    #: an unhandled action would hand the turn to n8n's legacy booking chain.
+    SB_ACTION_CREATED = "booking_created"
+    SB_ACTION_REPLAYED = "booking_replayed"
+    SB_ACTION_RETRY = "booking_retry_required"
+    SB_ACTION_REFUSED = "booking_refused_handoff"
+
+    def _smart_booking_ce_on(self) -> bool:
+        return getattr(getattr(self, "settings", None),
+                       "smart_booking_ce_enabled", False) is True
+
+    def _sb_note(self, **fields) -> None:
+        """Record booking facts for this turn's trace (`booking` block, contract 1.10)."""
+        rec = getattr(self, "_sb_trace", None)
+        if rec is None:
+            rec = self._sb_trace = {}
+        rec.update(fields)
+
+    def _sb_trace_payload(self) -> "dict | None":
+        rec = getattr(self, "_sb_trace", None)
+        if not rec:
+            return None
+        key = rec.get("key") or ""
+        prefix, _, digest = key.partition(":")
+        return {
+            # never the raw token: the key is already a hash; only its namespace and the
+            # first 12 hex characters of that hash are recorded
+            "key_prefix": (prefix + ":") if key else None,
+            "key_hash_prefix": digest[:12] if digest else None,
+            "writer": rec.get("writer"),
+            "outcome": rec.get("outcome"),
+            "reason": rec.get("reason"),
+            "revision_id": rec.get("revision_id"),
+            "thread_revision_id": rec.get("thread_revision_id"),
+            "occupying": rec.get("occupying"),
+            "replayed": bool(rec.get("replayed", False)),
+            "lookup_hit": bool(rec.get("lookup_hit", False)),
+            "ack_status_before": rec.get("ack_status_before"),
+            "ack_status_after": rec.get("ack_status_after"),
+            "ack_attempted": bool(rec.get("ack_attempted", False)),
+            "identity_outcome": rec.get("identity_outcome"),
+            "availability_revalidated": rec.get("availability_revalidated"),
+            "ce_synchronized": bool(rec.get("ce_synchronized", False)),
+            "manual_scheduling": rec.get("manual_scheduling"),
+            "authority_called": bool(rec.get("authority_called", False)),
+        }
+
+    def _sb_transaction_clean(self) -> bool:
+        """B-3 runtime guard: may CE call the authority now?
+
+        Only when CE's own transaction has WRITTEN nothing to the database. On PostgreSQL that
+        is `txid_current_if_assigned() IS NULL` on CE's connection (a SELECT never assigns a
+        transaction id; any flushed INSERT/UPDATE does). On SQLite (tests) the driver's
+        `in_transaction` is the equivalent: pysqlite opens a transaction only for DML. Any
+        other dialect, or a failure to ask, is refused — the guard fails closed.
+        """
+        try:
+            dialect = self.db.get_bind().dialect.name
+            if dialect == "postgresql":
+                from sqlalchemy import text as _sql
+                return self.db.execute(_sql("SELECT txid_current_if_assigned()")).scalar() is None
+            if dialect == "sqlite":
+                raw = self.db.connection().connection
+                return not bool(getattr(getattr(raw, "driver_connection", raw),
+                                        "in_transaction", True))
+        except Exception as exc:
+            logger.error("SB2B txid guard failed thread_turn=%s: %s",
+                         getattr(self, "_correlation_id", None), type(exc).__name__)
+        return False
+
+    def _sb_flow_ledger_entry(self, ctx, state, event) -> "ConversationHandleOut | None":
+        """B-1 + B-2: before the cursor, the cycle reset and the `needs_human` gate, ask the
+        booking ledger whether this Flow submission is already booked. A hit is the booking —
+        whoever committed it (the Data Exchange endpoint or an earlier CE attempt) — and goes
+        straight to synchronization and acknowledgement recovery. It is never `skipped_human`.
+        A miss returns None and the turn continues exactly as before."""
+        from .booking_ce_adapter import flow_booking_key, lookup_booking
+        key = flow_booking_key(ctx.thread.id, event.flow_token, event.wa_message_id)
+        self._sb_note(writer="CE_W1", key=key, lookup_hit=False)
+        ctx.inbound_wa_message_id = event.wa_message_id
+        hit = lookup_booking(self.db, key)
+        if hit is None:
+            return None
+        logger.info("SB2B ledger hit thread_id=%s — replaying the committed booking",
+                    ctx.thread.id)
+        self._sb_note(lookup_hit=True)
+        return self._sb_finish_committed(ctx, hit, replayed=True)
+
+    def _sb_flow_book(self, ctx, state, flow_data: dict, flow_token) -> ConversationHandleOut:
+        """CE-W1 under Option B. The adapter is called while CE has written nothing (B-3);
+        the committed ledger result decides everything that follows (B-4..B-6)."""
+        from .booking_authority import (AvailabilityRevalidation, BookingAttachmentPlan,
+                                        BookingOutcome, LeadIdentity, LeadUpdate,
+                                        PriceRecalculation, ThreadRevisionAttachment,
+                                        ThreadStateUpdate, refuse)
+        from .booking_ce_adapter import (CE_W1_FALLBACK_TO_MANUAL, CeFlowBookingRequest,
+                                         book_from_flow_response, flow_booking_key,
+                                         lookup_booking)
+        lead = ctx.lead
+        key = flow_booking_key(ctx.thread.id, flow_token, ctx.inbound_wa_message_id)
+        self._sb_note(writer="CE_W1", key=key)
+
+        # B-3: a CE transaction that already wrote (e.g. a cycle reset that archived a
+        # candidate) must never reach the authority: it would wait on its own row locks.
+        if not self._sb_transaction_clean():
+            return self._sb_handoff(ctx, action=self.SB_ACTION_REFUSED,
+                                    reason="CE_TRANSACTION_NOT_CLEAN", outcome="NOT_ATTEMPTED")
+        # The offer must still be the thread's live one. A token the thread no longer holds
+        # (withdrawn at handoff, cleared by a cycle reset, or never issued) books nothing.
+        expected = (state.flow_booking_token or "").strip() or None
+        submitted = (flow_token or "").strip() or None
+        if submitted is not None and submitted != expected:
+            return self._sb_handoff(ctx, action=self.SB_ACTION_REFUSED,
+                                    reason="FLOW_TOKEN_NOT_ACTIVE", outcome="NOT_ATTEMPTED")
+        if submitted is None and expected is not None:
+            return self._sb_handoff(ctx, action=self.SB_ACTION_REFUSED,
+                                    reason="FLOW_TOKEN_MISSING", outcome="NOT_ATTEMPTED")
+
+        # Inputs — the same fields the legacy writer reads, as typed data only.
+        is_website = getattr(state, "is_website_lead", False)
+        buyer_email = (flow_data.get("email") or "").strip() or None
+        direccion = (flow_data.get("direccion") or flow_data.get("direccion_texto")
+                     or "").strip() or None
+        seller_type = (flow_data.get("tipo_vendedor") or "").strip() or None
+        seller_name = (flow_data.get("nombre_vendedor") or "").strip() or None
+        publication_url = (flow_data.get("link_publicacion") or "").strip() or None
+        if is_website:
+            full_name = (state.customer_name or "").strip() or " ".join(
+                p for p in (lead.nombre or "", lead.apellido or "") if p).strip()
+            buyer_phone = (lead.telefono or ctx.contact.wa_id or "").strip() or None
+            canal = "Formulario web"
+        else:
+            full_name = (flow_data.get("nombre_apellido") or "").strip()
+            buyer_phone = (flow_data.get("telefono") or lead.telefono or "").strip() or None
+            canal = (flow_data.get("como_llego") or "").strip() or None
+        sched_date = sched_time = None
+        try:
+            sched_date = date.fromisoformat(str(state.preferred_day)) if state.preferred_day else None
+        except (ValueError, TypeError):
+            pass
+        try:
+            sched_time = time.fromisoformat(str(state.preferred_time)) if state.preferred_time else None
+        except (ValueError, TypeError):
+            pass
+        focus = self._focus_candidate(ctx, repair=False)
+        zone_group, zone_detail = self._get_active_inspection_location(ctx, state)
+        # B-7 / L4.7W4-F4 (the endpoint's own prerequisite): no canonical location, no booking.
+        if not zone_group and not zone_detail:
+            return self._sb_handoff(ctx, action=self.SB_ACTION_REFUSED,
+                                    reason="NO_CANONICAL_LOCATION", outcome="NOT_ATTEMPTED")
+        candidate_id = focus.id if focus is not None and self._sb_row_committed(
+            WhatsAppThreadCandidate, focus.id) else None
+        name_parts = full_name.split() if full_name else []
+        plan = BookingAttachmentPlan(
+            thread_revision=ThreadRevisionAttachment(
+                thread_id=ctx.thread.id, candidate_id=candidate_id,
+                buyer_name=full_name or None, buyer_phone=buyer_phone, buyer_email=buyer_email,
+                seller_type=seller_type, seller_name=seller_name, address=direccion,
+                tipo_vehiculo=focus.tipo_vehiculo if focus else None,
+                marca=focus.marca if focus else None, modelo=focus.modelo if focus else None,
+                anio=focus.anio if focus else None, publication_url=publication_url,
+                zone_group=zone_group, request_approval=True),
+            price=PriceRecalculation(require_inputs=(focus.tipo_vehiculo, zone_group, zone_detail))
+            if focus is not None else None,
+            lead=LeadUpdate(
+                estado="COORDINAR_DISPONIBILIDAD", flag="ACEPTADO", necesita_humano=True,
+                identity=LeadIdentity(nombre=name_parts[0],
+                                      apellido=" ".join(name_parts[1:]) or None,
+                                      email=buyer_email) if name_parts else None,
+                canal_if_empty=canal),
+            thread_state=ThreadStateUpdate(link_current_revision=True, last_stage=STAGE_BOOKED,
+                                           needs_human=True, consume_flow_token=True))
+        fields = {"tipo_vehiculo": focus.tipo_vehiculo if focus else None,
+                  "marca": focus.marca if focus else None,
+                  "modelo": focus.modelo if focus else None,
+                  "anio": focus.anio if focus else None,
+                  "zone_group": zone_group, "zone_detail": zone_detail,
+                  "direccion_texto": direccion, "vendedor_tipo": seller_type,
+                  "tipo_vendedor": seller_type}
+        req = CeFlowBookingRequest(
+            thread_id=ctx.thread.id, lead_id=lead.id,
+            inbound_event_id=ctx.inbound_wa_message_id, flow_token=submitted,
+            requested_date=sched_date, requested_time=sched_time,
+            revision_fields=fields, attachments=plan,
+            # B-7: the authority revalidates this slot itself, under its locks
+            availability=AvailabilityRevalidation(address=direccion or "-",
+                                                  zone_group=zone_group, is_holiday=False))
+        # B-3, re-checked at the call: nothing above may have written.
+        if not self._sb_transaction_clean():
+            return self._sb_handoff(ctx, action=self.SB_ACTION_REFUSED,
+                                    reason="CE_TRANSACTION_NOT_CLEAN", outcome="NOT_ATTEMPTED")
+        self._sb_note(authority_called=True)
+        try:
+            result = book_from_flow_response(self.db, req)
+        except Exception as exc:                 # the authority returns typed results;
+            logger.error("SB2B adapter raised thread_id=%s: %s",     # this is a defect
+                         ctx.thread.id, type(exc).__name__)
+            result = refuse(BookingOutcome.INTERNAL_FAILURE, "ADAPTER_EXCEPTION")
+        self._sb_note(outcome=result.outcome.value, reason=result.reason,
+                      identity_outcome=result.identity_outcome,
+                      availability_revalidated=(
+                          result.outcome is BookingOutcome.COMMITTED and bool(result.occupying))
+                      or result.reason == "SCHEDULE_REVALIDATION")
+        if not result.ok:
+            # B-1: a committed booking always wins — over KEY_REUSED, over a refusal raced by
+            # the Data Exchange endpoint, over every fallback.
+            hit = lookup_booking(self.db, key)
+            if hit is not None:
+                self._sb_note(lookup_hit=True)
+                return self._sb_finish_committed(ctx, hit, replayed=True)
+        if result.ok and result.occupying:
+            out = self._sb_finish_committed(
+                ctx, result, replayed=result.outcome is BookingOutcome.IDEMPOTENT_REPLAY)
+            if result.outcome is BookingOutcome.COMMITTED:
+                self._sb_notify_booking(ctx, result, full_name=full_name or None,
+                                        buyer_phone=buyer_phone, buyer_email=buyer_email,
+                                        focus=focus, zone_group=zone_group,
+                                        zone_detail=zone_detail, direccion=direccion,
+                                        seller_type=seller_type, seller_name=seller_name,
+                                        sched_date=sched_date, sched_time=sched_time)
+            return out
+        if result.ok:
+            # An incomplete agreed slot is recorded as a non-occupying manual request.
+            return self._sb_handoff(ctx, action=self.SB_ACTION_REFUSED,
+                                    reason="SLOT_INCOMPLETE_MANUAL_SCHEDULING",
+                                    outcome=result.outcome.value, manual=result)
+        manual = None
+        if result.outcome in CE_W1_FALLBACK_TO_MANUAL:
+            # B-6: only after the lookup above proved there is no booking for this key
+            manual = self._sb_manual_request(ctx, state, key=key, focus=focus,
+                                             candidate_id=candidate_id, fields=fields,
+                                             day=sched_date, at=sched_time)
+        action = (self.SB_ACTION_RETRY if result.outcome is BookingOutcome.RETRYABLE_FAILURE
+                  else self.SB_ACTION_REFUSED)
+        return self._sb_handoff(ctx, action=action, reason=result.reason,
+                                outcome=result.outcome.value, manual=manual)
+
+    def _sb_row_committed(self, model, row_id) -> bool:
+        """B-3 / SB2B-2: is this row visible OUTSIDE CE's transaction? A plan may only
+        reference committed rows — the authority reads in its own session."""
+        if row_id is None:
+            return False
+        try:
+            from .booking_ce_adapter import isolated_session
+            with isolated_session(self.db) as s:
+                return s.get(model, row_id) is not None
+        except Exception:
+            return False
+
+    def _sb_manual_request(self, ctx, state, *, key, focus, candidate_id, fields, day, at):
+        """B-6 fallback for SLOT_CONFLICT / CALENDAR_EXCEPTION: a NON-occupying manual
+        scheduling request with a booking-owned plan, keyed on this Flow submission so a
+        re-entry replays it instead of adding another."""
+        from .booking_authority import BookingAttachmentPlan, PriceRecalculation, \
+            ThreadRevisionAttachment
+        from .booking_ce_adapter import CeSchedulingEscalationRequest, request_manual_scheduling
+        plan = BookingAttachmentPlan(
+            thread_revision=ThreadRevisionAttachment(
+                thread_id=ctx.thread.id, candidate_id=candidate_id,
+                tipo_vehiculo=fields.get("tipo_vehiculo"), marca=fields.get("marca"),
+                modelo=fields.get("modelo"), anio=fields.get("anio"),
+                zone_group=fields.get("zone_group"), non_occupying_status="provisional"),
+            price=PriceRecalculation(require_inputs=(
+                fields.get("tipo_vehiculo"), fields.get("zone_group"), fields.get("zone_detail")))
+            if focus is not None else None)
+        try:
+            return request_manual_scheduling(self.db, CeSchedulingEscalationRequest(
+                thread_id=ctx.thread.id, lead_id=ctx.lead.id, escalation_id=f"flow-fallback|{key}",
+                requested_date=day, requested_time=at, revision_fields=dict(fields),
+                inbound_event_id=ctx.inbound_wa_message_id, attachments=plan))
+        except Exception as exc:
+            logger.error("SB2B manual fallback raised thread_id=%s: %s",
+                         ctx.thread.id, type(exc).__name__)
+            return None
+
+    def _sb_acknowledge(self, ctx, result) -> "tuple[str | None, object | None]":
+        """B-5: the acknowledgement is the ledger row's. Claim it (an atomic lease), send the
+        owner-approved text through the outbound gate on the BOOKING_FLOW path with this
+        turn's causal inbound, record SENT / FAILED / AMBIGUOUS on the ledger. SENT, an active
+        lease, or nothing owed → silence. Returns (ack status after, send outcome or None)."""
+        from .booking_authority import BookingAuthority
+        from .booking_ce_adapter import isolated_session, lookup_booking
+        from .booking_flow_service import send_booking_acknowledgement
+        key = result.idempotency_key
+        if not key or result.ack_status in (None, "SENT", "NOT_APPLICABLE"):
+            return result.ack_status, None
+        with isolated_session(self.db) as s:
+            auth = BookingAuthority(s)
+            claim = auth.claim_acknowledgement(key)
+            if claim is None:                      # SENT meanwhile, a live lease, exhausted
+                after = lookup_booking(self.db, key)
+                return (after.ack_status if after else result.ack_status), None
+            self._sb_note(ack_attempted=True)
+            outcome = send_booking_acknowledgement(
+                self.db, wa_id=ctx.contact.wa_id, thread_id=ctx.thread.id,
+                correlation_id=self._turn_correlation_id(),
+                causal_inbound_wa_message_id=ctx.inbound_wa_message_id)
+            recorded = auth.record_acknowledgement(
+                claim, sent=bool(outcome), transport_id=getattr(outcome, "wamid", None),
+                error=getattr(outcome, "error", None) or (None if outcome else "NOT_SENT"),
+                ambiguous=bool(getattr(outcome, "ambiguous", False)))
+            if not recorded:
+                logger.warning("SB2B ack outcome not recorded: lease reclaimed attempt=%s",
+                               claim.attempt)
+            if claim.duplicate_risk:
+                logger.warning("SB2B ack attempt %s reclaimed an expired lease — possible "
+                               "duplicate", claim.attempt)
+        # transport attribution for this turn (G3-5E fields)
+        err = (getattr(outcome, "error", None) or "").upper()
+        self._turn_dispatch_path = DispatchPath.TEXT
+        self._turn_renderer_source = RendererSource.DETERMINISTIC_TEMPLATE
+        if outcome:
+            self._turn_dispatch_result = DispatchResult.ALLOWED
+            self._turn_text_dispatches = getattr(self, "_turn_text_dispatches", 0) + 1
+        elif err.startswith("GATE_BLOCKED_DUPLICATE"):
+            self._turn_dispatch_result = DispatchResult.DUPLICATE_SUPPRESSED
+        elif err.startswith("GATE_") or err.startswith("PRE_DISPATCH"):
+            self._turn_dispatch_result = DispatchResult.BLOCKED
+        else:
+            self._turn_dispatch_result = DispatchResult.FAILED
+        after = lookup_booking(self.db, key)
+        return (after.ack_status if after else None), outcome
+
+    def _sb_synchronize(self, ctx, *, message_sent: bool) -> None:
+        """B-4: CE synchronization AFTER the authority committed. Order is the rule:
+        expire everything CE holds (its in-memory rows predate the authority's writes), then
+        set the cursor, then the CE-only writes, then commit. Setting the cursor before the
+        expiry would silently discard it (D1 P2b)."""
+        self.db.expire_all()
+        state = ctx.state
+        state.last_processed_inbound_wa_message_id = ctx.inbound_wa_message_id
+        self._maybe_set_attribution(ctx, state)          # first-write-only, CE-owned
+        if message_sent:
+            from zoneinfo import ZoneInfo
+            ctx.thread.last_message_at = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
+        self.db.commit()
+        if message_sent:
+            reset_unanswered_alert(self.db, ctx.thread.id)
+            self.db.commit()
+        self._sb_note(ce_synchronized=True)
+
+    def _sb_finish_committed(self, ctx, result, *, replayed: bool) -> ConversationHandleOut:
+        """COMMITTED or IDEMPOTENT_REPLAY (fresh, raced, or a ledger hit): acknowledgement
+        recovery first — after the authority commit, before CE's commit, so a crash in between
+        leaves the event re-enterable and the lease prevents a second send — then B-4."""
+        self._sb_note(outcome=("IDEMPOTENT_REPLAY" if replayed else result.outcome.value),
+                      reason=result.reason, replayed=replayed,
+                      revision_id=result.revision_id,
+                      thread_revision_id=result.thread_revision_id,
+                      occupying=result.occupying, ack_status_before=result.ack_status,
+                      identity_outcome=result.identity_outcome)
+        if not result.occupying:
+            # a committed non-occupying request: the human handoff it recorded stands
+            return self._sb_handoff(ctx, action=self.SB_ACTION_REFUSED,
+                                    reason="MANUAL_SCHEDULING_REPLAYED" if replayed
+                                    else "MANUAL_SCHEDULING", outcome=result.outcome.value,
+                                    already_committed=result, send_text=not replayed)
+        ack_after, outcome = self._sb_acknowledge(ctx, result)
+        self._sb_note(ack_status_after=ack_after)
+        self._sb_synchronize(ctx, message_sent=bool(outcome))
+        self._turn_decision_authority = DecisionAuthority.FLOW_TRANSACTION
+        self._note_fact_source(FactSource.FLOW_TRANSACTION)
+        action = self.SB_ACTION_REPLAYED if replayed else self.SB_ACTION_CREATED
+        out = _out(action, wa_message_id=getattr(outcome, "wamid", None),
+                   detail=f"ack:{ack_after}", answer_source="FLOW_RESPONSE")
+        # Truthful alerting: a reply was owed only when an acknowledgement was owed; it was
+        # produced only when one was actually sent in this turn.
+        owed = outcome is not None
+        out.reply_required = owed
+        out.alert_eligible = owed
+        out.reply_produced = bool(outcome)
+        return out
+
+    def _sb_handoff(self, ctx, *, action: str, reason: str, outcome: str,
+                    manual=None, already_committed=None,
+                    send_text: bool = True) -> ConversationHandleOut:
+        """B-6: a booking that did not happen (or a committed non-occupying request) commits
+        a truthful handoff — never a confirmation. For a refusal the authority wrote no
+        CE-owned row, so CE's in-memory state is current and is committed as is (an expiry
+        would discard a cycle reset this turn legitimately performed). For a committed
+        non-occupying request the plan did write lead and thread state, so B-4 applies:
+        expire first, then the cursor, then CE's writes."""
+        if already_committed is not None:
+            # the authority's plan wrote lead / thread-state rows: CE's copies are stale (B-4)
+            self.db.expire_all()
+        state, lead = ctx.state, ctx.lead
+        self._sb_note(outcome=outcome, reason=reason)
+        if manual is not None:
+            self._sb_note(manual_scheduling=getattr(manual, "outcome", None) and manual.outcome.value)
+            if manual.ok and manual.thread_revision_id:
+                state.current_revision_id = manual.thread_revision_id
+                self._sb_note(revision_id=manual.revision_id,
+                              thread_revision_id=manual.thread_revision_id)
+        if already_committed is not None and already_committed.thread_revision_id:
+            state.current_revision_id = already_committed.thread_revision_id
+        state.last_processed_inbound_wa_message_id = ctx.inbound_wa_message_id
+        state.needs_human = True
+        state.last_stage = STAGE_HUMAN
+        if state.flow_booking_token:
+            state.flow_booking_token = None        # the offer is withdrawn at handoff (F7A)
+        if lead is not None:
+            lead.necesita_humano = True
+            lead.estado = "ATENCION_HUMANA"
+        self.db.commit()
+        self._sb_note(ce_synchronized=True)
+        sent_id = None
+        if send_text:
+            from .booking_flow_service import BOOKING_HANDOFF_TEXT
+            try:
+                sent_id = self._send_text_to_wa(ctx, BOOKING_HANDOFF_TEXT)
+            except OutboundBlockedError as exc:
+                # the handoff is already committed; a blocked transport changes nothing
+                logger.warning("SB2B handoff text not sent thread_id=%s outcome=%s",
+                               ctx.thread.id, getattr(exc, "gate_outcome", "?"))
+                try:
+                    self.db.commit()
+                except Exception:
+                    self.db.rollback()
+        self._turn_decision_authority = DecisionAuthority.FLOW_TRANSACTION
+        self._note_fact_source(FactSource.FLOW_TRANSACTION)
+        out = _out(action, wa_message_id=sent_id, detail=reason, answer_source="FLOW_RESPONSE")
+        out.reply_required = send_text
+        out.alert_eligible = send_text
+        out.reply_produced = bool(sent_id)
+        return out
+
+    def _sb_notify_booking(self, ctx, result, **kw) -> None:
+        """B-8: the operator e-mail, only after the authority committed AND CE committed. A
+        failed notification never touches the booking (and `notification_sent_at` keeps it
+        once per ThreadRevision)."""
+        try:
+            focus = kw["focus"]
+            self._send_booking_notification(
+                thread_rev_id=result.thread_revision_id, crm_rev_id=result.revision_id,
+                lead_id=ctx.lead.id, buyer_name=kw["full_name"], buyer_phone=kw["buyer_phone"],
+                buyer_email=kw["buyer_email"], marca=focus.marca if focus else None,
+                modelo=focus.modelo if focus else None,
+                anio=str(focus.anio) if focus and focus.anio else None,
+                tipo_vehiculo=focus.tipo_vehiculo if focus else None,
+                zone_group=kw["zone_group"], zone_detail=kw["zone_detail"],
+                address=kw["direccion"], seller_type=kw["seller_type"],
+                seller_name=kw["seller_name"],
+                scheduled_date=kw["sched_date"].isoformat() if kw["sched_date"] else None,
+                scheduled_time=kw["sched_time"].strftime("%H:%M") if kw["sched_time"] else None)
+        except Exception as exc:
+            logger.error("SB2B booking notification failed thread_id=%s: %s — booking stands",
+                         ctx.thread.id, type(exc).__name__)
+
+    def _sb_escalation(self, ctx, state, last_message: str) -> ConversationHandleOut:
+        """CE-W2 under Option B. CE already set the handoff (lead, state, token withdrawal)
+        in its own session, possibly after flushes. The authority writes booking-owned rows
+        only — a NON-occupying request with a provisional ThreadRevision — so it can never
+        wait on a row CE holds (B-3). CE commits its handoff after the authority returns, and
+        only then is anything sent: the e-mail and the reply (B-8). The handoff survives every
+        authority outcome."""
+        from .booking_authority import BookingAttachmentPlan, PriceRecalculation, \
+            ThreadRevisionAttachment
+        from .booking_ce_adapter import (CeSchedulingEscalationRequest, ce_escalation_key,
+                                         request_manual_scheduling)
+        lead = ctx.lead
+        thread_rev_id = state.current_revision_id
+        if thread_rev_id is None:
+            focus = self._focus_candidate(ctx, repair=False)
+            prov_date = prov_time = None
+            try:
+                prov_date = date.fromisoformat(str(state.active_requested_date)) \
+                    if state.active_requested_date else None
+            except ValueError:
+                pass
+            try:
+                prov_time = time.fromisoformat(str(state.last_requested_time)) \
+                    if state.last_requested_time else None
+            except ValueError:
+                pass
+            grp, det = self._get_active_inspection_location(ctx, state)
+            candidate_id = focus.id if focus is not None and self._sb_row_committed(
+                WhatsAppThreadCandidate, focus.id) else None
+            buyer_name = ((state.customer_name or "").strip() or (lead.nombre or "").strip()
+                          or None)
+            req = CeSchedulingEscalationRequest(
+                thread_id=ctx.thread.id, lead_id=lead.id,
+                requested_date=prov_date, requested_time=prov_time,
+                revision_fields={
+                    "tipo_vehiculo": focus.tipo_vehiculo if focus else None,
+                    "marca": focus.marca if focus else None,
+                    "modelo": focus.modelo if focus else None,
+                    "anio": focus.anio if focus else None,
+                    "zone_group": grp, "zone_detail": det,
+                    "turno_notas": "Pendiente coordinación manual — cliente insiste con "
+                                   "horario no disponible"},
+                cycle_key=int(state.current_cycle_start_message_db_id or 0),
+                inbound_event_id=ctx.inbound_wa_message_id,
+                attachments=BookingAttachmentPlan(
+                    thread_revision=ThreadRevisionAttachment(
+                        thread_id=ctx.thread.id, candidate_id=candidate_id,
+                        buyer_name=buyer_name, buyer_phone=ctx.contact.wa_id or None,
+                        buyer_email=lead.email or None,
+                        tipo_vehiculo=focus.tipo_vehiculo if focus else None,
+                        marca=focus.marca if focus else None,
+                        modelo=focus.modelo if focus else None,
+                        anio=focus.anio if focus else None, zone_group=grp,
+                        non_occupying_status="provisional"),
+                    price=PriceRecalculation(require_inputs=(focus.tipo_vehiculo, grp, det))
+                    if focus is not None else None))
+            self._sb_note(writer="CE_W2", key=ce_escalation_key(req), authority_called=True)
+            try:
+                result = request_manual_scheduling(self.db, req)
+            except Exception as exc:
+                logger.error("SB2B CE-W2 adapter raised thread_id=%s: %s",
+                             ctx.thread.id, type(exc).__name__)
+                result = None
+            if result is not None:
+                self._sb_note(outcome=result.outcome.value, reason=result.reason,
+                              revision_id=result.revision_id,
+                              thread_revision_id=result.thread_revision_id,
+                              occupying=result.occupying, manual_scheduling=result.outcome.value,
+                              replayed=result.outcome.value == "IDEMPOTENT_REPLAY")
+            if result is not None and result.ok and result.thread_revision_id:
+                state.current_revision_id = result.thread_revision_id
+                thread_rev_id = result.thread_revision_id
+            else:
+                logger.warning("SB2B CE-W2 manual request not recorded thread_id=%s outcome=%s "
+                               "— the handoff stands", ctx.thread.id,
+                               getattr(getattr(result, "outcome", None), "value", "EXCEPTION"))
+        self.db.commit()                              # CE's handoff, after the authority
+        self._sb_note(ce_synchronized=True)
+        try:                                          # B-8: e-mail only now
+            self._send_scheduling_handoff_email(
+                ctx=ctx, state=state, thread_rev_id=thread_rev_id, last_message=last_message)
+        except Exception as exc:
+            logger.error("SB2B handoff e-mail failed thread_id=%s: %s — handoff stands",
+                         ctx.thread.id, type(exc).__name__)
+        msg = (
+            "Entiendo, querés ese horario puntual. "
+            "Lo paso con Julián para ver si puede acomodarlo manualmente "
+            "y te respondemos por acá apenas lo revise. 🙌"
+        )
+        sent_id = self._send_text_to_wa(ctx, msg)
+        return _out("replied", wa_message_id=sent_id)
 
     # ── Qualification fallback Flows ─────────────────────────────────────
 
@@ -9781,6 +10344,8 @@ class ConversationEngine:
                 pending_correction=self._pending_correction_for_trace(ctx),
                 # ── G3-7F-OWNER-RESOLUTION contract 1.8 ──
                 clarification=self._clarification_for_trace(),
+                # ── SB2B contract 1.10 ──
+                booking=self._sb_trace_payload(),
             )
             persist(self.db, trace)
         except Exception as exc:
@@ -11933,6 +12498,10 @@ class ConversationEngine:
                 "L4.7W5-F7A FLOW_OFFER_WITHDRAWN thread_id=%s — rejected offer's token "
                 "consumed at handoff", ctx.thread.id)
             state.flow_booking_token = None
+
+        # SB2B Option B (flag-gated): booking-owned plan, CE commit, then e-mail and reply.
+        if self._smart_booking_ce_on():
+            return self._sb_escalation(ctx, state, last_message)
 
         thread_rev_id: int | None = state.current_revision_id
 

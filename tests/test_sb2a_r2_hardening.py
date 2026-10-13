@@ -195,7 +195,7 @@ class R02AdapterIsolationOrm(unittest.TestCase):
             thread_id=1, lead_id=lead_id, cycle_key=1))
         refused = ce.book_from_flow_response(db, ce.CeFlowBookingRequest(
             thread_id=1, lead_id=lead_id, inbound_event_id="w", flow_token=None,
-            requested_date=D, requested_time=time(10)))
+            requested_date=D, requested_time=time(10), availability=ce.AvailabilityRevalidation()))  # SB2B B-7
         self.assertEqual(ok.outcome, Out.COMMITTED)
         self.assertEqual(refused.outcome, Out.SLOT_CONFLICT)       # refusal rolls back ITS session
         self.assertEqual(calls, [])
@@ -214,7 +214,7 @@ class R02AdapterIsolationOrm(unittest.TestCase):
         try:
             ce.book_from_flow_response(db, ce.CeFlowBookingRequest(
                 thread_id=1, lead_id=lead.id, inbound_event_id="w", flow_token="t",
-                requested_date=D, requested_time=time(10)))
+                requested_date=D, requested_time=time(10), availability=ce.AvailabilityRevalidation()))  # SB2B B-7
         finally:
             ce.BookingAuthority = real
         self.assertEqual(len(seen), 1)

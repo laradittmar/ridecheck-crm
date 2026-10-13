@@ -937,6 +937,39 @@ def render_control_page(user_email: str) -> str:
         </div>
       </div>
 
+      <!-- SB2B: booking ledger rows that need a person -->
+      <div class="panel" id="panel-bookings">
+        <div class="panelHeader">
+          <h2>Reservas que requieren atención</h2>
+          <div class="filterGroup">
+            <span class="legendNote">Filas del ledger de reservas: acuse pendiente hace más
+              de 5 minutos, fallido, ambiguo o con riesgo de duplicado; identidad en
+              conflicto; turno de CE que no terminó de sincronizar. La recuperación es
+              manual: re-envío del evento entrante guardado, o recuperación del acuse desde
+              el ledger. Nunca se muestran tokens ni WAMID completos.</span>
+          </div>
+        </div>
+        <div class="tableWrap">
+          <table id="bookings-table">
+            <thead>
+              <tr>
+                <th>Confirmada</th>
+                <th>Conversación</th>
+                <th>Clave</th>
+                <th>Revisión</th>
+                <th>Acuse</th>
+                <th>Identidad</th>
+                <th>Motivos</th>
+                <th>Recuperación</th>
+              </tr>
+            </thead>
+            <tbody id="bookings-tbody">
+              <tr><td colspan="8" class="emptyState">Cargando…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
       <!-- Critical events panel -->
       <div class="panel criticalPanel" id="panel-critical">
         <div class="panelHeader">
@@ -1523,6 +1556,46 @@ def render_control_page(user_email: str) -> str:
     }}
 
     // -------------------------------------------------------------------------
+    // SB2B: booking ledger attention (read-only; recovery is an operator action)
+    // -------------------------------------------------------------------------
+    var BOOKING_RECOVERY = {{
+      'STORED_INBOUND_REPLAY': 'Re-enviar el evento entrante guardado',
+      'LEDGER_ACK_RECOVERY': 'Recuperar el acuse desde el ledger',
+      'OPERATOR_REVIEW': 'Revisión de un operador'
+    }};
+    function fetchBookings() {{
+      apiFetch('/api/ops/booking-attention', function(data) {{
+        var rows = (data && data.rows) || [];
+        var tbody = document.getElementById('bookings-tbody');
+        if (!tbody) return;
+        if (!rows.length) {{
+          tbody.innerHTML = '<tr><td colspan="8" class="emptyState">'
+            + 'Ninguna reserva requiere atención</td></tr>';
+          return;
+        }}
+        tbody.innerHTML = rows.map(function(r) {{
+          var ack = esc(r.ack_status) + ' · ' + esc(r.ack_attempts) + ' intento(s)'
+            + (r.ack_duplicate_risk ? ' · <span class="badge badgeHigh">duplicado posible</span>' : '')
+            + (r.ack_error_category ? '<div class="subtle">' + esc(r.ack_error_category) + '</div>' : '')
+            + (r.ack_transport_tail ? '<div class="subtle">…' + esc(r.ack_transport_tail) + '</div>' : '');
+          return '<tr>'
+            + '<td>' + fmtDateTime(r.committed_at) + '</td>'
+            + '<td>' + (r.thread_url
+                 ? ('<a href="' + esc(r.thread_url) + '" target="_blank" rel="noopener">'
+                    + esc(r.thread_id) + '</a>')
+                 : '—') + '</td>'
+            + '<td>' + esc(r.key_kind) + ':' + esc(r.key_hash_prefix) + '…</td>'
+            + '<td>' + esc(r.revision_id) + ' / ' + esc(r.thread_revision_id) + '</td>'
+            + '<td>' + ack + '</td>'
+            + '<td>' + esc(r.identity_outcome) + '</td>'
+            + '<td>' + (r.reasons || []).map(esc).join('<br>') + '</td>'
+            + '<td>' + esc(BOOKING_RECOVERY[r.recovery] || r.recovery) + '</td>'
+            + '</tr>';
+        }}).join('');
+      }});
+    }}
+
+    // -------------------------------------------------------------------------
     // Orchestrate refresh
     // -------------------------------------------------------------------------
     function refreshAll() {{
@@ -1532,6 +1605,7 @@ def render_control_page(user_email: str) -> str:
       fetchCritical();
       fetchPaths();
       fetchTurns();
+      fetchBookings();
       document.getElementById('lastUpdated').textContent = nowHMS();
       fetchCustomerOptions();
       fetchPathRegistry();

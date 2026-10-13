@@ -246,7 +246,7 @@ class R5LockWait(unittest.TestCase):
         plan = B.BookingAttachmentPlan(thread_revision=B.ThreadRevisionAttachment(thread_id=tid))
         req = ce.CeFlowBookingRequest(thread_id=tid, lead_id=self.lead, inbound_event_id="wamid.R5", flow_token=None,
                                       requested_date=self.day, requested_time=time(15), revision_fields=rf,
-                                      attachments=plan)
+                                      attachments=plan, availability=ce.AvailabilityRevalidation())  # SB2B B-7
         expected_key = ce.ce_flow_booking_key(req)
         release, hth, _ = self.holder()
         th, res = self.contender_waiting(lambda: ce.book_from_flow_response(Session(self.engine), req, lock_timeout_ms=10000))

@@ -346,7 +346,7 @@ class R6_Adapter(unittest.TestCase):
             r1 = ce.book_from_flow_response(db, ce.CeFlowBookingRequest(
                 thread_id=tid, lead_id=lead.id, inbound_event_id="w.r6", flow_token=None,
                 requested_date=D, requested_time=time(10), revision_fields={"marca": "Fiat"},
-                attachments=Plan(thread_revision=TRA(thread_id=tid))))
+                attachments=Plan(thread_revision=TRA(thread_id=tid)), availability=ce.AvailabilityRevalidation()))  # SB2B B-7
             r2 = ce.request_manual_scheduling(db, ce.CeSchedulingEscalationRequest(
                 thread_id=tid, lead_id=lead.id, cycle_key=4))
         self.assertEqual((r1.outcome, r2.outcome), (Out.COMMITTED, Out.COMMITTED), (r1.reason, r2.reason))
@@ -373,7 +373,10 @@ class R6_KeyStability(unittest.TestCase):
     """Golden values computed on b10dbd5 (before R6). R6 must not move any key."""
 
     GOLDEN = {
-        "flow_token": "ce-flow-response:3940e098fb78170e3134cd62aff43e7e4acdfd776da012fd",
+        # SB2B B-1 (D1-01), deliberate: a token-bearing CE Flow response now uses the Data
+        # Exchange endpoint's key (`flow_idem` below), so one Flow submission has ONE ledger
+        # row. Was "ce-flow-response:3940e098fb78170e3134cd62aff43e7e4acdfd776da012fd".
+        "flow_token": "flow:1dc269d00d970f1852f83c9bf70131f39669cddeae2064b0",
         "flow_msg": "ce-flow-response:e2a88bf3802a0eea0e1aefc833d7f4f758c90f4d3fec3a81",
         "esc_cycle": "ce-escalation:e01a01f5c399e438fc2b3571345d5440578420160aa0a13c",
         "esc_id": "ce-escalation:8573d4db26b003397a91d434ee5cc84dde585cff244d7143",

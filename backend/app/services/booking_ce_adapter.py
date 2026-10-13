@@ -30,12 +30,28 @@ SB2A-R2 corrections:
 SB2A-R3: no callback. CE describes its associated writes (the ThreadRevision, lead and thread
 state) as a typed `BookingAttachmentPlan`; the booking authority performs them inside its
 own transaction. The binding SB2B rules are in the integration manifest.
+
+SB2B Option B (D1 §8.2, binding rules B-1..B-8) — what the adapter now enforces itself:
+
+* **B-1 one key per Flow submission.** A token-bearing Flow response is keyed exactly like the
+  Data Exchange confirmation, `flow_idempotency_key(token)`, so the two writers of one Flow
+  submission share ONE ledger row and can never both book. `ce-flow-response:` survives only
+  for a genuinely token-less event. `lookup_booking` is the read CE performs before any
+  execute.
+* **B-3 CE-W2 plans are booking-owned only.** CE-W2 runs after arbitrary CE flushes, so a
+  lead or thread-state write in its plan would wait on CE's own uncommitted row lock. Such a
+  plan is refused before any database access.
+* **B-7 availability.** An occupying CE-W1 command carries the same `AvailabilityRevalidation`
+  as the endpoint path; without one it is refused, so CE can never book a stale slot.
+* **R7-O1 / R7RV-04 metadata ownership.** CE may set only the non-booking Revision fields of
+  the approved booking plan (`CE_REVISION_FIELDS`). Timestamps, approval workflow state, ids,
+  booking-version and canonical booking columns are refused before any database access.
 """
 from __future__ import annotations
 
 import hashlib
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, time
 from typing import Any, Mapping, Optional
 
@@ -43,6 +59,7 @@ from sqlalchemy.orm import Session
 
 from .booking_authority import (
     DEFAULT_LOCK_TIMEOUT_MS,
+    AvailabilityRevalidation,
     BookingAttachmentPlan,
     BookingAuthority,
     BookingCommand,
@@ -50,6 +67,7 @@ from .booking_authority import (
     BookingOutcome,
     BookingResult,
     BookingSource,
+    flow_idempotency_key,
     refuse,
 )
 
@@ -58,6 +76,17 @@ from .booking_authority import (
 #: so the customer is still handed to a human.
 CE_W1_FALLBACK_TO_MANUAL = frozenset({BookingOutcome.SLOT_CONFLICT,
                                       BookingOutcome.CALENDAR_EXCEPTION})
+
+#: SB2B (R7-O1 / R7RV-04 carried forward): the ONLY Revision columns a Conversation Engine
+#: command may set — the non-booking fields of the approved booking plan, i.e. exactly what
+#: the Data Exchange confirmation (`booking_flow_service.handle_confirm_booking`) and the two
+#: legacy CE writers already write. Everything else is refused before any database access:
+#: `created_at`, the appointment-approval workflow (`appointment_approval_*`), ids,
+#: `booking_version` and the canonical booking columns the authority itself owns.
+CE_REVISION_FIELDS = frozenset({
+    "tipo_vehiculo", "marca", "modelo", "anio", "zone_group", "zone_detail",
+    "direccion_texto", "vendedor_tipo", "tipo_vendedor", "turno_notas",
+})
 
 
 @dataclass(frozen=True)
@@ -74,6 +103,9 @@ class CeFlowBookingRequest:
     revision_fields: Mapping[str, Any] = field(default_factory=dict)
     #: Typed associated writes (booked ThreadRevision, lead, thread state) — data only.
     attachments: Optional[BookingAttachmentPlan] = None
+    #: SB2B B-7: the authority's own `ScheduleService` revalidation inputs. Required for an
+    #: occupying booking; the check itself runs inside the authority, under its locks.
+    availability: Optional[AvailabilityRevalidation] = None
 
 
 @dataclass(frozen=True)
@@ -100,7 +132,8 @@ _REQUEST_SCHEMA = {
     "CeFlowBookingRequest": {"thread_id": ("int", False), "lead_id": ("int", False),
                              "inbound_event_id": ("str", True), "flow_token": ("str", True),
                              "requested_date": ("date", True), "requested_time": ("time", True),
-                             "revision_fields": ("dict", False), "attachments": ("plan", True)},
+                             "revision_fields": ("dict", False), "attachments": ("plan", True),
+                             "availability": ("avail", True)},
     "CeSchedulingEscalationRequest": {"thread_id": ("int", False), "lead_id": ("int", False),
                                       "escalation_id": ("str", True), "requested_date": ("date", True),
                                       "requested_time": ("time", True), "revision_fields": ("dict", False),
@@ -124,8 +157,13 @@ def _capture_request(req, cls) -> Optional[dict]:
     if att is ba._CAPTURE_FAILED:
         return None
     vals["attachments"] = att
+    if "availability" in vals:
+        avail = ba._capture_optional(vals["availability"], ba.AvailabilityRevalidation)
+        if avail is ba._CAPTURE_FAILED:
+            return None
+        vals["availability"] = avail
     exact = {"int": int, "str": str, "date": date, "time": time, "dict": dict,
-             "plan": ba.BookingAttachmentPlan}
+             "plan": ba.BookingAttachmentPlan, "avail": ba.AvailabilityRevalidation}
     for name, (kind, nullable) in schema.items():       # validate the CAPTURE
         v = vals[name]
         if v is None:
@@ -148,10 +186,51 @@ def _key(prefix: str, thread_id: int, kind: str, identity: str) -> str:
 def _flow_key(v: dict) -> Optional[str]:
     token = _nonblank(v["flow_token"])
     if token:
-        return _key("ce-flow-response", v["thread_id"], "token", token)
+        # SB2B B-1 (D1-01): the Data Exchange endpoint's key for the same Flow submission.
+        # One token, one ledger row, whichever writer arrives first.
+        return flow_idempotency_key(token)
     msg = _nonblank(v["inbound_event_id"])
     if msg:
         return _key("ce-flow-response", v["thread_id"], "msg", msg)
+    return None
+
+
+def flow_booking_key(thread_id: int, flow_token: Optional[str],
+                     inbound_event_id: Optional[str]) -> Optional[str]:
+    """The B-1 key CE looks up BEFORE anything else — the very key `book_from_flow_response`
+    executes under. None when the event has no identity (or is not plain data)."""
+    if type(thread_id) is not int or thread_id < 0:
+        return None
+    for value in (flow_token, inbound_event_id):
+        if value is not None and type(value) is not str:
+            return None
+    return _flow_key({"thread_id": thread_id, "flow_token": flow_token,
+                      "inbound_event_id": inbound_event_id})
+
+
+def lookup_booking(db: Session, key: Optional[str]) -> Optional[BookingResult]:
+    """SB2B B-1/B-2: the committed result for `key`, read in an isolated session (CE's own
+    session is not touched, so the read cannot assign CE a transaction id). None for a miss
+    or a missing key. Read-only: not counted as a replay."""
+    if type(key) is not str or not key:
+        return None
+    with isolated_session(db) as session:
+        return BookingAuthority(session).lookup(key)
+
+
+def inbound_correlation(inbound_event_id: Optional[str]) -> Optional[str]:
+    """A ledger `correlation_id` naming the inbound event that caused a CE command, without
+    storing the WAMID itself: `in:` + 32 hex of its SHA-256. Lets an operator surface tell
+    whether CE finished synchronizing after the booking committed."""
+    msg = _nonblank(inbound_event_id) if type(inbound_event_id) is str else None
+    return None if msg is None else "in:" + hashlib.sha256(msg.encode()).hexdigest()[:32]
+
+
+def _fields_refusal(fields: dict) -> Optional[BookingResult]:
+    """R7-O1 / R7RV-04: refuse any Revision field outside `CE_REVISION_FIELDS`, before SQL."""
+    for k in fields:                     # our own copy of exact str keys: runs no caller code
+        if k not in CE_REVISION_FIELDS:
+            return refuse(BookingOutcome.VALIDATION_FAILED, f"CE_FIELD_NOT_ALLOWED:{k}"[:64])
     return None
 
 
@@ -205,8 +284,9 @@ def book_from_flow_response(
     lock_timeout_ms: int = DEFAULT_LOCK_TIMEOUT_MS,
 ) -> BookingResult:
     """CE-W1. Books the agreed slot and performs `req.attachments` (typically the booked
-    ThreadRevision, lead and thread-state updates) in the authority's transaction; CE keeps
-    keying its `flow-txn:<ThreadRevision.id>` acknowledgement on `result.thread_revision_id`.
+    ThreadRevision, lead and thread-state updates) in the authority's transaction. SB2B
+    B-5: the acknowledgement is the ledger row's (`claim_acknowledgement` on this key), not a
+    `flow-txn:<ThreadRevision.id>` outbound lookup.
 
     A response without a complete agreed slot cannot be a booking: it is recorded as a
     non-occupying manual-scheduling request with whatever part of the slot is known.
@@ -218,16 +298,24 @@ def book_from_flow_response(
     key = _flow_key(v)
     if key is None:
         return _no_identity()
+    refused = _fields_refusal(v["revision_fields"])
+    if refused is not None:
+        return replace(refused, idempotency_key=key)
     complete = v["requested_date"] is not None and v["requested_time"] is not None
+    if complete and v["availability"] is None:           # SB2B B-7
+        return refuse(BookingOutcome.VALIDATION_FAILED, "AVAILABILITY_REVALIDATION_REQUIRED",
+                      idempotency_key=key)
     command = BookingCommand(
         operation=BookingOperation.CREATE if complete else BookingOperation.REQUEST_MANUAL_SCHEDULING,
         source=BookingSource.CONVERSATION_ENGINE, idempotency_key=key, lead_id=v["lead_id"],
         thread_id=v["thread_id"], requested_date=v["requested_date"],
         requested_time=v["requested_time"], revision_fields=v["revision_fields"],
+        correlation_id=inbound_correlation(v["inbound_event_id"]),
         tracks_acknowledgement=complete)
     with isolated_session(db) as session:
         return BookingAuthority(session, lock_timeout_ms=lock_timeout_ms).execute(
-            command, attachments=v["attachments"])
+            command, availability=v["availability"] if complete else None,
+            attachments=v["attachments"])
 
 
 def request_manual_scheduling(
@@ -246,11 +334,23 @@ def request_manual_scheduling(
     key = _escalation_key(v)
     if key is None:
         return _no_identity()
+    refused = _fields_refusal(v["revision_fields"])
+    if refused is not None:
+        return replace(refused, idempotency_key=key)
+    plan = v["attachments"]
+    # SB2B B-3: booking-owned rows only. CE performs needs_human, the canonical state and the
+    # token withdrawal in its own transaction; the authority never locks a lead or thread-state
+    # row CE may already hold. No approval workflow is started from an escalation either.
+    if plan is not None and (plan.lead is not None or plan.thread_state is not None or (
+            plan.thread_revision is not None and plan.thread_revision.request_approval)):
+        return refuse(BookingOutcome.VALIDATION_FAILED, "CE_W2_PLAN_NOT_BOOKING_OWNED",
+                      idempotency_key=key)
     command = BookingCommand(
         operation=BookingOperation.REQUEST_MANUAL_SCHEDULING,
         source=BookingSource.CONVERSATION_ENGINE, idempotency_key=key, lead_id=v["lead_id"],
         thread_id=v["thread_id"], requested_date=v["requested_date"],
-        requested_time=v["requested_time"], revision_fields=v["revision_fields"])
+        requested_time=v["requested_time"], revision_fields=v["revision_fields"],
+        correlation_id=inbound_correlation(v["inbound_event_id"]))
     with isolated_session(db) as session:
         return BookingAuthority(session, lock_timeout_ms=lock_timeout_ms).execute(
             command, attachments=v["attachments"])

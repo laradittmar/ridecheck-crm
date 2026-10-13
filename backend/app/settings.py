@@ -89,6 +89,11 @@ class Settings:
     # never change routing or customer-visible text. Turning it off stops the write and
     # leaves every prior trace readable, which is the whole rollback.
     hybrid_trace_enabled: bool = False
+    # SB2B Option B — Conversation Engine booking paths call the booking authority (adapter
+    # first, authoritative commit first, CE synchronization second). OFF by default
+    # everywhere: with it off CE-W1/CE-W2 keep their legacy behaviour exactly, and nothing
+    # writes a booking ledger row from CE. Read with `is True`, never truthiness.
+    smart_booking_ce_enabled: bool = False
     conversation_engine_direct_webhook_enabled: bool = False
     openai_chat_model: str = "gpt-4o-mini"
     quarantined_test_wa_ids: tuple[str, ...] = ()
@@ -192,6 +197,8 @@ def get_settings() -> Settings:
             "SEMANTIC_SAME_TURN_TIMEOUT_SECONDS", 6.0),
         shadow_evidence_path=_getenv("SHADOW_EVIDENCE_PATH"),
         hybrid_trace_enabled=(_getenv("HYBRID_TRACE_ENABLED", "false").lower() == "true"),
+        smart_booking_ce_enabled=(
+            _getenv("SMART_BOOKING_CE_ENABLED", "false").lower() == "true"),
         conversation_engine_direct_webhook_enabled=_getenv("CONVERSATION_ENGINE_DIRECT_WEBHOOK_ENABLED", "false").lower() in ("1", "true", "yes"),
         openai_chat_model=_getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
         quarantined_test_wa_ids=_parse_quarantined_wa_ids(),

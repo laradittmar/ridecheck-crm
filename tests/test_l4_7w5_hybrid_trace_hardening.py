@@ -626,7 +626,10 @@ class EndpointAuthorization(unittest.TestCase):
             calls = [d.call for d in getattr(getattr(route, "dependant", None),
                                              "dependencies", [])]
             (gated if require_crm_session in calls else ungated).append(path)
-        self.assertEqual(sorted(gated), ["/api/ops/turn/{turn_id}", "/api/ops/turns"])
+        # SB2B adds ONE new route, born behind the same gate (booking ledger attention). No
+        # existing route gained or lost it: the ungated list below is unchanged.
+        self.assertEqual(sorted(gated), ["/api/ops/booking-attention",
+                                         "/api/ops/turn/{turn_id}", "/api/ops/turns"])
         self.assertEqual(sorted(ungated),
                          ["/api/ops/critical-events", "/api/ops/messages",
                           "/api/ops/path-registry", "/api/ops/paths",

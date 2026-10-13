@@ -20,7 +20,7 @@
       "command": {
         "operation": "CREATE (REQUEST_MANUAL_SCHEDULING, non-occupying, when the agreed slot is incomplete)",
         "source": "CONVERSATION_ENGINE",
-        "idempotency_key": "ce-flow-response:<sha256('<thread_id>|token|<flow_token>')[:48]> | ce-flow-response:<sha256('<thread_id>|msg|<inbound wamid>')[:48]>; blank identities are never hashed",
+        "idempotency_key": "SB2B B-1: flow_idempotency_key(flow_token) = flow:<sha256(flow_token)[:48]> — the Data Exchange endpoint's key, one ledger row per Flow submission | ce-flow-response:<sha256('<thread_id>|msg|<inbound wamid>')[:48]> only for a token-less event; blank identities are never hashed",
         "requested_date": "state.preferred_day",
         "requested_time": "state.preferred_time",
         "attach": "typed BookingAttachmentPlan: ThreadRevisionAttachment (booked; slot derived) + LeadUpdate + ThreadStateUpdate(link_current_revision, last_stage, needs_human, consume_flow_token) [+ PriceRecalculation(require_inputs)]"
@@ -36,7 +36,7 @@
         "VALIDATION_FAILED"
       ],
       "sb2b_rules": [
-        "COMMITTED/IDEMPOTENT_REPLAY: keep the flow-txn:<ThreadRevision.id> acknowledgement keyed on result.thread_revision_id; then SB2B-3",
+        "COMMITTED/IDEMPOTENT_REPLAY (SB2B B-5): the acknowledgement is the ledger row's — claim_acknowledgement(key), the owner text BOOKING_FLOW_RECEIPT_TEXT through the gate on BOOKING_FLOW with the causal inbound, record_acknowledgement; then SB2B-3 (B-4: expire, cursor, CE-only writes, commit). flow-txn:<ThreadRevision.id> no longer governs the flag-on path",
         "SLOT_CONFLICT/CALENDAR_EXCEPTION: book nothing; call request_manual_scheduling so the human escalation survives",
         "RETRYABLE_FAILURE/INTERNAL_FAILURE: SB2B-5/SB2B-6/SB2B-7",
         "VALIDATION_FAILED (EVENT_IDENTITY_REQUIRED, IDEMPOTENCY_KEY_REUSED, ATTACHMENT_*, PLAN_NOT_DATA, COMMAND_NOT_DATA): book nothing, acknowledge nothing as confirmed, hand off"

@@ -327,7 +327,10 @@ def _git_blob_sha1(path: str) -> str:
 
 #: Blob ids at the SB1 parent `ab95706`. SB1 may change none of these files.
 _FROZEN_AT_PARENT = {
-    "backend/app/services/conversation_engine.py": "ec0571bd740bec678fd7dea63d80a0ac998973c2",
+    # SB2B: conversation_engine.py un-frozen — PRELAUNCH-SB2B-OPTION-B-CE-INTEGRATION is the
+    # milestone authorized to wire CE-W1/CE-W2 to the booking authority. Every new path is
+    # behind SMART_BOOKING_CE_ENABLED (default off); tests/test_sb2b_option_b.py pins the
+    # flag-off legacy behaviour and tests/test_sb2a_booking_authority.py pins the gating.
     "backend/app/services/semantic_interpreter.py": "0de2635795da8e408da12f1264c12f840a87d82c",
     "backend/app/services/semantic_turn_evidence.py": "50118bf6cbf21108bc1356057ba95c9a12e816c7",
     "backend/app/services/scheduling_reconciler.py": "cb102122e1dab93ff1d182b32d35f031dc7d0040",

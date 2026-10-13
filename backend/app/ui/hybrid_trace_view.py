@@ -761,6 +761,7 @@ CONTRACTS_WITH_CANDIDATE_SECTION = frozenset({
     "hybrid-decision-trace/1.7",
     "hybrid-decision-trace/1.8",
     "hybrid-decision-trace/1.9",
+    "hybrid-decision-trace/1.10",
 })
 
 #: G3-7F-OWNER-RESOLUTION. The clarification section needs its own note because the whole
@@ -1040,6 +1041,52 @@ def _clarification_card(trace: dict) -> str:
             f"{_kv(rows)}</div>")
 
 
+def _booking_card(trace: dict) -> str:
+    """SB2B, contract 1.10: what the booking authority did with this turn.
+
+    The ledger and `ai_events` are the guaranteed records; this card is the turn's view of
+    them. The key is shown as its namespace and a hash prefix — it never contains a Flow
+    token. A 1.9 or older trace has no such block and renders nothing; a 1.10 turn that did
+    not reach the authority says so, because there the absence is itself a recorded fact.
+    """
+    res = trace.get("booking")
+    if not isinstance(res, dict):
+        if str(trace.get("trace_version") or "") == "hybrid-decision-trace/1.10":
+            return ('<div class="card"><h2>Reserva — autoridad</h2>'
+                    f'<p class="note">{_e("este turno no llamó a la autoridad de reservas")}'
+                    "</p></div>")
+        return ""
+    _WRITER = {"CE_W1": "respuesta del Flow de reserva (CE-W1)",
+               "CE_W2": "derivación por horario no disponible (CE-W2)"}
+    _ACK = {"PENDING": "pendiente", "SENDING": "enviando (lease activo)", "SENT": "enviado",
+            "FAILED": "falló — reintentable o agotado", "NOT_APPLICABLE": "no corresponde"}
+    key = (f'{res.get("key_prefix") or ""}{res.get("key_hash_prefix") or ""}…'
+           if res.get("key_prefix") else None)
+    rows = [
+        ("Escritor", _e(_WRITER.get(str(res.get("writer")), res.get("writer")))),
+        ("Clave (prefijo del hash)", _e(key)),
+        ("Resultado", _e(res.get("outcome"))),
+        ("Motivo", _e(res.get("reason"))),
+        ("Consulta al ledger encontró la reserva", _e(res.get("lookup_hit"))),
+        ("Repetición idempotente", _e(res.get("replayed"))),
+        ("Autoridad invocada en este turno", _e(res.get("authority_called"))),
+        ("Revisión (CRM)", _e(res.get("revision_id"))),
+        ("Revisión del hilo", _e(res.get("thread_revision_id"))),
+        ("Ocupa agenda", _e(res.get("occupying"))),
+        ("Disponibilidad revalidada bajo la autoridad", _e(res.get("availability_revalidated"))),
+        ("Solicitud manual", _e(res.get("manual_scheduling"))),
+        ("Acuse — antes", _e(_ACK.get(str(res.get("ack_status_before")),
+                                     res.get("ack_status_before")))),
+        ("Acuse — después", _e(_ACK.get(str(res.get("ack_status_after")),
+                                       res.get("ack_status_after")))),
+        ("Acuse intentado en este turno", _e(res.get("ack_attempted"))),
+        ("Identidad enviada", _e(res.get("identity_outcome"))),
+        ("CE sincronizado", _e(res.get("ce_synchronized"))),
+    ]
+    return ('<div class="card"><h2>Reserva — autoridad</h2>'
+            f"{_kv(rows)}</div>")
+
+
 def _pending_correction_card(trace: dict) -> str:
     """The provisional patch: what was proposed, why it waits, and what it blocked.
 
@@ -1287,6 +1334,7 @@ def render_turn_trace_page(record: Optional[dict], turn_id: str = "") -> str:
         + _candidate_resolution_card(trace)
         + _pending_correction_card(trace)
         + _clarification_card(trace)
+        + _booking_card(trace)
         + _state_card(trace.get("canonical_before") or {}, trace.get("canonical_after") or {})
         + _outcome_card(trace)
         + _reply_model_card(trace)
