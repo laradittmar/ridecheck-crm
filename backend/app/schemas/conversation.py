@@ -36,6 +36,25 @@ ACTION_NO_REPLY_PRODUCED = "no_reply_produced"
 #: hear about it.
 ACTION_THREAD_CONTENDED = "thread_contended"
 
+#: L4.7W5-GATE3-G3-7R/S6 — this offer ALREADY produced a committed booking.
+#:
+#: Not a refusal, not an error, and not `skipped_duplicate_completion` either: that value
+#: means a clarification attempt was replayed, while this one means the authoritative
+#: booking exists and is being returned. The distinction is the whole point of the value.
+#:
+#: The architecture audit measured what the system did instead. A Flow completion arriving
+#: at the ConversationEngine after the Data Exchange writer had committed the booking was
+#: refused `OFFER_ALREADY_ACCEPTED`, which set `needs_human=True`, sent the warm-handoff
+#: text, and left the offer reading `ACCEPTED, refused_count=1,
+#: last_refusal='OFFER_ALREADY_ACCEPTED'` — the exact shape of a rejected submission, on
+#: the happy path. The Data Exchange side told the same customer *"Tu sesión de reserva
+#: expiró"* about a booking that had just succeeded.
+#:
+#: `reply_required` is FALSE: the acknowledgement for this booking was already sent by the
+#: transport that created it, and sending a second one would be the duplicate
+#: acknowledgement S6 exists to prevent. Silence here is correct, and it is ownership.
+ACTION_BOOKING_REPLAY = "booking_replay"
+
 # Actions that mean the engine fully owned the turn (n8n should stop)
 HANDLED_ACTIONS = frozenset({
     "replied", "flow_button_sent", "booking_created",
@@ -87,6 +106,10 @@ HANDLED_ACTIONS = frozenset({
     # authority, reached at the exact moment the first one is mid-booking. That is the one
     # outcome worse than dropping the turn.
     ACTION_THREAD_CONTENDED,
+    # G3-7R/S6: returning an existing booking is a CE decision and CE owns the turn.
+    # Left unhandled, a replayed completion would be handed to n8n's legacy booking chain
+    # — a second booking authority, invoked for a token whose booking already exists.
+    ACTION_BOOKING_REPLAY,
 })
 # NOT included, deliberately: "no_lead". M21.2.8 certified it as genuine non-ownership
 # (the thread has no lead, so CE could not act), the text-path false branch is empty, and

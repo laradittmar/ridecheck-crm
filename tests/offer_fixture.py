@@ -13,6 +13,10 @@ whose candidate or zone disagrees with the thread is refused by design.
 """
 from __future__ import annotations
 
+#: The stub leaves the candidate unpinned so `_offer_bound_candidate` falls through to the
+#: thread's own focus — which is what these field-mapping suites set up and assert on.
+_STUB_CANDIDATE = None
+
 
 def seed_live_offer(db, state, *, thread_id=None, token=None, candidate_id=None,
                     zone_group=None, zone_detail=None, tipo_vehiculo=None,
@@ -105,19 +109,84 @@ def _active_candidate_and_zone(db, state):
 
 
 def start_offer_claim_stub(test_case):
-    """Let a MagicMock-session unit test reach the booking body (G3-7P).
+    """Let a MagicMock-session unit test reach the booking body (G3-7P, extended by G3-7R).
 
-    `claim()` is a DATABASE decision: it reads `whatsapp_booking_offers` under a row lock.
-    A unit test whose session is a `MagicMock` cannot answer it — the mock returns a mock,
-    which the claim correctly reads as "not this thread's offer" and refuses. These tests
-    assert the booking body's FIELD MAPPING, not acceptance, so the authority is stubbed
-    here and proven for real in `test_l4_7w5_g3_7p_offer_authority_pg.py`, which runs
-    every refusal class against PostgreSQL.
+    Every decision on the acceptance path is a DATABASE decision, and a unit test whose
+    session is a `MagicMock` cannot answer any of them — the mock returns a mock, which each
+    control correctly reads as "not this thread's" and refuses. These tests assert the
+    booking body's FIELD MAPPING, not acceptance, so the controls are stubbed HERE, in one
+    declared place, and proven for real on PostgreSQL.
+
+    FOUR things are stubbed, and each one names where it is really proven:
+
+      `OfferLifecycle.claim`              acceptance, and every refusal class
+                                          -> test_l4_7w5_g3_7p_offer_authority_pg.py
+      `OfferLifecycle.admit`   (G3-7R/S2) database-first admission, replay and fail-closed
+                                          -> G37RAdmissionScope (sealed, no database) and
+                                             test_l4_7w5_g3_7r_booking_projection_pg.py P8
+      `_offer_bound_candidate` (G3-7R/S3) the candidate authority. The stub applies the REAL
+                                          rule — resolve the admitted offer's `candidate_id`
+                                          — against `ctx.candidates` instead of through
+                                          `db.get()`, so the field-mapping assertions still
+                                          mean something. Cycle-window and deleted-row
+                                          refusals -> the PG suites.
+      `_revalidate_booking_slot` (G3-7R/S5) final availability. Needs a real
+                                          `ScheduleService` over real occupying rows
+                                          -> test_l4_7w5_g3_7r_booking_projection_pg.py P7
 
     Registers its own cleanup on `test_case`.
     """
     from unittest import mock
-    from app.services.offer_lifecycle import OfferClaim, OfferLifecycle
+    from app.services.conversation_engine import ConversationEngine
+    from app.services.offer_lifecycle import (AdmissionOutcome, OfferAdmission, OfferClaim,
+                                              OfferLifecycle)
+
+    def _admit(self, *, thread_id, token):
+        """GRANTED, bound to whatever this thread's canonical values are.
+
+        Deliberately still fails closed on a missing token: that is pure logic with no
+        database in it, and it is the single most important thing admission does — the
+        G3-7N review measured NO TOKEN AT ALL booking successfully.
+        """
+        if not token or not isinstance(token, str) or not token.strip():
+            from app.services.offer_lifecycle import OfferRefusal
+            return OfferAdmission(AdmissionOutcome.REFUSED, OfferRefusal.NO_TOKEN)
+        return OfferAdmission(AdmissionOutcome.GRANTED, None, offer_id=1,
+                              fingerprint="0" * 64, status="ISSUED",
+                              candidate_id=_STUB_CANDIDATE, tipo_vehiculo=None,
+                              zone_group=None, zone_detail=None, cycle_key=0)
+
+    def _bound_candidate(self, ctx, admission):
+        """The real S3 rule, resolved in memory: the offer's candidate, or the thread's
+        focus when the stub did not pin one."""
+        candidate_id = getattr(admission, "candidate_id", None)
+        candidates = list(getattr(ctx, "candidates", None) or ())
+        if candidate_id is not None:
+            for candidate in candidates:
+                if getattr(candidate, "id", None) == candidate_id:
+                    return candidate
+        focus_id = getattr(getattr(ctx, "state", None), "current_focus_candidate_id", None)
+        for candidate in candidates:
+            if getattr(candidate, "id", None) == focus_id:
+                return candidate
+        return candidates[0] if len(candidates) == 1 else None
+
+    admit = mock.patch.object(OfferLifecycle, "admit", autospec=True, side_effect=_admit)
+    # `verify_bindings` is the same database decision `claim` is — G3-7R split it out so the
+    # bindings could be checked BEFORE availability revalidation. Stubbed for the same
+    # reason and proven in the same places.
+    bindings = mock.patch.object(OfferLifecycle, "verify_bindings", autospec=True,
+                                 return_value=None)
+    bindings.start()
+    test_case.addCleanup(bindings.stop)
+    bound = mock.patch.object(ConversationEngine, "_offer_bound_candidate", autospec=True,
+                              side_effect=_bound_candidate)
+    revalidate = mock.patch.object(ConversationEngine, "_revalidate_booking_slot",
+                                   autospec=True, return_value=None)
+    admit.start(); bound.start(); revalidate.start()
+    test_case.addCleanup(admit.stop)
+    test_case.addCleanup(bound.stop)
+    test_case.addCleanup(revalidate.stop)
 
     claim = mock.patch.object(
         OfferLifecycle, "claim",

@@ -77,8 +77,34 @@ production; empty value enables dev-mode skip (logged, not silent).
 
 Text conversation negotiates availability only: it interprets ordered day/time
 preferences (PRIMARY before FALLBACK), checks `ScheduleService`, explains rejections and
-offers alternatives. It never collects booking data and never creates a booking — the
-only path creating `ThreadRevision(status="booked")` is `_process_flow_response`.
+offers alternatives. It never collects booking data and never creates a booking.
+
+### Who may create a booked ThreadRevision (corrected — G3-7R, 2026-10-13)
+
+This section used to say "the only path creating `ThreadRevision(status="booked")` is
+`_process_flow_response`". **That was not true**, and the G3-7P architecture audit measured
+it. Three paths can create one, and they are three different authorities:
+
+| Path | Authority | Guarantee |
+|---|---|---|
+| `ConversationEngine._process_flow_response` | customer accepting a booking offer | admission + offer claim + final revalidation + `offer_id` |
+| `BookingFlowService.handle_confirm_booking` | customer accepting a booking offer | the same four, through the same `offer_lifecycle` |
+| `PATCH /api/revisions/{id}` → `ThreadRevisionService.patch_revision` | authenticated operator / machine | the CRM's own session or machine credential |
+
+The third is **not** customer offer acceptance and must not be routed into it. It sits
+behind the `/api/revisions` MACHINE prefix — a shared secret, a trusted peer container, or a
+logged-in human session — and it accepts `status='booked'` with `scheduled_date` /
+`scheduled_time`. It is a legitimate operator authority: an operator may book an appointment
+by hand. What it does NOT do is pass through the offer authority, so the bookings it creates
+carry `thread_revisions.offer_id = NULL`, which is why the one-offer/one-booking index is
+partial. Any number of operator-written bookings may coexist; at most one may exist per
+offer.
+
+**The customer-facing guarantee is a database constraint, not application code.**
+`UNIQUE (thread_revisions.offer_id) WHERE offer_id IS NOT NULL`. The acceptance row lock and
+the conditional `UPDATE ... WHERE status = 'ISSUED'` are coordination in front of it: the
+G3-7P-R3A review removed both and measured two bookings from one offer in 6 of 6 trials,
+with the whole test suite still identity-identical.
 
 Customer-facing operating hours come from `schedule.business_hours_for_weekday()`;
 never hard-code an hours sentence.

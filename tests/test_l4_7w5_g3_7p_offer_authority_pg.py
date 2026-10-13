@@ -61,6 +61,35 @@ class G7POfferAuthorityPG(unittest.TestCase):
     def setUp(self):
         import app.models as M
         self.M = M
+        # ── G3-7R: release every pooled connection before truncating ────────────
+        # `thread_revisions.offer_id` is a new foreign key INTO
+        # `whatsapp_booking_offers`, so `TRUNCATE whatsapp_booking_offers ... CASCADE` now
+        # needs an ACCESS EXCLUSIVE lock on `thread_revisions` as well. Any pooled
+        # connection still sitting `idle in transaction` — one a test left behind after
+        # reading a ThreadRevision — therefore blocks the truncate, where before the FK
+        # existed it did not. Measured: the suite stalled indefinitely at the same test.
+        #
+        # Disposing the pool here closes those connections and rolls their transactions
+        # back, so the fixture no longer depends on every test having closed its session.
+        # Safe at this point: no test thread is running.
+        self.engine.dispose()
+        # And terminate anything still attached to this DISPOSABLE database from outside
+        # the pool. The concurrency tests in these suites deliberately hold locks in
+        # worker threads and `join(timeout=...)`; a worker that outlives its join keeps
+        # resource 1 of OFFER_LOCK_ORDER, which since G3-7R every offer writer takes — so
+        # the next test's own writes would block behind it, forever, with no diagnosis.
+        # Measured: the suite stalled indefinitely with `pg_stat_activity` showing exactly
+        # that shape. This database exists only for this run, so terminating other
+        # backends on it costs nothing and makes the suite deterministic rather than
+        # order-dependent.
+        try:
+            with self.engine.begin() as c:
+                c.execute(text(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                    "WHERE datname = current_database() AND pid <> pg_backend_pid()"))
+        except Exception:                           # pragma: no cover - defensive
+            pass
+        self.engine.dispose()
         with self.engine.begin() as c:
             for t in ("whatsapp_booking_offers", "whatsapp_clarification_attempts",
                       "whatsapp_messages", "thread_revisions", "whatsapp_thread_candidates",
@@ -80,9 +109,27 @@ class G7POfferAuthorityPG(unittest.TestCase):
         st.current_focus_candidate_id = cand.id
         st.home_zone_group, st.home_zone_detail = "CABA", "Palermo"
         st.last_stage = "SCHEDULING"
-        st.preferred_day, st.preferred_time = "2026-11-10", "10:00"
-        st.active_requested_date, st.last_requested_time = "2026-11-10", "10:00"
-        st.last_offered_slots = st.last_visible_slots = '["2026-11-10T10:00"]'
+        # ── G3-7R: a slot the availability authority actually offers ─────────────
+        # This was the literal "2026-11-10 10:00". It stopped being bookable the moment
+        # the ConversationEngine began revalidating availability before it accepts (S5):
+        # `ScheduleService` refuses that slot on travel grounds, so every test here that
+        # drove a successful booking started answering `replied` instead of
+        # `booking_created`. The tests' PROPERTIES are unchanged — what changed is that a
+        # fixture may no longer assume a hard-coded slot is free.
+        #
+        # `_open_slot()` already existed in this file for exactly this reason, with the
+        # rule written on it: "Never a literal date." It is now applied to the fixture too,
+        # which is where the literal was. `setUp` truncates `revisions`, so the calendar is
+        # empty for every test and the slot it picks is genuinely open.
+        # Looked up ONCE for the class: `setUp` truncates `revisions`, so the calendar is
+        # empty for every test and the same opening is free each time. Per-test lookup
+        # would run `list_slots` up to 24 times per test for no extra assurance.
+        if getattr(type(self), "_fixture_slot", None) is None:
+            type(self)._fixture_slot = self._open_slot()
+        _day, _hhmm = type(self)._fixture_slot
+        st.preferred_day, st.preferred_time = _day, _hhmm
+        st.active_requested_date, st.last_requested_time = _day, _hhmm
+        st.last_offered_slots = st.last_visible_slots = f'["{_day}T{_hhmm}"]'
         db.commit()
         self.thread_id, self.lead_id, self.cand_a = th.id, lead.id, cand.id
         db.close()
@@ -263,13 +310,37 @@ class G7POfferAuthorityPG(unittest.TestCase):
         self.assertIsNone(self._state()["token"])
 
     def test_g7p_pg_02_an_accepted_token_cannot_be_replayed(self):
+        """G3-7R/S6 CORRECTED HOW THIS IS RECORDED, NOT WHETHER IT IS PREVENTED.
+
+        The property is unchanged and still asserted below: a second submission of an
+        accepted token creates no second booking. What changed is the bookkeeping. This
+        used to require `last_refusal == 'OFFER_ALREADY_ACCEPTED'`, and the G3-7P
+        architecture audit measured where that led — a Flow completion arriving after the
+        booking had committed left the offer reading
+        `ACCEPTED, refused_count=1, last_refusal='OFFER_ALREADY_ACCEPTED'`, the exact shape
+        of a rejected submission on the happy path, while the customer was told their
+        session had expired.
+
+        A replay is not a refusal. It is counted as a replay, and asserting the old
+        counters would be asserting the defect.
+        """
+        from app.schemas.conversation import ACTION_BOOKING_REPLAY
         token = self._issue()
         self._submit(token, tag="first")
         before = self._counts()
         out = self._submit(token, tag="replay")
         self.assertNotEqual(out.action, "booking_created")
-        self.assertEqual(self._counts(), before)
-        self.assertEqual(self._offers()[0][7], "OFFER_ALREADY_ACCEPTED")
+        self.assertEqual(out.action, ACTION_BOOKING_REPLAY)
+        self.assertEqual(self._counts(), before, "no second booking")
+        offer = self._offers()[0]
+        self.assertIsNone(offer[7], "a replay must not write last_refusal")
+        self.assertEqual(offer[6], 0, "a replay must not increment refused_count")
+        db = self.SF()
+        replays = db.execute(text(
+            "SELECT replay_count FROM whatsapp_booking_offers WHERE thread_id=:t "
+            "ORDER BY id"), {"t": self.thread_id}).scalars().first()
+        db.close()
+        self.assertEqual(replays, 1, "a replay must be distinguishable in evidence")
 
     # ── 2. every refusal creates nothing ─────────────────────────────────────
 
@@ -700,7 +771,9 @@ class G7POfferAuthorityPG(unittest.TestCase):
         # F7A deliberately preserves what the customer told us about availability, so
         # `_offer_outstanding` stays True — but on the SLOTS, not on the dead offer. Proven
         # by clearing only the slots and watching it go false while the offer is unchanged.
-        self.assertEqual(state.preferred_day, "2026-11-10")
+        # The fixture's slot, not a literal: `setUp` now asks `ScheduleService` for a
+        # genuinely open one (see the note there).
+        self.assertEqual(state.preferred_day, type(self)._fixture_slot[0])
         self.assertTrue(eng._offer_outstanding(state))
         state.active_requested_date = None
         state.last_offered_slots = None
@@ -1886,7 +1959,8 @@ class G7PR3AConversationScope(G7POfferAuthorityPG):
     def test_g7p_r3a_09_the_two_booking_writers_still_resolve_to_one_booking(self):
         """R3A must not loosen the case it was never about. Both winner orders, bounded,
         typed, exactly one booking, and no deadlock."""
-        from app.schemas.conversation import ACTION_THREAD_CONTENDED
+        from app.schemas.conversation import (ACTION_BOOKING_REPLAY,
+                                             ACTION_THREAD_CONTENDED)
         from app.services.offer_lifecycle import DEFAULT_OFFER_LOCK_TIMEOUT_MS
         bound = DEFAULT_OFFER_LOCK_TIMEOUT_MS / 1000.0
         import app.services.offer_lifecycle as lifecycle_module
@@ -1932,8 +2006,21 @@ class G7PR3AConversationScope(G7POfferAuthorityPG):
                 self.assertEqual(self._counts(), (1, 1), f"not one booking: {out}")
                 self.assertEqual(self._offer_row()["status"], "ACCEPTED")
                 self.assertNotIn("40P01", seen, "the writers deadlock again")
+                # ── G3-7R/S6 added a third typed loser outcome ───────────────────
+                # `booking_replay` / `BookingAlreadyCompletedError`. When the winner's
+                # booking has already COMMITTED by the time the loser reaches the
+                # boundary, the loser is not contended and has not been refused: the
+                # authoritative booking exists and is returned to it. Admitting only
+                # contention and refusal here would require the honest answer to be
+                # reported as one of those two, which is the confusion the architecture
+                # audit measured — a successful duplicate recorded as a rejection, with
+                # the customer told their session had expired.
+                #
+                # What the property still demands, and what is asserted above, is that the
+                # loser is TYPED and that exactly one booking exists.
                 self.assertIn(out.get("loser"),
-                              (ACTION_THREAD_CONTENDED, "EXC:BookingTokenError"),
+                              (ACTION_THREAD_CONTENDED, "EXC:BookingTokenError",
+                               ACTION_BOOKING_REPLAY, "EXC:BookingAlreadyCompletedError"),
                               f"the losing booking writer was not typed: {out}")
                 self.assertLess(waited, bound * 2.5,
                                 f"the losing booking writer waited {waited:.2f}s")

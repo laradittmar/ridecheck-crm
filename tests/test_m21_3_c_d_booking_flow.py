@@ -803,13 +803,49 @@ class TestBF23_TokenConsumed(unittest.TestCase):
         state = self.db.query(WhatsAppThreadState).filter_by(thread_id=self.thread.id).first()
         self.assertIsNone(state.flow_booking_token)
 
-    def test_bf23_second_confirm_with_same_token_fails(self):
+    def test_bf23_second_confirm_with_same_token_creates_no_second_booking(self):
+        """G3-7R/S6 CORRECTED THE ANSWER, NOT THE GUARANTEE.
+
+        BF23's property — a consumed token cannot produce a second booking — still holds and
+        is asserted below on the rows. What changed is what the customer is told. This test
+        used to require `BookingTokenError`, which the route renders as
+        *"Tu sesión de reserva expiró"*; the G3-7P architecture audit measured that wording
+        reaching a customer seconds after their booking had in fact succeeded, because a
+        committed booking clears the transport mirror and `resolve_context` read the cleared
+        mirror as a tampered token.
+
+        A replay is now its own typed outcome carrying the authoritative booking, so the
+        Flow is shown its completion instead of a false expiry. Asserting the old exception
+        would be asserting the defect.
+        """
+        from app.services.booking_flow_service import BookingAlreadyCompletedError
         svc = BookingFlowService(self.db)
         _mock_sched_valid(svc)
         svc.handle_confirm_booking(self.token, _confirm_data(self.token))
-        # Token is consumed — second call should raise
-        with self.assertRaises(BookingTokenError):
+        self.db.expire_all()
+        first = self.db.query(ThreadRevision).filter_by(
+            thread_id=self.thread.id, status="booked").all()
+        self.assertEqual(len(first), 1)
+
+        with self.assertRaises(BookingAlreadyCompletedError) as caught:
             svc.handle_confirm_booking(self.token, _confirm_data(self.token))
+        # The authoritative booking is RETURNED, not invented and not re-created.
+        self.assertEqual(caught.exception.thread_revision_id, first[0].id)
+        self.assertNotIsInstance(caught.exception, BookingTokenError,
+                                 "a replay must not be reported as an expired session")
+
+        self.db.expire_all()
+        after = self.db.query(ThreadRevision).filter_by(
+            thread_id=self.thread.id, status="booked").all()
+        self.assertEqual(len(after), 1, "no second booking may exist")
+        # And it is recorded as a REPLAY, never as a refusal.
+        import app.models as _M
+        offer = self.db.query(_M.WhatsAppBookingOffer).filter_by(
+            thread_id=self.thread.id).order_by(_M.WhatsAppBookingOffer.id.desc()).first()
+        if offer is not None:
+            self.assertEqual(offer.replay_count, 1)
+            self.assertEqual(offer.refused_count, 0)
+            self.assertIsNone(offer.last_refusal)
 
 
 class TestBF24_LastStageBooked(unittest.TestCase):

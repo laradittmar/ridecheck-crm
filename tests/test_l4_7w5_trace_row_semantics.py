@@ -702,10 +702,32 @@ class NothingElseMoved(unittest.TestCase):
         performs no UPDATE, no ALTER and no backfill of its own."""
         migrations = sorted(p.name for p in
                             (ROOT / "backend" / "migrations" / "versions").glob("*.py"))
-        # +1 clarification attempts (G3-7F sequencing), +1 booking offers (G3-7P).
-        self.assertEqual(len(migrations), 48)
-        self.assertEqual(migrations[-1], "20261010_offer_lifecycle.py",
-                         "the booking-offer authority is the newest migration")
+        # ── the global count and the "newest migration" pin are GONE (G3-7R) ──
+        # Both were bumped by every unrelated milestone that added a migration, which is
+        # four in a row now. Neither was ever this milestone's business: what ROW-29b
+        # claims is that THE TRACE WRITER performs no schema change and no backfill, and
+        # that is what is asserted below, against the trace writer's own source.
+        #
+        # The one structural fact worth keeping is that the migration graph still has a
+        # single head — a second head would be a real defect, and an unrelated milestone
+        # adding a migration correctly must not look like one.
+        self.assertTrue(migrations, "the migration tree must not be empty")
+        import re as _re
+        _revs, _downs = {}, {}
+        for _name in migrations:
+            _text = ((ROOT / "backend" / "migrations" / "versions" / _name)
+                     .read_text(encoding="utf-8-sig"))
+            _r = _re.search(r"^revision[^=\n]*=\s*[\"\']([^\"\']+)", _text, _re.M)
+            _d = _re.search(r"^down_revision[^=\n]*=\s*(.+)$", _text, _re.M)
+            if _r:
+                _revs[_r.group(1)] = _name
+                _downs[_r.group(1)] = _d.group(1).strip() if _d else "None"
+        _children = set()
+        for _parent in _downs.values():
+            _children.update(_re.findall(r"[\"\']([^\"\']+)[\"\']", _parent))
+        _heads = [r for r in _revs if r not in _children]
+        self.assertEqual(len(_heads), 1,
+                         f"the migration graph must have exactly one head: {_heads}")
         source = (ROOT / "backend" / "app" / "services"
                   / "hybrid_trace.py").read_text(encoding="utf-8-sig")
         for forbidden in ("UPDATE hybrid_decision_traces", "update(HybridDecisionTraceRow",

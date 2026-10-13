@@ -879,6 +879,56 @@ def get_turns(
     return {"count": len(rows), "turns": [_trace_row_summary(r) for r in rows]}
 
 
+#: G3-7R/S9. The columns an operator may read off an offer, and the ONLY ones. The raw
+#: token does not exist in the database to be selected; `token_fingerprint` is included
+#: because the page renders a short prefix of it, which identifies an offer among a
+#: thread's handful without being usable as a key against anything else.
+_OFFER_FIELDS = (
+    "id", "thread_id", "cycle_key", "candidate_id", "tipo_vehiculo", "zone_group",
+    "zone_detail", "offered_date", "offered_time", "flow_id", "contract_version",
+    "token_fingerprint", "status", "issued_at", "expires_at", "terminal_at", "accepted_at",
+    "terminal_reason", "refused_count", "last_refusal", "last_refused_at",
+    "replay_count", "last_replay_at", "accepted_revision_id",
+    "accepted_thread_revision_id",
+)
+
+
+def _offer_dict(row) -> dict:
+    """One offer row as a plain dict, field by declared field.
+
+    Explicit rather than reflective on purpose: a column added to the table later must be
+    chosen for this surface, not inherited by it. That is what keeps a future column
+    carrying something private from appearing on an operator page by default.
+    """
+    return {name: getattr(row, name, None) for name in _OFFER_FIELDS}
+
+
+def read_offers(db: Session, *, thread_id: Optional[int] = None,
+                limit: int = 200) -> list:
+    """Every booking offer, newest first — or one thread's, when a thread is named.
+
+    S9. The single accessor behind both the `/control/offers` page and
+    `/api/ops/offers`, so the page and the API cannot tell different stories about the same
+    offer. It carries no authorization of its own: `/control` is a protected prefix and the
+    endpoint adds its own session check.
+    """
+    from ..models import WhatsAppBookingOffer
+
+    stmt = select(WhatsAppBookingOffer)
+    if thread_id is not None:
+        stmt = stmt.where(WhatsAppBookingOffer.thread_id == int(thread_id))
+    stmt = stmt.order_by(WhatsAppBookingOffer.id.desc()).limit(int(limit))
+    return [_offer_dict(r) for r in db.execute(stmt).scalars().all()]
+
+
+def read_offer(offer_id: int, db: Session) -> Optional[dict]:
+    """One offer, or None. None is rendered as absence, never as an empty offer."""
+    from ..models import WhatsAppBookingOffer
+
+    row = db.get(WhatsAppBookingOffer, int(offer_id))
+    return _offer_dict(row) if row is not None else None
+
+
 def read_turn(turn_id: str, db: Session) -> dict:
     """The full trace for one turn — the single accessor.
 
@@ -917,3 +967,31 @@ def read_turn(turn_id: str, db: Session) -> dict:
 def get_turn(turn_id: str, db: Session = Depends(get_db),
              _operator: str = Depends(require_crm_session)) -> dict:
     return read_turn(turn_id, db)
+
+
+# ── G3-7R/S9: the booking-offer authority, as JSON ───────────────────────────
+#
+# Behind `require_crm_session`, the same signed CRM session `/control` requires, for the
+# same reason the hybrid-trace endpoints are: whether an offer exists at all is itself
+# information about a customer, and an unauthenticated caller does not get it. The check
+# runs before any database access, so a caller without a session gets the same 401 for an
+# offer that exists, one that does not, and a malformed id.
+
+@router.get("/offers")
+def get_offers(thread_id: Optional[int] = Query(None),
+               limit: int = Query(200, ge=1, le=1000),
+               db: Session = Depends(get_db),
+               _operator: str = Depends(require_crm_session)) -> dict:
+    rows = read_offers(db, thread_id=thread_id, limit=limit)
+    return {"count": len(rows), "thread_id": thread_id, "offers": rows}
+
+
+@router.get("/offer/{offer_id}")
+def get_offer(offer_id: int, db: Session = Depends(get_db),
+              _operator: str = Depends(require_crm_session)) -> dict:
+    row = read_offer(offer_id, db)
+    if row is None:
+        # Absence is reported as absence. An empty offer object would read like an offer
+        # that exists and decided nothing.
+        raise HTTPException(status_code=404, detail="offer not found")
+    return row

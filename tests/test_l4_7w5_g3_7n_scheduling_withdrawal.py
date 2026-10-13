@@ -187,16 +187,34 @@ class G7N_Withdrawal(unittest.TestCase):
 class G7N_Revocation(unittest.TestCase):
 
     def test_g7n_11_a_withdrawn_offer_is_refused_before_any_write(self):
-        """Still true, now asserted on the ORDER of real calls rather than on a string: the
-        claim happens before any booking field is parsed. The BEHAVIOUR is proven in
-        `test_l4_7w5_g3_7p_offer_authority_pg.py::test_g7p_pg_07`."""
+        """Still true, and G3-7R made the order it is asserted on STRONGER.
+
+        This used to require `_offers.claim(` before `buyer_email` — acceptance decided
+        before a booking field is read. G3-7R split that one decision into two: ADMISSION,
+        which is the boundary and now happens before ANY field is parsed, and the claim,
+        which is the terminal transition and happens after the final availability
+        revalidation. So the assertion moves to the boundary, where it belongs, and gains a
+        second clause: nothing may be WRITTEN before the claim either.
+
+        The reordering is why revalidation can leave a refused offer ISSUED instead of
+        relying on a rollback to undo an acceptance it should never have made. The only
+        parsed field revalidation receives is the address, and `ScheduleService.check()`
+        does not read it — so no customer-supplied value influences admission or
+        availability.
+
+        The BEHAVIOUR is proven in `test_l4_7w5_g3_7p_offer_authority_pg.py::test_g7p_pg_07`.
+        """
         src = inspect.getsource(CE._process_flow_response)
-        self.assertLess(src.index("_offers.claim("), src.index("buyer_email"),
-                        "acceptance must be decided before a booking field is read")
+        self.assertLess(src.index("_offers.admit("), src.index("buyer_email"),
+                        "admission must be decided before a booking field is read")
+        self.assertLess(src.index("_offers.claim("), src.index("thread_rev = ThreadRevision("),
+                        "acceptance must be decided before a booking row is built")
 
     def test_g7n_12_the_refusal_precedes_booking_processing(self):
         src = inspect.getsource(CE._process_flow_response)
-        self.assertLess(src.index("if not _claim.ok:"), src.index("buyer_email"))
+        self.assertLess(src.index("if not _adm.granted:"), src.index("buyer_email"))
+        self.assertLess(src.index("if not _claim.ok:"),
+                        src.index("thread_rev = ThreadRevision("))
 
     def test_g7n_13_a_foreign_token_is_refused_not_warned(self):
         """Superseded by behavioural proof: `test_g7p_pg_06` (foreign thread) and
@@ -215,10 +233,13 @@ class G7N_Revocation(unittest.TestCase):
         token is merely warned about."""
         src = inspect.getsource(CE._process_flow_response)
         self.assertNotIn("flow token mismatch", src)
-        # G3-7P: there is no comparison left to warn about. Acceptance is a single typed
-        # claim that either authorizes a booking or refuses it, decided before any booking
-        # field is parsed — and the refusal path cannot fall through to the booking code.
-        self.assertLess(src.index("_offers.claim("), src.index("buyer_email"))
+        # G3-7P: there is no comparison left to warn about. G3-7R: and there is no
+        # turn-entry prediction left either. The boundary is one typed admission that
+        # either grants, replays or refuses, decided before any booking field is parsed,
+        # and the terminal claim happens before any booking row is built. Neither path can
+        # fall through to the booking code.
+        self.assertLess(src.index("_offers.admit("), src.index("buyer_email"))
+        self.assertIn("if not _adm.granted:", src)
         self.assertIn("if not _claim.ok:", src)
 
     def test_g7n_16_the_refusal_survives_a_reload(self):
@@ -244,8 +265,15 @@ class G7N_Atomicity(unittest.TestCase):
         self.assertIn("self.db.commit()", src[w:], "a commit must follow the withdrawal")
 
     def test_g7n_19_withdrawal_itself_never_commits_or_sends(self):
-        src = inspect.getsource(CE._withdraw_booking_offer)
-        for forbidden in ("commit(", "_send_text_to_wa", "_apply_candidate"):
+        # CODE, not comments: G3-7R's comment here NAMES `_apply_candidate`, to explain why
+        # a terminal reason may need refining when that method withdrew first in the same
+        # turn. An oracle that cannot tell a comment from a call would make that
+        # explanation unwritable.
+        import ast
+        import textwrap
+        src = ast.unparse(ast.parse(textwrap.dedent(
+            inspect.getsource(CE._withdraw_booking_offer))))
+        for forbidden in ("commit(", "_send_text_to_wa", "_apply_candidate("):
             self.assertNotIn(forbidden, src)
 
 
@@ -328,11 +356,20 @@ class G7N_Acknowledgement(unittest.TestCase):
         # AFTER it. G3-7P-R3 added an earlier `replied` return — the typed outcome for a
         # submission that lost the lock race — and an unanchored `index` picked that one up,
         # producing an EMPTY slice that asserted nothing at all.
-        start = src.index("if not _claim.ok:")
-        refusal = src[start:src.index('return _out("replied"', start)]
-        self.assertTrue(refusal.strip(), "the refusal branch slice is empty")
+        # G3-7R routed EVERY refusal on this path — admission, contention, revalidation
+        # and acceptance — through one helper, so the property is asserted on that helper
+        # rather than on a source slice. One place to read means the four refusals cannot
+        # drift into different customer experiences, which is what a slice-based oracle
+        # could never have noticed.
+        for branch in ("if not _adm.granted:", "if not _claim.ok:",
+                       "_refuse_booking_submission("):
+            self.assertIn(branch, src, branch)
+        refusal = inspect.getsource(CE._refuse_booking_submission)
         self.assertNotIn("_FLOW_COMPLETION_ACK", refusal)
         self.assertIn("_FALLBACK_WARM_HANDOFF", refusal)
+        # And the completion acknowledgement is planned only on the path that committed.
+        self.assertIn("_plan_flow_completion_ack", src)
+        self.assertNotIn("_plan_flow_completion_ack", refusal)
 
 class G7N_PreservedSafety(unittest.TestCase):
 

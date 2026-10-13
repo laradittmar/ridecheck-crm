@@ -27,6 +27,7 @@ from ..db import get_db
 from ..services.booking_flow_service import (
     FLOW_VERSION,
     BookingFlowService,
+    BookingAlreadyCompletedError,
     BookingSlotConflictError,
     BookingTokenError,
     decrypt_flow_request,
@@ -122,6 +123,30 @@ async def booking_flow_data_exchange(
         else:
             logger.warning("BOOKING_FLOW unknown action=%r", action)
             raise HTTPException(status_code=422, detail=f"Unknown action: {action!r}")
+
+    except BookingAlreadyCompletedError as exc:
+        # ── G3-7R/S6: a REPLAY, caught BEFORE BookingTokenError on purpose ───────
+        # The architecture audit measured this case being reported as an expired session:
+        # a committed booking clears the transport mirror, `resolve_context` read the
+        # cleared mirror as "token invalid or already consumed", and the customer was told
+        # *"Tu sesión de reserva expiró"* about the booking that had just succeeded.
+        #
+        # The authoritative booking exists, so the Flow is shown its completion. Nothing is
+        # created, no refusal counter moves, and no second acknowledgement is sent — the
+        # transport that created the booking already sent one.
+        logger.info("BOOKING_FLOW_REPLAY offer_id=%s thread_rev=%s — returning completion",
+                    exc.offer_id, exc.thread_revision_id)
+        return _encrypt_and_return({
+            "version": FLOW_VERSION,
+            "screen": "SUCCESS",
+            "data": {
+                "extension_message_response": {
+                    "params": {
+                        "flow_token": booking_token,
+                    }
+                }
+            },
+        }, aes_key, iv)
 
     except BookingSlotConflictError as exc:
         # Return the conflict screen encrypted (not an HTTP error — Flow expects a valid encrypted response)

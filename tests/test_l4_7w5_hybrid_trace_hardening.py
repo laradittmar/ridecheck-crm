@@ -626,7 +626,14 @@ class EndpointAuthorization(unittest.TestCase):
             calls = [d.call for d in getattr(getattr(route, "dependant", None),
                                              "dependencies", [])]
             (gated if require_crm_session in calls else ungated).append(path)
-        self.assertEqual(sorted(gated), ["/api/ops/turn/{turn_id}", "/api/ops/turns"])
+        # G3-7R/S9 added two routes and gated BOTH: whether a booking offer exists at all
+        # is information about a customer, and an unauthenticated caller does not get it.
+        # The ungated list below is byte-for-byte what it was, which is the half of this
+        # assertion that carries the invariant — no UNRELATED route gained or lost the gate.
+        self.assertEqual(sorted(gated),
+                         ["/api/ops/offer/{offer_id}", "/api/ops/offers",
+                          "/api/ops/turn/{turn_id}", "/api/ops/turns"],
+                         "every route that exposes customer-specific forensics is gated")
         self.assertEqual(sorted(ungated),
                          ["/api/ops/critical-events", "/api/ops/messages",
                           "/api/ops/path-registry", "/api/ops/paths",

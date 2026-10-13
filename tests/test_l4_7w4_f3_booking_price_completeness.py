@@ -250,19 +250,53 @@ class TestAtomicity(_Base):
 
     def test_bookprice_10_price_and_booking_land_in_the_same_commit(self):
         """BOOKPRICE-10 — no window where a booked Revision exists without its price."""
-        fn = next(ast.unparse(n) for n in ast.walk(ast.parse(BFS_SOURCE))
-                  if isinstance(n, ast.FunctionDef) and n.name == "handle_confirm_booking")
-        i_price = fn.index("recalculate_revision_if_possible")
-        # `rindex`, not `index`. G3-7P-R3 gave this function a SECOND, earlier commit: a
-        # refused offer must persist its refusal instead of returning an error screen with
-        # the side effects rolled back behind it. That commit creates no booking, so it is
-        # not the one this invariant is about. The booking commit is the last one, and
-        # BOOKPRICE-10 is the claim that the price is stamped before IT.
-        i_commit = fn.rindex("self.db.commit()")
-        self.assertEqual(fn.count("self.db.commit()"), 2,
-                         "a new commit appeared in handle_confirm_booking — check which "
-                         "one commits the booking before trusting rindex")
-        self.assertLess(i_price, i_commit, "the price must be stamped before the commit")
+        node = next(n for n in ast.walk(ast.parse(BFS_SOURCE))
+                    if isinstance(n, ast.FunctionDef) and n.name == "handle_confirm_booking")
+
+        def _success_path(stmts):
+            """Unparse the function's SUCCESS path: everything except `except` handlers.
+
+            G3-7R translates the booking projection's uniqueness violation inside an
+            `except` around the booking flush, and that handler commits a REPLAY. An oracle
+            that reads the function as flat text sees that commit sitting between the
+            booking row and the price stamp and concludes the price is stamped too late —
+            about a path on which no booking is created at all. The handler bodies are
+            therefore excluded, which is also the honest reading: BOOKPRICE-10 is a claim
+            about the commit that CREATES a booking.
+            """
+            out = []
+            for stmt in stmts:
+                if isinstance(stmt, ast.Try):
+                    out.append(_success_path(stmt.body))
+                    out.append(_success_path(stmt.orelse))
+                    out.append(_success_path(stmt.finalbody))
+                elif isinstance(stmt, (ast.If, ast.For, ast.While, ast.With)):
+                    out.append(_success_path(stmt.body))
+                    out.append(_success_path(getattr(stmt, "orelse", [])))
+                else:
+                    out.append(ast.unparse(stmt))
+            return "\n".join(out)
+
+        fn = _success_path(node.body)
+        # ── the oracle is ANCHORED to the booking, not to a commit count (G3-7R) ──
+        # This used to take the LAST commit and require there be exactly two, on the
+        # reasoning that G3-7P-R3's refusal commit was the only other one. G3-7R added two
+        # more — an admission refusal and a replay — and the count assertion then failed on
+        # a function whose invariant was untouched: it was counting commits, not locating
+        # the one that matters.
+        #
+        # So the booking commit is now IDENTIFIED: it is the first commit after the booked
+        # ThreadRevision is built. BOOKPRICE-10 is the claim that the price is stamped
+        # between those two points, and that is what is asserted — which also means a
+        # future commit added anywhere else in this function cannot weaken or break it.
+        i_booking = fn.index("thread_rev = ThreadRevision(")
+        i_commit = fn.index("self.db.commit()", i_booking)
+        i_price = fn.index("recalculate_revision_if_possible", i_booking)
+        self.assertLess(i_booking, i_price,
+                        "the price is stamped on the Revision the booking created")
+        self.assertLess(i_price, i_commit,
+                        "the price must be stamped before the booking commit, so there is "
+                        "no window where a booked Revision exists without it")
         rev = self.book()
         tr = self.db.query(ThreadRevision).one()
         self.assertEqual(tr.status, "booked")

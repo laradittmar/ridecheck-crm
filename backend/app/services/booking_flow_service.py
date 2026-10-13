@@ -94,6 +94,27 @@ class BookingSlotConflictError(Exception):
         self.refreshed_data = refreshed_data
 
 
+class BookingAlreadyCompletedError(Exception):
+    """G3-7R/S6. This token's offer already produced a committed booking.
+
+    DELIBERATELY NOT a `BookingTokenError`. The architecture audit measured what happened
+    when it was treated as one: `resolve_context` found the transport mirror cleared — which
+    is what a successful booking does to it — raised "token invalid or already consumed",
+    and the customer was shown *"Tu sesión de reserva expiró"* seconds after their booking
+    had in fact succeeded. A replay is the most benign thing that can happen on this path,
+    and it was being reported as the most alarming.
+
+    So it is its own type, carrying the authoritative booking, and the route renders the
+    completion screen from it: no second booking, no refusal counter, no false expiry, and
+    no duplicate acknowledgement — the transport that created the booking already sent one.
+    """
+    def __init__(self, *, offer_id=None, thread_revision_id=None, revision_id=None):
+        super().__init__("offer already produced a committed booking")
+        self.offer_id = offer_id
+        self.thread_revision_id = thread_revision_id
+        self.revision_id = revision_id
+
+
 # ── Crypto helpers (Meta Flows Data Exchange, Data API 3.0) ───────────────────
 
 def load_private_key_pem() -> bytes | None:
@@ -287,6 +308,28 @@ class BookingFlowService:
         if now_ts - issued_at > TOKEN_MAX_AGE_SECONDS:
             raise BookingTokenError("token expired")
 
+        # ── G3-7R/S6: is this a REPLAY of a booking that already committed? ──────
+        # Asked BEFORE the mirror comparison below, because a committed booking CLEARS the
+        # mirror — so the comparison cannot tell a replay from a tampered token, and it
+        # reported both as an expired session. The offer row can tell them apart: ACCEPTED
+        # with a recorded ThreadRevision is a replay and nothing else is.
+        from .offer_lifecycle import OfferLifecycle as _OfferLifecycle
+        _offers_probe = _OfferLifecycle(self.db)
+        _adm = _offers_probe.admit(thread_id=thread_id, token=booking_token)
+        if _adm.replay:
+            _offers_probe.record_replay(_adm.offer_id)
+            try:
+                self.db.commit()                # the replay must be durable evidence
+            except Exception:                   # pragma: no cover - defensive
+                self.db.rollback()
+            logger.info(
+                "BOOKING_REPLAY thread_id=%s offer_id=%s thread_rev=%s — returning the "
+                "authoritative booking; nothing created, nothing refused",
+                thread_id, _adm.offer_id, _adm.thread_revision_id)
+            raise BookingAlreadyCompletedError(
+                offer_id=_adm.offer_id, thread_revision_id=_adm.thread_revision_id,
+                revision_id=_adm.revision_id)
+
         # Load thread state and verify token matches
         state = self.db.execute(
             select(WhatsAppThreadState).where(WhatsAppThreadState.thread_id == thread_id)
@@ -310,8 +353,8 @@ class BookingFlowService:
         if lead is None:
             raise BookingTokenError("lead not found")
 
-        # Load active candidate (current focus)
-        candidate = self._load_focus_candidate(thread_id, state)
+        # G3-7R/S3: ONE candidate authority — the binding on the token's own offer.
+        candidate = self._offer_bound_candidate(thread_id, state, booking_token)
 
         # Build summaries
         vehicle_summary = self._vehicle_summary(candidate)
@@ -331,26 +374,64 @@ class BookingFlowService:
             booking_token=booking_token,
         )
 
-    def _load_focus_candidate(
-        self, thread_id: int, state: WhatsAppThreadState
+    def _offer_bound_candidate(
+        self, thread_id: int, state: WhatsAppThreadState, booking_token: str
     ) -> Optional[WhatsAppThreadCandidate]:
-        """Return the most-recent candidate for the CURRENT active cycle only.
+        """THE candidate for this Flow: the one bound into the offer that armed the token.
 
-        Uses the same cycle watermark (current_cycle_started_at) that CE sets in
-        _execute_cycle_reset(), so Booking Flow cannot surface a candidate from a
-        previous Revision cycle.  When no watermark exists (first cycle), all
-        candidates for the thread are eligible.
+        G3-7R/S3. This replaced `_load_focus_candidate`, which answered the question
+        "which vehicle is this?" with *the most recently updated candidate in the current
+        cycle* — the focus pointer ignored, `None` never returned, and "newest updated row
+        wins" as the tie-break. The ConversationEngine answered the same question from the
+        focus pointer with a single-candidate fallback, and twice within one acceptance.
+        The architecture audit enumerated four ways those two resolvers could disagree about
+        the vehicle whose price the customer had already accepted.
+
+        The offer's `candidate_id` is immutable, was recorded when the quote was computed,
+        and is what `claim()` compares, so it is the one answer that cannot drift — and it
+        is the SAME answer the conversation engine now uses, which is what makes the two
+        transports equivalent rather than merely similar.
+
+        None when the binding cannot be honoured: no offer for this token, no candidate on
+        the offer, the row deleted, the row belonging to another thread, or the row outside
+        the active cycle watermark (the same watermark this method used before, and the one
+        `ConversationEngine._execute_cycle_reset` sets). None then refuses downstream — at
+        `claim()` as `OFFER_CANDIDATE_CHANGED`, or at the no-canonical-location guard —
+        which is the safe direction. There is no "newest row wins" fallback left.
         """
-        q = (
-            select(WhatsAppThreadCandidate)
-            .where(WhatsAppThreadCandidate.thread_id == thread_id)
-        )
+        from .offer_lifecycle import OfferLifecycle
+
+        offer = OfferLifecycle(self.db).offer_by_token(booking_token)
+        candidate_id = getattr(offer, "candidate_id", None) if offer is not None else None
+        if candidate_id is None:
+            logger.warning(
+                "BOOKING_CANDIDATE_UNBOUND thread_id=%s — the token's offer names no "
+                "candidate; nothing to book against", thread_id)
+            return None
+        candidate = self.db.get(WhatsAppThreadCandidate, int(candidate_id))
+        if candidate is None or getattr(candidate, "thread_id", None) != thread_id:
+            logger.warning(
+                "BOOKING_CANDIDATE_UNAVAILABLE thread_id=%s candidate_id=%s — deleted or "
+                "foreign", thread_id, candidate_id)
+            return None
+        # The same boundary guard the conversation engine applies, for the same reason and
+        # with the same shape — which is what makes the two transports equivalent rather
+        # than merely similar. It resolves nothing from the pointer; it refuses when an
+        # explicit pointer contradicts the binding.
+        focus_pointer = getattr(state, "current_focus_candidate_id", None)
+        if focus_pointer is not None and int(focus_pointer) != int(candidate_id):
+            logger.warning(
+                "BOOKING_CANDIDATE_SUPERSEDED thread_id=%s focus=%s offer_bound=%s",
+                thread_id, focus_pointer, candidate_id)
+            return None
         cycle_start = getattr(state, "current_cycle_started_at", None)
-        if cycle_start is not None:
-            q = q.where(WhatsAppThreadCandidate.created_at >= cycle_start)
-        q = q.order_by(WhatsAppThreadCandidate.updated_at.desc()).limit(1)
-        rows = self.db.execute(q).scalars().all()
-        return rows[0] if rows else None
+        created_at = getattr(candidate, "created_at", None)
+        if cycle_start is not None and created_at is not None and created_at < cycle_start:
+            logger.warning(
+                "BOOKING_CANDIDATE_OUT_OF_CYCLE thread_id=%s candidate_id=%s — predates "
+                "the active cycle watermark", thread_id, candidate_id)
+            return None
+        return candidate
 
     @staticmethod
     def _vehicle_summary(candidate: Optional[WhatsAppThreadCandidate]) -> str:
@@ -675,25 +756,48 @@ class BookingFlowService:
         """
         ctx = self.resolve_context(booking_token)
 
-        # ── G3-7P: the SAME acceptance authority as the conversation-engine path ────
-        # This is the second booking writer in the system; it must not be a second
-        # authority. `resolve_context` already checked the token against the state mirror
-        # and its age, but the mirror is not the authority — the offer row is — and only
-        # the offer row knows whether this offer was withdrawn because the vehicle or the
-        # zone moved. The claim is a conditional UPDATE off 'ISSUED' under a row lock, so
-        # it also makes the two writers mutually exclusive for one offer.
-        #
-        # It belongs HERE and not in `handle_prepare_summary`: acceptance is terminal, and
-        # claiming it while merely rendering the summary screen would consume the offer
-        # before the customer confirmed anything.
-        from .offer_lifecycle import OfferLifecycle
-        _offers = OfferLifecycle(self.db)
+        # ── G3-7R/S2: DATABASE-FIRST ADMISSION, the same question the engine asks ──
+        # `resolve_context` has checked the token's shape, its age and the transport
+        # mirror — none of which is the authority. The authority is the offer row, and the
+        # question is the same one `ConversationEngine` asks through the same method: does
+        # this token match an ISSUED offer for this thread? Asked before any lock is taken
+        # and before anything is written, so a refusal costs nothing and serialises nothing.
         from .clarification_attempt import cycle_key as _cycle_key
+        from .offer_lifecycle import OfferLifecycle, OfferRefusal
 
-        # ── R3/A4: the SAME canonical lock order as the conversation engine ──────
+        _offers = OfferLifecycle(self.db)
+        _adm = _offers.admit(thread_id=ctx.thread.id, token=booking_token)
+        if not _adm.granted:
+            # Durable, not a screen with a rollback behind it. The R2 review measured the
+            # defect that pattern caused: `claim()` terminalised the stale offer, cleared
+            # the mirror and recorded the refusal, and this path raised straight away — so
+            # the route returned an error screen WITHOUT committing and every one of those
+            # side effects was rolled back. The offer stayed ISSUED, `last_refusal` stayed
+            # NULL, the mirror stayed truthy, and the L4.7W5-F7A scheduling gate stayed
+            # CLOSED on a thread whose offer could never be accepted again.
+            _offers.finalise_admission_refusal(ctx.state, thread_id=ctx.thread.id,
+                                               admission=_adm)
+            logger.warning(
+                "BOOKING_OFFER_REFUSED thread_id=%s reason=%s offer_id=%s — no booking",
+                ctx.thread.id, _adm.refusal, _adm.offer_id)
+            _log_event(self.db, ctx.thread.id, "BOOKING_OFFER_REFUSED",
+                       booking_token=booking_token,
+                       extra={"reason": _adm.refusal, "offer_id": _adm.offer_id})
+            try:
+                self.db.commit()
+            except Exception:                       # pragma: no cover - defensive
+                logger.exception(
+                    "BOOKING_OFFER_REFUSED thread_id=%s — the refusal could not be "
+                    "committed; falling back to an out-of-band record", ctx.thread.id)
+                self.db.rollback()
+                _offers.record_refusal_out_of_band(booking_token, _adm.refusal)
+            raise BookingTokenError(f"offer not acceptable: {_adm.refusal}")
+
+        # ── R3/A4 + S1: the SAME canonical lock order as the conversation engine ──
         # This writer used to take the offer row first and the thread state afterwards —
-        # the opposite order — which deadlocked the two writers. It now takes the thread
-        # state first, under a bounded `lock_timeout`.
+        # the opposite order — which deadlocked the two writers. Resource 1 first, under a
+        # bounded `lock_timeout`; and since S1 every writer of the offer table takes it,
+        # ISSUE included, which is what removed the last measured `40P01`.
         _contended = _offers.begin_offer_transaction(ctx.thread.id)
         if _contended is not None:
             _offers.record_refusal_out_of_band(booking_token, _contended)
@@ -702,45 +806,6 @@ class BookingFlowService:
             _log_event(self.db, ctx.thread.id, "BOOKING_OFFER_REFUSED",
                        booking_token=booking_token, extra={"reason": _contended})
             raise BookingTokenError(f"offer not acceptable: {_contended}")
-
-        _claim = _offers.claim(
-            ctx.state, thread_id=ctx.thread.id, token=booking_token,
-            # `ctx.candidate` is the candidate this booking will actually reference, which
-            # is the thing the offer was bound to — and R2 binds its CATEGORY too, because
-            # that category is what `PricingService.quote()` prices the booking with.
-            candidate_id=getattr(ctx.candidate, "id", None),
-            tipo_vehiculo=getattr(ctx.candidate, "tipo_vehiculo", None),
-            cycle_key=_cycle_key(ctx.state),
-            zone_group=ctx.zone_group, zone_detail=ctx.zone_detail)
-        if not _claim.ok:
-            # ── R3/A: the refusal is DURABLE, not a screen with a rollback behind it ──
-            # The R2 review measured the defect this closes. `claim()` terminalises the
-            # stale offer, clears the transport mirror and records the refusal — and this
-            # path raised `BookingTokenError` straight away, so the route returned an error
-            # screen WITHOUT committing and every one of those side effects was rolled
-            # back. The offer stayed ISSUED, `last_refusal` stayed NULL, the mirror stayed
-            # truthy, and the L4.7W5-F7A scheduling gate stayed CLOSED on a thread whose
-            # offer could never be accepted again.
-            #
-            # Committing here makes the canonical offer outcome identical to the
-            # ConversationEngine path for the same refusal. The transport responses still
-            # differ — this one owes the Flow an error screen — but the offer, the mirror
-            # and the audit trail do not depend on which writer heard the submission.
-            logger.warning(
-                "BOOKING_OFFER_REFUSED thread_id=%s reason=%s offer_id=%s — no booking",
-                ctx.thread.id, _claim.refusal, _claim.offer_id)
-            _log_event(self.db, ctx.thread.id, "BOOKING_OFFER_REFUSED",
-                       booking_token=booking_token,
-                       extra={"reason": _claim.refusal, "offer_id": _claim.offer_id})
-            try:
-                self.db.commit()
-            except Exception:                       # pragma: no cover - defensive
-                logger.exception(
-                    "BOOKING_OFFER_REFUSED thread_id=%s — the refusal could not be "
-                    "committed; falling back to an out-of-band record", ctx.thread.id)
-                self.db.rollback()
-                _offers.record_refusal_out_of_band(booking_token, _claim.refusal)
-            raise BookingTokenError(f"offer not acceptable: {_claim.refusal}")
 
         date_str = str(data.get("date", "")).strip()
         time_str = str(data.get("time", "")).strip()
@@ -762,6 +827,38 @@ class BookingFlowService:
         seller_name = str(data.get("seller_name", "")).strip()
         seller_phone = str(data.get("seller_phone", "")).strip()
         listing_url = str(data.get("listing_url", "")).strip()
+
+        # ── owner booking-slot policy (2026-10-13) ───────────────────────────────
+        # The Flow may legitimately offer the customer a slot other than the representative
+        # one the offer recorded, so `offered_date`/`offered_time` are historical metadata
+        # and are NOT compared against the submission. What the policy does require is that
+        # the SUBMITTED slot pass authoritative final revalidation — which is what follows.
+
+        # ── the bindings come FIRST, then availability (S3/S5) ───────────────────
+        # The same order as the conversation engine, for the same reason: a submission that
+        # is both stale-slot and category-changed must be reported as the category change,
+        # because a moved category invalidates the accepted quote and must terminalise the
+        # offer — while a vanished slot invalidates nothing about the offer and leaves it
+        # ISSUED for another attempt.
+        _binding = _offers.verify_bindings(
+            ctx.state, thread_id=ctx.thread.id, token=booking_token,
+            candidate_id=getattr(ctx.candidate, "id", None),
+            tipo_vehiculo=getattr(ctx.candidate, "tipo_vehiculo", None),
+            cycle_key=_cycle_key(ctx.state),
+            zone_group=ctx.zone_group, zone_detail=ctx.zone_detail)
+        if _binding is not None:
+            logger.warning(
+                "BOOKING_OFFER_REFUSED thread_id=%s reason=%s offer_id=%s — no booking",
+                ctx.thread.id, _binding, _adm.offer_id)
+            _log_event(self.db, ctx.thread.id, "BOOKING_OFFER_REFUSED",
+                       booking_token=booking_token,
+                       extra={"reason": _binding, "offer_id": _adm.offer_id})
+            try:
+                self.db.commit()
+            except Exception:                       # pragma: no cover - defensive
+                self.db.rollback()
+                _offers.record_refusal_out_of_band(booking_token, _binding)
+            raise BookingTokenError(f"offer not acceptable: {_binding}")
 
         # Acquire advisory lock to prevent double-booking the same date.
         # Key is deterministic: hash of ISO date string → 32-bit signed int.
@@ -838,9 +935,53 @@ class BookingFlowService:
                 },
             })
 
+        # ── acceptance: the terminal transition, AFTER revalidation ──────────────
+        # G3-7R moved `claim()` to here, below the availability check. A slot that has gone
+        # is a fact about the CALENDAR and not about the offer: nothing on the offer became
+        # invalid, so it must stay ISSUED and the customer must stay able to pick another
+        # slot with the same token. Claiming first and relying on a rollback to undo the
+        # acceptance is the pattern a durability review has already found on this path once.
+        #
+        # `claim()` is the coordination — a row lock and a conditional UPDATE off 'ISSUED',
+        # which is what makes a duplicate confirmation a typed answer instead of an
+        # exception. The GUARANTEE that this offer yields at most one booking is the partial
+        # unique index on `thread_revisions.offer_id`, enforced at the insert below.
+        _claim = _offers.claim(
+            ctx.state, thread_id=ctx.thread.id, token=booking_token,
+            # `ctx.candidate` is the candidate the offer itself is bound to (S3), which is
+            # the SAME candidate the conversation engine resolves — and R2 binds its
+            # CATEGORY too, because that category is what `PricingService.quote()` prices
+            # the booking with.
+            candidate_id=getattr(candidate, "id", None),
+            tipo_vehiculo=getattr(candidate, "tipo_vehiculo", None),
+            cycle_key=_cycle_key(ctx.state),
+            zone_group=zone_group, zone_detail=zone_detail)
+        if not _claim.ok:
+            logger.warning(
+                "BOOKING_OFFER_REFUSED thread_id=%s reason=%s offer_id=%s — no booking",
+                ctx.thread.id, _claim.refusal, _claim.offer_id)
+            _log_event(self.db, ctx.thread.id, "BOOKING_OFFER_REFUSED",
+                       booking_token=booking_token,
+                       extra={"reason": _claim.refusal, "offer_id": _claim.offer_id})
+            try:
+                self.db.commit()
+            except Exception:                       # pragma: no cover - defensive
+                logger.exception(
+                    "BOOKING_OFFER_REFUSED thread_id=%s — the refusal could not be "
+                    "committed; falling back to an out-of-band record", ctx.thread.id)
+                self.db.rollback()
+                _offers.record_refusal_out_of_band(booking_token, _claim.refusal)
+            raise BookingTokenError(f"offer not acceptable: {_claim.refusal}")
+
         thread_rev = ThreadRevision(
             thread_id=ctx.thread.id,
             candidate_id=candidate.id if candidate else None,
+            # ── S1: the booking names the offer that authorized it ───────────────
+            # The partial unique index on this column is what makes "one offer, at most one
+            # booking" a GUARANTEE rather than a convention, and it is why BOTH transports
+            # must write it: a constraint that only one of two writers participates in
+            # guarantees nothing about the pair.
+            offer_id=_claim.offer_id,
             status="booked",
             buyer_name=name or None,
             buyer_phone=phone or None,
@@ -860,7 +1001,32 @@ class BookingFlowService:
             appointment_approval_token=secrets.token_urlsafe(32),
         )
         self.db.add(thread_rev)
-        self.db.flush()
+        # ── S1: the guarantee fires HERE, and is translated, never leaked ────────
+        # A raw `IntegrityError`, a SQLSTATE or a constraint name must never reach a
+        # customer, and the honest meaning of THIS violation is not "error": the
+        # authoritative booking already exists, so this is a replay and the Flow must be
+        # shown its completion.
+        try:
+            self.db.flush()
+        except Exception as _integrity:
+            if not _offers.is_booking_projection_violation(_integrity):
+                raise
+            self.db.rollback()
+            _tr_id, _rv_id = _offers.authoritative_booking(_claim.offer_id)
+            _offers.record_replay(_claim.offer_id)
+            try:
+                self.db.commit()
+            except Exception:                       # pragma: no cover - defensive
+                self.db.rollback()
+            logger.warning(
+                "BOOKING_REPLAY thread_id=%s the booking projection refused a second "
+                "booking for offer_id=%s — returning thread_rev=%s",
+                ctx.thread.id, _claim.offer_id, _tr_id)
+            _log_event(self.db, ctx.thread.id, "BOOKING_REPLAY",
+                       booking_token=booking_token,
+                       extra={"offer_id": _claim.offer_id, "thread_rev_id": _tr_id})
+            raise BookingAlreadyCompletedError(
+                offer_id=_claim.offer_id, thread_revision_id=_tr_id, revision_id=_rv_id)
 
         crm_rev = Revision(
             lead_id=ctx.lead.id,

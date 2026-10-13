@@ -434,6 +434,18 @@ class ThreadRevision(Base):
         ForeignKey("whatsapp_thread_candidates.id", ondelete="SET NULL"),
         nullable=True,
     )
+    #: G3-7R/S1. WHICH booking offer authorized this booking, and — through the partial
+    #: unique index declared below — the database's guarantee that one offer can authorize
+    #: at most ONE of them.
+    #:
+    #: Nullable and never backfilled. A booking that predates this column, or one written by
+    #: the authenticated operator/machine endpoint rather than by a customer accepting an
+    #: offer, legitimately has no offer behind it; NULL is the honest value and the index is
+    #: partial so any number of those may coexist. `ondelete` is deliberately absent: an
+    #: offer row is history and is never deleted, and if one ever were, losing the link
+    #: silently would destroy the audit trail the whole table exists for.
+    offer_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("whatsapp_booking_offers.id"), nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="collecting_data", server_default="collecting_data")
     buyer_name: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
     buyer_phone: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
@@ -745,13 +757,24 @@ class WhatsAppBookingOffer(Base):
     only thing that may authorize a booking. Absence of a row is therefore a refusal, never
     a permission: `claim()` fails closed.
 
-    Two database-enforced invariants, both of which hold against callers not yet written:
+    Three database-enforced invariants, all of which hold against callers not yet written:
 
         UNIQUE (token_fingerprint)                      one token -> at most one offer
         UNIQUE (thread_id) WHERE status = 'ISSUED'      at most one LIVE offer per thread
+        UNIQUE (thread_revisions.offer_id)              one offer -> at most one BOOKING
+               WHERE offer_id IS NOT NULL
 
     The second is what makes "issue supersedes the previous offer" a fact rather than a
     convention, and it is why two concurrent issues cannot both leave a live offer behind.
+
+    The third was added by G3-7R and it replaces a claim this docstring used to make.
+    Acceptance being "a conditional UPDATE off 'ISSUED' under a row lock" was described here
+    as if it guaranteed at most one acceptance per offer. It does not: the G3-7P-R3A
+    independent review removed both of those application guards and measured TWO bookings
+    from ONE offer in 6 of 6 trials, at two different and genuinely free slots, with the
+    whole test suite still identity-identical. The guards remain — they are what makes the
+    race a typed refusal instead of an exception — but the GUARANTEE now lives on the
+    booking's own `offer_id`, where a constraint can hold it.
 
     The raw token is NEVER stored. `token_fingerprint` is sha256(token) — enough to match a
     submission, useless to replay elsewhere, and safe to render in the Inspector.
@@ -822,11 +845,30 @@ class WhatsAppBookingOffer(Base):
     last_refused_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True)
 
+    #: G3-7R/S6. A REPLAY — the same committed booking asked for again, by a Meta retry or
+    #: by the other transport delivering the completion event — counted separately from a
+    #: refusal, because it is not one. The architecture audit measured the confusion this
+    #: ends: a Flow completion arriving at the conversation engine after the Data Exchange
+    #: writer had already booked left the offer reading
+    #: `ACCEPTED, refused_count=1, last_refusal='OFFER_ALREADY_ACCEPTED'` — the exact shape
+    #: of a rejected submission, on the happy path. These two columns are what let an
+    #: operator tell the successful duplicate from the real rejection.
+    replay_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0")
+    last_replay_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+
     # ── what the acceptance produced, for audit ──────────────────────────────
     accepted_revision_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("revisions.id"), nullable=True)
+    #: `use_alter` breaks a genuine cycle in the schema graph: G3-7R added
+    #: `thread_revisions.offer_id` pointing the other way, because that column is where the
+    #: one-offer/one-booking guarantee lives. Without this, SQLAlchemy reports
+    #: "unresolvable cycles ... foreign key constraints involving these tables will not be
+    #: considered" and quietly drops BOTH constraints from any `create_all`. The annotation
+    #: side yields: this column is audit metadata, while `offer_id` is a safety control.
     accepted_thread_revision_id: Mapped[Optional[int]] = mapped_column(
-        ForeignKey("thread_revisions.id"), nullable=True)
+        ForeignKey("thread_revisions.id", use_alter=True), nullable=True)
 
 
 #: At most ONE live offer per thread, enforced by the database. Declared for both dialects:
@@ -839,6 +881,27 @@ Index("uq_booking_offer_one_live_per_thread", WhatsAppBookingOffer.thread_id,
 
 Index("ix_booking_offer_thread_status", WhatsAppBookingOffer.thread_id,
       WhatsAppBookingOffer.status)
+
+#: ── G3-7R/S1: ONE OFFER, AT MOST ONE BOOKING — the database's own guarantee ──────────
+#:
+#: The G3-7P-R3A independent review measured that the application guards in front of this
+#: were invisible to the test suite and insufficient on their own: with the acceptance
+#: row lock AND the conditional `UPDATE ... WHERE status = 'ISSUED'` both removed, two
+#: concurrent confirmations of one offer produced TWO bookings at two different slots in
+#: 6 of 6 trials — and the 6,000-test suite stayed identity-identical. A same-slot calendar
+#: conflict does not catch that case, because the two slots were both genuinely free.
+#:
+#: Partial, so the column stays additive: a booking with no offer behind it — anything
+#: predating G3-7R, and every booking the authenticated operator endpoint writes — keeps
+#: NULL, and any number of those may coexist. Declared for both dialects, because without
+#: the predicate on SQLite this would forbid more than one NULL-offer booking in the whole
+#: table, which is the opposite of the intent.
+#:
+#: The advisory lock is coordination. The exclusion constraint is the guarantee.
+Index("uq_thread_revision_one_booking_per_offer", ThreadRevision.offer_id,
+      unique=True,
+      postgresql_where=text("offer_id IS NOT NULL"),
+      sqlite_where=text("offer_id IS NOT NULL"))
 
 
 Index("ix_dedup_wa_kind_fp_created", WhatsAppOutboundDedup.wa_id, WhatsAppOutboundDedup.message_kind, WhatsAppOutboundDedup.content_fingerprint, WhatsAppOutboundDedup.created_at)

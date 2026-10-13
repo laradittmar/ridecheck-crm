@@ -627,6 +627,44 @@ def control_dashboard(request: Request):
     )
 
 
+@router.get("/control/offers", response_class=HTMLResponse)
+def control_offers(request: Request, thread_id: int | None = None,
+                   db: Session = Depends(get_db)):
+    """G3-7R/S9 — the booking-offer authority, for an operator.
+
+    Behind the `/control` protected prefix, so `main.py`'s session guard already applies:
+    an anonymous caller is redirected to `/login` before this function runs. Reads through
+    the same accessor `/api/ops/offers` uses, so the page and the API cannot tell two
+    different stories about the same offer.
+    """
+    from ..routes.ops_dashboard import read_offers
+    from ..settings import get_settings
+    from .offer_authority_view import render_offer_list_page
+
+    return HTMLResponse(
+        render_offer_list_page(
+            read_offers(db, thread_id=thread_id), thread_id=thread_id,
+            booking_flow_id=getattr(get_settings(), "booking_flow_id", None)),
+        media_type="text/html; charset=utf-8",
+    )
+
+
+@router.get("/control/offer/{offer_id}", response_class=HTMLResponse)
+def control_offer_detail(offer_id: int, request: Request,
+                         db: Session = Depends(get_db)):
+    """One offer, in full. Same accessor, same boundary."""
+    from ..routes.ops_dashboard import read_offer
+    from ..settings import get_settings
+    from .offer_authority_view import render_offer_detail_page
+
+    return HTMLResponse(
+        render_offer_detail_page(
+            read_offer(offer_id, db), offer_id=offer_id,
+            booking_flow_id=getattr(get_settings(), "booking_flow_id", None)),
+        media_type="text/html; charset=utf-8",
+    )
+
+
 @router.get("/control/turn/{turn_id}", response_class=HTMLResponse)
 def control_turn_trace(turn_id: str, db: Session = Depends(get_db)):
     """L4.7W5 Gate 2 — one hybrid decision, rendered.

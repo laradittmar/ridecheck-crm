@@ -274,7 +274,9 @@ def proposal_disposition(state, corrected_fields) -> dict:
 #   A correction applied AFTER a booking already exists leaves the booked
 #   `ThreadRevision` and the CRM `Revision` holding the old marca/modelo/anio/
 #   tipo_vehiculo. `booking_flow_service.py:789` and `:803` write those from
-#   `_load_focus_candidate(...)` at booking time, and nothing syncs them afterwards —
+#   `_offer_bound_candidate(...)` at booking time (G3-7R renamed it from
+#   `_load_focus_candidate` and made the offer's own binding the authority; the deferral
+#   below is unaffected), and nothing syncs them afterwards —
 #   this module holds no reference to `current_revision_id` and writes no revision.
 #   The agenda, the appointment record and the CRM therefore show the pre-correction
 #   vehicle.

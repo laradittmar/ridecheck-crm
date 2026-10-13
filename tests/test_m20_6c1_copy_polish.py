@@ -146,6 +146,14 @@ def _clean_all(db: Session) -> None:
         "whatsapp_thread_candidates", "whatsapp_thread_states",
         "whatsapp_threads", "whatsapp_contacts", "viaticos_zones",
         "whatsapp_recipient_locks", "leads", "thread_revisions",
+        # G3-7R: `revisions` and `whatsapp_booking_offers` were missing from this list, and
+        # the omission was invisible until the ConversationEngine started revalidating
+        # availability. Every test in this file seeds the SAME slot, so the CRM Revision one
+        # booking test committed stayed in the shared in-memory database and OCCUPIED that
+        # slot for the next one — which `ScheduleService` now correctly refuses. The
+        # previous behaviour was the engine double-booking an occupied slot without
+        # checking, which is the HIGH the G3-7P architecture audit measured.
+        "revisions", "whatsapp_booking_offers",
     ]:
         try:
             db.execute(sql_text(f"DELETE FROM {tbl}"))

@@ -530,109 +530,247 @@ class R3DurabilityContract(OfferLifecycleRows):
         self.assertIsNone(self.offers.contention_sqlstate(ValueError("plain")))
 
 
-class R3AContentionScope(unittest.TestCase):
-    """R3A — WHICH turns may enter the booking lock order, decided without a database.
+class G37RAdmissionScope(unittest.TestCase):
+    """G3-7R/S2 — ordinary traffic performs no booking lock operation, and the reason is
+    now structural rather than predicted.
 
-    The R3 independent review measured what an unconditional acquisition cost: on the parent
-    a second conversation turn on the same thread completed in 0.05–0.20s while the first
-    held the thread for twelve seconds; with R3's turn-entry lock on every turn, that second
-    turn was DECLINED after 4.05s with `thread_contended`. An ordinary message never calls
-    `claim()`, so serialising it protected nothing and lost customer turns.
+    This class replaces `R3AContentionScope`, which tested
+    `ConversationEngine._is_offer_acceptance_turn`. That predicate is DELETED, so the tests
+    that asserted its answers are deleted with it — but the PROPERTY they were protecting is
+    not, and it matters more than ever. The R3 independent review measured the cost of
+    getting it wrong: on the parent commit a second conversation turn on the same thread
+    completed in 0.05–0.20s while the first held the thread for twelve seconds; with R3's
+    turn-entry acquisition that second turn was DECLINED after 4.05s with
+    `thread_contended`. A lost customer message.
 
-    This suite lives here, not only in the PostgreSQL file, deliberately. The review's
-    MUT-D showed the sealed gate could not see R3's §D mechanism being deleted — all of its
-    coverage sat behind `G7P_PG_URL` and skipped. The PREDICATE is pure logic, so it is
-    tested where the default regression gate will actually run it.
+    What changed is WHERE the property comes from. R3A kept the property by making the
+    predicate narrower, and a predicate that answers from the payload shape and the
+    transport mirror can always be made to answer wrongly — its own docstring recorded that
+    it answered True when it could not tell, so its fallback was to serialise traffic that
+    could never book. G3-7R removes the gate instead of narrowing it: there is no turn-entry
+    acquisition left for any turn to be classified into, and the boundary question is
+    answered by `OfferLifecycle.admit()` at the acceptance point, with one indexed read and
+    no lock at all.
+
+    So this suite asserts three things, all without a database, because the regression gate
+    that runs by default is the sealed SQLite one — the review's MUT-D showed that coverage
+    sitting behind `G7P_PG_URL` could not see R3's own mechanism being deleted:
+
+        * the gate is GONE and has not been reintroduced under another name;
+        * admission fails closed on every shape of non-booking and malformed input, and
+          decides from the offer table rather than from prose, prefixes or payload keys;
+        * admission acquires nothing.
     """
 
     def setUp(self):
         from app.services.conversation_engine import ConversationEngine
         self.CE = ConversationEngine
 
-    class _Ev:
-        def __init__(self, message_type="text", flow_response=None):
-            self.message_type = message_type
-            self.flow_response = flow_response
+    # ── the gate is gone (S2) ─────────────────────────────────────────────────
 
-    class _St:
-        def __init__(self, token=None):
-            self.flow_booking_token = token
+    def test_g37r_01_the_turn_entry_predicate_no_longer_exists(self):
+        """Deleted, not deprecated. A predicate that still exists is a predicate a later
+        change can start calling again."""
+        self.assertFalse(hasattr(self.CE, "_is_offer_acceptance_turn"),
+                         "_is_offer_acceptance_turn must be deleted, not retained")
+        self.assertFalse(hasattr(self.CE, "_begin_thread_transaction"),
+                         "_begin_thread_transaction must be deleted, not retained")
 
-    def _is(self, event, state=None):
-        return self.CE._is_offer_acceptance_turn(
-            self.CE.__new__(self.CE), event, state or self._St())
-
-    BOOKING_PAYLOAD = {"nombre_apellido": "P C", "email": "p@e.t", "telefono": "5491100",
-                       "como_llego": "IG", "direccion": "Palermo 1",
-                       "tipo_vendedor": "particular"}
-
-    # ── the turns that must NOT take the booking lock ─────────────────────────
-
-    def test_r3a_01_ordinary_transports_never_enter_the_lock_order(self):
-        for kind in ("text", "audio", "image", "interactive", "button", "list", ""):
-            with self.subTest(message_type=kind):
-                self.assertFalse(self._is(self._Ev(kind)),
-                                 f"{kind!r} is not a booking writer and must not serialise")
-
-    def test_r3a_02_a_text_turn_carrying_a_payload_is_still_not_a_booking_turn(self):
-        """Only `message_type == "flow_response"` routes to `_process_flow_response`; a
-        payload on any other transport never reaches `claim()`."""
-        self.assertFalse(self._is(self._Ev("text", dict(self.BOOKING_PAYLOAD))))
-
-    def test_r3a_03_the_vehicle_clarification_flow_is_not_a_booking_turn(self):
-        self.assertFalse(self._is(self._Ev("flow_response", {"tipo_vehiculo": "AUTO"})))
-        self.assertFalse(self._is(self._Ev(
-            "flow_response", {"tipo_vehiculo": "MOTO", "marca": "Honda"})))
-
-    def test_r3a_04_the_location_clarification_flow_is_not_a_booking_turn(self):
-        self.assertFalse(self._is(self._Ev("flow_response", {"zona_general": "CABA"})))
-        self.assertFalse(self._is(self._Ev(
-            "flow_response", {"zona_general": "GBA_NORTE", "zona_detalle": "Tigre"})))
-
-    def test_r3a_05_the_motorcycle_contact_flow_is_not_a_booking_turn(self):
-        from app.services.conversation_engine import _MOTO_HANDOFF_TOKEN_PREFIX
-        state = self._St(_MOTO_HANDOFF_TOKEN_PREFIX + "abc123")
-        self.assertFalse(self._is(self._Ev(
-            "flow_response", dict(self.BOOKING_PAYLOAD)), state))
-
-    def test_r3a_06_an_empty_or_malformed_payload_is_not_a_booking_turn(self):
-        for payload in (None, {}, [], "", 0, "nombre_apellido"):
-            with self.subTest(payload=payload):
-                self.assertFalse(self._is(self._Ev("flow_response", payload)))
-
-    # ── the turns that MUST take it ───────────────────────────────────────────
-
-    def test_r3a_07_a_booking_flow_response_does_enter_the_lock_order(self):
-        """The one turn that can reach `claim()` and race the Data Exchange writer."""
-        self.assertTrue(self._is(self._Ev("flow_response", dict(self.BOOKING_PAYLOAD))))
-
-    def test_r3a_08_a_booking_response_with_an_unrelated_live_token_still_qualifies(self):
-        """A booking mirror that is NOT the motorcycle family is a booking turn, and so is
-        one with no mirror at all — the latter still calls `claim()`, which fails closed."""
-        for token in (None, "", "bk-1234567890-abcdef"):
-            with self.subTest(mirror=token):
-                self.assertTrue(self._is(
-                    self._Ev("flow_response", dict(self.BOOKING_PAYLOAD)),
-                    self._St(token)))
-
-    def test_r3a_09_the_predicate_agrees_with_the_engine_s_own_routing_order(self):
-        """The discriminators and their ORDER are the same ones `_process_flow_response`
-        routes on. If that routing is ever reordered, this test is the thing that notices
-        the predicate no longer describes where the turn goes."""
+    def test_g37r_02_handle_takes_no_booking_lock_at_turn_entry(self):
+        """MUTATION ORACLE (required mutation 5). Reintroducing the turn-entry lock — by
+        calling `begin_offer_transaction` anywhere in `_handle`, under any predicate — is
+        what this test exists to fail on."""
+        import ast
         import inspect
-        src = inspect.getsource(self.CE._process_flow_response)
-        head = src[:src.index("G3-7P: FAIL-CLOSED ACCEPTANCE")]
-        self.assertLess(head.index("_MOTO_HANDOFF_TOKEN_PREFIX"),
-                        head.index('"tipo_vehiculo" in flow_data'))
-        self.assertLess(head.index('"tipo_vehiculo" in flow_data'),
-                        head.index('"zona_general" in flow_data'))
-        pred = inspect.getsource(self.CE._is_offer_acceptance_turn)
-        for token in ('"flow_response"', '"tipo_vehiculo"', '"zona_general"',
-                      "_MOTO_HANDOFF_TOKEN_PREFIX"):
-            self.assertIn(token, pred)
-        self.assertNotIn("lower()", pred, "the predicate must not read customer prose")
+        import textwrap
+        # CODE, not comments: the comments in `_handle` name the deleted mechanism in order
+        # to explain why it is gone, and an oracle that cannot tell a comment from a call
+        # would make that explanation unwritable.
+        src = ast.unparse(ast.parse(textwrap.dedent(inspect.getsource(self.CE._handle))))
+        for forbidden in ("begin_offer_transaction", "_begin_thread_transaction",
+                          "_is_offer_acceptance_turn", "FOR NO KEY UPDATE"):
+            self.assertNotIn(forbidden, src,
+                             f"_handle must take no booking lock at turn entry: {forbidden}")
 
-    # ── the bound is scoped to an acquisition, not to a turn ──────────────────
+    def test_g37r_03_no_phrase_catalogue_decides_admission(self):
+        """The boundary must not be able to drift back into reading customer prose."""
+        import inspect
+        from app.services import offer_lifecycle as OL
+        src = inspect.getsource(OL.OfferLifecycle.admit)
+        for forbidden in ("lower()", "startswith", "in text", "LEXICON", "PHRASE"):
+            self.assertNotIn(forbidden, src,
+                             f"admission must not read prose or prefixes: {forbidden}")
+
+    # ── admission fails closed, and decides from the offer row ────────────────
+
+    class _Offers:
+        """A fake offer table. `admit()` is pure logic over the row it finds, so the row is
+        the only thing that has to be faked — which is the point: nothing about the payload,
+        the transport or the mirror reaches the decision."""
+
+        def __init__(self, row=None, now=None):
+            self.row = row
+            self._now = now or datetime(2026, 10, 13, 12, 0, tzinfo=timezone.utc)
+            self.sql = []
+
+        def make(self, **kw):
+            from app.services.offer_lifecycle import OfferLifecycle, OfferStatus
+            lifecycle = OfferLifecycle.__new__(OfferLifecycle)
+            lifecycle.db = self
+            lifecycle._postgres = lambda: False
+            lifecycle._now = lambda: self._now
+            lifecycle.offer_by_token = lambda token: self.row
+            return lifecycle
+
+        def execute(self, stmt, *a, **k):          # pragma: no cover - must not be reached
+            self.sql.append(str(stmt))
+            raise AssertionError("admission must issue no SQL of its own")
+
+    class _Row:
+        def __init__(self, **kw):
+            from app.services.offer_lifecycle import OfferStatus
+            self.id = kw.get("id", 7)
+            self.thread_id = kw.get("thread_id", 1)
+            self.status = kw.get("status", OfferStatus.ISSUED)
+            self.candidate_id = kw.get("candidate_id", 11)
+            self.tipo_vehiculo = kw.get("tipo_vehiculo", "AUTO")
+            self.zone_group = kw.get("zone_group", "CABA")
+            self.zone_detail = kw.get("zone_detail", "Palermo")
+            self.cycle_key = kw.get("cycle_key", 0)
+            self.offered_date = kw.get("offered_date")
+            self.offered_time = kw.get("offered_time")
+            self.expires_at = kw.get("expires_at")
+            self.accepted_thread_revision_id = kw.get("accepted_thread_revision_id")
+            self.accepted_revision_id = kw.get("accepted_revision_id")
+
+    def _admit(self, row, *, token="bk-1-abc", thread_id=1, now=None):
+        fake = self._Offers(row, now=now)
+        adm = fake.make().admit(thread_id=thread_id, token=token)
+        self.assertEqual(fake.sql, [], "admission must take no lock and issue no SQL")
+        return adm
+
+    def test_g37r_04_absence_of_an_offer_row_is_a_refusal(self):
+        """Fails closed. The only thing a missing record can honestly authorize is nothing."""
+        from app.services.offer_lifecycle import OfferRefusal
+        adm = self._admit(None)
+        self.assertFalse(adm.granted)
+        self.assertFalse(adm.replay)
+        self.assertEqual(adm.refusal, OfferRefusal.UNKNOWN_TOKEN)
+
+    def test_g37r_05_every_shape_of_missing_token_is_a_refusal(self):
+        """Including the one the G3-7N review measured booking successfully: NO TOKEN."""
+        from app.services.offer_lifecycle import OfferRefusal
+        for token in (None, "", "   ", 0, [], {}, 12345, object()):
+            with self.subTest(token=repr(token)):
+                adm = self._admit(self._Row(), token=token)
+                self.assertFalse(adm.granted)
+                self.assertEqual(adm.refusal, OfferRefusal.NO_TOKEN)
+
+    def test_g37r_06_a_foreign_offer_is_a_refusal(self):
+        from app.services.offer_lifecycle import OfferRefusal
+        adm = self._admit(self._Row(thread_id=999), thread_id=1)
+        self.assertFalse(adm.granted)
+        self.assertEqual(adm.refusal, OfferRefusal.FOREIGN_OFFER)
+
+    def test_g37r_07_every_terminal_status_is_a_refusal_with_its_own_reason(self):
+        from app.services.offer_lifecycle import OfferRefusal, OfferStatus
+        expected = {
+            OfferStatus.WITHDRAWN: OfferRefusal.OFFER_WITHDRAWN,
+            OfferStatus.SUPERSEDED: OfferRefusal.SUPERSEDED_OFFER,
+            OfferStatus.EXPIRED: OfferRefusal.OFFER_EXPIRED,
+        }
+        for status, refusal in expected.items():
+            with self.subTest(status=status):
+                adm = self._admit(self._Row(status=status))
+                self.assertFalse(adm.granted)
+                self.assertFalse(adm.replay)
+                self.assertEqual(adm.refusal, refusal)
+
+    def test_g37r_08_an_expired_offer_is_refused_and_admission_writes_nothing(self):
+        from app.services.offer_lifecycle import OfferRefusal
+        adm = self._admit(self._Row(
+            expires_at=datetime(2026, 10, 13, 11, 0, tzinfo=timezone.utc)))
+        self.assertEqual(adm.refusal, OfferRefusal.OFFER_EXPIRED)
+
+    def test_g37r_09_an_issued_offer_is_granted_and_carries_its_bindings(self):
+        """The grant travels with the immutable facts, so the execution path re-resolves
+        nothing — which is what makes the two transports agree (S3)."""
+        adm = self._admit(self._Row(candidate_id=42, tipo_vehiculo="CAMIONETA",
+                                    zone_group="GBA_NORTE", zone_detail="Tigre",
+                                    cycle_key=9))
+        self.assertTrue(adm.granted)
+        self.assertTrue(bool(adm))
+        self.assertIsNone(adm.refusal)
+        self.assertEqual(adm.candidate_id, 42)
+        self.assertEqual(adm.tipo_vehiculo, "CAMIONETA")
+        self.assertEqual((adm.zone_group, adm.zone_detail), ("GBA_NORTE", "Tigre"))
+        self.assertEqual(adm.cycle_key, 9)
+
+    def test_g37r_10_accepted_with_a_booking_is_a_replay_not_a_refusal(self):
+        """S6. The architecture audit measured this case refused `OFFER_ALREADY_ACCEPTED`,
+        which set `needs_human=True` and told the customer their session had expired —
+        about a booking that had just succeeded."""
+        from app.services.offer_lifecycle import OfferStatus
+        adm = self._admit(self._Row(status=OfferStatus.ACCEPTED,
+                                    accepted_thread_revision_id=55,
+                                    accepted_revision_id=66))
+        self.assertTrue(adm.replay)
+        self.assertFalse(adm.granted)
+        self.assertFalse(bool(adm), "a replay is not a permission to execute")
+        self.assertIsNone(adm.refusal, "a replay must never carry a refusal")
+        self.assertEqual(adm.thread_revision_id, 55)
+        self.assertEqual(adm.revision_id, 66)
+
+    def test_g37r_11_accepted_without_a_booking_is_refused_not_replayed(self):
+        """There is no authoritative booking to return, so inventing one would be worse
+        than refusing."""
+        from app.services.offer_lifecycle import OfferRefusal, OfferStatus
+        adm = self._admit(self._Row(status=OfferStatus.ACCEPTED,
+                                    accepted_thread_revision_id=None))
+        self.assertFalse(adm.replay)
+        self.assertFalse(adm.granted)
+        self.assertEqual(adm.refusal, OfferRefusal.OFFER_ALREADY_ACCEPTED)
+
+    def test_g37r_12_an_unrecognised_status_fails_closed(self):
+        from app.services.offer_lifecycle import OfferRefusal
+        adm = self._admit(self._Row(status="SOMETHING_NEW"))
+        self.assertFalse(adm.granted)
+        self.assertEqual(adm.refusal, OfferRefusal.UNKNOWN_TOKEN)
+
+    # ── the bound is scoped to an acquisition, and restored exactly (S7) ──────
+
+    class _PgDb:
+        """A PostgreSQL-shaped session that answers `SHOW lock_timeout` truthfully, so the
+        restore path has a real prior value to put back. The previous fake returned None for
+        every statement, which made `SHOW` fail and the restore fall through to DEFAULT —
+        so the old test passed whether the bug was present or not."""
+
+        def __init__(self, initial="0"):
+            self.value = initial
+            self.issued = []
+
+        class _Res:
+            def __init__(self, v):
+                self._v = v
+
+            def scalar(self):
+                return self._v
+
+        def execute(self, stmt, *a, **k):
+            sql = str(stmt)
+            self.issued.append(sql)
+            if sql.strip().upper().startswith("SHOW"):
+                return self._Res(self.value)
+            if "SET LOCAL lock_timeout" in sql:
+                raw = sql.split("=", 1)[1].strip().strip("'")
+                self.value = "0" if raw.upper() == "DEFAULT" else raw
+            return self._Res(None)
+
+        def get_bind(self):
+            class _B:
+                class dialect:
+                    name = "postgresql"
+            return _B()
 
     def test_r3a_10_the_bounded_wait_is_a_no_op_without_row_locks(self):
         """SQLite has nothing to bound, so the context manager must not touch the session —
@@ -659,47 +797,129 @@ class R3AContentionScope(unittest.TestCase):
         self.assertEqual(entered, [True])
         self.assertEqual(executed, [])
 
-    def test_r3a_11_the_bound_is_set_then_restored_around_the_acquisition(self):
-        """R3 left `SET LOCAL lock_timeout` standing for the rest of the transaction, so a
-        booking turn's bound governed every later statement in it. The set/restore pair is
-        what keeps it on the acquisition it was chosen for."""
+    def test_g37r_13_the_bound_is_set_then_the_PRIOR_value_restored(self):
+        """MUTATION ORACLE (required mutation 12). R3A restored `DEFAULT`, which on this
+        database means NO LIMIT: a caller that had deliberately set a stricter bound was
+        silently handed unlimited waiting by the inner block's cleanup. The prior value is
+        read and that exact value is put back."""
         from app.services.offer_lifecycle import OfferLifecycle
-        issued = []
+        db = self._PgDb(initial="250ms")
+        with OfferLifecycle(db)._bounded_lock_wait(4000):
+            self.assertTrue(any("SET LOCAL lock_timeout = 4000" in s for s in db.issued))
+            self.assertEqual(db.value, "4000")
+        self.assertEqual(db.value, "250ms",
+                         "the caller's own stricter bound must be restored, not DEFAULT")
+        self.assertNotIn("SET LOCAL lock_timeout = DEFAULT", db.issued,
+                         "DEFAULT would widen a stricter caller to unlimited")
 
-        class _Db:
+    def test_g37r_14_nested_bounds_compose(self):
+        """The inner block restores the OUTER block's bound, not the session's."""
+        from app.services.offer_lifecycle import OfferLifecycle
+        db = self._PgDb(initial="0")
+        lifecycle = OfferLifecycle(db)
+        with lifecycle._bounded_lock_wait(4000):
+            self.assertEqual(db.value, "4000")
+            with lifecycle._bounded_lock_wait(1000):
+                self.assertEqual(db.value, "1000")
+            self.assertEqual(db.value, "4000", "the inner block must restore the outer bound")
+        self.assertEqual(db.value, "0")
+
+    def test_g37r_15_an_unset_prior_bound_restores_DEFAULT(self):
+        """`DEFAULT` is correct in exactly one case: there was genuinely nothing to put back.
+        A session that cannot answer `SHOW` is that case."""
+        from app.services.offer_lifecycle import OfferLifecycle
+
+        class _Mute(G37RAdmissionScope._PgDb):
             def execute(self, stmt, *a, **k):
-                issued.append(str(stmt))
+                sql = str(stmt)
+                self.issued.append(sql)
+                if sql.strip().upper().startswith("SHOW"):
+                    raise RuntimeError("this session will not say")
+                return self._Res(None)
 
-            def get_bind(self):
-                class _B:
-                    class dialect:
-                        name = "postgresql"
-                return _B()
+        db = _Mute()
+        with OfferLifecycle(db)._bounded_lock_wait(4000):
+            pass
+        self.assertIn("SET LOCAL lock_timeout = DEFAULT", db.issued[-1])
 
-        with OfferLifecycle(_Db())._bounded_lock_wait(4000):
-            self.assertEqual(len(issued), 1)
-            self.assertIn("SET LOCAL lock_timeout = 4000", issued[0])
-        self.assertEqual(len(issued), 2)
-        self.assertIn("SET LOCAL lock_timeout = DEFAULT", issued[1])
+    def test_g37r_16_a_non_literal_prior_value_is_never_re_inlined(self):
+        """`SET` takes no bind parameter, so a restored value is re-inlined — and only after
+        it has matched a timeout literal. Anything else falls back to DEFAULT rather than
+        reaching the statement."""
+        from app.services.offer_lifecycle import OfferLifecycle
+        db = self._PgDb(initial="4s'; DROP TABLE whatsapp_booking_offers; --")
+        with OfferLifecycle(db)._bounded_lock_wait(4000):
+            pass
+        joined = " ".join(db.issued)
+        self.assertNotIn("DROP TABLE", joined)
+        self.assertIn("SET LOCAL lock_timeout = DEFAULT", db.issued[-1])
 
     def test_r3a_12_the_bound_is_restored_even_when_the_acquisition_fails(self):
+        """And the ORIGINAL exception is what the caller sees — never the restore's."""
         from app.services.offer_lifecycle import OfferLifecycle
-        issued = []
-
-        class _Db:
-            def execute(self, stmt, *a, **k):
-                issued.append(str(stmt))
-
-            def get_bind(self):
-                class _B:
-                    class dialect:
-                        name = "postgresql"
-                return _B()
-
-        with self.assertRaises(RuntimeError):
-            with OfferLifecycle(_Db())._bounded_lock_wait(4000):
+        db = self._PgDb(initial="750ms")
+        with self.assertRaises(RuntimeError) as caught:
+            with OfferLifecycle(db)._bounded_lock_wait(4000):
                 raise RuntimeError("the acquisition timed out")
-        self.assertIn("SET LOCAL lock_timeout = DEFAULT", issued[-1])
+        self.assertEqual(str(caught.exception), "the acquisition timed out")
+        self.assertEqual(db.value, "750ms")
+
+    def test_g37r_17_a_failed_restore_does_not_replace_the_original_exception(self):
+        """After a transaction abort the session rejects every statement, so the restore
+        cannot run. What the caller must see is still the original failure."""
+        from app.services.offer_lifecycle import OfferLifecycle
+
+        class _Aborted(G37RAdmissionScope._PgDb):
+            def __init__(self):
+                super().__init__(initial="500ms")
+                self.aborted = False
+
+            def execute(self, stmt, *a, **k):
+                if self.aborted:
+                    raise RuntimeError("current transaction is aborted")
+                return super().execute(stmt, *a, **k)
+
+        db = _Aborted()
+        with self.assertRaises(ValueError) as caught:
+            with OfferLifecycle(db)._bounded_lock_wait(4000):
+                db.aborted = True
+                raise ValueError("55P03 lock_not_available")
+        self.assertEqual(str(caught.exception), "55P03 lock_not_available")
+
+    # ── a deadlock is classified apart from ordinary contention (S4) ──────────
+
+    def test_g37r_18_40P01_is_not_reported_as_contention(self):
+        """MUTATION ORACLE. Under ONE declared lock order a deadlock is impossible, so it is
+        evidence of a protocol violation — and R3 folded it in with 55P03, which is how the
+        architecture audit's measured ISSUE/acceptance deadlock reached operators as
+        `OFFER_CONTENDED`: the wrong diagnosis of a real defect."""
+        from app.services.offer_lifecycle import OfferLifecycle, OfferRefusal
+        self.assertEqual(OfferLifecycle.refusal_for_sqlstate("40P01"),
+                         OfferRefusal.OFFER_DEADLOCK)
+        for state in ("55P03", "40001"):
+            with self.subTest(sqlstate=state):
+                self.assertEqual(OfferLifecycle.refusal_for_sqlstate(state),
+                                 OfferRefusal.OFFER_CONTENDED)
+        self.assertNotEqual(OfferRefusal.OFFER_DEADLOCK, OfferRefusal.OFFER_CONTENDED)
+
+    def test_g37r_19_a_deadlock_is_still_CAUGHT_and_never_escapes_as_an_error(self):
+        """Classified separately, but still answered with a typed domain outcome: the
+        customer must not meet an internal error either way."""
+        from app.services.offer_lifecycle import OfferLifecycle
+
+        class _Exc(Exception):
+            sqlstate = "40P01"
+
+        self.assertEqual(OfferLifecycle.contention_sqlstate(_Exc()), "40P01")
+
+    def test_g37r_20_an_unrelated_sqlstate_still_raises(self):
+        """A bug must not be absorbed into the contention vocabulary."""
+        from app.services.offer_lifecycle import OfferLifecycle
+
+        class _Exc(Exception):
+            sqlstate = "23502"
+
+        self.assertIsNone(OfferLifecycle.contention_sqlstate(_Exc()))
 
     def test_r3a_13_a_contended_booking_turn_is_still_an_owned_turn(self):
         """R3A narrows WHO contends; it must not change what a real contention means. An

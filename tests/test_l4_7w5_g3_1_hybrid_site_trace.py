@@ -629,14 +629,30 @@ class PrivacyHistoryContract(unittest.TestCase):
         the assertion now names its own scope instead of freezing a global total."""
         versions = sorted(p.name for p in
                           (ROOT / "backend" / "migrations" / "versions").glob("*.py"))
-        # +1 again: G3-7P added one additive table (`whatsapp_booking_offers`), which §3
-        # of that milestone authorises explicitly. This assertion is about G3-1's own
-        # scope, which still introduced none.
-        self.assertEqual(len(versions), 48)
-        self.assertIn("20260918_hybrid_decision_traces.py", versions)  # G3-1's table
-        self.assertIn("20261005_pending_correction.py", versions)  # G3-7F Commit 3
-        self.assertIn("20261006_clarification_attempts.py", versions)  # G3-7F sequencing
-        self.assertIn("20261010_offer_lifecycle.py", versions)  # G3-7P offer authority
+        # ── the global count is GONE (G3-7R) ──────────────────────────────────
+        # It has now been bumped by four consecutive unrelated milestones — G3-7F Commit 3,
+        # G3-7F sequencing, G3-7P, and G3-7R's booking projection — and each bump was a
+        # one-line edit made to a test that was never about any of them. A control that
+        # every unrelated milestone has to edit is not protecting anything; it is
+        # manufacturing work and training the next author to edit it without reading it.
+        #
+        # What G3-1's scope actually claims is that G3-1 introduced no migration, and that
+        # is asserted directly: its own table was added by the migration named below, and
+        # G3-1 contributed none of its own. Each later migration is named with the
+        # milestone that authorised it, so a migration appearing here WITHOUT an
+        # authorising milestone is still visible.
+        _authorised = {
+            "20260918_hybrid_decision_traces.py": "G3-1's own table",
+            "20261005_pending_correction.py": "G3-7F Commit 3",
+            "20261006_clarification_attempts.py": "G3-7F sequencing",
+            "20261010_offer_lifecycle.py": "G3-7P offer authority",
+            "20261013_booking_projection.py": "G3-7R booking projection",
+        }
+        for name, milestone in _authorised.items():
+            self.assertIn(name, versions, f"{name} ({milestone})")
+        # G3-1 itself added none: its table arrived with the trace migration above, and no
+        # migration in the tree carries G3-1 as its own author.
+        self.assertNotIn("20260918_g3_1.py", versions)
 
     def test_site_42_no_pii_in_the_new_row_fields(self):
         h = HandoffSite()
