@@ -647,6 +647,11 @@ class PrivacyHistoryContract(unittest.TestCase):
             "20261006_clarification_attempts.py": "G3-7F sequencing",
             "20261010_offer_lifecycle.py": "G3-7P offer authority",
             "20261013_booking_projection.py": "G3-7R booking projection",
+            "20261007_sb1_booking_representation.py": "SB1 (Track B)",
+            "20261008_sb2a_booking_authority.py": "SB2A (Track B)",
+            "20261009_sb2a_r2_ack_lease.py": "SB2A-R2 (Track B)",
+            "20261013_sb2b_identity_outcome.py": "SB2B (Track B)",
+            "20261014_converge_track_heads.py": "convergence Phase 1 merge revision",
         }
         for name, milestone in _authorised.items():
             self.assertIn(name, versions, f"{name} ({milestone})")

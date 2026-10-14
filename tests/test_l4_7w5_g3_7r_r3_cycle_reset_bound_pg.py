@@ -1029,7 +1029,10 @@ class G37RR3ForeignKeyNameAgreement(unittest.TestCase):
         os.environ["DATABASE_URL"] = ALEMBIC_URL
         try:
             command.stamp(cfg, "head")
-            command.downgrade(cfg, "-1")
+            # Convergence Phase 1: the head is now a MERGE revision, from which a relative
+            # `-1` is ambiguous. Name the parent `-1` meant on Track A, so exactly the booking
+            # projection migration (and the no-op merge) is undone, as before.
+            command.downgrade(cfg, "20261010_offer_lifecycle")
             cls.stages["downgrade"] = cls._fk_names()
             cls.stages["downgrade_index"] = cls._index_present()
             command.upgrade(cfg, "head")

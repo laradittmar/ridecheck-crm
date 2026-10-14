@@ -61,7 +61,16 @@ from dataclasses import dataclass, field, asdict
 from typing import Any, Optional
 
 TRACE_VERSION = "hybrid-decision-trace/1.10"
+#: INTEGRATION (convergence Phase 1): both development lines independently named their
+#: next contract 1.10, and neither was ever deployed or persisted. The integrated 1.10 is
+#: the union of the two additive changes below; no field of either changed meaning.
 #: G3-7P added the canonical offer identity and status to the snapshot.
+#: SB2B. 1.10 adds the `booking` block: what the booking authority did with this turn's
+#: booking request — the key's namespace and hash prefix (never a token), outcome and reason,
+#: the revision and ThreadRevision ids, whether it was a ledger replay or lookup hit, the
+#: acknowledgement status before and after, the identity outcome, whether availability was
+#: revalidated, and whether CE finished synchronizing. Additive: no 1.9 field changed
+#: meaning; `booking` is null on a turn that did not touch the booking authority.
 TRACE_VERSION_1_9 = "hybrid-decision-trace/1.9"
 #: 1.8 added the clarification block; 1.9 adds the ATTEMPT LIFECYCLE inside it, so a
 #: dispatch turn, a completion turn and a prevented-second turn can be joined by
@@ -89,7 +98,7 @@ TRACE_VERSION_1_1 = "hybrid-decision-trace/1.1"
 #: The first contract. Its reconciliation rows carry no producer provenance, so a
 #: reader must never treat their absent 1.1 fields as empty 1.1 fields.
 TRACE_VERSION_1_0 = "hybrid-decision-trace/1.0"
-READABLE_VERSIONS = (TRACE_VERSION, TRACE_VERSION_1_8, TRACE_VERSION_1_4,
+READABLE_VERSIONS = (TRACE_VERSION, TRACE_VERSION_1_9, TRACE_VERSION_1_8, TRACE_VERSION_1_4,
                      TRACE_VERSION_1_3, TRACE_VERSION_1_2, TRACE_VERSION_1_1,
                      TRACE_VERSION_1_0)
 #: Contracts whose `response_plan`, where present, only ever DESCRIBED a turn. A reader must
@@ -1307,6 +1316,10 @@ class HybridDecisionTrace:
     #: measurable on purpose — the hybrid architecture is supposed to REDUCE clarification
     #: Flows, so "resolved without a Flow" has to be countable, not merely absent.
     clarification: Optional[Any] = None
+    # ── SB2B contract 1.10 ──
+    #: The booking authority's part in this turn (see the note on TRACE_VERSION). Null
+    #: when the turn never reached it; absent on 1.9 and older rows.
+    booking: Optional[Any] = None
     response_item_count: Optional[int] = None
     response_item_kinds: tuple = ()
     suppressed_item_count: Optional[int] = None

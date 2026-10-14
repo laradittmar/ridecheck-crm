@@ -137,7 +137,10 @@ class _ResetHarness(unittest.TestCase):
             os.environ["DATABASE_URL"] = PG_URL
             try:
                 command.stamp(cfg, "head")
-                command.downgrade(cfg, "-1")
+                # Convergence Phase 1: the head is now a MERGE revision, from which a relative
+                # `-1` is ambiguous. Name the parent `-1` meant on Track A, so exactly the booking
+                # projection migration (and the no-op merge) is undone, as before.
+                command.downgrade(cfg, "20261010_offer_lifecycle")
                 command.upgrade(cfg, "head")
             finally:
                 if prior is None:
@@ -437,8 +440,18 @@ class RV03SchemaIsTheMigratedOne(_ResetHarness):
     """Say out loud which schema everything below ran against."""
 
     def test_rv03_pg_00_the_schema_is_the_migrated_one(self):
-        self.assertEqual(
-            self.scalar("SELECT version_num FROM alembic_version"), PROJECTION_REVISION,
+        # Convergence Phase 1: the head is now the merge revision that joins this chain with
+        # the Smart Booking chain, so "migrated through" means PROJECTION_REVISION is the
+        # stamped revision or one of its ancestors in Alembic's own graph.
+        from alembic.config import Config
+        from alembic.script import ScriptDirectory
+        cfg = Config(str(Path(_BACKEND) / "alembic.ini"))
+        cfg.set_main_option("script_location", str(Path(_BACKEND) / "migrations"))
+        version = self.scalar("SELECT version_num FROM alembic_version")
+        applied = {r.revision for r in
+                   ScriptDirectory.from_config(cfg).iterate_revisions(version, "base")}
+        self.assertIn(
+            PROJECTION_REVISION, applied,
             "this suite must run against a schema migrated through %r" % PROJECTION_REVISION)
         self.assertTrue(self.scalar(
             "SELECT 1 FROM pg_constraint WHERE conname = :n", n=PROJECTION_FK),

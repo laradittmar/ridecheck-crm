@@ -1309,6 +1309,7 @@ class BookingFlowService:
             pass
 
 
+
 # ── Observability helpers ─────────────────────────────────────────────────────
 
 def _booking_event(
@@ -1353,3 +1354,11 @@ def _booking_event(
 def health_response() -> dict:
     """Return the standard Meta Flow health-check response."""
     return {"version": FLOW_VERSION, "data": {"status": "active"}}
+
+
+# ── SB2B dormant capability (integration Phase 1) ──────────────────────────────
+# Re-exported for the dormant SB2B callers (CE-W1 behind SMART_BOOKING_CE_ENABLED, and
+# booking_recovery), which import them from here. Nothing on this module's active Data
+# Exchange path uses them; see `booking_acknowledgement`.
+from .booking_acknowledgement import (  # noqa: E402,F401
+    BOOKING_FLOW_RECEIPT_TEXT, BOOKING_HANDOFF_TEXT, ReceiptOutcome, send_booking_acknowledgement)

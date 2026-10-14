@@ -57,6 +57,15 @@ class RevisionCreate(BaseModel):
             raise ValueError('cobrado inválido: debe ser "SI" o "NO"')
         return normalized
 
+    @field_validator("turno_hora")
+    @classmethod
+    def validate_turno_hora(cls, value: time | None) -> time | None:
+        # SB2A-R7: a turno is a local civil time. An offset ("11:00-03:00") is refused here as a
+        # validation error instead of being dropped by the database or failing as a 500.
+        if value is not None and value.tzinfo is not None:
+            raise ValueError("turno_hora inválido: debe ser una hora local sin zona horaria")
+        return value
+
     @field_validator("compro")
     @classmethod
     def validate_compro(cls, value: str | None) -> str | None:

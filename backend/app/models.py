@@ -7,6 +7,7 @@ from typing import Optional
 from sqlalchemy import (
     String,
     Integer,
+    BigInteger,
     DateTime,
     ForeignKey,
     CheckConstraint,
@@ -23,6 +24,11 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
+from .services.booking_representation import (
+    APPOINTMENT_TIMEZONE,
+    BUFFER_MINUTES_DEFAULT,
+    SERVICE_MINUTES_DEFAULT,
+)
 
 
 class Lead(Base):
@@ -75,7 +81,24 @@ class Lead(Base):
 
 
 class Profesional(Base):
+    """An inspector — and, since SB1, the agenda resource an appointment occupies.
+
+    OD-01: one canonical professional at launch, keyed by `resource_key`
+    (`booking_representation.LAUNCH_PROFESSIONAL_KEY`) and marked `is_launch_default`. The
+    database allows at most one default; a writer that names no professional for an
+    occupying revision is attributed to it (trigger in `20261007_sb1_booking_repr`), or
+    refused if none is designated. More professionals can exist; nothing allocates between
+    them yet.
+    """
     __tablename__ = "profesionales"
+    __table_args__ = (
+        UniqueConstraint("resource_key", name="uq_profesionales_resource_key"),
+        CheckConstraint("NOT is_launch_default OR resource_key IS NOT NULL",
+                        name="ck_profesionales_launch_default_has_key"),
+        Index("uq_profesionales_single_launch_default", "is_launch_default", unique=True,
+              postgresql_where=text("is_launch_default"),
+              sqlite_where=text("is_launch_default")),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     nombre: Mapped[str] = mapped_column(String(80))
@@ -84,6 +107,13 @@ class Profesional(Base):
     telefono: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
     cargo: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    # ── SB1: resource identity ──
+    resource_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    is_launch_default: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false"))
+    # SB2A: eligibility. An inactive professional is never assigned a new booking.
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=text("true"))
 
     revisions: Mapped[list["Revision"]] = relationship("Revision", back_populates="profesional")
 
@@ -118,7 +148,23 @@ class Agencia(Base):
 
 
 class Revision(Base):
+    """A CRM revision; when scheduled, an appointment on the agenda.
+
+    SB1 interval: `[turno_fecha + turno_hora, + service_minutes + buffer_minutes)`, half-open,
+    Buenos Aires wall-clock (`turno_timezone`). On PostgreSQL two STORED generated columns —
+    `agenda_occupying` and `occupied_during` (tsrange) — derive it from the columns below and
+    an exclusion constraint forbids overlap per `profesional_id`. They are deliberately not
+    mapped here: they are database-computed, PostgreSQL-only, and read by SQL when needed.
+    `services/booking_representation.py` mirrors them for code that runs without PostgreSQL.
+    """
     __tablename__ = "revisions"
+    __table_args__ = (
+        CheckConstraint("service_minutes > 0", name="ck_revisions_service_minutes_positive"),
+        CheckConstraint("buffer_minutes >= 0", name="ck_revisions_buffer_minutes_nonneg"),
+        CheckConstraint("booking_version >= 0", name="ck_revisions_booking_version_nonneg"),
+        CheckConstraint(f"turno_timezone = '{APPOINTMENT_TIMEZONE}'",
+                        name="ck_revisions_turno_timezone"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     lead_id: Mapped[int] = mapped_column(
@@ -169,6 +215,23 @@ class Revision(Base):
     turno_hora: Mapped[Optional[time]] = mapped_column(Time, nullable=True)
     cliente_presente: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     turno_notas: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # SB1 (OD-03/04): the two parts of the occupied interval, stored separately. Travel is
+    # additional and never included.
+    service_minutes: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=SERVICE_MINUTES_DEFAULT,
+        server_default=text(str(SERVICE_MINUTES_DEFAULT)))
+    buffer_minutes: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=BUFFER_MINUTES_DEFAULT,
+        server_default=text(str(BUFFER_MINUTES_DEFAULT)))
+    # SB1: the interpretation turno_fecha/turno_hora have always had, now stated.
+    turno_timezone: Mapped[str] = mapped_column(
+        String(64), nullable=False, default=APPOINTMENT_TIMEZONE,
+        server_default=text(f"'{APPOINTMENT_TIMEZONE}'"))
+    # SB2A: optimistic-concurrency version of the booking (slot, durations, status,
+    # professional). The booking authority bumps it; a PostgreSQL trigger bumps it for any
+    # writer that does not, so a stale edit can be detected whoever made the newer one.
+    booking_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0"))
 
     # --- REVISION PIPELINE ---
     estado_revision: Mapped[str] = mapped_column(String(20), default="PENDIENTE")
@@ -185,6 +248,119 @@ class Revision(Base):
         back_populates="revisions",
     )
     agencia: Mapped[Optional["Agencia"]] = relationship("Agencia", back_populates="revisions")
+
+
+class CalendarException(Base):
+    """SB1 (OD-05): an operator-recorded closure or unavailable period.
+
+    No external holiday source exists or is consulted; normal weekday rules apply unless a
+    row here says otherwise. `CLOSED_DATE` closes a whole business date;
+    `UNAVAILABLE_INTERVAL` removes `[start_time, end_time)` from it. Times are Buenos Aires
+    wall-clock, like the agenda. `profesional_id` NULL means the whole business.
+
+    Representation only: in SB1 nothing reads this table, so availability is unchanged.
+    The schedule authority consumes it in a later milestone.
+    """
+    __tablename__ = "calendar_exceptions"
+    __table_args__ = (
+        CheckConstraint("kind IN ('CLOSED_DATE', 'UNAVAILABLE_INTERVAL')",
+                        name="ck_calendar_exceptions_kind"),
+        CheckConstraint(
+            "(kind = 'CLOSED_DATE' AND start_time IS NULL AND end_time IS NULL) OR "
+            "(kind = 'UNAVAILABLE_INTERVAL' AND start_time IS NOT NULL "
+            "AND end_time IS NOT NULL AND start_time < end_time)",
+            name="ck_calendar_exceptions_shape"),
+        CheckConstraint(f"timezone = '{APPOINTMENT_TIMEZONE}'",
+                        name="ck_calendar_exceptions_timezone"),
+        Index("ix_calendar_exceptions_date", "exception_date"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    exception_date: Mapped[date] = mapped_column(Date, nullable=False)
+    start_time: Mapped[Optional[time]] = mapped_column(Time, nullable=True)
+    end_time: Mapped[Optional[time]] = mapped_column(Time, nullable=True)
+    timezone: Mapped[str] = mapped_column(
+        String(64), nullable=False, default=APPOINTMENT_TIMEZONE,
+        server_default=text(f"'{APPOINTMENT_TIMEZONE}'"))
+    profesional_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("profesionales.id"), nullable=True)
+    reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    #: The operator identity as the session knows it (`auth.build_session`); `users` is not
+    #: the login authority, so this is a reference, not a foreign key.
+    created_by: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class BookingCommandRecord(Base):
+    """SB2A: one row per committed booking command that carried an idempotency key.
+
+    Written in the same transaction as the booking it records, so the ledger and the agenda
+    can never disagree. `UNIQUE (idempotency_key)` is the final duplicate authority.
+    Acknowledgement state is deliberately separate from commit state.
+    """
+    __tablename__ = "booking_commands"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_booking_commands_idempotency_key"),
+        CheckConstraint(
+            "source IN ('WHATSAPP_FLOW', 'CRM', 'API', 'CONVERSATION_ENGINE', 'OTHER')",
+            name="ck_booking_commands_source"),
+        CheckConstraint(
+            "operation IN ('CREATE', 'RESCHEDULE', 'CANCEL', 'MARK_FOR_RESCHEDULE', "
+            "'SET_STATUS', 'UNSCHEDULE', 'REQUEST_MANUAL_SCHEDULING')",
+            name="ck_booking_commands_operation"),
+        CheckConstraint(
+            "ack_status IN ('NOT_APPLICABLE', 'PENDING', 'SENDING', 'SENT', 'FAILED')",
+            name="ck_booking_commands_ack_status"),
+        Index("ix_booking_commands_revision_id", "revision_id"),
+        Index("ix_booking_commands_thread_revision_id", "thread_revision_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    operation: Mapped[str] = mapped_column(String(32), nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    revision_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("revisions.id", ondelete="SET NULL"), nullable=True)
+    thread_revision_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("thread_revisions.id", ondelete="SET NULL"), nullable=True)
+    lead_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    thread_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    profesional_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    slot_start: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    slot_end: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    occupying: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    booking_version: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    correlation_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    actor: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    committed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now())
+    ack_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="NOT_APPLICABLE",
+        server_default=text("'NOT_APPLICABLE'"))
+    ack_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0"))
+    ack_updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    replay_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0"))
+    last_replayed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    # SB2A-R2: the acknowledgement claim is a bounded lease with an owner.
+    ack_claim_token: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    ack_claimed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    ack_lease_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    ack_transport_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    ack_last_error: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    ack_duplicate_risk: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false"))
+    # SB2B: what happened to the submitted person identity (ADMITTED | FILLED | UNCHANGED |
+    # CONFLICT), written in the booking's own transaction; NULL when none was submitted or
+    # for rows committed before SB2B.
+    identity_outcome: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
 
 
 class ViaticosZone(Base):
@@ -425,7 +601,8 @@ class ThreadRevision(Base):
     __tablename__ = "thread_revisions"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('draft', 'collecting_data', 'booked', 'completed', 'provisional')",
+            "status IN ('draft', 'collecting_data', 'booked', 'completed', 'provisional', "
+            "'cancelled', 'reschedule_pending')",
             name="ck_thread_revisions_status",
         ),
     )

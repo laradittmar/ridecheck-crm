@@ -110,6 +110,16 @@ HANDLED_ACTIONS = frozenset({
     # Left unhandled, a replayed completion would be handed to n8n's legacy booking chain
     # — a second booking authority, invoked for a token whose booking already exists.
     ACTION_BOOKING_REPLAY,
+    # SB2B Option B (D1 B-6, §8.6): the booking authority's outcomes as CE records them.
+    # `booking_replayed` — a Flow submission already booked (by the Data Exchange endpoint or
+    # an earlier CE attempt) was synchronized from the ledger; `booking_retry_required` — the
+    # authority could not book now (lock timeout, disconnect) and a person was handed the
+    # turn; `booking_refused_handoff` — the booking was refused or not attempted and a person
+    # was handed the turn. Each is a CE DECISION about a booking. Left unhandled, n8n's false
+    # branch would run its legacy booking chain: a second autonomous booking route.
+    "booking_replayed",
+    "booking_retry_required",
+    "booking_refused_handoff",
 })
 # NOT included, deliberately: "no_lead". M21.2.8 certified it as genuine non-ownership
 # (the thread has no lead, so CE could not act), the text-path false branch is empty, and

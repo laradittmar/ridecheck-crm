@@ -39,6 +39,7 @@ class ThreadRevisionService:
             raise HTTPException(status_code=404, detail="Revision not found")
 
         patch_data = payload.model_dump(exclude_unset=True)
+        self._refuse_occupancy_change(revision, patch_data)
         changed = False
         for field, value in patch_data.items():
             if value is None:
@@ -57,6 +58,40 @@ class ThreadRevisionService:
             revision.updated_at = datetime.now(timezone.utc)
 
         return self._persist_update(revision)
+
+    #: Statuses `schedule.py` counts as occupying the agenda.
+    _OCCUPYING_STATUSES = ("booked", "completed")
+
+    @classmethod
+    def _occupancy(cls, status, scheduled_date, scheduled_time):
+        """The schedule-visible occupancy a ThreadRevision represents, or None."""
+        if status in cls._OCCUPYING_STATUSES and scheduled_date is not None \
+                and scheduled_time is not None:
+            return (scheduled_date, scheduled_time)
+        return None
+
+    def _refuse_occupancy_change(self, revision: ThreadRevision, patch_data: dict) -> None:
+        """SB2A-R2 (SB2A-R-05): this generic PATCH may not create, move or remove
+        schedule-visible occupancy. Booking changes belong to the canonical booking authority
+        (`BookingAuthority` via the booking endpoints); every other field stays editable."""
+        # the slot itself is never edited here; status only when it moves occupancy
+        refused = [f for f in ("scheduled_date", "scheduled_time")
+                   if patch_data.get(f) is not None and patch_data[f] != getattr(revision, f)]
+        if patch_data.get("status") is not None and patch_data["status"] != revision.status:
+            before = self._occupancy(revision.status, revision.scheduled_date,
+                                     revision.scheduled_time)
+            after = self._occupancy(patch_data["status"], revision.scheduled_date,
+                                    revision.scheduled_time)
+            if before != after:
+                refused.insert(0, "status")
+        if refused:
+            touched = refused
+            raise HTTPException(status_code=409, detail={
+                "code": "BOOKING_CHANGE_REQUIRES_AUTHORITY",
+                "message": ("Los cambios de turno (estado reservado, fecha u hora) se hacen "
+                            "desde la agenda o el flujo de reserva, no desde esta edición."),
+                "fields": touched,
+            })
 
     def _persist_create(self, revision: ThreadRevision) -> ThreadRevision:
         try:

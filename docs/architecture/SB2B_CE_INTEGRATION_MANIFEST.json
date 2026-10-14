@@ -1,0 +1,124 @@
+{
+  "schema": "sb2b-ce-integration-manifest/1",
+  "milestone": "PRELAUNCH-SB2A-BOOKING-AUTHORITY-CORE + SB2A-R2 + PRELAUNCH-SB2A-R3-CALLBACK-AND-LEASE-CLOSURE",
+  "status": "CONTRACT ONLY — conversation_engine.py is not modified in SB2A, R2 or R3; SB2B wires these sites",
+  "source_file": "backend/app/services/conversation_engine.py",
+  "adapter_module": "app.services.booking_ce_adapter",
+  "sites": [
+    {
+      "id": "CE-W1",
+      "function": "_process_flow_response",
+      "anchors": [
+        "crm_rev = Revision(",
+        "status=\"booked\"",
+        "turno_fecha=sched_date",
+        "turno_hora=sched_time"
+      ],
+      "current_operation": "Writes ThreadRevision(status='booked') and an occupying Revision at state.preferred_day/preferred_time, then self.db.commit(). No advisory lock, no revalidation, no calendar check, no professional, no idempotency; under SB1 an overlap raises 23P01 inside CE.",
+      "adapter": "book_from_flow_response",
+      "request": "CeFlowBookingRequest",
+      "command": {
+        "operation": "CREATE (REQUEST_MANUAL_SCHEDULING, non-occupying, when the agreed slot is incomplete)",
+        "source": "CONVERSATION_ENGINE",
+        "idempotency_key": "SB2B B-1: flow_idempotency_key(flow_token) = flow:<sha256(flow_token)[:48]> — the Data Exchange endpoint's key, one ledger row per Flow submission | ce-flow-response:<sha256('<thread_id>|msg|<inbound wamid>')[:48]> only for a token-less event; blank identities are never hashed",
+        "requested_date": "state.preferred_day",
+        "requested_time": "state.preferred_time",
+        "attach": "typed BookingAttachmentPlan: ThreadRevisionAttachment (booked; slot derived) + LeadUpdate + ThreadStateUpdate(link_current_revision, last_stage, needs_human, consume_flow_token) [+ PriceRecalculation(require_inputs)]"
+      },
+      "expected_results": [
+        "COMMITTED",
+        "IDEMPOTENT_REPLAY",
+        "SLOT_CONFLICT",
+        "CALENDAR_EXCEPTION",
+        "MISSING_PROFESSIONAL",
+        "RETRYABLE_FAILURE",
+        "INTERNAL_FAILURE",
+        "VALIDATION_FAILED"
+      ],
+      "sb2b_rules": [
+        "COMMITTED/IDEMPOTENT_REPLAY (SB2B B-5): the acknowledgement is the ledger row's — claim_acknowledgement(key), the owner text BOOKING_FLOW_RECEIPT_TEXT through the gate on BOOKING_FLOW with the causal inbound, record_acknowledgement; then SB2B-3 (B-4: expire, cursor, CE-only writes, commit). flow-txn:<ThreadRevision.id> no longer governs the flag-on path",
+        "SLOT_CONFLICT/CALENDAR_EXCEPTION: book nothing; call request_manual_scheduling so the human escalation survives",
+        "RETRYABLE_FAILURE/INTERNAL_FAILURE: SB2B-5/SB2B-6/SB2B-7",
+        "VALIDATION_FAILED (EVENT_IDENTITY_REQUIRED, IDEMPOTENCY_KEY_REUSED, ATTACHMENT_*, PLAN_NOT_DATA, COMMAND_NOT_DATA): book nothing, acknowledge nothing as confirmed, hand off"
+      ],
+      "identity_rule": "flow_token, else ctx.inbound_wa_message_id; neither present (or blank) → VALIDATION_FAILED / EVENT_IDENTITY_REQUIRED, nothing written"
+    },
+    {
+      "id": "CE-W2",
+      "function": "_handle_scheduling_escalation",
+      "anchors": [
+        "crm_rev = Revision(",
+        "status=\"provisional\"",
+        "turno_notas=\"Pendiente coordinación manual"
+      ],
+      "current_operation": "Writes an OCCUPYING Revision (default PENDIENTE) at the time the customer insists on after CE judged it unavailable. Under SB1 an overlap raises 23P01, CE's catch-all rolls back the entire turn and returns action='error' (handled=True): no reply, and the escalation, needs_human and handoff e-mail are lost.",
+      "adapter": "request_manual_scheduling",
+      "request": "CeSchedulingEscalationRequest",
+      "command": {
+        "operation": "REQUEST_MANUAL_SCHEDULING",
+        "source": "CONVERSATION_ENGINE",
+        "idempotency_key": "ce-escalation:<sha256('<thread_id>|esc|<escalation_id>' | '<thread_id>|cycle|<cycle_key>' | '<thread_id>|msg|<inbound wamid>')[:48]>, first non-blank in that order",
+        "target_status": "REPROGRAMAR (non-occupying)",
+        "attach": "optional typed BookingAttachmentPlan: ThreadRevisionAttachment(non_occupying_status='provisional') + LeadUpdate + ThreadStateUpdate",
+        "requested_slot": "complete, date only, time only or neither — stored as given; the missing half is never invented"
+      },
+      "expected_results": [
+        "COMMITTED",
+        "IDEMPOTENT_REPLAY",
+        "VALIDATION_FAILED (EVENT_IDENTITY_REQUIRED, IDEMPOTENCY_KEY_REUSED, ATTACHMENT_*)",
+        "RETRYABLE_FAILURE",
+        "INTERNAL_FAILURE"
+      ],
+      "invariants": [
+        "never occupies the agenda",
+        "never SLOT_CONFLICT",
+        "never PARTIAL_SLOT: a partial requested slot is accepted (SB2B-8)",
+        "the human escalation is preserved for EVERY result (SB2B-4..7) — the handoff happens outside the adapter transaction"
+      ],
+      "request_fields": {
+        "escalation_id": "optional explicit id",
+        "cycle_key": "COALESCE(state.current_cycle_start_message_db_id, 0)",
+        "inbound_event_id": "ctx.inbound_wa_message_id"
+      }
+    }
+  ],
+  "session_contract": "Each adapter call runs in its OWN short-lived session (isolated_session) on its own connection and commits or rolls back only that session; the caller's session is never flushed, committed, rolled back or closed by the adapter. There is NO callback (SB2A-R3): CE describes its associated writes as a typed BookingAttachmentPlan (ThreadRevisionAttachment, LeadUpdate, ThreadStateUpdate, PriceRecalculation) — plain data the booking authority executes in its own transaction. The ThreadRevision's status and slot are derived from the booking, never supplied.",
+  "sb2b_mandatory_rules": [
+    {
+      "id": "SB2B-1",
+      "rule": "CE must not hold uncommitted row locks on rows the authority will write (leads, whatsapp_thread_states, thread_revisions, revisions, booking_commands). Commit CE's own turn work on those rows BEFORE calling the adapter, or do not write them in CE before the call. Otherwise the adapter waits on its own caller and returns RETRYABLE_FAILURE/LOCK_TIMEOUT every time (proven: R2 audit i7, R3 pg tests)."
+    },
+    {
+      "id": "SB2B-2",
+      "rule": "Every row the plan references (thread, candidate, lead) must already be COMMITTED and visible to the adapter's separate connection. A candidate inserted earlier in the same uncommitted CE turn is invisible to the adapter (ATTACHMENT_CANDIDATE_NOT_IN_THREAD) or blocks its FK check."
+    },
+    {
+      "id": "SB2B-3",
+      "rule": "After any adapter COMMITTED/IDEMPOTENT_REPLAY, CE must expire or refresh its own ORM objects for the lead, thread state and ThreadRevision (session.expire / refresh) before reading or flushing them; CE's copies are stale (e.g. flow_booking_token was consumed by the authority)."
+    },
+    {
+      "id": "SB2B-4",
+      "rule": "VALIDATION_FAILED/IDEMPOTENCY_KEY_REUSED from CE-W2 (a second escalation in the same cycle with a different requested slot) means 'already escalated in this cycle' — CE must still perform the human handoff (needs_human, handoff e-mail, reply) and must never invent a new identity to force a second placeholder."
+    },
+    {
+      "id": "SB2B-5",
+      "rule": "RETRYABLE_FAILURE: book nothing, preserve the turn (no rollback of CE's committed work), escalate to a human. CE may retry once only after satisfying SB2B-1."
+    },
+    {
+      "id": "SB2B-6",
+      "rule": "INTERNAL_FAILURE: book nothing, preserve the turn, escalate to a human; never report the booking as made."
+    },
+    {
+      "id": "SB2B-7",
+      "rule": "The human handoff (needs_human, handoff e-mail, customer reply) happens OUTSIDE the failed adapter transaction — in CE's own session after the adapter returns — so a refused or failed booking can never erase it."
+    },
+    {
+      "id": "SB2B-8",
+      "rule": "Partial manual slots (date only, time only, neither) are accepted only by REQUEST_MANUAL_SCHEDULING, which never occupies. CREATE/RESCHEDULE refuse partial slots (SLOT_REQUIRED/PARTIAL_SLOT)."
+    },
+    {
+      "id": "SB2B-9",
+      "rule": "No CE integration may reintroduce arbitrary database writes into the booking transaction: no callable, session, ORM object or Mapping subclass may be passed to the authority (it refuses COMMAND_NOT_DATA / PLAN_NOT_DATA). New associated writes require a new typed plan field reviewed in its own milestone."
+    }
+  ]
+}
