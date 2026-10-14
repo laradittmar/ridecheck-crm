@@ -18,13 +18,51 @@ Status resolution matches on `wa_message_id` alone (`routes/whatsapp.py`), never
 so an archived row still answers a callback correctly. A WAMID we never sent remains
 genuinely unknown and still raises its security event — detection is not weakened, only
 stopped from firing on our own history.
+
+G37R-RV-03 — WHY THIS HELPER NOW TOUCHES `whatsapp_booking_offers`.
+`20261013_booking_projection` added `thread_revisions.offer_id`, and the offer table
+already pointed the other way through `accepted_thread_revision_id` and
+`accepted_revision_id`. That is a genuine two-cycle in the foreign-key graph, and the
+G3-7R-R3 independent review measured what it does to this function once a tester has
+completed one booking: `23503`, and **nothing deleted at all**.
+
+Measured on a schema built through the migration, the offer row blocks the reset at FOUR
+separate points, not one — every `NO ACTION` foreign key that leaves the offer table:
+
+    DELETE thread_revisions   -> whatsapp_booking_offers_accepted_thread_revision_id_fkey
+    DELETE candidates         -> whatsapp_booking_offers_candidate_id_fkey
+    DELETE revisions          -> whatsapp_booking_offers_accepted_revision_id_fkey
+    DELETE whatsapp_threads   -> whatsapp_booking_offers_thread_id_fkey
+    DELETE offers first       -> fk_thread_revisions_offer_id   (the other half of the cycle)
+
+So clearing the two accepted pointers is necessary and not sufficient: this helper never
+deleted the tester's offers at all, which is why the candidate and thread deletions failed
+too. The correction is therefore two things, both scoped to the tester being reset:
+
+  * the two accepted-booking pointers are cleared FIRST, which breaks the cycle without
+    touching production referential integrity; and
+  * the tester's own offer rows are deleted in the canonical order — after the bookings
+    that reference them, before the candidates and threads they reference.
+
+Asking the catalogue rather than the code for the full list turned up a SECOND blocking
+referent that predates the booking projection entirely:
+`whatsapp_clarification_attempts` references the thread and the outbound message it
+dispatched, both `NO ACTION`, and this helper never deleted it either. One clarification
+attempt is enough to make the whole reset fail and delete nothing. Both referents are now
+handled, and `test_rv03_pg_13` derives the list from `pg_constraint` so a third one added
+by a future migration fails the gate instead of silently breaking the reset again.
+
+The production foreign keys are deliberately NOT changed to `ON DELETE SET NULL`. A
+test-support reset must not weaken the referential integrity of the booking authority to
+make its own job easier; the audit's requirement is explicit about that, and the scoped
+clear measured here is sufficient.
 """
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
 
-from sqlalchemy import select, text
+from sqlalchemy import inspect as sa_inspect, select, text
 from sqlalchemy.orm import Session
 
 from ..models import (
@@ -32,6 +70,8 @@ from ..models import (
     Lead,
     Revision,
     ThreadRevision,
+    WhatsAppBookingOffer,
+    WhatsAppClarificationAttempt,
     WhatsAppContact,
     WhatsAppMessage,
     WhatsAppThread,
@@ -53,6 +93,10 @@ class ResetResult:
     archived_outbound: int = 0
     deleted: dict[str, int] = field(default_factory=dict)
     archive_thread_id: int | None = None
+    #: G37R-RV-03. How many of the tester's offer rows had an accepted-booking pointer
+    #: cleared so the two-cycle could be broken. Reported rather than inferred, because a
+    #: reset that silently cleared nothing would fail later and much less legibly.
+    cleared_offer_pointers: int = 0
 
 
 def _archive_thread(db: Session) -> WhatsAppThread:
@@ -72,6 +116,32 @@ def _archive_thread(db: Session) -> WhatsAppThread:
         db.add(thread)
         db.flush()
     return thread
+
+
+def _offer_table_present(db: Session) -> bool:
+    """Is `whatsapp_booking_offers` in this database?
+
+    G37R-RV-03. `20261013_booking_projection` is NOT yet applied to `crm` or `crm_test`, so
+    this helper has to keep working against a schema that has no offer table — the same
+    reason the dedup and recipient-lock deletions below are guarded. Asked through the
+    inspector rather than by catching an exception, because a failed statement would abort
+    the reset's own transaction and there would be nothing left to continue with.
+
+    THE INSPECTOR IS GIVEN THE SESSION'S OWN CONNECTION, not its engine. Asking the engine
+    opens a second connection and closes it again, and on the in-memory SQLite the test
+    suite uses — one DBAPI connection shared through a `StaticPool` — that close issues a
+    ROLLBACK on the very transaction this reset is in the middle of. Measured: the outbound
+    re-parenting was undone and the archived ledger row was then deleted along with the
+    tester, breaking RESET-WAMID-01, -02 and -04. `db.connection()` stays inside the
+    transaction, which is also the only honest thing to ask: whether the table exists in
+    the database this session is talking to.
+    """
+    try:
+        return sa_inspect(db.connection()).has_table(
+            WhatsAppBookingOffer.__tablename__)
+    except Exception:                           # pragma: no cover - defensive
+        logger.debug("reset: could not inspect for the offer table", exc_info=True)
+        return False
 
 
 def reset_tester_to_zero_state(db: Session, wa_id: str) -> ResetResult:
@@ -118,6 +188,39 @@ def reset_tester_to_zero_state(db: Session, wa_id: str) -> ResetResult:
         result.archived_outbound = len(outbound)
         db.flush()
 
+        # 2. G37R-RV-03: BREAK THE TWO-CYCLE BEFORE ANYTHING DEPENDENT IS DELETED.
+        #    `whatsapp_booking_offers.accepted_thread_revision_id` and
+        #    `accepted_revision_id` are audit metadata recording what an acceptance
+        #    produced; `thread_revisions.offer_id` points back and is the safety control
+        #    that carries the one-offer/one-booking guarantee. The control side must not
+        #    move, so the audit side yields — exactly as the model's own comment on
+        #    `use_alter` says it does for the schema graph.
+        #
+        #    Scoped to THIS tester's threads and to nothing else. A `WHERE thread_id IN
+        #    (...)` is the whole guard: no other tester's offer, booking, lead or candidate
+        #    is read or written, and a table-wide clear would make this helper capable of
+        #    destroying the audit trail of every booking in the database.
+        #
+        #    Done with an ORM update rather than a Core `UPDATE ... WHERE`, so the offers
+        #    are identified once, counted, and already in the session when the deletion
+        #    below removes them — and so a SQLite test schema behaves the same way.
+        if _offer_table_present(db):
+            offers = db.execute(
+                select(WhatsAppBookingOffer).where(
+                    WhatsAppBookingOffer.thread_id.in_(thread_ids)
+                )
+            ).scalars().all()
+            for offer in offers:
+                if (offer.accepted_thread_revision_id is not None
+                        or offer.accepted_revision_id is not None):
+                    offer.accepted_thread_revision_id = None
+                    offer.accepted_revision_id = None
+                    result.cleared_offer_pointers += 1
+            # The pointers must be durable in this transaction BEFORE the bookings they
+            # reference are deleted. Without this flush the ORM is free to order the
+            # UPDATE after the DELETE and the reset fails exactly as it did before.
+            db.flush()
+
     def _delete(model, condition, label: str) -> None:
         rows = db.execute(select(model).where(condition)).scalars().all()
         for row in rows:
@@ -128,6 +231,23 @@ def reset_tester_to_zero_state(db: Session, wa_id: str) -> ResetResult:
     if thread_ids:
         _delete(AiEvent, AiEvent.thread_id.in_(thread_ids), "ai_events")
         _delete(ThreadRevision, ThreadRevision.thread_id.in_(thread_ids), "thread_revisions")
+        # G37R-RV-03: the offers go HERE and nowhere else in this order — after the
+        # bookings whose `offer_id` references them, and before the candidates and threads
+        # that THEY reference. Both of those deletions used to fail on this table.
+        if _offer_table_present(db):
+            _delete(WhatsAppBookingOffer,
+                    WhatsAppBookingOffer.thread_id.in_(thread_ids), "booking_offers")
+        # G37R-RV-03, SECOND BLOCKING REFERENT — found while proving the first, and older
+        # than it. `whatsapp_clarification_attempts` references BOTH the thread
+        # (`thread_id`) and the outbound row it dispatched (`outbound_message_id`), both
+        # `NO ACTION`, and this helper never deleted it. Measured: one clarification
+        # attempt makes the whole reset fail `23503` on
+        # `whatsapp_clarification_attempts_thread_id_fkey` and delete NOTHING — with or
+        # without the offer table, so it is live on `crm_test` today. It is deleted here,
+        # before the messages its `outbound_message_id` may reference.
+        _delete(WhatsAppClarificationAttempt,
+                WhatsAppClarificationAttempt.thread_id.in_(thread_ids),
+                "clarification_attempts")
         _delete(WhatsAppMessage, WhatsAppMessage.thread_id.in_(thread_ids), "messages")
         _delete(WhatsAppThreadCandidate,
                 WhatsAppThreadCandidate.thread_id.in_(thread_ids), "candidates")
@@ -154,7 +274,9 @@ def reset_tester_to_zero_state(db: Session, wa_id: str) -> ResetResult:
 
     db.commit()
     logger.info(
-        "TESTER_RESET wa_id=...%s archived_outbound=%s deleted=%s archive_thread=%s",
-        wa_id[-4:], result.archived_outbound, result.deleted, result.archive_thread_id,
+        "TESTER_RESET wa_id=...%s archived_outbound=%s cleared_offer_pointers=%s "
+        "deleted=%s archive_thread=%s",
+        wa_id[-4:], result.archived_outbound, result.cleared_offer_pointers,
+        result.deleted, result.archive_thread_id,
     )
     return result
