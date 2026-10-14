@@ -313,6 +313,21 @@ class BookingCommandRecord(Base):
         CheckConstraint(
             "ack_status IN ('NOT_APPLICABLE', 'PENDING', 'SENDING', 'SENT', 'FAILED')",
             name="ck_booking_commands_ack_status"),
+        # Convergence Phase 2 (RV03RV-05): the command's own lifecycle, separate from its
+        # acknowledgement. DETACHED is terminal and its SHAPE is enforced here: no live
+        # booking pointer, no reusable id, no slot and not occupying, with a reason and a
+        # time. A COMMITTED row carries no detachment fields at all.
+        CheckConstraint("command_state IN ('COMMITTED', 'DETACHED')",
+                        name="ck_booking_commands_command_state"),
+        CheckConstraint(
+            "(command_state = 'COMMITTED' AND detached_at IS NULL AND detached_reason IS NULL "
+            "AND detached_history IS NULL) OR "
+            "(command_state = 'DETACHED' AND detached_at IS NOT NULL "
+            "AND detached_reason IS NOT NULL AND revision_id IS NULL "
+            "AND thread_revision_id IS NULL AND lead_id IS NULL AND thread_id IS NULL "
+            "AND profesional_id IS NULL AND slot_start IS NULL AND slot_end IS NULL "
+            "AND occupying = false)",
+            name="ck_booking_commands_detached_shape"),
         Index("ix_booking_commands_revision_id", "revision_id"),
         Index("ix_booking_commands_thread_revision_id", "thread_revision_id"),
     )
@@ -361,6 +376,17 @@ class BookingCommandRecord(Base):
     # CONFLICT), written in the booking's own transaction; NULL when none was submitted or
     # for rows committed before SB2B.
     identity_outcome: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    # Convergence Phase 2 (RV03RV-05). COMMITTED for every row the authority writes;
+    # DETACHED (terminal) once a tester reset removed the business rows it recorded. A
+    # DETACHED row keeps its key CONSUMED and never replays (`BookingAuthority.lookup`).
+    command_state: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="COMMITTED", server_default=text("'COMMITTED'"))
+    detached_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    detached_reason: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    #: HISTORICAL, NON-AUTHORITATIVE JSON written at detachment: the slot and the ids the row
+    #: named before the reset. Never joined, never read by replay, admission or a customer
+    #: path — the authoritative columns above are NULL so nothing joinable points at a reused id.
+    detached_history: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
 
 class ViaticosZone(Base):

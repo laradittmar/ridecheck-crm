@@ -211,11 +211,17 @@ def flow_booking_key(thread_id: int, flow_token: Optional[str],
 def lookup_booking(db: Session, key: Optional[str]) -> Optional[BookingResult]:
     """SB2B B-1/B-2: the committed result for `key`, read in an isolated session (CE's own
     session is not touched, so the read cannot assign CE a transaction id). None for a miss
-    or a missing key. Read-only: not counted as a replay."""
+    or a missing key. Read-only: not counted as a replay.
+
+    Convergence Phase 2: only a REPLAYABLE result is a hit. A key whose ledger row a tester
+    reset DETACHED answers `COMMAND_DETACHED` from the authority; to CE that is not a booking
+    to replay, acknowledge or synchronise, so it is a miss here — and the key, still consumed,
+    makes any booking attempt under it a terminal refusal inside the authority."""
     if type(key) is not str or not key:
         return None
     with isolated_session(db) as session:
-        return BookingAuthority(session).lookup(key)
+        found = BookingAuthority(session).lookup(key)
+    return found if found is not None and found.outcome is BookingOutcome.IDEMPOTENT_REPLAY else None
 
 
 def inbound_correlation(inbound_event_id: Optional[str]) -> Optional[str]:

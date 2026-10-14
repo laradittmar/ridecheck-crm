@@ -56,17 +56,30 @@ The production foreign keys are deliberately NOT changed to `ON DELETE SET NULL`
 test-support reset must not weaken the referential integrity of the booking authority to
 make its own job easier; the audit's requirement is explicit about that, and the scoped
 clear measured here is sufficient.
+
+CONVERGENCE PHASE 2 (RV03RV-05) — THE BOOKING-COMMAND LEDGER IS DETACHED, NOT DELETED.
+`booking_commands` survived a reset already (its two booking foreign keys are `ON DELETE SET
+NULL`), but the surviving row still answered `IDEMPOTENT_REPLAY / ALREADY_COMMITTED` with
+`occupying=True` and the original slot for a booking that no longer exists, and its
+`lead_id` / `thread_id` / `profesional_id` dangled at deleted ids a reseeded tester may
+reuse. Before anything is deleted, the tester's ledger rows are now made terminally
+`DETACHED` (`_detach_ledger`): retained as history with their key still consumed, every live
+pointer and reusable id NULL, never replayable, never acknowledged, never bookable again.
+This stays a TESTER tool: it selects only by this tester's threads, leads and bookings.
 """
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
-from sqlalchemy import inspect as sa_inspect, select, text
+from sqlalchemy import inspect as sa_inspect, or_, select, text
 from sqlalchemy.orm import Session
 
 from ..models import (
     AiEvent,
+    BookingCommandRecord,
     Lead,
     Revision,
     ThreadRevision,
@@ -97,6 +110,9 @@ class ResetResult:
     #: cleared so the two-cycle could be broken. Reported rather than inferred, because a
     #: reset that silently cleared nothing would fail later and much less legibly.
     cleared_offer_pointers: int = 0
+    #: Convergence Phase 2 (RV03RV-05). How many of the tester's booking-command ledger rows
+    #: were DETACHED: retained as history, terminally non-replayable, nothing joinable left.
+    detached_commands: int = 0
 
 
 def _archive_thread(db: Session) -> WhatsAppThread:
@@ -142,6 +158,68 @@ def _offer_table_present(db: Session) -> bool:
     except Exception:                           # pragma: no cover - defensive
         logger.debug("reset: could not inspect for the offer table", exc_info=True)
         return False
+
+
+def _ledger_table_present(db: Session) -> bool:
+    """Is `booking_commands` in this database? Same reasoning, and the same session-own
+    connection, as `_offer_table_present`: `crm` / `crm_test` do not have the table yet."""
+    try:
+        return sa_inspect(db.connection()).has_table(BookingCommandRecord.__tablename__)
+    except Exception:                           # pragma: no cover - defensive
+        logger.debug("reset: could not inspect for the ledger table", exc_info=True)
+        return False
+
+
+def _detach_ledger(db: Session, thread_ids: list, lead_ids: list) -> int:
+    """Convergence Phase 2 (RV03RV-05): DETACH the tester's booking-command ledger rows.
+
+    Retained, never deleted — the ledger is forensic history and its key stays consumed — but
+    made TERMINAL: `command_state = 'DETACHED'` with the reason and the time, every live
+    pointer (`revision_id`, `thread_revision_id`) and reusable id (`lead_id`, `thread_id`,
+    `profesional_id`) NULL, no slot and `occupying = false`. What the row named before is
+    kept only as historical JSON that nothing joins. `BookingAuthority.lookup()` then answers
+    `COMMAND_DETACHED`, never a replay.
+
+    It must run BEFORE the deletions: two of the four identities it selects by are foreign
+    keys that the deletion of the bookings would set NULL. Scoped to this tester's threads,
+    leads and their bookings, and nothing else — another tester's command is not read.
+    """
+    from .booking_authority import DETACH_REASON_TESTER_RESET, LEDGER_COMMITTED, LEDGER_DETACHED
+    R = BookingCommandRecord
+    revision_ids = list(db.execute(
+        select(Revision.id).where(Revision.lead_id.in_(lead_ids))).scalars().all()) if lead_ids else []
+    thread_revision_ids = list(db.execute(
+        select(ThreadRevision.id).where(ThreadRevision.thread_id.in_(thread_ids))
+    ).scalars().all())
+    scope = [R.thread_id.in_(thread_ids), R.thread_revision_id.in_(thread_revision_ids)]
+    if lead_ids:
+        scope += [R.lead_id.in_(lead_ids), R.revision_id.in_(revision_ids)]
+    rows = db.execute(select(R).where(R.command_state == LEDGER_COMMITTED)
+                      .where(or_(*scope))).scalars().all()
+    now = datetime.now(timezone.utc)
+    for rec in rows:
+        rec.detached_history = json.dumps({
+            "historical": True, "detached_by": DETACH_REASON_TESTER_RESET,
+            "revision_id": rec.revision_id, "thread_revision_id": rec.thread_revision_id,
+            "lead_id": rec.lead_id, "thread_id": rec.thread_id,
+            "profesional_id": rec.profesional_id,
+            "slot_start": rec.slot_start.isoformat() if rec.slot_start else None,
+            "slot_end": rec.slot_end.isoformat() if rec.slot_end else None,
+            "occupying": rec.occupying,
+        }, sort_keys=True)
+        rec.command_state = LEDGER_DETACHED
+        rec.detached_at = now
+        rec.detached_reason = DETACH_REASON_TESTER_RESET
+        rec.revision_id = None
+        rec.thread_revision_id = None
+        rec.lead_id = None
+        rec.thread_id = None
+        rec.profesional_id = None
+        rec.slot_start = None
+        rec.slot_end = None
+        rec.occupying = False
+    db.flush()
+    return len(rows)
 
 
 def reset_tester_to_zero_state(db: Session, wa_id: str) -> ResetResult:
@@ -221,6 +299,11 @@ def reset_tester_to_zero_state(db: Session, wa_id: str) -> ResetResult:
             # UPDATE after the DELETE and the reset fails exactly as it did before.
             db.flush()
 
+        # 3. Convergence Phase 2 (RV03RV-05): detach the tester's booking-command ledger
+        #    rows while the identities that select them still exist (see `_detach_ledger`).
+        if _ledger_table_present(db):
+            result.detached_commands = _detach_ledger(db, thread_ids, lead_ids)
+
     def _delete(model, condition, label: str) -> None:
         rows = db.execute(select(model).where(condition)).scalars().all()
         for row in rows:
@@ -275,8 +358,8 @@ def reset_tester_to_zero_state(db: Session, wa_id: str) -> ResetResult:
     db.commit()
     logger.info(
         "TESTER_RESET wa_id=...%s archived_outbound=%s cleared_offer_pointers=%s "
-        "deleted=%s archive_thread=%s",
+        "detached_commands=%s deleted=%s archive_thread=%s",
         wa_id[-4:], result.archived_outbound, result.cleared_offer_pointers,
-        result.deleted, result.archive_thread_id,
+        result.detached_commands, result.deleted, result.archive_thread_id,
     )
     return result

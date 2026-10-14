@@ -289,9 +289,16 @@ class Migration(unittest.TestCase):
             up = self._cols(eng)
             self.assertEqual(up["identity_outcome"], ("character varying", 16, "YES", None))
             self.assertEqual(set(up) - set(before), {"identity_outcome"})
-            with Session(eng) as db:                            # old rows read as "not recorded"
-                r = BookingAuthority(db).lookup("flow:legacyrow")
-                self.assertEqual((r.ack_status, r.identity_outcome), ("SENT", None))
+            # Convergence Phase 2 added LATER ledger columns to the ORM model, so the ORM
+            # (and with it `BookingAuthority.lookup`) can no longer read this table at the
+            # intermediate SB2B revision — the model is ahead of this schema, as it is for every
+            # other table at a pre-head revision. The old row is read with SQL here; the
+            # authority's own read of a pre-existing ledger row at the head schema is asserted
+            # in `test_convergence_p2_authority_pg.P2_50_Migration` (mg_02).
+            with eng.connect() as c:                            # old rows read as "not recorded"
+                self.assertEqual(tuple(c.execute(text(
+                    "SELECT ack_status, identity_outcome FROM booking_commands WHERE "
+                    "idempotency_key = 'flow:legacyrow'")).one()), ("SENT", None))
             _alembic(PG_MIG_URL, "downgrade", PRE)
             self.assertEqual((self._ver(eng), self._cols(eng)), (PRE, before))
             _alembic(PG_MIG_URL, "upgrade", SB2B)

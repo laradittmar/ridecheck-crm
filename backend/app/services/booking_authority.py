@@ -9,9 +9,14 @@ and commits once. Every failure rolls everything back and comes back as a typed
 
 Order inside the transaction (PostgreSQL):
 
+    0. pure validation     — the captured command, plans and offer acceptance; no lock, no write
     1. preflight          — the SB1/SB2A schema is really there (a `create_all` + `stamp`
                             database is refused), triggers are not disabled for this session
-    2. idempotency (fast)  — a committed command with the same key replays its original result
+    2. idempotency (fast)  — an UNLOCKED ledger read: a committed command with the same key
+                            replays its original result; a DETACHED one is a terminal refusal
+    2b. bounds            — `SET LOCAL lock_timeout` (4000 ms) and `statement_timeout`
+    2c. K1, then K2        — the thread-state row explicitly (convergence Phase 2), the ledger
+                            re-read under it, then the offer row and its acceptance
     3. revision row lock   — `SELECT … FOR UPDATE`, then the expected-version check
     4. professional        — explicit, eligible professional, or the single active launch
                             default; never "the first row", never NULL
@@ -36,27 +41,52 @@ booking row) are defence in depth, not the sandbox.
 
 The advisory lock is coordination. The exclusion constraint is the guarantee.
 
-LOCK ORDER (SB2A-R4 — every authority writer acquires in exactly this order):
+LOCK ORDER — canonical order K (convergence design, ratified 2026-10-14; Phase 2 builds it).
+Every authority path acquires an increasing SUBSEQUENCE of:
 
-    L1  shared per-date advisory locks        (DATE_LOCK_NAMESPACE, yyyymmdd), sorted by date
-    L2  exclusive (professional, date) locks  for the CURRENT and the TARGET occupancy,
+    K1  the command thread's whatsapp_thread_states row   FOR NO KEY UPDATE, EXPLICIT and
+                                              FIRST (created if missing, then locked)
+    K2  the accepted offer row                FOR UPDATE; bindings compared to the LOCKED
+                                              row; conditional ISSUED → ACCEPTED
+    K3  shared per-date advisory locks        (DATE_LOCK_NAMESPACE, yyyymmdd), sorted by date
+    K4  exclusive (professional, date) locks  for the CURRENT and the TARGET occupancy,
                                               sorted by (professional, date)
-    L3  the target Revision row               SELECT … FOR UPDATE (re-read; a change since
+    K5  the target Revision row               SELECT … FOR UPDATE (re-read; a change since
                                               the unlocked read is STALE_VERSION or
                                               RETRYABLE_FAILURE/CONCURRENT_CHANGE)
-    L4  occupying Revisions of the SAME professional whose protected interval overlaps
+    K6  occupying Revisions of the SAME professional whose protected interval overlaps
         the proposed interval                 FOR SHARE, ordered by id (normally none: an
                                               overlap is refused)
-    L5  the linked ThreadRevision (sync)      FOR UPDATE
-    L6  the command's lead row (identity)     FOR NO KEY UPDATE (compatible with the FK's
+    K7  thread_revisions                      the attached INSERT (with `offer_id` only while
+                                              K2 is held) and the linked row FOR UPDATE
+    K8  the command's lead row (identity)     FOR NO KEY UPDATE (compatible with the FK's
                                               KEY SHARE taken by the Revision INSERT)
-    L7  the attachment thread's state row     row write
-    L8  the ledger row                        INSERT (UNIQUE idempotency key)
+    K9  the ledger row                        INSERT (UNIQUE idempotency key)
+        ── COMMIT ──
+    L   the acknowledgement lease             its own short transactions, after the commit
+
+SB2A-R4 documented the same tail as L1–L8 (L1/L2 = K3/K4, L3 = K5, L4 = K6, L5 = K7,
+L6 = K8, L7 = the thread-state write, L8 = K9). What Phase 2 changes is L7: the thread-state
+row used to be read plainly and locked implicitly at the FINAL flush — the last row lock
+taken, after the date locks — so a booking for one thread could wait on another holder of
+that row while holding a whole date (CD-03; design audit E2: 3.62 s head-of-line wait for an
+unrelated customer). It is now K1, taken explicitly before anything else.
+
+K1 is taken for every thread-bound command, with one exception: a
+REQUEST_MANUAL_SCHEDULING command that carries neither a thread-state update nor an offer
+acceptance (SB2B CE-W2, rule B-3). That command writes nothing thread-side and occupies
+nothing; it is issued while the Conversation Engine may hold K1 itself, so taking K1 would
+make it wait on its own caller. Its subsequence is K5w → K7 → K9. A threadless (operator)
+command starts at K3; one whose current and target are both non-occupying starts at K5.
 
 Nothing else is locked: no other professional's bookings, no non-occupying rows, no
-unrelated ThreadRevision and no calendar day as a whole. Operations whose current and target
-are both non-occupying take no advisory lock and start at L3. A lock wait beyond
-`lock_timeout` or a detected deadlock is RETRYABLE_FAILURE; nothing partial survives.
+unrelated ThreadRevision and no calendar day as a whole. Foreign-key checks take KEY SHARE
+on parent rows (the lead, the thread, the professional, the already-held offer); KEY SHARE
+conflicts only with FOR UPDATE / DELETE, which no booking path takes on those rows.
+Every wait is bounded by `lock_timeout` (4000 ms by default) and every statement by
+`statement_timeout`. A lock wait beyond the bound or a detected deadlock is
+RETRYABLE_FAILURE; nothing partial survives. No external I/O may happen while the
+transaction is open (`forbid_external_io`).
 
 SQLite (tests) has neither advisory locks nor exclusion constraints. There the lock step is an
 explicit, labelled `sqlite-serialized` mode — SQLite serializes writers database-wide — and
@@ -90,7 +120,21 @@ logger = logging.getLogger(__name__)
 
 #: Advisory-lock namespace for per-date locks — must match the SB2A migration's trigger.
 DATE_LOCK_NAMESPACE = -1
-DEFAULT_LOCK_TIMEOUT_MS = 5000
+#: Convergence Phase 2: ONE bound for every booking lock wait, Track A's 4000 ms (the offer
+#: lifecycle's `DEFAULT_OFFER_LOCK_TIMEOUT_MS`). SB2A used 5000.
+DEFAULT_LOCK_TIMEOUT_MS = 4000
+#: `statement_timeout` = the lock bound plus this margin, so a lock wait always fails as the
+#: typed `55P03` first and no single statement can run unbounded either.
+STATEMENT_TIMEOUT_MARGIN_MS = 6000
+
+#: Ledger command state (convergence Phase 2, RV03RV-05). Every row is written COMMITTED in
+#: the booking's own transaction. DETACHED is TERMINAL: the business rows it recorded were
+#: removed by a tester reset, its live pointers and reusable ids are NULL, and it can never
+#: replay, be acknowledged or book again. The idempotency key stays consumed.
+LEDGER_COMMITTED = "COMMITTED"
+LEDGER_DETACHED = "DETACHED"
+LEDGER_STATES = (LEDGER_COMMITTED, LEDGER_DETACHED)
+DETACH_REASON_TESTER_RESET = "TESTER_RESET"
 
 
 # ── canonical statuses ───────────────────────────────────────────────────────
@@ -146,6 +190,12 @@ class BookingOutcome(str, Enum):
     VALIDATION_FAILED = "VALIDATION_FAILED"
     RETRYABLE_FAILURE = "RETRYABLE_FAILURE"
     INTERNAL_FAILURE = "INTERNAL_FAILURE"
+    #: Convergence Phase 2: the attached offer may not be accepted. `reason` is the
+    #: `offer_lifecycle.OfferRefusal` code decided against the LOCKED offer row.
+    OFFER_REFUSED = "OFFER_REFUSED"
+    #: Convergence Phase 2: the key names a ledger row a tester reset DETACHED. Terminal —
+    #: never a replay, never a success, never a new booking under that key.
+    COMMAND_DETACHED = "COMMAND_DETACHED"
 
 
 class AckStatus(str, Enum):
@@ -205,6 +255,8 @@ _MESSAGES: dict[BookingOutcome, str] = {
     BookingOutcome.VALIDATION_FAILED: "Los datos del turno no son válidos.",
     BookingOutcome.RETRYABLE_FAILURE: "La agenda está ocupada en este momento. Volvé a intentar.",
     BookingOutcome.INTERNAL_FAILURE: "No se pudo registrar el turno.",
+    BookingOutcome.OFFER_REFUSED: "La propuesta de turno ya no es válida. Pedí un horario nuevo.",
+    BookingOutcome.COMMAND_DETACHED: "Este registro de turno fue anulado y ya no tiene efecto.",
 }
 
 _OUTCOMES_OK = frozenset({BookingOutcome.COMMITTED, BookingOutcome.IDEMPOTENT_REPLAY})
@@ -306,6 +358,14 @@ def request_fingerprint(cmd: BookingCommand) -> str:
 def flow_idempotency_key(booking_token: str) -> str:
     """One Flow offer token → at most one booking. The raw token is never stored."""
     return "flow:" + hashlib.sha256(booking_token.encode()).hexdigest()[:48]
+
+
+def flow_idempotency_key_for_fingerprint(token_fingerprint: str) -> str:
+    """The same key from the offer's `token_fingerprint` (= sha256(token) hex), so an
+    `OfferAcceptance` — which carries only the fingerprint — is bound to exactly the ledger
+    key `flow_idempotency_key(token)` derives (decision C: the ledger key is the root and the
+    offer fingerprint is a derived reference, with no new column)."""
+    return "flow:" + token_fingerprint[:48]
 
 
 def form_idempotency_key(source: BookingSource, revision_id: int, expected_version: Optional[int],
@@ -499,11 +559,38 @@ class PriceRecalculation:
 
 
 @dataclass(frozen=True)
+class OfferAcceptance:
+    """Convergence Phase 2 — the acceptance of ONE issued offer, as data.
+
+    The caller's EVIDENCE of what it believes is being accepted. The authority never trusts
+    it: after K1 it locks the offer row (K2) and compares every field to the LOCKED row, and
+    it re-derives the candidate, its current category, the cycle and the canonical location
+    from rows it reads itself (the K1 thread-state row and the offer-bound candidate). Only an
+    ISSUED, un-expired offer whose every binding agrees moves to ACCEPTED, in the booking's
+    own transaction, and the booking's ThreadRevision carries its `offer_id` (the partial
+    unique index `uq_thread_revision_one_booking_per_offer` stays the final guarantee).
+
+    Carries no token (only `sha256(token)` hex), no callback, session, service or prose.
+    `offered_date`/`offered_time` are deliberately absent: they are historical metadata on
+    the offer, never an acceptance binding (owner policy 2026-10-13).
+    """
+    token_fingerprint: str
+    thread_id: int
+    cycle_key: int
+    candidate_id: Optional[int] = None
+    tipo_vehiculo: Optional[str] = None
+    zone_group: Optional[str] = None
+    zone_detail: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class BookingAttachmentPlan:
     thread_revision: Optional[ThreadRevisionAttachment] = None
     lead: Optional[LeadUpdate] = None
     thread_state: Optional[ThreadStateUpdate] = None
     price: Optional[PriceRecalculation] = None
+    #: Convergence Phase 2: accept this issued offer in the booking's own transaction (K2).
+    offer_acceptance: Optional[OfferAcceptance] = None
 
 
 # ── strict plan schema (SB2A-R4, R3A-01/R3A-02) ─────────────────────────────
@@ -549,8 +636,21 @@ _PLAN_SCHEMA: dict = {
     "BookingAttachmentPlan": {
         "thread_revision": ("plan", True, "ThreadRevisionAttachment"),
         "lead": ("plan", True, "LeadUpdate"), "thread_state": ("plan", True, "ThreadStateUpdate"),
-        "price": ("plan", True, "PriceRecalculation")},
+        "price": ("plan", True, "PriceRecalculation"),
+        "offer_acceptance": ("plan", True, "OfferAcceptance")},
+    "OfferAcceptance": {
+        # exact str bounded by the column; its sha256-hex FORMAT is checked in
+        # `_validate_acceptance`
+        "token_fingerprint": ("str", False, ("WhatsAppBookingOffer", "token_fingerprint")),
+        "thread_id": ("int", False, 1), "cycle_key": ("int", False, 0),
+        "candidate_id": ("int", True, 1),
+        "tipo_vehiculo": ("str", True, ("WhatsAppBookingOffer", "tipo_vehiculo")),
+        "zone_group": ("str", True, ("WhatsAppBookingOffer", "zone_group")),
+        "zone_detail": ("str", True, ("WhatsAppBookingOffer", "zone_detail"))},
 }
+
+#: A token fingerprint is exactly `sha256(token).hexdigest()`: 64 lowercase hex characters.
+_HEX64 = frozenset("0123456789abcdef")
 
 
 def _ok_str(value, limit) -> bool:
@@ -641,7 +741,7 @@ _PLAN_CLASSES: dict = {}
 
 _PLAN_CLASSES.update({c.__name__: c for c in (
     AvailabilityRevalidation, ThreadRevisionAttachment, LeadIdentity, LeadUpdate,
-    ThreadStateUpdate, PriceRecalculation, BookingAttachmentPlan)})
+    ThreadStateUpdate, PriceRecalculation, BookingAttachmentPlan, OfferAcceptance)})
 
 
 # ── SB2A-R5: capture first, validate the capture, execute only the capture ──
@@ -813,8 +913,9 @@ _MINTED_LOCK = threading.Lock()
 
 def _capture_call(cmd, availability, attachments) -> _CapturedCall:
     """Capture first (before ANY validation): the command and both plans are rebuilt from
-    one-shot copies. A structurally invalid command is captured as None, a plan as the
-    `_CAPTURE_FAILED` sentinel; the executor refuses them."""
+    one-shot copies (the plan's nested `OfferAcceptance` with it). A structurally invalid
+    command is captured as None, a plan as the `_CAPTURE_FAILED` sentinel; the executor
+    refuses them."""
     call = object.__new__(_CapturedCall)
     object.__setattr__(call, "command", _capture_command(cmd))
     object.__setattr__(call, "availability", _capture_optional(availability, AvailabilityRevalidation))
@@ -852,19 +953,33 @@ class BookingAuthority:
     # ── read-only lookups ────────────────────────────────────────────────
 
     def lookup(self, idempotency_key: str) -> Optional[BookingResult]:
-        """The committed result for a key, or None. Read-only; does not count as a replay."""
+        """The committed result for a key, None for an unknown key, or — for a ledger row a
+        tester reset DETACHED — the terminal `COMMAND_DETACHED` result, which is never a
+        replay and never `ok`. Read-only; does not count as a replay."""
         from ..models import BookingCommandRecord
         rec = self.db.execute(select(BookingCommandRecord).where(
             BookingCommandRecord.idempotency_key == idempotency_key)).scalar_one_or_none()
         return None if rec is None else self._replay_result(rec)
 
     def _replay_result(self, rec) -> BookingResult:
+        """A COMMITTED row replays its result; anything else is the terminal detached answer.
+        The state is checked FIRST and positively: only `COMMITTED` can ever replay."""
+        if rec.command_state != LEDGER_COMMITTED:
+            return self._detached_result(rec)
         return _result(BookingOutcome.IDEMPOTENT_REPLAY, "ALREADY_COMMITTED",
                        revision_id=rec.revision_id, thread_revision_id=rec.thread_revision_id,
                        profesional_id=rec.profesional_id, slot_start=rec.slot_start,
                        slot_end=rec.slot_end, occupying=rec.occupying,
                        booking_version=rec.booking_version, idempotency_key=rec.idempotency_key,
                        ack_status=rec.ack_status, identity_outcome=rec.identity_outcome)
+
+    @staticmethod
+    def _detached_result(rec) -> BookingResult:
+        """RV03RV-05. Carries no booking pointer, no slot and `occupying=False`: the booking it
+        recorded no longer exists, and nothing about it may read as live."""
+        reason = f"LEDGER_DETACHED:{rec.detached_reason or 'UNKNOWN'}"[:64]
+        return _result(BookingOutcome.COMMAND_DETACHED, reason, occupying=False,
+                       idempotency_key=rec.idempotency_key, ack_status=rec.ack_status)
 
     # ── acknowledgement (separate from commit) ───────────────────────────
 
@@ -886,6 +1001,7 @@ class BookingAuthority:
         from ..models import BookingCommandRecord as R
         now = self._clock()
         stmt = (update(R)
+                .where(R.command_state == LEDGER_COMMITTED)
                 .where(R.ack_status == AckStatus.SENDING.value)
                 .where(R.ack_attempts >= ACK_MAX_ATTEMPTS)
                 .where(or_(R.ack_lease_expires_at.is_(None), R.ack_lease_expires_at < now))
@@ -920,6 +1036,8 @@ class BookingAuthority:
         res = self.db.execute(
             update(R)
             .where(R.idempotency_key == idempotency_key)
+            # Convergence Phase 2: a DETACHED row's booking no longer exists — nothing is owed
+            .where(R.command_state == LEDGER_COMMITTED)
             .where(R.ack_attempts < ACK_MAX_ATTEMPTS)
             .where(or_(R.ack_status.in_((AckStatus.PENDING.value, AckStatus.FAILED.value)),
                        and_(R.ack_status == AckStatus.SENDING.value,
@@ -996,6 +1114,7 @@ class BookingAuthority:
                         R.ack_last_error, R.ack_transport_id, R.revision_id, R.ack_updated_at,
                         and_(lease_gone, R.ack_attempts >= ACK_MAX_ATTEMPTS)
                         .label("pending_terminalization"))
+                 .where(R.command_state == LEDGER_COMMITTED)
                  .where(R.ack_status != AckStatus.NOT_APPLICABLE.value)
                  .where(or_(and_(R.ack_status == AckStatus.FAILED.value,
                                  R.ack_attempts >= ACK_MAX_ATTEMPTS),
@@ -1016,7 +1135,8 @@ class BookingAuthority:
           ACK_DUPLICATE_RISK  a reclaimed lease may have sent twice
           ACK_LEASE_GONE      SENDING with no live lease (its sender died)
           IDENTITY_CONFLICT   the submitted identity disagreed and was NOT applied
-        Performs no write and no commit. Rows carry the raw key: callers that DISPLAY them
+        A DETACHED row (tester reset, convergence Phase 2) is never listed: its booking no
+        longer exists and nothing about it needs a person. Performs no write and no commit. Rows carry the raw key: callers that DISPLAY them
         must reduce it to its namespace and a hash prefix (the key never contains a token).
         """
         from ..models import BookingCommandRecord as R
@@ -1040,6 +1160,7 @@ class BookingAuthority:
                         R.ack_duplicate_risk, R.ack_last_error, R.ack_transport_id,
                         R.identity_outcome,
                         *[case((c, True), else_=False).label(name) for name, c in conds.items()])
+                 .where(R.command_state == LEDGER_COMMITTED)
                  .where(or_(*conds.values()))
                  .order_by(R.id))
         with self.db.no_autoflush:                      # a read never flushes anything
@@ -1075,7 +1196,8 @@ class BookingAuthority:
                 attachments: Optional[BookingAttachmentPlan] = None) -> BookingResult:
         """Run one booking command in ONE authority-owned transaction.
 
-        `availability` and `attachments` are typed DATA. SB2A-R5: they and the command are
+        `availability` and `attachments` are typed DATA (convergence Phase 2: an offer
+        acceptance is `attachments.offer_acceptance`). SB2A-R5: they and the command are
         captured into authority-owned copies FIRST; only the copies are validated and
         executed, and the caller's objects are never read again — mutating them afterwards
         (even while this call waits on a lock) cannot influence the booking. SB2A-R6: the
@@ -1102,9 +1224,11 @@ class BookingAuthority:
         fingerprint = ""
         identity_outcome: Optional[str] = None
         deletes_at_start = 0
+        offer_id: Optional[int] = None              # set once K2 accepted the offer
         # Nothing about an unvalidated command is touched (no attribute, no str()): R3A-02.
         token = _TXN_SCOPE.set(_TxnScope("BOOKING"))
         try:
+            # ── 0. pure validation: no lock, no read, no write ───────────────────
             spec = self._validate(cmd)
             if availability is _CAPTURE_FAILED:
                 raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, "PLAN_NOT_DATA:availability"))
@@ -1112,21 +1236,47 @@ class BookingAuthority:
                 raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, "PLAN_NOT_DATA:attachments"))
             fingerprint = request_fingerprint(cmd)
             self._validate_plans(cmd, availability, attachments)
+            acceptance = attachments.offer_acceptance if attachments is not None else None
+            self._validate_acceptance(cmd, attachments, acceptance)
+            k1_thread = self._k1_thread(cmd, attachments, acceptance)
+
+            # ── 1. preflight (catalog read) and 2. the UNLOCKED ledger lookup ────
             txid = None
             if self._postgres():
                 reason = verify_booking_schema(self.db)        # every transaction
                 if reason:
                     raise _Refused(_result(BookingOutcome.INTERNAL_FAILURE, reason))
-                self.db.execute(text(f"SET LOCAL lock_timeout = {self.lock_timeout_ms}"))
-                txid = self.db.execute(text("SELECT txid_current()")).scalar()
-                deletes_at_start = self._booking_deletes()
-
             if cmd.idempotency_key:
                 replay = self._check_replay(cmd.idempotency_key, fingerprint)
                 if replay is not None:
                     self.db.rollback()
                     self.note_replay(cmd.idempotency_key)
                     return replay
+
+            # ── 2b. the authority transaction's bounds ─────────────────────────────
+            if self._postgres():
+                self.db.execute(text(f"SET LOCAL lock_timeout = {self.lock_timeout_ms}"))
+                self.db.execute(text("SET LOCAL statement_timeout = %d"
+                                     % (self.lock_timeout_ms + STATEMENT_TIMEOUT_MARGIN_MS)))
+                txid = self.db.execute(text("SELECT txid_current()")).scalar()
+                deletes_at_start = self._booking_deletes()
+
+            # ── K1: the thread-state row, explicitly, before any other business lock ──
+            state = None
+            if k1_thread is not None:
+                state = self._lock_thread_state(k1_thread, cmd, attachments)
+                if cmd.idempotency_key:
+                    # Identical commands serialize on K1; the second sees the first's ledger
+                    # row here, before it can touch the offer or any date.
+                    replay = self._check_replay(cmd.idempotency_key, fingerprint)
+                    if replay is not None:
+                        self.db.rollback()
+                        self.note_replay(cmd.idempotency_key)
+                        return replay
+
+            # ── K2: the offer row; bindings vs the LOCKED row; ISSUED → ACCEPTED ────
+            if acceptance is not None:
+                offer_id = self._claim_offer(acceptance, state)
 
             revision = self._load_revision(cmd)                # unlocked read
             current = _Snapshot.of(revision)
@@ -1144,11 +1294,11 @@ class BookingAuthority:
             elif cmd.operation is not BookingOperation.UNSCHEDULE:
                 profesional_id = current.profesional_id if revision is not None else None
 
-            # L1 + L2: advisory locks for the current AND the target occupancy, sorted
+            # K3 + K4: advisory locks for the current AND the target occupancy, sorted
             keys = self._lock_keys(current, target, profesional_id)
             if keys:
                 lock_mode = self._acquire_locks(keys)
-            # L3: the target row, re-read under the locks
+            # K5: the target row, re-read under the locks
             if revision is not None:
                 revision, current = self._lock_revision(cmd, revision, current)
             if keys and cmd.idempotency_key:
@@ -1159,7 +1309,7 @@ class BookingAuthority:
                     return replay
             if target.occupying:
                 self._check_calendar(profesional_id, target)
-                # L4: only same-professional occupying rows overlapping the proposed interval
+                # K6: only same-professional occupying rows overlapping the proposed interval
                 self._lock_overlapping(profesional_id, target,
                                        exclude_id=revision.id if revision is not None else None)
                 self._check_overlap(profesional_id, target,
@@ -1174,18 +1324,25 @@ class BookingAuthority:
             expected_row = self._booking_row(revision.id)
             thread_revision_id = None
             if attachments is not None:
-                thread_revision_id, identity_outcome = self._apply_attachments(
-                    cmd, attachments, revision, target)
+                # K7: the attached ThreadRevision (carrying `offer_id` only while K2 is held)
+                thread_revision_id = self._apply_attachments(cmd, attachments, revision, target)
             self._assert_continuous(txid)          # before any further write (e.g. the ledger)
             linked_id = self._sync_thread_revision(cmd, revision, target, thread_revision_id)
+            if attachments is not None or offer_id is not None:
+                # K8 (lead), then the K1 row and the K2 projection, both already held
+                identity_outcome = self._apply_canonical_state(
+                    cmd, attachments, revision, thread_revision_id, state, offer_id)
             self.db.flush()
             version = revision.booking_version
             if cmd.idempotency_key:
+                # K9
                 self._record(cmd, fingerprint, revision, thread_revision_id or linked_id,
                              target, version, identity_outcome)
             self._verify_before_commit(txid, revision, expected_row, target, window, before,
                                        allowed_tr={i for i in (thread_revision_id, linked_id) if i},
                                        deletes_at_start=deletes_at_start)
+            if offer_id is not None:
+                self._verify_offer_projection(offer_id, revision.id, thread_revision_id)
             self.db.commit()
             if identity_outcome == "CONFLICT":
                 logger.warning("BOOKING_IDENTITY_CONFLICT revision_id=%s — submitted identity "
@@ -1211,17 +1368,18 @@ class BookingAuthority:
                            idempotency_key=_safe_key(cmd))
         except IntegrityError as exc:
             self._safe_rollback()
-            return self._translate_integrity(exc, cmd, fingerprint)
+            return self._translate_integrity(exc, cmd, fingerprint, offer_id=offer_id)
         except DBAPIError as exc:
             self._safe_rollback()
-            state = getattr(getattr(exc, "orig", None), "sqlstate", None) or ""
-            if state in ("55P03", "40P01", "40001") or state.startswith("08") \
+            state_ = getattr(getattr(exc, "orig", None), "sqlstate", None) or ""
+            if state_ in ("55P03", "40P01", "40001", "57014") or state_.startswith("08") \
                     or exc.connection_invalidated:
-                return _result(BookingOutcome.RETRYABLE_FAILURE,
-                               "LOCK_TIMEOUT" if state == "55P03" else f"DB_{state or 'DISCONNECT'}",
+                reason = {"55P03": "LOCK_TIMEOUT", "57014": "STATEMENT_TIMEOUT"}.get(
+                    state_, f"DB_{state_ or 'DISCONNECT'}")
+                return _result(BookingOutcome.RETRYABLE_FAILURE, reason,
                                idempotency_key=_safe_key(cmd), lock_mode=lock_mode)
-            logger.error("BOOKING_AUTHORITY database error sqlstate=%s", state)
-            return _result(BookingOutcome.INTERNAL_FAILURE, f"DB_{state or 'ERROR'}",
+            logger.error("BOOKING_AUTHORITY database error sqlstate=%s", state_)
+            return _result(BookingOutcome.INTERNAL_FAILURE, f"DB_{state_ or 'ERROR'}",
                            idempotency_key=_safe_key(cmd))
         except Exception:
             self._safe_rollback()
@@ -1231,6 +1389,228 @@ class BookingAuthority:
                            idempotency_key=_safe_key(cmd))
         finally:
             _TXN_SCOPE.reset(token)
+
+    # ── convergence Phase 2: K1 and the offer attachment (K2) ────────────
+
+    def _validate_acceptance(self, cmd: BookingCommand, attachments,
+                             acceptance) -> None:
+        """Pure: an offer acceptance belongs to exactly one thread-bound CREATE whose attached
+        ThreadRevision names the same thread and candidate, under exactly the ledger key its
+        fingerprint derives. No database access. (Its exact type and field kinds were already
+        admitted with the plan by `_validate_plans`.)"""
+        if acceptance is None:
+            return
+        fp = acceptance.token_fingerprint
+        if len(fp) != 64 or not all(c in _HEX64 for c in fp):
+            raise _Refused(_result(BookingOutcome.VALIDATION_FAILED,
+                                   "OFFER_ACCEPTANCE_FINGERPRINT_NOT_SHA256"))
+        if cmd.operation is not BookingOperation.CREATE:
+            raise _Refused(_result(BookingOutcome.VALIDATION_FAILED,
+                                   "OFFER_ACCEPTANCE_ONLY_FOR_CREATE"))
+        if cmd.thread_id != acceptance.thread_id:
+            raise _Refused(_result(BookingOutcome.VALIDATION_FAILED,
+                                   "OFFER_ACCEPTANCE_THREAD_MISMATCH"))
+        tr = attachments.thread_revision if attachments is not None else None
+        if tr is None or tr.thread_id != acceptance.thread_id:
+            raise _Refused(_result(BookingOutcome.VALIDATION_FAILED,
+                                   "OFFER_ACCEPTANCE_REQUIRES_THREAD_REVISION"))
+        if tr.candidate_id != acceptance.candidate_id:
+            raise _Refused(_result(BookingOutcome.VALIDATION_FAILED,
+                                   "OFFER_ACCEPTANCE_CANDIDATE_MISMATCH"))
+        if cmd.idempotency_key != flow_idempotency_key_for_fingerprint(acceptance.token_fingerprint):
+            raise _Refused(_result(BookingOutcome.VALIDATION_FAILED,
+                                   "OFFER_ACCEPTANCE_KEY_MISMATCH"))
+
+    @staticmethod
+    def _k1_thread(cmd: BookingCommand, attachments, acceptance) -> Optional[int]:
+        """The thread whose state row is K1, or None when this command takes no K1.
+
+        Thread-bound = the command names a thread or attaches a ThreadRevision to one (the two
+        are validated equal). The one thread-bound exception is a REQUEST_MANUAL_SCHEDULING
+        with neither a thread-state update nor an offer acceptance (SB2B CE-W2, B-3): it writes
+        nothing thread-side, occupies nothing, and runs while CE may hold K1 itself."""
+        tr = attachments.thread_revision if attachments is not None else None
+        thread_id = cmd.thread_id if cmd.thread_id is not None else (
+            tr.thread_id if tr is not None else None)
+        if thread_id is None:
+            return None
+        writes_state = attachments is not None and attachments.thread_state is not None
+        if cmd.operation is BookingOperation.REQUEST_MANUAL_SCHEDULING \
+                and not writes_state and acceptance is None:
+            return None
+        return int(thread_id)
+
+    def _lock_thread_state(self, thread_id: int, cmd: BookingCommand, attachments):  # -> state | None
+        """K1. `SELECT … FOR NO KEY UPDATE` on the command thread's state row — the FIRST
+        business-row lock of the transaction and never an implicit one at a flush.
+
+        A thread with no state row gets one: `INSERT … ON CONFLICT (thread_id) DO NOTHING`,
+        then the same locking SELECT. One attempt, no loop: a concurrent creator makes the
+        INSERT wait (bounded by `lock_timeout`) and then do nothing, and the SELECT locks the
+        row it committed. The INSERT takes only the FK's KEY SHARE on the thread row, which no
+        booking path holds exclusively, so nothing earlier than K1 is acquired out of order."""
+        from ..models import WhatsAppThread, WhatsAppThreadState as S
+        attached = attachments is not None and (attachments.thread_revision is not None
+                                                or attachments.thread_state is not None
+                                                or attachments.offer_acceptance is not None)
+        if self.db.get(WhatsAppThread, thread_id) is None:
+            if attached:
+                raise _Refused(_result(BookingOutcome.VALIDATION_FAILED,
+                                       "ATTACHMENT_THREAD_NOT_FOUND"))
+            # The command names a thread only as ledger metadata and writes nothing
+            # thread-side (SB2A contract, unchanged): there is no row to serialize on.
+            return None
+        pg = self._postgres()
+
+        def locked_row():
+            stmt = select(S).where(S.thread_id == thread_id).execution_options(
+                populate_existing=True)
+            if pg:
+                stmt = stmt.with_for_update(key_share=True)        # FOR NO KEY UPDATE
+            return self.db.execute(stmt).scalar_one_or_none()
+
+        try:
+            state = locked_row()
+            if state is None:
+                if pg:
+                    from sqlalchemy.dialects.postgresql import insert as dialect_insert
+                else:
+                    from sqlalchemy.dialects.sqlite import insert as dialect_insert
+                self.db.execute(dialect_insert(S.__table__).values(thread_id=thread_id)
+                                .on_conflict_do_nothing(index_elements=["thread_id"]))
+                state = locked_row()
+        except DBAPIError as exc:
+            if getattr(getattr(exc, "orig", None), "sqlstate", None) == "55P03":
+                raise _Refused(_result(BookingOutcome.RETRYABLE_FAILURE,
+                                       "THREAD_STATE_CONTENDED")) from None
+            raise
+        if state is None:
+            raise _Refused(_result(BookingOutcome.INTERNAL_FAILURE, "THREAD_STATE_UNAVAILABLE"))
+        return state
+
+    def _db_now(self) -> datetime:
+        """The offer clock: the database's on PostgreSQL (as `OfferLifecycle._now`)."""
+        if self._postgres():
+            now = self.db.execute(select(func.now())).scalar()
+            return now if now.tzinfo else now.replace(tzinfo=timezone.utc)
+        return _app_now()
+
+    @staticmethod
+    def _aware(value) -> Optional[datetime]:
+        if not isinstance(value, datetime):
+            return None
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+    def _claim_offer(self, acceptance: OfferAcceptance, state) -> int:
+        """K2. Lock the offer row FOR UPDATE, decide every binding against the LOCKED row and
+        against rows the authority reads itself, then move it ISSUED → ACCEPTED with a
+        conditional UPDATE. Returns the offer id; any refusal is a typed `OFFER_REFUSED`
+        whose reason is the `OfferRefusal` code, and rolls back everything (K1 included)."""
+        from ..models import WhatsAppBookingOffer as O
+        from .offer_lifecycle import OfferStatus, WithdrawReason
+        stmt = select(O).where(O.token_fingerprint == acceptance.token_fingerprint) \
+            .execution_options(populate_existing=True)
+        if self._postgres():
+            stmt = stmt.with_for_update()
+        try:
+            offer = self.db.execute(stmt).scalar_one_or_none()      # fingerprint is UNIQUE
+        except DBAPIError as exc:
+            if getattr(getattr(exc, "orig", None), "sqlstate", None) == "55P03":
+                raise _Refused(_result(BookingOutcome.RETRYABLE_FAILURE,
+                                       "OFFER_CONTENDED")) from None
+            raise
+        refusal = self._offer_refusal(offer, acceptance, state)
+        if refusal is not None:
+            raise _Refused(_result(BookingOutcome.OFFER_REFUSED, refusal))
+        now = self._db_now()
+        res = self.db.execute(
+            update(O).where(O.id == offer.id).where(O.status == OfferStatus.ISSUED)
+            .values(status=OfferStatus.ACCEPTED, accepted_at=now, terminal_at=now,
+                    terminal_reason=WithdrawReason.CONSUMED_BY_BOOKING)
+            .execution_options(synchronize_session="fetch"))
+        if res.rowcount != 1:
+            raise _Refused(_result(BookingOutcome.OFFER_REFUSED, "OFFER_ALREADY_ACCEPTED"))
+        return int(offer.id)
+
+    def _accepted_offer_id(self, acceptance) -> Optional[int]:
+        """The id of the offer `_claim_offer` ACCEPTED in this transaction (K2 still held), for
+        the ThreadRevision's `offer_id`; None when the plan accepts no offer. Read by the
+        fingerprint under our own lock, so it cannot name any other offer."""
+        if acceptance is None:
+            return None
+        from ..models import WhatsAppBookingOffer as O
+        offer_id = self.db.execute(select(O.id).where(
+            O.token_fingerprint == acceptance.token_fingerprint)
+            .where(O.thread_id == acceptance.thread_id).where(O.status == "ACCEPTED")).scalar()
+        if offer_id is None:
+            raise _InvariantBreach("ACCEPTED_OFFER_NOT_HELD")
+        return int(offer_id)
+
+    def _offer_refusal(self, offer, acceptance: OfferAcceptance, state) -> Optional[str]:
+        """Every reason the locked offer may not be accepted, in `_claim_checks` order, or
+        None. Caller evidence is compared to the LOCKED row; the candidate, its current
+        category, the cycle and the canonical location are re-derived from the K1 state row
+        and the offer-bound candidate, so plausible-looking caller values never suffice."""
+        from ..models import WhatsAppThreadCandidate
+        from .clarification_attempt import cycle_key as state_cycle_key
+        from .offer_lifecycle import OfferRefusal as R, OfferStatus
+        if offer is None:
+            return R.UNKNOWN_TOKEN
+        if offer.thread_id != acceptance.thread_id:
+            return R.FOREIGN_OFFER
+        if offer.status != OfferStatus.ISSUED:
+            return {OfferStatus.WITHDRAWN: R.OFFER_WITHDRAWN,
+                    OfferStatus.SUPERSEDED: R.SUPERSEDED_OFFER,
+                    OfferStatus.ACCEPTED: R.OFFER_ALREADY_ACCEPTED,
+                    OfferStatus.EXPIRED: R.OFFER_EXPIRED}.get(offer.status, R.UNKNOWN_TOKEN)
+        expires = self._aware(offer.expires_at)
+        if expires is not None and self._db_now() > expires:
+            return R.OFFER_EXPIRED
+        # candidate — the caller's, the offer's, and the row itself, in this thread and cycle
+        if offer.candidate_id is None or acceptance.candidate_id != offer.candidate_id:
+            return R.OFFER_CANDIDATE_CHANGED
+        cand = self.db.execute(select(WhatsAppThreadCandidate).where(
+            WhatsAppThreadCandidate.id == offer.candidate_id)
+            .execution_options(populate_existing=True)).scalar_one_or_none()
+        if cand is None or cand.thread_id != acceptance.thread_id:
+            return R.OFFER_CANDIDATE_CHANGED
+        focus = getattr(state, "current_focus_candidate_id", None)
+        if focus is not None and int(focus) != int(offer.candidate_id):
+            return R.OFFER_CANDIDATE_CHANGED
+        cycle_start = self._aware(getattr(state, "current_cycle_started_at", None))
+        created = self._aware(cand.created_at)
+        if cycle_start is not None and created is not None and created < cycle_start:
+            return R.OFFER_CANDIDATE_CHANGED
+        # cycle — the caller's AND the locked state row's
+        if int(acceptance.cycle_key) != int(offer.cycle_key or 0) \
+                or int(state_cycle_key(state)) != int(offer.cycle_key or 0):
+            return R.OFFER_CYCLE_CHANGED
+        # category — a pricing input: the caller's AND the candidate's current value
+        if acceptance.tipo_vehiculo != offer.tipo_vehiculo \
+                or cand.tipo_vehiculo != offer.tipo_vehiculo:
+            return R.OFFER_VEHICLE_CATEGORY_CHANGED
+        if offer.tipo_vehiculo is None:
+            return R.OFFER_VEHICLE_CATEGORY_UNRESOLVED
+        # location — a pricing input: the caller's AND the canonical one (CE's precedence for
+        # the offer-bound candidate: its own zone, gaps filled from the state; else the state's)
+        bound = (offer.zone_group, offer.zone_detail)
+        if (acceptance.zone_group, acceptance.zone_detail) != bound:
+            return R.OFFER_LOCATION_CHANGED
+        if _canonical_location(cand, state) != bound:
+            return R.OFFER_LOCATION_CHANGED
+        return None
+
+    def _verify_offer_projection(self, offer_id: int, revision_id: int,
+                                 thread_revision_id: Optional[int]) -> None:
+        """Defence in depth before the ONE commit: the offer is ACCEPTED and names exactly this
+        booking, and the booking's ThreadRevision names exactly this offer."""
+        from ..models import ThreadRevision, WhatsAppBookingOffer as O
+        row = self.db.execute(select(O.status, O.accepted_revision_id,
+                                     O.accepted_thread_revision_id).where(O.id == offer_id)).one()
+        linked = self.db.execute(select(ThreadRevision.offer_id).where(
+            ThreadRevision.id == thread_revision_id)).scalar() if thread_revision_id else None
+        if tuple(row) != ("ACCEPTED", revision_id, thread_revision_id) or linked != offer_id:
+            raise _InvariantBreach("OFFER_PROJECTION_SPLIT")
 
     # ── steps ────────────────────────────────────────────────────────────
 
@@ -1295,12 +1675,18 @@ class BookingAuthority:
 
     def _apply_attachments(self, cmd: BookingCommand, plan: BookingAttachmentPlan, revision,
                            target: "_Target") -> Optional[int]:
-        """Perform the typed associated writes. Every row touched is chosen by the authority:
-        the booking's own lead, the attachment's thread (verified to belong to that lead), and
-        a new ThreadRevision whose status and slot are derived from the booking."""
-        from ..models import Lead, ThreadRevision, WhatsAppThread, WhatsAppThreadCandidate, \
-            WhatsAppThreadState
+        """K7: the typed ThreadRevision attachment (and the price). Every row touched is chosen
+        by the authority: the attachment's thread (verified to belong to the booking's lead)
+        and a new ThreadRevision whose status and slot are derived from the booking.
+
+        `offer_id` is written onto the ThreadRevision ONLY when `_claim_offer` accepted that
+        offer in this transaction, i.e. while K2 is held — so the INSERT's foreign-key
+        KEY SHARE on the offer row is never an out-of-order acquisition. The partial unique
+        index on that column is the final one-offer/one-booking guarantee; a violation is
+        translated by `_translate_integrity`, never leaked."""
+        from ..models import ThreadRevision, WhatsAppThread, WhatsAppThreadCandidate
         tr_id = None
+        offer_id = self._accepted_offer_id(plan.offer_acceptance)
         thread_id = plan.thread_revision.thread_id if plan.thread_revision else cmd.thread_id
         if plan.thread_revision is not None or plan.thread_state is not None:
             thread = self.db.get(WhatsAppThread, thread_id)
@@ -1322,6 +1708,7 @@ class BookingAuthority:
                 status = a.non_occupying_status
             tr = ThreadRevision(
                 thread_id=a.thread_id, candidate_id=a.candidate_id, status=status,
+                offer_id=offer_id,
                 buyer_name=a.buyer_name, buyer_phone=a.buyer_phone, buyer_email=a.buyer_email,
                 seller_type=a.seller_type, seller_name=a.seller_name, address=a.address,
                 scheduled_date=target.day, scheduled_time=target.at,
@@ -1335,9 +1722,20 @@ class BookingAuthority:
             tr_id = tr.id
         if plan.price is not None:
             self._recalculate_price(plan.price, revision)
+        self.db.flush()
+        return tr_id
+
+    def _apply_canonical_state(self, cmd: BookingCommand, plan: Optional[BookingAttachmentPlan],
+                               revision, tr_id: Optional[int], state,
+                               offer_id: Optional[int]) -> Optional[str]:
+        """K8, then the rows already held: the lead (FOR NO KEY UPDATE), the K1 thread-state
+        row and the K2 offer projection. All booking-related canonical state is written here,
+        in the booking's transaction; nothing reaches a row whose rank is below one already
+        taken, because K1 and K2 were taken first and are only UPDATEd now."""
+        from ..models import Lead, WhatsAppBookingOffer as O
         identity_outcome = None
-        if plan.lead is not None:
-            # L6: the command's lead row, locked so concurrent identities serialize. FOR NO KEY
+        if plan is not None and plan.lead is not None:
+            # K8: the command's lead row, locked so concurrent identities serialize. FOR NO KEY
             # UPDATE, not FOR UPDATE: the Revision INSERT already holds the FK's KEY SHARE on
             # this row, and two bookings of one lead upgrading to FOR UPDATE would deadlock.
             lead = self.db.get(Lead, revision.lead_id,
@@ -1352,22 +1750,31 @@ class BookingAuthority:
                 lead.canal = u.canal_if_empty
             if u.identity is not None:
                 identity_outcome = _apply_identity(lead, u.identity)
-        if plan.thread_state is not None:
-            st = self.db.execute(select(WhatsAppThreadState).where(
-                WhatsAppThreadState.thread_id == thread_id)).scalar_one_or_none()
-            if st is None:
-                raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, "THREAD_STATE_NOT_FOUND"))
+        if plan is not None and plan.thread_state is not None:
+            if state is None:                      # K1 is mandatory for a thread-state write
+                raise _InvariantBreach("THREAD_STATE_WRITE_WITHOUT_K1")
             u = plan.thread_state
             if u.link_current_revision:
-                st.current_revision_id = tr_id
+                state.current_revision_id = tr_id
             if u.last_stage is not None:
-                st.last_stage = u.last_stage
+                state.last_stage = u.last_stage
             if u.needs_human is not None:
-                st.needs_human = u.needs_human
+                state.needs_human = u.needs_human
             if u.consume_flow_token:
-                st.flow_booking_token = None
+                state.flow_booking_token = None
+        if offer_id is not None:
+            # The transport mirror follows the authority: the offer it mirrored is consumed.
+            if state is None:
+                raise _InvariantBreach("OFFER_ACCEPTANCE_WITHOUT_K1")
+            state.flow_booking_token = None
+            res = self.db.execute(
+                update(O).where(O.id == offer_id).where(O.status == "ACCEPTED")
+                .values(accepted_revision_id=revision.id, accepted_thread_revision_id=tr_id)
+                .execution_options(synchronize_session="fetch"))
+            if res.rowcount != 1:
+                raise _InvariantBreach("OFFER_PROJECTION_NOT_WRITTEN")
         self.db.flush()
-        return tr_id, identity_outcome
+        return identity_outcome
 
     def _recalculate_price(self, plan: PriceRecalculation, revision) -> None:
         if plan.require_inputs is not None:
@@ -1548,6 +1955,10 @@ class BookingAuthority:
             BookingCommandRecord.idempotency_key == key)).scalar_one_or_none()
         if rec is None:
             return None
+        if rec.command_state != LEDGER_COMMITTED:
+            # RV03RV-05: the key stays CONSUMED. A detached command neither replays nor books
+            # again — whatever the request — so this is terminal before the fingerprint check.
+            raise _Refused(self._detached_result(rec))
         if rec.request_fingerprint != fingerprint:
             raise _Refused(_result(BookingOutcome.VALIDATION_FAILED, "IDEMPOTENCY_KEY_REUSED"))
         return self._replay_result(rec)
@@ -1820,11 +2231,15 @@ class BookingAuthority:
         self.db.flush()
 
     def _translate_integrity(self, exc: IntegrityError, cmd: BookingCommand,
-                             fingerprint: str) -> BookingResult:
+                             fingerprint: str, *, offer_id: Optional[int] = None) -> BookingResult:
         orig = getattr(exc, "orig", None)
         state = getattr(orig, "sqlstate", None)
         constraint = getattr(getattr(orig, "diag", None), "constraint_name", None) or ""
         text_ = str(orig or exc)
+        if offer_id is not None and _is_projection_violation(state, constraint, text_):
+            # The partial unique index decided a race this transaction lost: another booking
+            # of THIS offer committed first. Answer with that winner — never a second booking.
+            return self._projection_winner_replay(offer_id, cmd)
         if state == "23P01" or "ex_revisions_professional_occupied_overlap" in constraint:
             return _result(BookingOutcome.SLOT_CONFLICT, "EXCLUSION_CONSTRAINT",
                            idempotency_key=cmd.idempotency_key)
@@ -1844,10 +2259,77 @@ class BookingAuthority:
         return _result(BookingOutcome.INTERNAL_FAILURE, f"INTEGRITY_{state or 'ERROR'}",
                        idempotency_key=cmd.idempotency_key)
 
+    def _projection_winner_replay(self, offer_id: int, cmd: BookingCommand) -> BookingResult:
+        """Convergence Phase 2 (decision D). Called after this transaction rolled back on
+        `uq_thread_revision_one_booking_per_offer`. In a fresh read-only transaction:
+
+          1. the WINNING ThreadRevision, by `offer_id` (business evidence);
+          2. the winning command's ledger row, by that ThreadRevision (command truth);
+          3. the CURRENT booking row the ledger names (business truth — a later reschedule
+             or cancellation is reported as it is now, never as it was).
+
+        The offer's `accepted_*` projection is never read: the loser may see it stale. If any
+        link is missing the winner is not proven, and the answer is a typed inconsistency —
+        never a guess, never a second booking, ledger row or acknowledgement lease."""
+        from ..models import BookingCommandRecord as R, Revision, ThreadRevision
+        try:
+            tr_id = self.db.execute(select(ThreadRevision.id).where(
+                ThreadRevision.offer_id == offer_id)
+                .execution_options(populate_existing=True)).scalar()
+            rec = None if tr_id is None else self.db.execute(
+                select(R).where(R.thread_revision_id == tr_id)
+                .where(R.command_state == LEDGER_COMMITTED).order_by(R.id).limit(1)
+                .execution_options(populate_existing=True)).scalar_one_or_none()
+            rev = None if rec is None or rec.revision_id is None else self.db.execute(
+                select(Revision).where(Revision.id == rec.revision_id)
+                .execution_options(populate_existing=True)).scalar_one_or_none()
+            if rev is None:
+                logger.error("BOOKING_AUTHORITY projection winner unproven offer_id=%s "
+                             "thread_revision=%s ledger=%s", offer_id, tr_id,
+                             None if rec is None else rec.id)
+                return _result(BookingOutcome.INTERNAL_FAILURE, "PROJECTION_WINNER_UNPROVEN",
+                               idempotency_key=_safe_key(cmd))
+            iv = br.occupied_interval(rev.turno_fecha, rev.turno_hora,
+                                      rev.service_minutes, rev.buffer_minutes)
+            return _result(BookingOutcome.IDEMPOTENT_REPLAY, "PROJECTION_WINNER_REPLAY",
+                           revision_id=rev.id, thread_revision_id=int(tr_id),
+                           profesional_id=rev.profesional_id,
+                           slot_start=iv.start if iv else None, slot_end=iv.end if iv else None,
+                           occupying=br.is_occupying(rev.turno_fecha, rev.turno_hora,
+                                                     rev.estado_revision),
+                           booking_version=rev.booking_version,
+                           idempotency_key=rec.idempotency_key, ack_status=rec.ack_status,
+                           identity_outcome=rec.identity_outcome)
+        finally:
+            self._safe_rollback()                  # a read: end it, hold nothing
+
 
 _BOOKING_FIELDS = frozenset({"turno_fecha", "turno_hora", "service_minutes", "buffer_minutes",
                              "estado_revision", "profesional_id", "booking_version", "lead_id",
                              "id", "turno_timezone", "occupied_during", "agenda_occupying"})
+
+
+def _is_projection_violation(sqlstate: Optional[str], constraint: str, text_: str) -> bool:
+    """EXACTLY the one-offer/one-booking partial unique index, and nothing else. PostgreSQL:
+    `23505` and that constraint name from the diagnostics. SQLite reports a partial index by
+    name with no SQLSTATE. Any other unique violation is not a replay."""
+    from .offer_lifecycle import BOOKING_PROJECTION_CONSTRAINT as NAME
+    if sqlstate is not None:
+        return sqlstate == "23505" and constraint == NAME
+    return NAME in text_
+
+
+def _canonical_location(candidate, state) -> tuple:
+    """The inspection location of the offer-bound candidate, by the Conversation Engine's
+    precedence (`_get_active_inspection_location`): the candidate's own zone when it carries
+    any, with a missing half filled from the thread state; otherwise the thread state's."""
+    grp = getattr(candidate, "zone_group", None) or None
+    det = getattr(candidate, "zone_detail", None) or None
+    home_grp = getattr(state, "home_zone_group", None) if state is not None else None
+    home_det = getattr(state, "home_zone_detail", None) if state is not None else None
+    if grp or det:
+        return (grp or home_grp, det or home_det)
+    return (home_grp, home_det)
 
 
 def _norm(value: Optional[str]) -> Optional[str]:

@@ -1067,6 +1067,7 @@ def booking_attention(db: Session, *, now: Optional[datetime] = None,
                R.correlation_id, R.ack_status, R.ack_attempts, R.ack_duplicate_risk,
                R.ack_last_error, R.ack_transport_id, R.identity_outcome)
         .where(R.source == "CONVERSATION_ENGINE", R.correlation_id.like("in:%"),
+               R.command_state == "COMMITTED",       # a DETACHED row has no turn to finish
                R.committed_at >= now - timedelta(days=BOOKING_SYNC_LOOKBACK_DAYS))
     ).all()
     settled = now - timedelta(seconds=age)

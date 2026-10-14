@@ -41,8 +41,10 @@ def _db() -> Session:
     tables = [Lead.__table__, Profesional.__table__, Revision.__table__,
               CalendarException.__table__, BookingCommandRecord.__table__,
               WhatsAppContact.__table__, WhatsAppThread.__table__, ThreadRevision.__table__]
-    from app.models import Agencia, Vendedor, WhatsAppThreadCandidate
-    tables += [Agencia.__table__, Vendedor.__table__, WhatsAppThreadCandidate.__table__]
+    from app.models import Agencia, Vendedor, WhatsAppThreadCandidate, WhatsAppThreadState
+    tables += [Agencia.__table__, Vendedor.__table__, WhatsAppThreadCandidate.__table__,
+               # convergence Phase 2: a thread-bound booking takes the thread's state row (K1)
+               WhatsAppThreadState.__table__]
     Lead.__table__.metadata.create_all(engine, tables=tables)
     return Session(engine)
 
@@ -81,7 +83,11 @@ class TypedContract(unittest.TestCase):
         self.assertEqual({o.value for o in Out}, {
             "COMMITTED", "IDEMPOTENT_REPLAY", "SLOT_CONFLICT", "CALENDAR_EXCEPTION",
             "MISSING_PROFESSIONAL", "STALE_VERSION", "INVALID_TRANSITION", "VALIDATION_FAILED",
-            "RETRYABLE_FAILURE", "INTERNAL_FAILURE"})
+            "RETRYABLE_FAILURE", "INTERNAL_FAILURE",
+            # convergence Phase 2: the locked-offer refusal and the terminal detached ledger
+            "OFFER_REFUSED", "COMMAND_DETACHED"})
+        # neither new outcome may ever read as success
+        self.assertFalse({Out.OFFER_REFUSED, Out.COMMAND_DETACHED} & ba._OUTCOMES_OK)
         self.assertTrue({"CREATE", "RESCHEDULE", "CANCEL", "MARK_FOR_RESCHEDULE"}
                         <= {o.value for o in Op})
         self.assertTrue({"WHATSAPP_FLOW", "CRM", "API", "CONVERSATION_ENGINE", "OTHER"}

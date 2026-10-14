@@ -268,12 +268,29 @@ class R3_Attachments(unittest.TestCase):
                          (r.thread_revision_id, "BOOKED", True, None))
 
     def test_r3_11_missing_thread_state_rolls_back_everything(self):
+        # Convergence Phase 2 CHANGED THIS CONTRACT deliberately. The thread-state row is K1,
+        # taken explicitly FIRST; a thread without one gets one, created and locked inside
+        # the booking's transaction (it used to be a THREAD_STATE_NOT_FOUND refusal after the
+        # Revision was written). What must still hold — nothing partial survives — is proved
+        # in both directions: the created row commits WITH the booking, and a refusal after
+        # it leaves no state row, no booking, no ThreadRevision and no ledger row.
         db, lead, tid = _world(with_state=False)
+        cand = WhatsAppThreadCandidate(thread_id=tid + 999); db.add(cand)   # another thread's
+        db.commit()
+        refused = BookingAuthority(db).execute(_cmd(lead, key="ts-no"), attachments=BookingAttachmentPlan(
+            thread_revision=ThreadRevisionAttachment(thread_id=tid, candidate_id=cand.id),
+            thread_state=ThreadStateUpdate(link_current_revision=True)))
+        self.assertEqual((refused.outcome, refused.reason),
+                         (Out.VALIDATION_FAILED, "ATTACHMENT_CANDIDATE_NOT_IN_THREAD"))
+        self.assertEqual(_counts(db), (0, 0, 0))                # no booking, no TR, no ledger
+        self.assertEqual(db.query(WhatsAppThreadState).filter_by(thread_id=tid).count(), 0)
         r = BookingAuthority(db).execute(_cmd(lead, key="ts"), attachments=BookingAttachmentPlan(
             thread_revision=ThreadRevisionAttachment(thread_id=tid),
             thread_state=ThreadStateUpdate(link_current_revision=True)))
-        self.assertEqual((r.outcome, r.reason), (Out.VALIDATION_FAILED, "THREAD_STATE_NOT_FOUND"))
-        self.assertEqual(_counts(db), (0, 0, 0))                # no booking, no TR, no ledger
+        self.assertEqual(r.outcome, Out.COMMITTED, r.reason)
+        self.assertEqual(_counts(db), (1, 1, 1))
+        st = db.query(WhatsAppThreadState).filter_by(thread_id=tid).one()
+        self.assertEqual(st.current_revision_id, r.thread_revision_id)
 
     def test_r3_12_price_is_skipped_when_inputs_do_not_match(self):
         db, lead, _ = _world()

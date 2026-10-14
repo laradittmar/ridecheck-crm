@@ -404,19 +404,30 @@ class SB2AAuthorityPostgres(unittest.TestCase):
     def test_pg13_rollback_leaves_no_partial_combination(self):
         self.prof(default=True)
         tid = self.make_thread()
+        other = self.make_thread()
+        with self.engine.begin() as c:
+            foreign_cand = c.execute(text(
+                "INSERT INTO whatsapp_thread_candidates (thread_id, status, created_at, updated_at) "
+                "VALUES (:t, 'mentioned', now(), now()) RETURNING id"), {"t": other}).scalar()
         with Session(self.engine) as s:
-            # SB2A-R3 rewrite: the failing step after the write is now a typed attachment that
-            # creates a ThreadRevision and then fails (its thread-state row does not exist).
+            # SB2A-R3 rewrite: the failing step after the write is a typed attachment.
+            # Convergence Phase 2: a missing thread-state row is no longer a refusal — K1
+            # creates and locks it FIRST — so the post-write failure here is a candidate that
+            # belongs to another thread, and the assertions add the K1 row the transaction
+            # created: it must not survive the rollback either.
             plan = self.ba.BookingAttachmentPlan(
-                thread_revision=self.ba.ThreadRevisionAttachment(thread_id=tid),
+                thread_revision=self.ba.ThreadRevisionAttachment(thread_id=tid,
+                                                                 candidate_id=foreign_cand),
                 thread_state=self.ba.ThreadStateUpdate(link_current_revision=True))
             r = self.ba.BookingAuthority(s).execute(self.cmd(time(10), key="rb-1"), attachments=plan)
-            self.assertEqual((r.outcome.value, r.reason), ("VALIDATION_FAILED", "THREAD_STATE_NOT_FOUND"))
+            self.assertEqual((r.outcome.value, r.reason),
+                             ("VALIDATION_FAILED", "ATTACHMENT_CANDIDATE_NOT_IN_THREAD"))
             self.assertEqual(s.execute(text("SELECT count(*) FROM revisions WHERE lead_id=:l"),
                                        {"l": self.lead}).scalar(), 0)
         self.assertEqual(self.rows("SELECT id FROM revisions WHERE lead_id=:l", l=self.lead), [])
         self.assertEqual(self.rows("SELECT id FROM thread_revisions WHERE thread_id=:t", t=tid), [])
         self.assertEqual(self.rows("SELECT id FROM booking_commands WHERE idempotency_key='rb-1'"), [])
+        self.assertEqual(self.rows("SELECT id FROM whatsapp_thread_states WHERE thread_id=:t", t=tid), [])
 
     # ── 14: advisory-lock failure ──────────────────────────────────────────
 

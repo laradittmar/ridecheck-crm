@@ -91,9 +91,22 @@ it. Three paths can create one, and they are three different authorities:
 | `BookingFlowService.handle_confirm_booking` | customer accepting a booking offer | the same four, through the same `offer_lifecycle` |
 | `PATCH /api/revisions/{id}` → `ThreadRevisionService.patch_revision` | authenticated operator / machine | the CRM's own session or machine credential |
 
+**Corrected again — convergence (integration branch, CP1-03).** On the integration branch
+(`integration/prelaunch-booking-convergence`, Smart Booking merged) the third row is no longer
+a booking path. `ThreadRevisionService.patch_revision` REFUSES any change that would create,
+move or remove schedule-visible occupancy — `status` into or out of `booked`/`completed`,
+`scheduled_date`, `scheduled_time` — with **HTTP 409 `BOOKING_CHANGE_REQUIRES_AUTHORITY`**;
+every other field stays editable. Operator bookings belong to `BookingAuthority` through the
+booking endpoints. The live-connected legacy n8n node `Patch Revision Booked (Flow)` (on the
+false branch of `IF - Engine Handled? (Flow M18)`, reached only when CE answers
+`handled=false`, i.e. `no_lead`) therefore receives that safe 409 instead of creating a booked
+ThreadRevision. That refusal is intended and must be preserved; do not restore the bypass and
+do not "fix" it in n8n. On Track A alone (`fix/m21.1.1-primary-flow-regression`, not merged)
+the paragraph below still describes the code.
+
 The third is **not** customer offer acceptance and must not be routed into it. It sits
 behind the `/api/revisions` MACHINE prefix — a shared secret, a trusted peer container, or a
-logged-in human session — and it accepts `status='booked'` with `scheduled_date` /
+logged-in human session — and on Track A it accepts `status='booked'` with `scheduled_date` /
 `scheduled_time`. It is a legitimate operator authority: an operator may book an appointment
 by hand. What it does NOT do is pass through the offer authority, so the bookings it creates
 carry `thread_revisions.offer_id = NULL`, which is why the one-offer/one-booking index is
