@@ -3591,6 +3591,60 @@ class ConversationEngine:
         # WILD-01 FINDING-03: store inbound ID on ctx for causal dedup in gate calls
         ctx.inbound_wa_message_id = event.wa_message_id
 
+        # ── R3/RVR2-01: A BOOKING-SHAPED TURN ENTERS THE BOUND BEFORE THE CURSOR ──
+        #
+        # The assignment on the next line makes an UPDATE of `whatsapp_thread_states`
+        # pending — and that row IS resource 1 of `OFFER_LOCK_ORDER`. R2 closed the window
+        # it opens by taking the canonical bounded acquisition at the top of
+        # `_process_flow_response`, before any of admission's three outcomes could write,
+        # and measured all five ordinary submission classes answering in ~4s.
+        #
+        # The R2 independent review then measured a sixth shape R2 never tried. A booking
+        # submission arriving on a turn that ALSO carries `cycle_reset_pending` never
+        # reaches `_process_flow_response` with the cursor still pending: the reset block
+        # below runs first, and `_execute_cycle_reset`, `_reload_active_candidates` and
+        # `_query_active_messages` are Session operations, so autoflush pushes the cursor
+        # UPDATE out ahead of them. Against a held resource 1 that measured 14.03s and
+        # 20.05s against 14s and 20s holds — the full pre-fix behaviour, tracking the
+        # holder — returning `replied`, consuming the cursor, withdrawing the offer,
+        # archiving the candidate, setting `needs_human`, and SENDING the customer a warm
+        # handoff plus an internal notification. The flag is production-reachable: it is
+        # set by `lead_lifecycle.set_lead_estado()` whenever a human moves a lead
+        # backwards in the CRM, and the L4 Wild preflight requires it.
+        #
+        # The error R2 made was scoping the fix to a code path instead of to a FACT. The
+        # fact is that the cursor write targets resource 1, so from the instant it becomes
+        # pending every later statement of this turn can block on it. The remedy is
+        # therefore not "enter the bound before the branches" but "enter the bound before
+        # the cursor" — which is what this does, so there is no window left to enumerate
+        # turn shapes for.
+        #
+        # THE PREDICATE, STATED EXACTLY. `_is_booking_shaped_submission` is true when, and
+        # only when, the transport delivered `message_type == "flow_response"` with a
+        # payload, the thread's mirror token is not a motorcycle-handoff token, and the
+        # payload carries neither `tipo_vehiculo` nor `zona_general`. Those are precisely
+        # the three discriminators `_process_flow_response` itself routes on, so the
+        # predicate is true exactly for submissions that can reach the acceptance
+        # boundary. All four tests are on transport metadata and payload KEYS — never on
+        # customer phrasing and never on anything a reply model produced.
+        #
+        # THIS IS NOT THE DELETED TURN-ENTRY GATE. That one was taken on EVERY turn on a
+        # prediction about what the turn might become, and the R3 review measured its cost
+        # at 4.05s on threads the parent served in 0.05s. An ordinary text turn, a
+        # motorcycle handoff and the two qualification fallbacks all answer this predicate
+        # False and take no booking lock at all. One canonical order, one booking
+        # authority, and one acquisition per booking turn — moved earlier, not widened.
+        _booking_shaped = self._is_booking_shaped_submission(event, state)
+        self._turn_booking_shaped = _booking_shaped
+        if _booking_shaped:
+            _thread_id = int(ctx.thread.id)
+            from .offer_lifecycle import OfferLifecycle as _EntryOffers
+            _entry_contended = _EntryOffers(self.db).begin_offer_transaction(_thread_id)
+            if _entry_contended is not None:
+                return self._contended_booking_turn(
+                    ctx, _thread_id, _entry_contended, where="turn_entry",
+                    had_token=bool(event.flow_token))
+
         state.last_processed_inbound_wa_message_id = event.wa_message_id
 
         # No lead linked — cannot make business decisions; commit dedup marker now
@@ -3601,6 +3655,25 @@ class ConversationEngine:
 
         # WILD-04R: consume cycle reset signal (set by set_lead_estado() in CRM)
         if state.cycle_reset_pending:
+            # ── R3/RVR2-01, defence in depth: THE RESET IS ITSELF A WRITER ─────────
+            # The acquisition above already covers every booking-shaped turn, and on one
+            # of those this call costs nothing — the same row lock twice inside one
+            # transaction is free, and the cursor was already flushed inside that bound.
+            #
+            # It is here as well because the cycle reset does not only READ. It archives
+            # prior-cycle candidates, flushes them, clears eighteen state fields, clears
+            # four lead fields and WITHDRAWS the thread's live offer through the offer
+            # authority. A writer enters the canonical order before it writes, whatever
+            # turn shape carried it — so a text turn that happens to carry the flag gets
+            # the same bounded, typed answer instead of the open-ended wait that shape
+            # still had after the entry acquisition above. `begin_offer_transaction` is
+            # the entry form on purpose: it rolls the aborted transaction back, so the
+            # pending cursor is discarded and a redelivery is free to try again.
+            _reset_contended = self._enter_cycle_reset_bound(ctx)
+            if _reset_contended is not None:
+                return self._contended_booking_turn(
+                    ctx, int(ctx.thread.id), _reset_contended, where="cycle_reset",
+                    had_token=bool(event.flow_token))
             self._execute_cycle_reset(ctx, state, event, previous_cursor)
             # WILD-04R-F2: reload semantic context with the new cycle watermark.
             # _load_context ran before the reset and used the OLD watermark, so
@@ -3633,6 +3706,86 @@ class ConversationEngine:
 
         # Text path: uses n8n-provided content (audio already transcribed by n8n)
         return self._process_text(ctx, event)
+
+    # ── R3/RVR2-01: the booking-shaped predicate and the contended answer ────
+
+    @staticmethod
+    def _is_booking_shaped_submission(event: ConversationHandleIn, state) -> bool:
+        """Can this delivery reach the booking acceptance boundary? Transport only.
+
+        R3/RVR2-01. The predicate the early bounded acquisition is gated on, stated once
+        so the gate and its tests cannot drift. It answers True for exactly the deliveries
+        `_process_flow_response` routes to admission, by repeating that method's own three
+        discriminators in its own order:
+
+          1. the transport delivered a Flow response, with a payload — `message_type` and
+             `flow_response`, both set by the n8n webhook from Meta's envelope;
+          2. the thread's mirror token is NOT a motorcycle-handoff token, which
+             `_process_flow_response` checks first because both paths share one Flow id and
+             the prefix is the only discriminator;
+          3. the payload carries neither `tipo_vehiculo` nor `zona_general`, the
+             distinctive keys of the two qualification fallback forms.
+
+        Every test is on transport metadata, on a token PREFIX this engine itself minted,
+        or on the PRESENCE of a payload key. Nothing here reads customer prose, a semantic
+        interpretation, a reply proposal or any model output — a predicate that gates a
+        lock must not be able to change its mind because a sentence was phrased
+        differently. It takes no lock, issues no query and writes nothing.
+        """
+        if event.message_type != "flow_response" or not event.flow_response:
+            return False
+        if (getattr(state, "flow_booking_token", None) or "").startswith(
+                _MOTO_HANDOFF_TOKEN_PREFIX):
+            return False
+        payload = event.flow_response
+        if "tipo_vehiculo" in payload or "zona_general" in payload:
+            return False
+        return True
+
+    def _enter_cycle_reset_bound(self, ctx: _Context) -> "str | None":
+        """Take resource 1 for the cycle reset, bounded. `None` to proceed.
+
+        R3/RVR2-01. The reset archives candidates, clears state and lead fields and
+        withdraws the live offer through the offer authority, so it is a writer and enters
+        the canonical order before it writes. Separate from the turn-entry acquisition
+        because the two are gated differently: that one on the turn being booking-shaped,
+        this one on the flag actually being set. On a booking-shaped turn this is the
+        second, free acquisition of a row this transaction already holds.
+        """
+        from .offer_lifecycle import OfferLifecycle as _ResetEntryOffers
+        return _ResetEntryOffers(self.db).begin_offer_transaction(int(ctx.thread.id))
+
+    def _contended_booking_turn(self, ctx: _Context, thread_id: int, reason: str, *,
+                                where: str, had_token: bool) -> ConversationHandleOut:
+        """The whole contended answer: typed, silent, and having written nothing.
+
+        R3/RVR2-01. `begin_offer_transaction` has already rolled the aborted transaction
+        back, which discarded this turn's pending dedup cursor — correct, because the turn
+        did not complete and a redelivery must be free to try again against the offer's
+        then-current state. Reached before the cursor is even assigned on the turn-entry
+        path, so on that path there is nothing to discard.
+
+        WHAT THIS DELIBERATELY DOES NOT DO, each one measured on the pre-fix code by the R2
+        independent review: it does not execute or partially execute the cycle reset, does
+        not archive the candidate, does not withdraw or otherwise mutate the offer, does
+        not move the refusal or replay counter, does not create or touch a booking or a
+        revision, does not change the thread or lead stage or `needs_human`, does not send
+        the customer anything, and does not raise an internal handoff. Declaring a human
+        handoff for a submission nobody has judged would be a false statement, and that
+        path's own `needs_human` commit would itself block on the row the other writer is
+        holding.
+
+        The evidence is the decision log plus the typed action, and the action stays
+        `reply_required` so the no-reply rescue still sees the dropped turn.
+        """
+        self._turn_offer_claim = None
+        self._decision_log(ctx, "booking_offer_contended", reason=reason, where=where,
+                           had_token=had_token)
+        logger.warning(
+            "G3-7R-R3 thread_id=%s contended at %s by the other booking writer (%s) — "
+            "booking turn declined inside the bound, cursor not consumed, offer "
+            "untouched, cycle reset not executed, nothing sent", thread_id, where, reason)
+        return _out(ACTION_THREAD_CONTENDED, detail=reason)
 
     # ── Flow response (deterministic, no AI) ─────────────────────────────
 
@@ -3706,30 +3859,26 @@ class ConversationEngine:
         # prediction about what the turn might become; this one is taken at the acceptance
         # boundary, after the submitted token has already been matched against an offer
         # row, and an ordinary conversation turn never reaches it.
+        #
+        # R3/RVR2-01: THIS ACQUISITION IS NOW DEFENCE IN DEPTH, NOT THE OPERATIVE BOUND.
+        # `_handle` takes the same acquisition before the dedup cursor is assigned, for
+        # every turn `_is_booking_shaped_submission` admits — which is exactly the set that
+        # reaches this line. So on the live path this call finds the row already locked by
+        # its own transaction and costs nothing: re-taking a row lock inside one
+        # transaction is free, and there is no longer a pending cursor write for its
+        # deliberate flush to push out. It is kept because it is what makes the GUARANTEE
+        # local to the authority rather than a property of one caller's statement order —
+        # a future caller that reaches admission without `_handle`'s gate still cannot
+        # write outside the order. If it ever reports contention, that is a real answer and
+        # it is handled exactly as the turn-entry one is.
         _contended = _offers.begin_offer_transaction(ctx.thread.id)
         if _contended is not None:
-            # CONTENTION IS NOT A REFUSAL AND MUST WRITE NOTHING.
-            # `begin_offer_transaction` already rolled the aborted transaction back, which
-            # also discarded this turn's dedup cursor — correct, because the turn did not
-            # complete and a redelivery must be free to try again against the offer's
-            # then-current state.
-            #
-            # Nothing is recorded against the offer either, not even out of band: the
-            # review's contract is explicit that a contended turn mutates no offer and
-            # moves no counter. The evidence is the decision log plus the typed action,
-            # which stays `reply_required` so the no-reply rescue still sees the dropped
-            # turn. And it deliberately does not take the warm-handoff path: declaring a
-            # human handoff for a submission nobody has judged would be a false statement,
-            # and that path's own `needs_human` commit would itself block on the row the
-            # other writer is holding.
-            self._turn_offer_claim = None
-            self._decision_log(ctx, "booking_offer_contended", reason=_contended,
-                               offer_id=_adm.offer_id, had_token=bool(flow_token))
-            logger.warning(
-                "G3-7R-R2 thread_id=%s contended by the other booking writer (%s) — "
-                "booking turn declined inside the bound, cursor not consumed, offer "
-                "untouched, nothing sent", ctx.thread.id, _contended)
-            return _out(ACTION_THREAD_CONTENDED, detail=_contended)
+            # CONTENTION IS NOT A REFUSAL AND MUST WRITE NOTHING. The whole contract —
+            # what is not written, not archived, not counted and not sent — lives in
+            # `_contended_booking_turn`, so the two entry points cannot answer differently.
+            return self._contended_booking_turn(
+                ctx, int(ctx.thread.id), _contended, where="admission",
+                had_token=bool(flow_token))
 
         if _adm.replay:
             return self._booking_replay_outcome(ctx, state, _adm, flow_token)
@@ -3892,6 +4041,17 @@ class ConversationEngine:
             appointment_approval_status="PENDING",
             appointment_approval_token=secrets.token_urlsafe(32),
         )
+        # ── R3/RVR2-03: READ THE THREAD ID BEFORE THE FLUSH THAT MAY FAIL ───────
+        # A failed flush expires the session's instances and leaves the transaction
+        # needing a rollback, so any ORM attribute read after it raises
+        # `PendingRollbackError` — including one in a LOG LINE. That is not a theoretical
+        # ordering point. R2 shipped the handler below with `ctx.thread.id` in its
+        # `logger.warning` call, before the rollback, and R3's first exercise of this path
+        # measured the consequence: the index fired correctly, the warning's attribute load
+        # raised, and the turn answered `error` / `internal_error` instead of returning the
+        # customer's existing booking. The replay path was unreachable in practice, which
+        # is why R2's own mutation of it survived every oracle — nothing could reach it.
+        _tid = int(ctx.thread.id)
         self.db.add(thread_rev)
         # ── S1: the guarantee fires HERE, and is translated, never leaked ────────
         # The insert is where the database refuses a second booking for one offer. A raw
@@ -3906,8 +4066,9 @@ class ConversationEngine:
             logger.warning(
                 "G3-7R thread_id=%s the booking projection refused a second booking for "
                 "offer_id=%s — returning the authoritative booking",
-                ctx.thread.id, _claim.offer_id)
-            return self._booking_projection_replay(ctx, _claim.offer_id, flow_token)
+                _tid, _claim.offer_id)
+            return self._booking_projection_replay(ctx, _claim.offer_id, flow_token,
+                                                   thread_id=_tid)
 
         # Create CRM Revision
         crm_rev = Revision(
@@ -4236,8 +4397,9 @@ class ConversationEngine:
         self.db.commit()
         return _out(ACTION_BOOKING_REPLAY, detail=str(admission.thread_revision_id or ""))
 
-    def _booking_projection_replay(self, ctx: _Context, offer_id,
-                                   flow_token) -> ConversationHandleOut:
+    def _booking_projection_replay(self, ctx: _Context, offer_id, flow_token, *,
+                                   thread_id: int | None = None
+                                   ) -> ConversationHandleOut:
         """The database refused a second booking for this offer. Return the first one.
 
         S1/S6. Reached only when the partial unique index on `thread_revisions.offer_id`
@@ -4245,9 +4407,15 @@ class ConversationEngine:
         admission and its insert. The transaction is aborted, so it is rolled back first
         and the authoritative booking is read afresh; the customer is told nothing new,
         because the winner already acknowledged it.
+
+        R3/RVR2-03: `thread_id` is passed as an int by the caller, read BEFORE the flush
+        that failed. The caller's session is in a failed-flush state on entry, so reading
+        `ctx.thread.id` here would raise `PendingRollbackError` — measured, and the reason
+        this path answered `error` instead of the booking.
         """
         from .offer_lifecycle import OfferLifecycle as _OfferLifecycle
         self.db.rollback()
+        _tid = int(thread_id) if thread_id is not None else int(ctx.thread.id)
         _offers = _OfferLifecycle(self.db)
         thread_revision_id, revision_id = _offers.authoritative_booking(offer_id)
         # R2/RV-01+RV-02. The rollback above released resource 1, so it is re-entered
@@ -4257,20 +4425,20 @@ class ConversationEngine:
         # waiting for it would reintroduce exactly the unbounded wait this milestone closes.
         _counted = False
         if offer_id is not None:
-            if _offers.begin_offer_transaction(ctx.thread.id) is None:
-                _offers.record_replay(offer_id, thread_id=ctx.thread.id)
+            if _offers.begin_offer_transaction(_tid) is None:
+                _offers.record_replay(offer_id, thread_id=_tid)
                 _counted = True
             else:
                 logger.warning(
                     "G3-7R-R2 thread_id=%s replay not counted — contended; the "
-                    "authoritative booking is still returned", ctx.thread.id)
+                    "authoritative booking is still returned", _tid)
         self._decision_log(ctx, "booking_offer_replay", counted=_counted, offer_id=offer_id,
                            thread_revision_id=thread_revision_id,
                            revision_id=revision_id, had_token=bool(flow_token),
                            source="booking_projection")
         logger.info(
             "G3-7R booking_replay (projection) thread_id=%s offer_id=%s thread_rev=%s",
-            ctx.thread.id, offer_id, thread_revision_id)
+            _tid, offer_id, thread_revision_id)
         self.db.commit()
         return _out(ACTION_BOOKING_REPLAY, detail=str(thread_revision_id or ""))
 

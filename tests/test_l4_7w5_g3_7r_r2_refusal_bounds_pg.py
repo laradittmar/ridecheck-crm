@@ -365,10 +365,13 @@ class G37RR2RefusalBoundsPG(unittest.TestCase):
         `record_replay`, `_refuse`, `record_refusal` and `record_refusal_out_of_band` did
         when the review inventoried them, while the authority's docstring claimed otherwise.
         """
-        from app.services.offer_lifecycle import (OFFER_WRITERS, OfferLifecycle,
-                                                  OfferProtocolContended)
-        self.assertEqual(len(OFFER_WRITERS), 10,
+        from app.services.offer_lifecycle import (OFFER_LOCK_PARTICIPANTS, OFFER_WRITERS,
+                                                  OfferLifecycle, OfferProtocolContended)
+        # R3/RVR2-08: nine DIRECT writers, plus the one lock helper that persists nothing.
+        # R2 declared ten and called them all writers; the review derived nine.
+        self.assertEqual(len(OFFER_WRITERS), 9,
                          "the declared writer list changed — re-derive this test from it")
+        self.assertEqual(OFFER_LOCK_PARTICIPANTS, ("_claim_checks",))
         token = self._issue()
         offer_id = int(self._snapshot()["offers"][0][0])
         checked = {}

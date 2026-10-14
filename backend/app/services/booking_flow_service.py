@@ -674,7 +674,7 @@ class BookingFlowService:
     def handle_init(self, booking_token: str) -> dict:
         """Handle INIT action: return initial APPOINTMENT screen."""
         ctx = self.resolve_context(booking_token)
-        _log_event(self.db, ctx.thread.id, "BOOKING_FLOW_CONTEXT_CREATED", booking_token=booking_token)
+        _booking_event(ctx.thread.id, "BOOKING_FLOW_CONTEXT_CREATED", booking_token=booking_token)
         return {
             "version": FLOW_VERSION,
             "screen": "APPOINTMENT",
@@ -684,9 +684,8 @@ class BookingFlowService:
     def handle_date_selected(self, booking_token: str, selected_date: str) -> dict:
         """Handle date_selected trigger: return slots for the chosen date."""
         ctx = self.resolve_context(booking_token)
-        _log_event(
-            self.db, ctx.thread.id, "BOOKING_FLOW_DATE_SELECTED",
-            booking_token=booking_token, extra={"date": selected_date},
+        _booking_event(ctx.thread.id, "BOOKING_FLOW_DATE_SELECTED",
+                       booking_token=booking_token, extra={"date": selected_date},
         )
         return {
             "version": FLOW_VERSION,
@@ -731,10 +730,9 @@ class BookingFlowService:
         seller_phone = str(data.get("seller_phone", "")).strip()
         listing_url = str(data.get("listing_url", "")).strip()
 
-        _log_event(
-            self.db, ctx.thread.id, "BOOKING_FLOW_SUMMARY_PREPARED",
-            booking_token=booking_token,
-            extra={"date": date_str, "time": time_str},
+        _booking_event(ctx.thread.id, "BOOKING_FLOW_SUMMARY_PREPARED",
+                       booking_token=booking_token,
+                       extra={"date": date_str, "time": time_str},
         )
 
         return {
@@ -790,10 +788,13 @@ class BookingFlowService:
         # offer at all.
         _contended = _offers.begin_offer_transaction(ctx.thread.id)
         if _contended is not None:
+            # R3/RVR2-07: the transaction is already rolled back, so NOTHING durable is
+            # written here and nothing pretends to be. `_booking_event` takes no session
+            # and persists nothing; the typed error below is what the caller is told.
             logger.warning("BOOKING_OFFER_CONTENDED thread_id=%s reason=%s — nothing "
                            "written", ctx.thread.id, _contended)
-            _log_event(self.db, ctx.thread.id, "BOOKING_OFFER_CONTENDED",
-                       booking_token=booking_token, extra={"reason": _contended})
+            _booking_event(ctx.thread.id, "BOOKING_OFFER_CONTENDED",
+                           booking_token=booking_token, extra={"reason": _contended})
             raise BookingTokenError(f"offer not acceptable: {_contended}")
 
         _adm = _offers.admit(thread_id=ctx.thread.id, token=booking_token)
@@ -810,9 +811,9 @@ class BookingFlowService:
             logger.warning(
                 "BOOKING_OFFER_REFUSED thread_id=%s reason=%s offer_id=%s — no booking",
                 ctx.thread.id, _adm.refusal, _adm.offer_id)
-            _log_event(self.db, ctx.thread.id, "BOOKING_OFFER_REFUSED",
-                       booking_token=booking_token,
-                       extra={"reason": _adm.refusal, "offer_id": _adm.offer_id})
+            _booking_event(ctx.thread.id, "BOOKING_OFFER_REFUSED",
+                           booking_token=booking_token,
+                           extra={"reason": _adm.refusal, "offer_id": _adm.offer_id})
             try:
                 self.db.commit()
             except Exception:                       # pragma: no cover - defensive
@@ -871,9 +872,9 @@ class BookingFlowService:
             logger.warning(
                 "BOOKING_OFFER_REFUSED thread_id=%s reason=%s offer_id=%s — no booking",
                 ctx.thread.id, _binding, _adm.offer_id)
-            _log_event(self.db, ctx.thread.id, "BOOKING_OFFER_REFUSED",
-                       booking_token=booking_token,
-                       extra={"reason": _binding, "offer_id": _adm.offer_id})
+            _booking_event(ctx.thread.id, "BOOKING_OFFER_REFUSED",
+                           booking_token=booking_token,
+                           extra={"reason": _binding, "offer_id": _adm.offer_id})
             try:
                 self.db.commit()
             except Exception:                       # pragma: no cover - defensive
@@ -897,10 +898,9 @@ class BookingFlowService:
         check_out = self._sched.check(check_in)
 
         if not check_out.valid:
-            _log_event(
-                self.db, ctx.thread.id, "BOOKING_REVALIDATION_FAIL",
-                booking_token=booking_token,
-                extra={"date": date_str, "time": time_str, "reasons": check_out.reasons},
+            _booking_event(ctx.thread.id, "BOOKING_REVALIDATION_FAIL",
+                           booking_token=booking_token,
+                           extra={"date": date_str, "time": time_str, "reasons": check_out.reasons},
             )
             # Refresh available slots for conflict recovery
             refreshed_time_items = self._slots_for_date(selected_date, ctx.zone_group)
@@ -918,10 +918,9 @@ class BookingFlowService:
                 },
             })
 
-        _log_event(
-            self.db, ctx.thread.id, "BOOKING_REVALIDATION_PASS",
-            booking_token=booking_token,
-            extra={"date": date_str, "time": time_str},
+        _booking_event(ctx.thread.id, "BOOKING_REVALIDATION_PASS",
+                       booking_token=booking_token,
+                       extra={"date": date_str, "time": time_str},
         )
 
         # Create booking atomically
@@ -934,11 +933,10 @@ class BookingFlowService:
         # sees a job and no figure, and the amount the customer was quoted lives nowhere.
         # Better to send the customer back one screen than to write that record.
         if not zone_group and not zone_detail:
-            _log_event(
-                self.db, ctx.thread.id, "BOOKING_REFUSED_NO_CANONICAL_LOCATION",
-                booking_token=booking_token,
-                extra={"date": date_str, "time": time_str,
-                       "candidate_id": getattr(candidate, "id", None)},
+            _booking_event(ctx.thread.id, "BOOKING_REFUSED_NO_CANONICAL_LOCATION",
+                           booking_token=booking_token,
+                           extra={"date": date_str, "time": time_str,
+                           "candidate_id": getattr(candidate, "id", None)},
             )
             logger.error(
                 "BOOKING_REFUSED_NO_CANONICAL_LOCATION thread_id=%s — refusing to create "
@@ -981,9 +979,9 @@ class BookingFlowService:
             logger.warning(
                 "BOOKING_OFFER_REFUSED thread_id=%s reason=%s offer_id=%s — no booking",
                 ctx.thread.id, _claim.refusal, _claim.offer_id)
-            _log_event(self.db, ctx.thread.id, "BOOKING_OFFER_REFUSED",
-                       booking_token=booking_token,
-                       extra={"reason": _claim.refusal, "offer_id": _claim.offer_id})
+            _booking_event(ctx.thread.id, "BOOKING_OFFER_REFUSED",
+                           booking_token=booking_token,
+                           extra={"reason": _claim.refusal, "offer_id": _claim.offer_id})
             try:
                 self.db.commit()
             except Exception:                       # pragma: no cover - defensive
@@ -1050,9 +1048,9 @@ class BookingFlowService:
                 "BOOKING_REPLAY thread_id=%s the booking projection refused a second "
                 "booking for offer_id=%s — returning thread_rev=%s",
                 ctx.thread.id, _claim.offer_id, _tr_id)
-            _log_event(self.db, ctx.thread.id, "BOOKING_REPLAY",
-                       booking_token=booking_token,
-                       extra={"offer_id": _claim.offer_id, "thread_rev_id": _tr_id})
+            _booking_event(ctx.thread.id, "BOOKING_REPLAY",
+                           booking_token=booking_token,
+                           extra={"offer_id": _claim.offer_id, "thread_rev_id": _tr_id})
             raise BookingAlreadyCompletedError(
                 offer_id=_claim.offer_id, thread_revision_id=_tr_id, revision_id=_rv_id)
 
@@ -1094,26 +1092,24 @@ class BookingFlowService:
             and crm_rev.zone_detail == zone_detail
         )
         if not price_inputs_ok:
-            _log_event(
-                self.db, ctx.thread.id, "BOOKING_PRICE_INPUT_MISMATCH",
-                booking_token=booking_token,
-                extra={"crm_rev_id": crm_rev.id,
-                       "rev_tipo": crm_rev.tipo_vehiculo,
-                       "rev_zone_group": crm_rev.zone_group,
-                       "rev_zone_detail": crm_rev.zone_detail},
+            _booking_event(ctx.thread.id, "BOOKING_PRICE_INPUT_MISMATCH",
+                           booking_token=booking_token,
+                           extra={"crm_rev_id": crm_rev.id,
+                           "rev_tipo": crm_rev.tipo_vehiculo,
+                           "rev_zone_group": crm_rev.zone_group,
+                           "rev_zone_detail": crm_rev.zone_detail},
             )
         else:
             self._pricing.recalculate_revision_if_possible(db=self.db, revision=crm_rev)
             if crm_rev.precio_total is None:
                 # Priceable inputs that the catalog cannot price is a real commercial gap,
                 # not a silent "-". Recorded so it is visible without reading the booking.
-                _log_event(
-                    self.db, ctx.thread.id, "BOOKING_PRICE_UNRESOLVED",
-                    booking_token=booking_token,
-                    extra={"crm_rev_id": crm_rev.id,
-                           "tipo_vehiculo": crm_rev.tipo_vehiculo,
-                           "zone_group": crm_rev.zone_group,
-                           "zone_detail": crm_rev.zone_detail},
+                _booking_event(ctx.thread.id, "BOOKING_PRICE_UNRESOLVED",
+                               booking_token=booking_token,
+                               extra={"crm_rev_id": crm_rev.id,
+                               "tipo_vehiculo": crm_rev.tipo_vehiculo,
+                               "zone_group": crm_rev.zone_group,
+                               "zone_detail": crm_rev.zone_detail},
                 )
             self.db.flush()
 
@@ -1139,16 +1135,15 @@ class BookingFlowService:
 
         self.db.commit()
 
-        _log_event(
-            self.db, ctx.thread.id, "BOOKING_CREATED",
-            booking_token=booking_token,
-            extra={
-                "thread_rev_id": thread_rev.id,
-                "crm_rev_id": crm_rev.id,
-                "date": date_str,
-                "time": time_str,
-                "precio_total": crm_rev.precio_total,
-            },
+        _booking_event(ctx.thread.id, "BOOKING_CREATED",
+                       booking_token=booking_token,
+                       extra={
+                       "thread_rev_id": thread_rev.id,
+                       "crm_rev_id": crm_rev.id,
+                       "date": date_str,
+                       "time": time_str,
+                       "precio_total": crm_rev.precio_total,
+                       },
         )
 
         logger.info(
@@ -1208,10 +1203,10 @@ class BookingFlowService:
                 self.db.rollback()
             except Exception:
                 pass
-        _log_event(self.db, int(thread_id), "BOOKING_REPLAY",
-                   booking_token=booking_token,
-                   extra={"offer_id": offer_id,
-                          "thread_rev_id": getattr(replay, "thread_revision_id", None)})
+        _booking_event(int(thread_id), "BOOKING_REPLAY",
+                       booking_token=booking_token,
+                       extra={"offer_id": offer_id,
+                       "thread_rev_id": getattr(replay, "thread_revision_id", None)})
 
     def _send_booking_receipt(
         self, ctx: BookingContext, *, name: str, selected_date: date, selected_time: time
@@ -1288,9 +1283,8 @@ class BookingFlowService:
             ).scalar()
             if result is False:
                 # Another transaction holds the lock — slot contention
-                _log_event(
-                    self.db, 0, "BOOKING_CONCURRENCY_CONFLICT",
-                    extra={"date": date_str, "lock_key": lock_key},
+                _booking_event(0, "BOOKING_CONCURRENCY_CONFLICT",
+                               extra={"date": date_str, "lock_key": lock_key},
                 )
                 # GATE A: hand-built response — it must still satisfy the candidate schema,
                 # so the selection keys are present and empty (nothing is selected during a
@@ -1317,14 +1311,30 @@ class BookingFlowService:
 
 # ── Observability helpers ─────────────────────────────────────────────────────
 
-def _log_event(
-    db: Session,
+def _booking_event(
     thread_id: int,
     event_type: str,
     booking_token: str = "",
     extra: Optional[dict] = None,
 ) -> None:
-    """Persist a booking lifecycle event. Uses AiEvent-compatible logging."""
+    """Emit ONE structured log line for a booking lifecycle event. Persists NOTHING.
+
+    R3/RVR2-07. This used to be called `_log_event`, take a `Session` it never used, and
+    say "Persist a booking lifecycle event" — while its body was a single `logger.info`.
+    The R2 independent review found what that cost on the contended branch of
+    `handle_confirm_booking`: `begin_offer_transaction` had already ROLLED BACK, and the
+    next line handed `self.db` to something documented as persisting, so the code read as
+    though a durable `BOOKING_OFFER_CONTENDED` record survived the contention. None ever
+    did, on that branch or any other.
+
+    The lie was in the signature and the docstring, not in the behaviour, so the
+    correction is to the signature and the docstring: no session is taken, nothing claims
+    durability, and no caller can read a database event into it. Diagnostic evidence must
+    never delay or alter a bounded response, and a log line cannot.
+
+    The durable record of a contended booking turn remains what the audit says it is: the
+    typed outcome returned to the caller and the structured line below.
+    """
     details = extra or {}
     if booking_token:
         details = {"booking_token_prefix": booking_token[:12] + "...", **details}

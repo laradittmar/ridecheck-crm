@@ -131,21 +131,39 @@ OFFER_CONTRACT_VERSION = "offer/1.0"
 #: them with a thread-state write, which is a property of today's callers rather than of
 #: the protocol. All nine now take resource 1 first.
 #:
-#: The list below is therefore executable, not aspirational: `OFFER_WRITERS` names every
-#: persisted mutation of `whatsapp_booking_offers`, and the suite asserts that each one
-#: acquires resource 1 — so a tenth writer added without it fails the gate instead of
-#: silently widening the surface.
+#: The lists below are therefore executable, not aspirational: `OFFER_WRITERS` names every
+#: persisted mutation of `whatsapp_booking_offers` and `OFFER_LOCK_PARTICIPANTS` names the
+#: helpers that take the resources without writing, and the suite derives both from the
+#: source — so a writer added without the acquisition, or a helper mislabelled as a writer,
+#: fails the gate instead of silently widening the surface.
 OFFER_LOCK_ORDER = ("whatsapp_thread_states", "whatsapp_booking_offers")
 
-#: Every method on `OfferLifecycle` that persists a mutation of `whatsapp_booking_offers`.
-#: Declared here so the invariant above has a subject the tests can enumerate.
-#: `claim` is listed because it issues the ACCEPTED transition itself; it enters the order
-#: through `_claim_checks`, which is listed in its own right because `_refuse` writes from
-#: inside it. The test that walks this list accepts that one delegation and no other.
+#: Every method on `OfferLifecycle` that PERSISTS a mutation of `whatsapp_booking_offers`
+#: — nine of them, derived from the code and asserted against it.
+#:
+#: R3/RVR2-08 MADE THIS DECLARATION TRUTHFUL. R2 listed ten names and called all ten
+#: "writers". The independent review derived the writers from the source and found NINE:
+#: `_claim_checks` was in the list, but it persists nothing. It reads the offer row under
+#: resource 2 and delegates every refusal it reaches to `_refuse` and `_terminalise`, which
+#: are declared here in their own right. Calling a lock-and-read helper a persisted writer
+#: made the list wrong in the one direction a safety declaration must never be wrong:
+#: it over-claimed, so a reader could not tell which names the lock-order assertion was
+#: actually about.
+#:
+#: The two roles are therefore declared separately. Both are checked, for different
+#: properties: a WRITER must take resource 1 before it writes; a PARTICIPANT must take
+#: resource 1 before it takes resource 2.
 OFFER_WRITERS = (
-    "issue", "_terminalise", "consume", "refine_terminal_reason", "claim", "_claim_checks",
+    "issue", "_terminalise", "consume", "refine_terminal_reason", "claim",
     "_refuse", "record_refusal", "record_replay", "record_refusal_out_of_band",
 )
+
+#: Methods that participate in `OFFER_LOCK_ORDER` without persisting anything themselves.
+#: They acquire resource 1 — and `_claim_checks` also acquires resource 2, the offer row,
+#: under its own bound — so they are bound by the order; they are not writers, and the
+#: writer assertion must not pretend they are. `claim` reaches the order THROUGH
+#: `_claim_checks`; that one delegation is named in the test and no other is accepted.
+OFFER_LOCK_PARTICIPANTS = ("_claim_checks",)
 
 #: S1. The name of the partial unique index that IS the one-offer/one-booking guarantee.
 #: Declared here, beside the authority, so the model, the migration and the one function
@@ -718,8 +736,20 @@ class OfferLifecycle:
         # The bound is now in force. The caller's pending writes are flushed DELIBERATELY,
         # inside it, so a contended cursor write is a bounded 55P03 the caller's handler
         # classifies as contention — never an open-ended wait.
-        self.db.flush()
+        #
+        # ── R3/RVR2-02: THE DELIBERATE FLUSH IS INSIDE THE PROTECTED REGION ───────
+        # R2 put this line between the `SET LOCAL` and the `try`, so a flush that RAISED
+        # left `lock_timeout` at this block's widened value and never restored the
+        # caller's. The R2 independent review measured it: a caller holding a deliberate
+        # 777ms bound entered the 4s block, the flush raised, and the session was left at
+        # 4s — the same invisible-widening defect this helper was written to close, moved
+        # from the exit path to the entry path.
+        #
+        # Inside the `try` the `finally` runs on every exit, raising or not, so the
+        # caller's bound survives its own flush failing. The original exception still
+        # propagates: `finally` restores and re-raises nothing of its own.
         try:
+            self.db.flush()
             yield
         finally:
             with self.db.no_autoflush:

@@ -38,6 +38,105 @@ def _code(fn) -> str:
     return "\n".join(ast.unparse(s) for s in body)
 
 
+#: R3/RVR2-09. The offer model's canonical name. Every writer in the authority imports it
+#: lazily, as `from ..models import WhatsAppBookingOffer as O`, so the alias is resolved
+#: per function rather than assumed.
+_OFFER_MODEL = "WhatsAppBookingOffer"
+_OFFER_TABLE = "whatsapp_booking_offers"
+
+
+def _offer_aliases(fn_node) -> set:
+    """Every local name bound to the offer model inside this function."""
+    names = {_OFFER_MODEL}
+    for node in ast.walk(fn_node):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for a in node.names:
+                if a.name == _OFFER_MODEL:
+                    names.add(a.asname or a.name)
+    return names
+
+
+def _classify(fn_node) -> tuple:
+    """`(writes_the_offer_table, acquires_resource_1)` for one function, from its AST.
+
+    R3/RVR2-09 REPLACED A SUBSTRING. R2's derivation asked `"db.add(" in body`, which
+    cannot tell WHAT is being added: a method that added a `SecurityEvent`, an `AiEvent` or
+    a `Revision` would have been forced into the offer-writer declaration, and a reader
+    could no longer tell which names the lock-order assertion was about. The R2 independent
+    review derived nine writers by hand and found the declaration claimed ten.
+
+    So a write is now recognised by its SUBJECT, in three shapes and no others:
+
+      * `db.add(<offer model>(...))` — an ORM insert of an offer instance. An add of any
+        other model is not an offer write.
+      * `update(<offer model>)` / `insert(<offer model>)` — a Core statement whose target
+        is the offer model.
+      * a SQL string naming the offer table in an `UPDATE` or `INSERT` — the raw-text form.
+
+    Acquisition is recognised by a call to `_acquire_thread_state` or
+    `_require_thread_state`, which are the only two entry points to resource 1.
+    """
+    aliases = _offer_aliases(fn_node)
+    writes = False
+    acquires = False
+
+    def _is_offer_name(node) -> bool:
+        return ((isinstance(node, ast.Name) and node.id in aliases)
+                or (isinstance(node, ast.Attribute) and node.attr == _OFFER_MODEL))
+
+    for node in ast.walk(fn_node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            sql = " ".join(node.value.split()).upper()
+            if ("UPDATE %s" % _OFFER_TABLE.upper()) in sql or (
+                    "INSERT INTO %s" % _OFFER_TABLE.upper()) in sql:
+                writes = True
+            continue
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        # db.add(Offer(...)) — the subject is the argument, not the method name.
+        if isinstance(fn, ast.Attribute) and fn.attr == "add":
+            for arg in node.args:
+                if isinstance(arg, ast.Call) and _is_offer_name(arg.func):
+                    writes = True
+                # `db.add(offer)` where `offer` was built from the model in this function
+                elif isinstance(arg, ast.Name):
+                    for n2 in ast.walk(fn_node):
+                        if (isinstance(n2, ast.Assign)
+                                and any(isinstance(t, ast.Name) and t.id == arg.id
+                                        for t in n2.targets)
+                                and isinstance(n2.value, ast.Call)
+                                and _is_offer_name(n2.value.func)):
+                            writes = True
+        # update(Offer) / insert(Offer)
+        if isinstance(fn, ast.Name) and fn.id in ("update", "insert"):
+            if node.args and _is_offer_name(node.args[0]):
+                writes = True
+        if isinstance(fn, ast.Attribute) and fn.attr in (
+                "_acquire_thread_state", "_require_thread_state"):
+            acquires = True
+    return writes, acquires
+
+
+def _derive_roles() -> tuple:
+    """`(writers, participants)` derived from the authority's own source."""
+    from app.services import offer_lifecycle as mod
+    tree = ast.parse(inspect.getsource(mod))
+    cls = next(n for n in tree.body
+               if isinstance(n, ast.ClassDef) and n.name == "OfferLifecycle")
+    writers, participants = set(), set()
+    for fn_node in cls.body:
+        if not isinstance(fn_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        writes, acquires = _classify(fn_node)
+        if writes:
+            writers.add(fn_node.name)
+        elif acquires:
+            participants.add(fn_node.name)
+    return writers, participants
+
+
+
 # ══ S1 — the two application guards are VISIBLE to the default gate ══════════
 
 class ApplicationGuardsAreVisible(unittest.TestCase):
@@ -395,41 +494,100 @@ class R2BoundsCoverEveryExit(unittest.TestCase):
         `OFFER_WRITERS` now NAMES them all, and this walks the list — so a tenth writer
         added without the acquisition fails the gate instead of silently widening it.
         """
-        from app.services.offer_lifecycle import OFFER_WRITERS, OfferLifecycle
+        from app.services.offer_lifecycle import (OFFER_LOCK_PARTICIPANTS, OFFER_WRITERS,
+                                                   OfferLifecycle)
         for name in OFFER_WRITERS:
             with self.subTest(writer=name):
                 src = _code(getattr(OfferLifecycle, name))
                 acquires = ("_require_thread_state(" in src
                             or "_acquire_thread_state(" in src
-                            # `claim` enters through `_claim_checks`, which is itself in
-                            # this list and is therefore checked directly. One delegation,
+                            # `claim` enters through `_claim_checks`, which is declared in
+                            # OFFER_LOCK_PARTICIPANTS and is checked there. One delegation,
                             # named, and no other.
                             or (name == "claim" and "_claim_checks(" in src))
                 self.assertTrue(
                     acquires,
                     f"{name} writes whatsapp_booking_offers without entering "
                     f"OFFER_LOCK_ORDER — the inverse order deadlocks 40P01")
+        # R3/RVR2-08: the participants are held to the property they actually have —
+        # they enter the order — not to being writers.
+        for name in OFFER_LOCK_PARTICIPANTS:
+            with self.subTest(participant=name):
+                src = _code(getattr(OfferLifecycle, name))
+                self.assertTrue("_acquire_thread_state(" in src
+                                or "_require_thread_state(" in src,
+                                f"{name} participates in OFFER_LOCK_ORDER without taking "
+                                f"resource 1")
 
     def test_r2_02_the_declared_writer_list_is_the_actual_writer_list(self):
-        """A declaration that drifts from the code is worse than no declaration."""
-        import re
-        from app.services import offer_lifecycle as mod
-        from app.services.offer_lifecycle import OFFER_WRITERS, OfferLifecycle
-        source = _code(OfferLifecycle)
-        # Every method that issues an UPDATE or INSERT against the offer table.
-        found = set()
-        for name, fn in vars(OfferLifecycle).items():
-            if not callable(fn) or name.startswith("__"):
-                continue
-            try:
-                body = _code(fn)
-            except (OSError, TypeError):            # pragma: no cover - defensive
-                continue
-            if re.search(r"\b(update|insert)\(\s*O\b", body) or "db.add(" in body:
-                found.add(name)
-        self.assertEqual(found - set(OFFER_WRITERS), set(),
-                         "an offer-table writer is missing from OFFER_WRITERS")
+        """MUTATION ORACLE for required mutations 11 and 12 (RVR2-08, RVR2-09).
+
+        A declaration that drifts from the code is worse than no declaration. R2's version
+        of this test asked `"db.add(" in body`, which cannot tell WHAT is being added — so
+        it would have forced any method adding any model into the offer-writer list, and it
+        accepted a list of ten when the code had nine writers and one lock helper. The
+        derivation is now by SUBJECT (`_classify`), and both roles are checked.
+        """
+        from app.services.offer_lifecycle import OFFER_LOCK_PARTICIPANTS, OFFER_WRITERS
+        writers, participants = _derive_roles()
+        self.assertEqual(writers, set(OFFER_WRITERS),
+                         "OFFER_WRITERS and the code's actual offer-table writers differ: "
+                         "missing=%s over-claimed=%s"
+                         % (sorted(writers - set(OFFER_WRITERS)),
+                            sorted(set(OFFER_WRITERS) - writers)))
         self.assertEqual(len(OFFER_WRITERS), len(set(OFFER_WRITERS)))
+        self.assertEqual(len(OFFER_WRITERS), 9,
+                         "nine direct writers were derived by the R2 independent review")
+        # The helper is NOT a writer, and the declaration must not say it is.
+        self.assertNotIn("_claim_checks", OFFER_WRITERS,
+                         "_claim_checks persists nothing — it reads the offer row under "
+                         "resource 2 and delegates every write to a declared writer")
+        self.assertIn("_claim_checks", OFFER_LOCK_PARTICIPANTS)
+        self.assertEqual(set(OFFER_WRITERS) & set(OFFER_LOCK_PARTICIPANTS), set(),
+                         "a name cannot be both a persisted writer and a non-writing "
+                         "participant")
+        self.assertTrue(set(OFFER_LOCK_PARTICIPANTS) <= participants | set(OFFER_WRITERS),
+                        "a declared participant does not take resource 1 at all")
+
+    def test_r2_02b_the_derivation_reads_the_SUBJECT_of_a_write(self):
+        """MUTATION ORACLE for required mutation 12 (RVR2-09), as a negative control.
+
+        The deriver is given a class whose four methods are, deliberately, one offer add,
+        one unrelated add, one offer Core update and one lock-only helper. A derivation
+        that keys on the string `db.add(` classifies the unrelated add as an offer writer
+        and this fails — which is exactly the weakening R2 shipped.
+        """
+        src = textwrap.dedent('''
+            class Probe:
+                def writes_an_offer(self):
+                    from ..models import WhatsAppBookingOffer as O
+                    self._require_thread_state(1)
+                    o = O(thread_id=1)
+                    self.db.add(o)
+
+                def adds_something_unrelated(self):
+                    from ..models import SecurityEvent
+                    self.db.add(SecurityEvent(kind="x"))
+
+                def updates_the_offer_table(self):
+                    from ..models import WhatsAppBookingOffer as O
+                    self._require_thread_state(1)
+                    self.db.execute(update(O).where(O.id == 1).values(status="X"))
+
+                def only_locks(self):
+                    self._acquire_thread_state(1)
+                    return self.db.execute(select(1)).first()
+        ''')
+        cls = ast.parse(src).body[0]
+        roles = {fn.name: _classify(fn) for fn in cls.body}
+        self.assertEqual(roles["writes_an_offer"], (True, True))
+        self.assertEqual(roles["updates_the_offer_table"], (True, True))
+        self.assertEqual(
+            roles["adds_something_unrelated"], (False, False),
+            "an unrelated db.add() was classified as an offer-table write — the "
+            "derivation is keying on the method name instead of its subject")
+        self.assertEqual(roles["only_locks"], (False, True),
+                         "a lock-only helper was classified as a writer")
 
     def test_r2_03_the_bounded_entry_precedes_EVERY_admission_outcome(self):
         """MUTATION ORACLE for required mutation 3 (RV-01).
@@ -448,17 +606,90 @@ class R2BoundsCoverEveryExit(unittest.TestCase):
                                 f"first write would wait with no bound in force")
 
     def test_r2_04_a_contended_turn_mutates_nothing(self):
-        """Contention is not a refusal: no counter moves, and the cursor is not consumed."""
+        """Contention is not a refusal: no counter moves, and the cursor is not consumed.
+
+        R3 moved the contended answer into ONE method, `_contended_booking_turn`, because
+        there are now three entry points that can reach it — turn entry, the cycle reset
+        and admission — and three copies of a contract is three chances to answer
+        differently. So this oracle follows the delegation: every branch must delegate, and
+        the single handler is what carries the contract.
+        """
         from app.services.conversation_engine import ConversationEngine
         src = _code(ConversationEngine._process_flow_response)
         head, _sep, tail = src.partition("if _contended is not None:")
         contended_block = tail.split("if _adm.replay:")[0]
         self.assertTrue(_sep, "the contended branch disappeared")
+        self.assertIn("_contended_booking_turn(", contended_block,
+                      "the admission branch no longer delegates to the one handler")
+        handler = _code(ConversationEngine._contended_booking_turn)
         for forbidden in ("record_refusal", "record_replay", "finalise_admission_refusal",
-                          "needs_human"):
+                          "needs_human", "self.db.commit(", "_send_text_to_wa",
+                          "_send_fallback_human_review_notification",
+                          "_execute_cycle_reset", "archived"):
+            self.assertNotIn(forbidden, handler,
+                             f"a contended turn must not {forbidden}")
             self.assertNotIn(forbidden, contended_block,
                              f"a contended turn must not {forbidden}")
-        self.assertIn("ACTION_THREAD_CONTENDED", contended_block)
+        self.assertIn("ACTION_THREAD_CONTENDED", handler)
+        # Every entry point must reach the SAME handler, so none of them can drift.
+        entry = _code(ConversationEngine._handle)
+        self.assertEqual(entry.count("_contended_booking_turn("), 2,
+                         "`_handle` has %d contended answers; there are two gated "
+                         "acquisitions, so there must be exactly two"
+                         % entry.count("_contended_booking_turn("))
+
+    def test_r2_04b_the_data_exchange_event_claims_no_durability(self):
+        """MUTATION ORACLE for required mutation 13 (RVR2-07). STRUCTURAL, deliberately.
+
+        The R2 independent review's finding was about what the code CLAIMS, not about what
+        it did: `_log_event(self.db, ...)` was called on the contended branch of
+        `handle_confirm_booking` AFTER `begin_offer_transaction` had already rolled back,
+        and it was documented as "Persist a booking lifecycle event" while its body was one
+        `logger.info`. No durable record ever existed, on that branch or any other, so there
+        is no behaviour for a behavioural test to observe — the defect was that a reader, or
+        a later author, could reasonably believe there was one.
+
+        A claim can only be checked where it is made, so this is asserted on the
+        declaration: the function takes no session, and nothing in it says it persists. It
+        is not evidence about concurrency and is not offered as any.
+        """
+        import inspect
+        from app.services import booking_flow_service as BF
+        self.assertFalse(hasattr(BF, "_log_event"),
+                         "_log_event is back — the name that implied a durable write")
+        fn = BF._booking_event
+        params = list(inspect.signature(fn).parameters)
+        self.assertNotIn("db", params,
+                         "_booking_event takes a Session again; it persists nothing, and a "
+                         "session in the signature is what made the contended branch read "
+                         "as though a durable event survived the rollback")
+        for p in params:
+            self.assertNotIn("session", p.lower())
+        doc = (fn.__doc__ or "").lower()
+        self.assertIn("persists nothing", doc,
+                      "_booking_event must say plainly that it persists nothing")
+        # The SUMMARY LINE is the claim a reader acts on. The body below it quotes the old
+        # wording in order to explain what was wrong with it, so the check is scoped to the
+        # summary — an oracle that could not tell a quotation from a claim would make the
+        # explanation unwritable, which is the same mistake `_code()` exists to avoid.
+        summary = doc.strip().splitlines()[0] if doc.strip() else ""
+        self.assertNotIn("persist a booking lifecycle event", summary,
+                         "_booking_event's summary line still claims to persist")
+        self.assertTrue(summary.startswith("emit"),
+                        "_booking_event's summary must say what it does — emit a log line "
+                        "— not what it does not do; got %r" % summary)
+        body = _code(fn)
+        for forbidden in ("db.add(", "db.commit(", "db.execute(", "db.flush("):
+            self.assertNotIn(forbidden, body,
+                             f"_booking_event performs {forbidden} — it is a log line, and "
+                             f"a writer here would run after a rollback")
+        # And the contended branch must not hand it a session either.
+        dx = _code(BF.BookingFlowService.handle_confirm_booking)
+        head, _sep, tail = dx.partition("if _contended is not None:")
+        self.assertTrue(_sep, "the DX contended branch disappeared")
+        contended = tail.split("_adm = ")[0]
+        self.assertNotIn("self.db", contended,
+                         "the DX contended branch touches the session after the rollback")
 
     def test_r2_05_the_data_exchange_command_enters_the_order_before_refusing(self):
         """MUTATION ORACLE for required mutation 4. Both transports, or only half a fix."""

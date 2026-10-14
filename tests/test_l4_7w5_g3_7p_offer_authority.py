@@ -576,21 +576,123 @@ class G37RAdmissionScope(unittest.TestCase):
         self.assertFalse(hasattr(self.CE, "_begin_thread_transaction"),
                          "_begin_thread_transaction must be deleted, not retained")
 
-    def test_g37r_02_handle_takes_no_booking_lock_at_turn_entry(self):
-        """MUTATION ORACLE (required mutation 5). Reintroducing the turn-entry lock — by
-        calling `begin_offer_transaction` anywhere in `_handle`, under any predicate — is
-        what this test exists to fail on."""
+    def test_g37r_02_handle_takes_no_UNCONDITIONAL_booking_lock_at_turn_entry(self):
+        """MUTATION ORACLE (required mutation 5), RESTATED BY R3 — read the reason.
+
+        G3-7R wrote this oracle as "no `begin_offer_transaction` anywhere in `_handle`,
+        under any predicate", because the gate it had just deleted was unconditional and
+        the measured cost was 4.05s on threads the parent served in 0.05–0.20s.
+
+        R3 had to acquire resource 1 in `_handle` to close RVR2-01, and this test is
+        therefore DELIBERATELY WEAKENED IN ONE RESPECT AND STRENGTHENED IN FOUR. The
+        milestone prompt authorises exactly that and no more: "If the bound must move
+        earlier, gate it only on an already-established booking-shaped submission and
+        document the exact predicate", and "No correction may restore the deleted general
+        turn-entry gate."
+
+        The invariant the old form was really protecting is not "no acquisition here"; it
+        is "no acquisition on a turn that cannot book". That is what is asserted now, and
+        it is asserted on the AST rather than on a substring:
+
+          1. the legacy mechanisms stay deleted by name;
+          2. there is NO acquisition at the statement level of `_handle` — every one is
+             inside a guard;
+          3. every guard is one of exactly two permitted predicates — the booking-shaped
+             transport predicate, or `cycle_reset_pending`, which is a real writer;
+          4. the booking-shaped flag comes from `_is_booking_shaped_submission` and nothing
+             else;
+          5. that predicate reads no prose, no semantic result and no model output.
+
+        The behavioural half lives on PostgreSQL, where an ordinary text turn is measured
+        running to completion while another session holds resource 1
+        (`test_r3_pg_07_an_ordinary_text_turn_takes_no_booking_lock`). A structural
+        statement about a lock is not a concurrency proof, and this one does not claim to
+        be: it exists so the predicate cannot quietly widen.
+        """
         import ast
         import inspect
         import textwrap
         # CODE, not comments: the comments in `_handle` name the deleted mechanism in order
         # to explain why it is gone, and an oracle that cannot tell a comment from a call
         # would make that explanation unwritable.
-        src = ast.unparse(ast.parse(textwrap.dedent(inspect.getsource(self.CE._handle))))
-        for forbidden in ("begin_offer_transaction", "_begin_thread_transaction",
-                          "_is_offer_acceptance_turn", "FOR NO KEY UPDATE"):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(self.CE._handle)))
+        src = ast.unparse(tree)
+        for forbidden in ("_begin_thread_transaction", "_is_offer_acceptance_turn",
+                          "FOR NO KEY UPDATE"):
             self.assertNotIn(forbidden, src,
                              f"_handle must take no booking lock at turn entry: {forbidden}")
+
+        ACQUIRE = ("begin_offer_transaction", "_enter_cycle_reset_bound",
+                   "_acquire_thread_state", "_require_thread_state")
+        fn = tree.body[0]
+
+        def acquisitions(node):
+            found = []
+            for n in ast.walk(node):
+                if isinstance(n, ast.Call):
+                    name = getattr(n.func, "attr", None) or getattr(n.func, "id", None)
+                    if name in ACQUIRE:
+                        found.append(name)
+            return found
+
+        # (2) nothing unconditional: every acquisition sits inside an `if`.
+        for stmt in fn.body:
+            if isinstance(stmt, ast.If):
+                continue
+            self.assertEqual(
+                acquisitions(stmt), [],
+                "`_handle` acquires the booking lock OUTSIDE any guard — that is the "
+                "unconditional turn-entry gate, restored")
+
+        # (3) every guard is one of the two permitted predicates.
+        permitted = ("_booking_shaped", "cycle_reset_pending")
+        guarded = 0
+        for stmt in fn.body:
+            if not isinstance(stmt, ast.If):
+                continue
+            if not acquisitions(stmt):
+                continue
+            guarded += 1
+            test_src = ast.unparse(stmt.test)
+            self.assertTrue(
+                any(p in test_src for p in permitted),
+                "`_handle` acquires the booking lock under the predicate %r, which is "
+                "neither the booking-shaped transport predicate nor cycle_reset_pending"
+                % test_src)
+        self.assertEqual(guarded, 2,
+                         "expected exactly two guarded acquisitions in `_handle` (the "
+                         "booking-shaped turn entry and the cycle reset), found %d"
+                         % guarded)
+
+        # (4) the flag is derived from the declared predicate and nothing else.
+        assigns = [ast.unparse(n.value) for n in ast.walk(fn)
+                   if isinstance(n, ast.Assign)
+                   and any(isinstance(t, ast.Name) and t.id == "_booking_shaped"
+                           for t in n.targets)]
+        self.assertEqual(len(assigns), 1,
+                         "_booking_shaped must be assigned exactly once, found %r"
+                         % (assigns,))
+        self.assertIn("_is_booking_shaped_submission", assigns[0],
+                      "_booking_shaped is derived from something other than the declared "
+                      "predicate: %r" % assigns[0])
+
+        # (5) the predicate itself reads nothing semantic. CODE only: the docstring
+        # explains what the predicate must not read, and an oracle that could not tell a
+        # docstring from a statement would make that explanation unwritable.
+        _pnode = ast.parse(textwrap.dedent(inspect.getsource(
+            self.CE._is_booking_shaped_submission))).body[0]
+        _pbody = list(_pnode.body)
+        if (_pbody and isinstance(_pbody[0], ast.Expr)
+                and isinstance(_pbody[0].value, ast.Constant)):
+            _pbody = _pbody[1:]
+        pred = "\n".join(ast.unparse(n) for n in _pbody)
+        for forbidden in ("semantic", "understand", "interpret", "_live_plan", "proposal",
+                          "LEXICON", "PHRASE", "lower()", "self.db", "execute(",
+                          "openai", "llm"):
+            self.assertNotIn(forbidden, pred,
+                             "the booking-shaped predicate reads %r — a predicate that "
+                             "gates a lock must not depend on prose or on a model"
+                             % forbidden)
 
     def test_g37r_03_no_phrase_catalogue_decides_admission(self):
         """The boundary must not be able to drift back into reading customer prose."""
