@@ -404,8 +404,20 @@ class CrmAndApi(unittest.TestCase):
 
     def test_sb2a_24_api_conflict_is_structured_409(self):
         c = self._client()
+        # Convergence Phase 4 adaptation (CP1-02). OLD: an unkeyed POST reached the authority
+        # and answered the overlap with 409. NEW: an unkeyed booking command is refused 428
+        # IDEMPOTENCY_KEY_REQUIRED with nothing written; the same overlap, sent WITH a key,
+        # still answers the structured 409. WHY: a booking command without a durable key is
+        # not executed (operator retries must replay). INVARIANT kept: conflicts are typed
+        # 409 with their conflicts listed, never a 500. PROOF: the parent returns 409 to the
+        # unkeyed request.
+        unkeyed = c.post(f"/leads/{self.lead.id}/revisions",
+                         json={"turno_fecha": D.isoformat(), "turno_hora": "10:30:00"})
+        self.assertEqual((unkeyed.status_code, unkeyed.json()["detail"]["code"]),
+                         (428, "IDEMPOTENCY_KEY_REQUIRED"), unkeyed.text)
         r = c.post(f"/leads/{self.lead.id}/revisions",
-                   json={"turno_fecha": D.isoformat(), "turno_hora": "10:30:00"})
+                   json={"turno_fecha": D.isoformat(), "turno_hora": "10:30:00"},
+                   headers={"Idempotency-Key": "client-req-overlap"})
         self.assertEqual(r.status_code, 409, r.text)
         detail = r.json()["detail"]
         self.assertEqual((detail["code"], detail["reason"]), ("SLOT_CONFLICT", "OVERLAP"))
@@ -431,8 +443,15 @@ class CrmAndApi(unittest.TestCase):
 
     def test_sb2a_26_api_patch_conflict_and_if_match(self):
         c = self._client()
+        # Convergence Phase 4 adaptation (CP1-02): as sb2a_24 — the unkeyed booking change is
+        # refused 428 before any write; the keyed one still answers the typed 409.
+        unkeyed = c.patch(f"/leads/{self.other_lead.id}/revisions/latest",
+                          json={"turno_hora": "10:15:00"})
+        self.assertEqual((unkeyed.status_code, unkeyed.json()["detail"]["code"]),
+                         (428, "IDEMPOTENCY_KEY_REQUIRED"), unkeyed.text)
         r = c.patch(f"/leads/{self.other_lead.id}/revisions/latest",
-                    json={"turno_hora": "10:15:00"})
+                    json={"turno_hora": "10:15:00"},
+                    headers={"Idempotency-Key": "client-patch-overlap"})
         self.assertEqual(r.status_code, 409)
         r = c.patch(f"/leads/{self.other_lead.id}/revisions/latest",
                     json={"turno_hora": "16:00:00"}, headers={"If-Match": '"7"'})

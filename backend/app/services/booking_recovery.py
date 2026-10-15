@@ -65,18 +65,25 @@ def stored_inbound_event(db: Session, wa_message_id: str):
 
 def recover_acknowledgement(db: Session, idempotency_key: str) -> Optional[str]:
     """Ledger-driven acknowledgement recovery. Returns the acknowledgement status after the
-    attempt (None if the key is unknown). SENT, an active lease, exhausted attempts and
-    NOT_APPLICABLE are left alone — the claim decides, atomically, not this function."""
+    attempt (None if the key is unknown; "DETACHED" for a command a tester reset detached —
+    its booking no longer exists and nothing is owed). SENT, an active lease, exhausted
+    attempts and NOT_APPLICABLE are left alone — the claim decides, atomically, not this
+    function."""
     from ..models import BookingCommandRecord, WhatsAppContact, WhatsAppThread
     from .booking_authority import BookingAuthority
     from .booking_ce_adapter import isolated_session
     from .booking_flow_service import send_booking_acknowledgement
     with isolated_session(db) as s:
         auth = BookingAuthority(s)
-        found = s.execute(select(BookingCommandRecord.id, BookingCommandRecord.thread_id).where(
+        found = s.execute(select(BookingCommandRecord.id, BookingCommandRecord.thread_id,
+                                 BookingCommandRecord.command_state).where(
             BookingCommandRecord.idempotency_key == idempotency_key)).one_or_none()
         if found is None:
             return None
+        if found.command_state == "DETACHED":
+            # Convergence Phase 4 (P2R-02): a DETACHED command is history whose booking a reset
+            # removed — never a pending acknowledgement. Nothing is claimed or sent.
+            return "DETACHED"
         thread_id = found.thread_id
         claim = auth.claim_acknowledgement(idempotency_key)
         if claim is None:

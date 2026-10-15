@@ -144,6 +144,8 @@ def _try_send_alert(event: SecurityEvent) -> None:
     msg.set_content(body)
 
     try:
+        from .booking_authority import forbid_external_io  # convergence Phase 4 (P2R-05)
+        forbid_external_io("smtp")
         with smtplib.SMTP(s.smtp_host, s.smtp_port, timeout=15) as conn:
             conn.starttls()
             conn.login(s.smtp_user, s.smtp_password)

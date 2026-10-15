@@ -1561,7 +1561,13 @@ def render_control_page(user_email: str) -> str:
     var BOOKING_RECOVERY = {{
       'STORED_INBOUND_REPLAY': 'Re-enviar el evento entrante guardado',
       'LEDGER_ACK_RECOVERY': 'Recuperar el acuse desde el ledger',
-      'OPERATOR_REVIEW': 'Revisión de un operador'
+      'OPERATOR_REVIEW': 'Revisión de un operador',
+      'NOTIFY_TEAM_MANUALLY': 'Avisar al equipo a mano (el turno está registrado)'
+    }};
+    // Convergence Phase 4 (SB2B-RV-04): the TEAM's booking e-mail, distinct from the customer ack.
+    var NOTIFICATION_STATE = {{
+      'SENT': 'enviado', 'PENDING': 'no enviado', 'FAILED': 'falló', 'HELD': 'no configurado',
+      'NOT_APPLICABLE': '—'
     }};
     function fetchBookings() {{
       apiFetch('/api/ops/booking-attention', function(data) {{
@@ -1575,9 +1581,14 @@ def render_control_page(user_email: str) -> str:
         }}
         tbody.innerHTML = rows.map(function(r) {{
           var ack = esc(r.ack_status) + ' · ' + esc(r.ack_attempts) + ' intento(s)'
-            + (r.ack_duplicate_risk ? ' · <span class="badge badgeHigh">duplicado posible</span>' : '')
+            + (r.ack_duplicate_risk ? ' · <span class="badge badgeHigh">entrega incierta · reenvío retenido</span>' : '')
             + (r.ack_error_category ? '<div class="subtle">' + esc(r.ack_error_category) + '</div>' : '')
-            + (r.ack_transport_tail ? '<div class="subtle">…' + esc(r.ack_transport_tail) + '</div>' : '');
+            + (r.ack_transport_tail ? '<div class="subtle">…' + esc(r.ack_transport_tail) + '</div>' : '')
+            + (r.notification_state && r.notification_state !== 'NOT_APPLICABLE'
+                 ? '<div class="subtle">Aviso al equipo: '
+                   + esc(NOTIFICATION_STATE[r.notification_state] || r.notification_state)
+                   + (r.notification_last_reason ? ' · ' + esc(r.notification_last_reason) : '')
+                   + '</div>' : '');
           return '<tr>'
             + '<td>' + fmtDateTime(r.committed_at) + '</td>'
             + '<td>' + (r.thread_url

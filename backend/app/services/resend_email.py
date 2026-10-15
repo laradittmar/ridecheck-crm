@@ -199,6 +199,8 @@ def send_booking_notification(
     )
 
     try:
+        from .booking_authority import forbid_external_io  # convergence Phase 4 (P2R-05)
+        forbid_external_io("resend_email")
         with urlrequest.urlopen(req, timeout=15) as resp:
             body = resp.read().decode("utf-8", errors="replace")
         logger.info("[M15.8] Resend email sent OK for revision_id=%s lead_id=%s — %s", revision_id, lead_id, body)
@@ -355,6 +357,8 @@ def send_scheduling_handoff_notification(
     )
 
     try:
+        from .booking_authority import forbid_external_io  # convergence Phase 4 (P2R-05)
+        forbid_external_io("resend_email")
         with urlrequest.urlopen(req, timeout=15) as resp:
             body = resp.read().decode("utf-8", errors="replace")
         logger.info("[M15.8] Handoff email sent OK lead_id=%s — %s", lead_id, body)
@@ -427,6 +431,8 @@ def send_unanswered_alert(
     )
 
     try:
+        from .booking_authority import forbid_external_io  # convergence Phase 4 (P2R-05)
+        forbid_external_io("resend_email")
         with urlrequest.urlopen(req, timeout=15) as resp:
             body = resp.read().decode("utf-8", errors="replace")
         logger.info(
@@ -531,6 +537,8 @@ def send_human_review_notification(
     )
 
     try:
+        from .booking_authority import forbid_external_io  # convergence Phase 4 (P2R-05)
+        forbid_external_io("resend_email")
         with urlrequest.urlopen(req, timeout=15) as resp:
             body = resp.read().decode("utf-8", errors="replace")
         logger.info(

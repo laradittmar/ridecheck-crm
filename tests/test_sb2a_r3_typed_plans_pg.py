@@ -396,11 +396,15 @@ class R3Postgres(unittest.TestCase):
                                                            "estado_revision": "PENDIENTE"},
                     headers={"Idempotency-Key": f"r3-api-{self.lead}"})
         self.assertEqual(r1.status_code, 200, r1.text)
+        # Convergence Phase 4 adaptation (CP1-02): every booking command carries a durable key
+        # (an unkeyed one is refused 428 before the conflict or the edit this test is about).
         clash = c.post(f"/leads/{self.lead}/revisions", json={"turno_fecha": d, "turno_hora": "10:15:00",
-                                                              "estado_revision": "PENDIENTE"})
+                                                              "estado_revision": "PENDIENTE"},
+                       headers={"Idempotency-Key": f"r3-api-clash-{self.lead}"})
         self.assertEqual(clash.status_code, 409, clash.text)
         up = c.patch(f"/leads/{self.lead}/revisions/latest", json={"turno_fecha": d, "turno_hora": "15:00:00",
-                                                                     "estado_revision": "PENDIENTE"})
+                                                                     "estado_revision": "PENDIENTE"},
+                     headers={"Idempotency-Key": f"r3-api-up-{self.lead}"})
         self.assertEqual(up.status_code, 200, up.text)
         # the CRM form's command path (command_for_edit → authority)
         from app.models import Revision

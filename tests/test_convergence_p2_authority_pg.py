@@ -46,6 +46,10 @@ PG_MIG_URL = os.environ.get("CONV_P2_PG_MIG_URL", "")
 
 HEAD = "20261014_ledger_detached_state"
 PARENT = "20261014_converge_track_heads"
+#: Convergence Phase 4 adaptation: the script head moved to the one additive Phase 4 migration
+#: (booking_attempt_events), a child of HEAD. The Phase 2 assertions below now name it where
+#: they mean "the head", and still prove the Phase 2 revision itself.
+P4_HEAD = "20261015_booking_attempt_events"
 DAY = date(2027, 3, 2)                       # a Tuesday; ScheduleService is not consulted here
 DAY2 = date(2027, 3, 3)
 WA_A, WA_B = "549110000901", "549110000902"
@@ -225,7 +229,9 @@ class _Base(unittest.TestCase):
 class P2_00_Schema(_Base):
 
     def test_p2_pg_00_the_schema_is_the_migrated_head(self):
-        self.assertEqual([r[0] for r in self.q("SELECT version_num FROM alembic_version")], [HEAD])
+        # Convergence Phase 4 adaptation: the migrated head is now Phase 4's, whose parent is HEAD.
+        self.assertEqual([r[0] for r in self.q("SELECT version_num FROM alembic_version")],
+                         [P4_HEAD])
         self.assertEqual(self.one("SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal AND "
                                   "tgname = 'trg_booking_commands_detached_terminal'"), 1)
         names = {r[0] for r in self.q("SELECT conname FROM pg_constraint WHERE conrelid = "
@@ -1157,14 +1163,19 @@ class P2_50_Migration(unittest.TestCase):
         cwd = os.getcwd(); os.chdir(_BACKEND)
         try:
             script = ScriptDirectory.from_config(Config("alembic.ini"))
-            self.assertEqual(script.get_heads(), [HEAD])
+            # Convergence Phase 4 adaptation: still ONE head — the Phase 4 migration — whose
+            # parent is the Phase 2 revision, whose parent is the Phase 1 merge.
+            self.assertEqual(script.get_heads(), [P4_HEAD])
+            self.assertEqual(script.get_revision(P4_HEAD).down_revision, HEAD)
             self.assertEqual(script.get_revision(HEAD).down_revision, PARENT)
         finally:
             os.chdir(cwd)
 
     def test_p2_mg_02_downgrade_and_upgrade_round_trip_byte_identically(self):
         top = self.catalog()
-        self.assertEqual(top[4], [HEAD]); self.assertEqual(top[3], 1)
+        # Convergence Phase 4 adaptation: the round trip starts at the Phase 4 head and passes
+        # through the (empty) booking_attempt_events downgrade on its way to PARENT.
+        self.assertEqual(top[4], [P4_HEAD]); self.assertEqual(top[3], 1)
         self.alembic("downgrade", PARENT)
         mid = self.catalog()
         self.assertEqual(mid[4], [PARENT])

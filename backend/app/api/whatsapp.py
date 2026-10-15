@@ -96,6 +96,8 @@ def _load_whatsapp_media_info(media_id: str) -> WhatsAppMediaInfoOut:
         headers={"Authorization": f"Bearer {token}"},
     )
     try:
+        from ..services.booking_authority import forbid_external_io  # convergence Phase 4 (P2R-05)
+        forbid_external_io("meta_graph_media")
         with urlrequest.urlopen(req, timeout=15) as resp:
             body = resp.read().decode("utf-8", errors="replace")
     except error.HTTPError as exc:
@@ -138,6 +140,8 @@ def _open_whatsapp_media_stream(info: WhatsAppMediaInfoOut):
         headers={"Authorization": f"Bearer {token}"},
     )
     try:
+        from ..services.booking_authority import forbid_external_io  # convergence Phase 4 (P2R-05)
+        forbid_external_io("meta_graph_media")
         return urlrequest.urlopen(req, timeout=30)
     except error.HTTPError as exc:
         err_body = exc.read().decode("utf-8", errors="replace")
@@ -251,6 +255,8 @@ def _transcribe_audio_bytes(media_id: str, audio_bytes: bytes, mime_type: str | 
     last_exc: Exception | None = None
     for attempt in range(TRANSCRIPTION_MAX_ATTEMPTS):
         try:
+            from ..services.booking_authority import forbid_external_io  # convergence Phase 4 (P2R-05)
+            forbid_external_io("openai")
             with urlrequest.urlopen(req, timeout=60) as resp:
                 response_body = resp.read().decode("utf-8", errors="replace")
             break

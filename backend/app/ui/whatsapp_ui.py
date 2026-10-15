@@ -165,6 +165,8 @@ def _send_whatsapp_cloud_text(to_wa_id: str, text: str) -> tuple[str, int]:
     )
     logger.info("WHATSAPP_OUTBOUND_META endpoint=%s", endpoint)
     try:
+        from ..services.booking_authority import forbid_external_io  # convergence Phase 4 (P2R-05)
+        forbid_external_io("meta_graph")
         with urlrequest.urlopen(req, timeout=15) as resp:
             status_code = int(getattr(resp, "status", 200))
             body = resp.read().decode("utf-8", errors="replace")
@@ -233,6 +235,8 @@ def _send_whatsapp_cloud_interactive(
     )
     logger.info("WHATSAPP_OUTBOUND_INTERACTIVE_META endpoint=%s", endpoint)
     try:
+        from ..services.booking_authority import forbid_external_io  # convergence Phase 4 (P2R-05)
+        forbid_external_io("meta_graph")
         with urlrequest.urlopen(req, timeout=15) as resp:
             status_code = int(getattr(resp, "status", 200))
             body = resp.read().decode("utf-8", errors="replace")
@@ -305,6 +309,8 @@ def _send_whatsapp_cloud_list(
     )
     logger.info("WHATSAPP_OUTBOUND_LIST_META endpoint=%s", endpoint)
     try:
+        from ..services.booking_authority import forbid_external_io  # convergence Phase 4 (P2R-05)
+        forbid_external_io("meta_graph")
         with urlrequest.urlopen(req, timeout=15) as resp:
             status_code = int(getattr(resp, "status", 200))
             body = resp.read().decode("utf-8", errors="replace")
@@ -420,6 +426,8 @@ def _send_whatsapp_cloud_flow(
     )
     logger.info("WHATSAPP_OUTBOUND_FLOW_META endpoint=%s", endpoint)
     try:
+        from ..services.booking_authority import forbid_external_io  # convergence Phase 4 (P2R-05)
+        forbid_external_io("meta_graph")
         with urlrequest.urlopen(req, timeout=15) as resp:
             status_code = int(getattr(resp, "status", 200))
             body = resp.read().decode("utf-8", errors="replace")

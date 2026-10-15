@@ -224,9 +224,18 @@ class OptionBCases:
         self.assertEqual((len(before["ledger"]), before["ledger"][0][3], before["cursor"]),
                          (1, "PENDING", None))
         self.assertTrue(before["needs_human"])                     # the D1-02 trap is set
-        self.assertEqual(before["attention"], ["ACK_PENDING_STALE", "CE_SYNC_INCOMPLETE"])
+        # Convergence Phase 4 adaptation (SB2B-RV-04): a crash right after the authority commit
+        # also means the operator e-mail was never sent — now listed (design §13: "/control
+        # must list it"). The exact list grows by that one truthful reason.
+        self.assertEqual(before["attention"], ["ACK_PENDING_STALE", "CE_SYNC_INCOMPLETE",
+                                               "OPERATOR_NOTIFICATION_PENDING"])
         self._assert_recovered(w, out, ex)
-        self.assertEqual(self.attention_rows_before(w), [])          # resolved
+        # Convergence Phase 4 adaptation (SB2B-RV-04). OLD: after the replay nothing was listed.
+        # NEW: the acknowledgement and the CE synchronisation are resolved, and exactly one
+        # reason remains — the operator e-mail, which a ledger replay never sends. WHY: that
+        # e-mail really was lost with the crash; hiding it was the RV-04 gap. PROOF: on the
+        # parent the operator surface knows nothing about notifications, so the list is [].
+        self.assertEqual(self.attention_rows_before(w), [["OPERATOR_NOTIFICATION_PENDING"]])
         self.assertEqual(len(self.owner_sends(m)), 1)
 
     def attention_rows_before(self, w):
@@ -315,7 +324,10 @@ class OptionBCases:
         before, out, eng, m, ex = self._crash_then_replay(w, mock.patch.object(
             ConversationEngine, "_sb_synchronize", side_effect=Crash()))
         self.assertEqual((before["ledger"][0][3], before["cursor"]), ("SENT", None))
-        self.assertEqual(before["attention"], ["CE_SYNC_INCOMPLETE"])
+        # Convergence Phase 4 adaptation (SB2B-RV-04): as sb2b_06 — the operator e-mail was never
+        # sent before the crash, and the operator surface now says so.
+        self.assertEqual(before["attention"], ["CE_SYNC_INCOMPLETE",
+                                               "OPERATOR_NOTIFICATION_PENDING"])
         self._assert_recovered(w, out, ex)
         self.assertEqual(self.owner_sends(m), [])                  # SENT ⇒ silent
         self.assertNotIn("CE_SYNC_INCOMPLETE",

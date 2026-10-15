@@ -787,6 +787,10 @@ class BookingFlowService:
         if not token.strip():
             raise BookingTokenError("token missing")
         key = flow_idempotency_key(token)
+        # Convergence Phase 4: a Data Exchange request carries no replay identity of its own,
+        # so each request is a distinct attempt for the evidence it leaves (P2R-10).
+        from .booking_attempt_events import fresh_attempt_ref
+        attempt = fresh_attempt_ref()
 
         # ── 1. the ledger speaks first ───────────────────────────────────────────
         hit = self._ledger_hit(key)
@@ -800,6 +804,8 @@ class BookingFlowService:
             except BookingAlreadyCompletedError:
                 ctx = None
             self._refusal_reread(token, key)
+            self._refusal_evidence(token, key, attempt, "SMART_BOOKING_DISABLED",
+                                   ctx=ctx, finalise=False)
             if ctx is not None:
                 self._handoff_to_person(ctx, "SMART_BOOKING_DISABLED")
             _booking_event(getattr(getattr(ctx, "thread", None), "id", 0) or 0,
@@ -816,11 +822,13 @@ class BookingFlowService:
             # The offer projection is never a replay authority (design §8): re-read the
             # ledger; a miss is refused, never confirmed.
             self._refusal_reread(token, key)
+            self._refusal_evidence(token, key, attempt, OfferRefusal.OFFER_ALREADY_ACCEPTED)
             raise BookingTokenError(f"offer not acceptable: {OfferRefusal.OFFER_ALREADY_ACCEPTED}")
         adm = OfferLifecycle(self.db).admit(thread_id=ctx.thread.id, token=token)
         if not adm.granted:
             self._refusal_reread(token, key)
             reason = adm.refusal or OfferRefusal.OFFER_ALREADY_ACCEPTED
+            self._refusal_evidence(token, key, attempt, reason, ctx=ctx)
             _booking_event(ctx.thread.id, "BOOKING_OFFER_REFUSED", booking_token=token,
                            extra={"reason": reason, "offer_id": adm.offer_id})
             raise BookingTokenError(f"offer not acceptable: {reason}")
@@ -849,6 +857,8 @@ class BookingFlowService:
         zone_group, zone_detail = ctx.zone_group, ctx.zone_detail
         if candidate is None:
             self._refusal_reread(token, key)
+            self._refusal_evidence(token, key, attempt, OfferRefusal.OFFER_CANDIDATE_CHANGED,
+                                   ctx=ctx, candidate_id=None)
             _booking_event(ctx.thread.id, "BOOKING_OFFER_REFUSED", booking_token=token,
                            extra={"reason": OfferRefusal.OFFER_CANDIDATE_CHANGED,
                                   "offer_id": adm.offer_id})
@@ -859,6 +869,10 @@ class BookingFlowService:
         # promises an advisor, so a person is handed the thread.
         if not zone_group and not zone_detail:
             self._refusal_reread(token, key)
+            self._refusal_evidence(token, key, attempt, OfferRefusal.NO_CANONICAL_LOCATION,
+                                   ctx=ctx, candidate_id=int(candidate.id),
+                                   tipo_vehiculo=candidate.tipo_vehiculo,
+                                   cycle_key=int(_cycle_key(ctx.state)))
             _booking_event(ctx.thread.id, "BOOKING_REFUSED_NO_CANONICAL_LOCATION",
                            booking_token=token,
                            extra={"date": date_str, "time": time_str,
@@ -918,6 +932,8 @@ class BookingFlowService:
         # ── 4. clean request session, then ONE authority transaction ─────────────
         if not _session_clean(self.db):
             self._refusal_reread(token, key)
+            self._refusal_evidence(token, key, attempt, "DX_TRANSACTION_NOT_CLEAN", ctx=ctx,
+                                   finalise=False)
             logger.error("BOOKING_REFUSED thread_id=%s — the request session holds a "
                          "transaction id; the authority is not called", ctx.thread.id)
             self._handoff_to_person(ctx, "DX_TRANSACTION_NOT_CLEAN")
@@ -941,6 +957,23 @@ class BookingFlowService:
             _booking_event(ctx.thread.id, "BOOKING_REFUSED", booking_token=token,
                            extra={"outcome": result.outcome.value, "reason": result.reason,
                                   "date": date_str, "time": time_str})
+            # P2R-10: durable evidence, after the authority's rollback — on the offer for an
+            # offer or slot refusal (canonical finaliser), as an attempt event otherwise.
+            from .booking_attempt_events import outcome_for
+            if result.outcome in (BookingOutcome.OFFER_REFUSED, BookingOutcome.SLOT_CONFLICT,
+                                  BookingOutcome.CALENDAR_EXCEPTION):
+                self._refusal_evidence(
+                    token, key, attempt,
+                    result.reason if result.outcome is BookingOutcome.OFFER_REFUSED
+                    else result.outcome.value,
+                    ctx=ctx, stage="AUTHORITY", candidate_id=int(candidate.id),
+                    tipo_vehiculo=candidate.tipo_vehiculo, zone_group=zone_group,
+                    zone_detail=zone_detail, cycle_key=acceptance.cycle_key)
+            else:
+                self._refusal_evidence(token, key, attempt,
+                                       result.reason or result.outcome.value, ctx=ctx,
+                                       finalise=False, stage="AUTHORITY",
+                                       outcome=outcome_for(result.outcome))
             if result.outcome is BookingOutcome.OFFER_REFUSED:
                 raise BookingTokenError(f"offer not acceptable: {result.reason}")
             message = _FLOW_REFUSAL_MESSAGES.get(result.outcome, BOOKING_HANDOFF_TEXT)
@@ -967,6 +1000,28 @@ class BookingFlowService:
         return self._success_response(token)
 
     # ── convergence Phase 3 helpers ───────────────────────────────────────────
+
+    def _refusal_evidence(self, token: str, key: str, attempt: str, reason: str, *, ctx=None,
+                          finalise: bool = True, stage: str = "PRE_EXECUTE",
+                          outcome: str = "REFUSED", **bindings) -> None:
+        """Convergence Phase 4 (P2R-10): the durable evidence of a refused confirmation —
+        the canonical finaliser on its offer, or an attempt event for a refusal that concerns
+        no offer. Called only after the ledger re-read missed. Never raises; never changes
+        the screen this request answers with."""
+        from .booking_attempt_events import record_attempt_event
+        from .booking_refusal import finalise_offer_refusal
+        thread_id = getattr(getattr(ctx, "thread", None), "id", None)
+        try:
+            if finalise and thread_id is not None:
+                finalise_offer_refusal(self.db, source="WHATSAPP_FLOW", thread_id=int(thread_id),
+                                       token=token, observed_reason=reason, attempt_ref=attempt,
+                                       command_key=key, **bindings)
+            else:
+                record_attempt_event(self.db, source="WHATSAPP_FLOW", stage=stage,
+                                     outcome=outcome, reason=reason, command_key=key,
+                                     attempt_ref=attempt, thread_id=thread_id)
+        except Exception as exc:
+            logger.error("BOOKING refusal evidence failed: %s", type(exc).__name__)
 
     @staticmethod
     def _success_response(booking_token: str) -> dict:

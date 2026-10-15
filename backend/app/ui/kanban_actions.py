@@ -70,13 +70,24 @@ def _to_date(v: str | None) -> date | None:
     s = _clean_str(v)
     if s is None:
         return None
-    return date.fromisoformat(s)
+    try:
+        return date.fromisoformat(s)
+    except ValueError:
+        # Convergence Phase 4: a malformed form value is a typed 422, never a 500.
+        raise HTTPException(status_code=422, detail={
+            "code": "VALIDATION_FAILED", "reason": "INVALID_DATE",
+            "message": "La fecha no tiene un formato válido (AAAA-MM-DD)."})
 
 def _to_time(v: str | None) -> time | None:
     s = _clean_str(v)
     if s is None:
         return None
-    return time.fromisoformat(s)
+    try:
+        return time.fromisoformat(s)
+    except ValueError:
+        raise HTTPException(status_code=422, detail={
+            "code": "VALIDATION_FAILED", "reason": "INVALID_TIME",
+            "message": "La hora no tiene un formato válido (HH:MM)."})
 
 
 def _utcnow() -> datetime:
@@ -483,19 +494,59 @@ def ui_commit_delete(
         lead_id = int(item.get("lead_id"))
         lead = db.get(Lead, lead_id)
         if lead:
+            revs = db.execute(select(Revision).where(Revision.lead_id == lead_id)
+                              .order_by(Revision.id)).scalars().all()
+            refused = _cancel_occupying_before_delete(db, revs)
+            if refused is not None:
+                return refused
             db.query(Revision).filter(Revision.lead_id == lead_id).delete(synchronize_session=False)
-            db.delete(lead)
+            db.delete(db.get(Lead, lead_id))
             db.commit()
     elif kind == "revision":
         rev_id = int(item.get("revision_id"))
         rev = db.get(Revision, rev_id)
         if rev:
-            db.delete(rev)
+            refused = _cancel_occupying_before_delete(db, [rev])
+            if refused is not None:
+                return refused
+            db.delete(db.get(Revision, rev_id))
             db.commit()
     else:
         return JSONResponse({"ok": True, "committed": False, "state": "unsupported_type"})
 
     return JSONResponse({"ok": True, "committed": True})
+
+
+def _cancel_occupying_before_delete(db: Session, revisions) -> JSONResponse | None:
+    """Convergence Phase 4: deleting a revision that OCCUPIES the agenda is a cancellation,
+    and a cancellation belongs to the booking authority. Each occupying revision is first
+    CANCELLED through `BookingAuthority` (typed CANCEL command, durable form key derived from
+    the revision and the booking version it was deleted at — so a retried delete replays);
+    only then is the row removed, as before. A refusal deletes nothing and answers a typed
+    409 with the authority's code. Non-occupying rows are deleted as before."""
+    from ..services import booking_representation as br
+    from ..services.booking_attempt_events import outcome_for, record_attempt_event
+    for rev in revisions:
+        if not br.is_occupying(rev.turno_fecha, rev.turno_hora, rev.estado_revision):
+            continue
+        command = command_for_edit(
+            rev, source=BookingSource.CRM, new_date=rev.turno_fecha, new_time=rev.turno_hora,
+            new_status="CANCELADO", new_profesional_id=None,
+            expected_version=int(rev.booking_version), actor="crm-delete")
+        result = BookingAuthority(db).execute(command)
+        if not result.ok:
+            record_attempt_event(db, source="CRM", stage="AUTHORITY",
+                                 outcome=outcome_for(result.outcome),
+                                 reason=result.reason or result.outcome.value,
+                                 command_key=command.idempotency_key,
+                                 attempt_ref=command.idempotency_key, revision_id=rev.id)
+            return JSONResponse(status_code=_CRM_REFUSAL_STATUS.get(result.outcome.value, 409),
+                                content={"ok": False, "committed": False,
+                                         "state": "booking_refused",
+                                         "code": result.outcome.value,
+                                         "reason": result.reason,
+                                         "message": result.message})
+    return None
 
 
 def _render_booking_refusal(db: Session, lead_id: int, result, requested_day):
@@ -700,12 +751,32 @@ def ui_revision_latest_update(
     if command is None:
         db.commit()                     # nothing booking-related changed
         return RedirectResponse(url="/kanban", status_code=303)
+    from ..services.booking_attempt_events import outcome_for, record_attempt_event
+    if command.idempotency_key is None:
+        # Convergence Phase 4 (CP1-02): the form carried no booking version, so this change
+        # has no stable identity. Refused — nothing is written — rather than run unkeyed.
+        import dataclasses
+        from ..services.booking_authority import BookingOutcome, refuse
+        db.rollback()
+        record_attempt_event(db, source="CRM", stage="PRE_EXECUTE", outcome="REFUSED",
+                             reason="BOOKING_VERSION_REQUIRED",
+                             attempt_ref=f"crm:lead{lead_id}:rev{latest.id}:noversion",
+                             revision_id=latest.id)
+        stale = dataclasses.replace(
+            refuse(BookingOutcome.VALIDATION_FAILED, "BOOKING_VERSION_REQUIRED"),
+            message="La ficha no trae la versión del turno. Recargala y volvé a guardar.")
+        return _render_booking_refusal(db, lead_id, stale, None)
 
     # One transaction: the non-booking edits above and the booking change commit together,
     # or — on any refusal — neither does and the original booking is left exactly as it was.
     result = BookingAuthority(db).execute(command)
     if result.ok:
         return RedirectResponse(url="/kanban", status_code=303)
+    record_attempt_event(db, source="CRM", stage="AUTHORITY",
+                         outcome=outcome_for(result.outcome),
+                         reason=result.reason or result.outcome.value,
+                         command_key=command.idempotency_key,
+                         attempt_ref=command.idempotency_key, revision_id=latest.id)
     return _render_booking_refusal(db, lead_id, result, new_turno_fecha)
 
 

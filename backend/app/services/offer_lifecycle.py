@@ -523,12 +523,16 @@ class OfferLifecycle:
 
     # ── transitions ──────────────────────────────────────────────────────────
 
-    def _terminalise(self, thread_id: int, *, status: str, reason: str) -> int:
+    def _terminalise(self, thread_id: int, *, status: str, reason: str,
+                     offer_id: Optional[int] = None) -> int:
         """Move every LIVE offer of this thread to a terminal status. Conditional on
         'ISSUED', so it is idempotent and cannot re-terminalise history.
 
         S1. Resource 1 first. Every terminal transition — withdraw, supersede, expire —
         funnels through here, so one acquisition covers all of them.
+
+        Convergence Phase 4: `offer_id` narrows it to ONE offer. A refusal terminalises the
+        offer it examined and nothing else — never a replacement issued in the meantime.
         """
         from ..models import WhatsAppBookingOffer as O
         self._require_thread_state(thread_id)
@@ -537,10 +541,12 @@ class OfferLifecycle:
         # principle, and a bound is what turns "impossible" into "cannot hang" if some
         # future writer ever reaches the offer table another way.
         with self._bounded_lock_wait(DEFAULT_OFFER_LOCK_TIMEOUT_MS):
+            stmt = (update(O).where(O.thread_id == thread_id)
+                    .where(O.status == OfferStatus.ISSUED))
+            if offer_id is not None:
+                stmt = stmt.where(O.id == int(offer_id))
             res = self.db.execute(
-                update(O).where(O.thread_id == thread_id)
-                .where(O.status == OfferStatus.ISSUED)
-                .values(status=status, terminal_at=now, terminal_reason=reason[:64])
+                stmt.values(status=status, terminal_at=now, terminal_reason=reason[:64])
                 .execution_options(synchronize_session="fetch"))
         return int(res.rowcount or 0)
 
@@ -792,6 +798,8 @@ class OfferLifecycle:
                 self.db.execute(
                     text("SELECT 1 FROM whatsapp_thread_states WHERE thread_id = :t "
                          "FOR NO KEY UPDATE").bindparams(t=int(thread_id)))
+            from .flush_order import note_thread_states_locked
+            note_thread_states_locked(self.db, [thread_id])
             return None
         except Exception as exc:
             sqlstate = self.contention_sqlstate(exc)
@@ -831,6 +839,8 @@ class OfferLifecycle:
                 self.db.execute(
                     text("SELECT 1 FROM whatsapp_thread_states WHERE thread_id = :t "
                          "FOR NO KEY UPDATE").bindparams(t=int(thread_id)))
+            from .flush_order import note_thread_states_locked
+            note_thread_states_locked(self.db, [thread_id])
             return None
         except Exception as exc:
             sqlstate = self.contention_sqlstate(exc)
@@ -950,8 +960,9 @@ class OfferLifecycle:
 
     def _claim_checks(self, state, *, thread_id: int, token: Optional[str],
                       candidate_id=None, tipo_vehiculo=None, zone_group=None,
-                      zone_detail=None, cycle_key=None,
-                      lock: bool = True) -> "tuple[Optional[OfferClaim], object]":
+                      zone_detail=None, cycle_key=None, lock: bool = True,
+                      lock_timeout_ms: int = DEFAULT_OFFER_LOCK_TIMEOUT_MS
+                      ) -> "tuple[Optional[OfferClaim], object]":
         """Every reason to refuse except losing the race. `(refusal_or_None, offer)`.
 
         Shared by `verify_bindings()` (read-only, `lock=False`, run BEFORE availability
@@ -966,7 +977,7 @@ class OfferLifecycle:
         # S1. Resource 1 before resource 2, for callers that did not enter through
         # `begin_offer_transaction()`. Free for callers that did: taking the same row lock
         # twice inside one transaction costs nothing.
-        _blocked = self._acquire_thread_state(thread_id)
+        _blocked = self._acquire_thread_state(thread_id, lock_timeout_ms=lock_timeout_ms)
         if _blocked is not None:
             return (OfferClaim(False, _blocked, fingerprint=fp), None)
 
@@ -981,7 +992,7 @@ class OfferLifecycle:
         try:
             # R3A: step 2 carries its OWN bound, because step 1 no longer leaves one
             # standing for the rest of the transaction.
-            with self._bounded_lock_wait(DEFAULT_OFFER_LOCK_TIMEOUT_MS):
+            with self._bounded_lock_wait(lock_timeout_ms):
                 offer = self.db.execute(stmt).scalars().first()
         except Exception as exc:
             # Step 2 of OFFER_LOCK_ORDER. With the order enforced this is a bounded WAIT
@@ -1022,7 +1033,7 @@ class OfferLifecycle:
         expires = self._aware(offer.expires_at)
         if expires is not None and self._now() > expires:
             self._terminalise(thread_id, status=OfferStatus.EXPIRED,
-                              reason=OfferRefusal.OFFER_EXPIRED)
+                              reason=OfferRefusal.OFFER_EXPIRED, offer_id=offer.id)
             self._clear_mirror(state)
             return (self._refuse(offer, OfferRefusal.OFFER_EXPIRED, fp,
                                  status=OfferStatus.EXPIRED), offer)
@@ -1048,7 +1059,7 @@ class OfferLifecycle:
         # binding that is never evaluated is a false assurance.
         if cycle_key is not None and int(offer.cycle_key or 0) != int(cycle_key):
             self._terminalise(thread_id, status=OfferStatus.WITHDRAWN,
-                              reason=OfferRefusal.OFFER_CYCLE_CHANGED)
+                              reason=OfferRefusal.OFFER_CYCLE_CHANGED, offer_id=offer.id)
             self._clear_mirror(state)
             return (self._refuse(offer, OfferRefusal.OFFER_CYCLE_CHANGED, fp,
                                  status=OfferStatus.WITHDRAWN), offer)
@@ -1061,7 +1072,7 @@ class OfferLifecycle:
         # own authority; nothing here reads customer prose, model wording or an alias.
         if offer.tipo_vehiculo != tipo_vehiculo:
             self._terminalise(thread_id, status=OfferStatus.WITHDRAWN,
-                              reason=OfferRefusal.OFFER_VEHICLE_CATEGORY_CHANGED)
+                              reason=OfferRefusal.OFFER_VEHICLE_CATEGORY_CHANGED, offer_id=offer.id)
             self._clear_mirror(state)
             return (self._refuse(offer, OfferRefusal.OFFER_VEHICLE_CATEGORY_CHANGED, fp,
                                  status=OfferStatus.WITHDRAWN), offer)
@@ -1069,7 +1080,7 @@ class OfferLifecycle:
         # the harm A2 produced. Refuse rather than book something with no price basis.
         if tipo_vehiculo is None:
             self._terminalise(thread_id, status=OfferStatus.WITHDRAWN,
-                              reason=OfferRefusal.OFFER_VEHICLE_CATEGORY_UNRESOLVED)
+                              reason=OfferRefusal.OFFER_VEHICLE_CATEGORY_UNRESOLVED, offer_id=offer.id)
             self._clear_mirror(state)
             return (self._refuse(offer, OfferRefusal.OFFER_VEHICLE_CATEGORY_UNRESOLVED, fp,
                                  status=OfferStatus.WITHDRAWN), offer)

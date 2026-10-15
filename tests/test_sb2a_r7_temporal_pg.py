@@ -181,12 +181,16 @@ class R7Postgres(unittest.TestCase):
             app.dependency_overrides[get_db] = lambda: s
             app.dependency_overrides[api.get_db] = lambda: s
             c = TestClient(app, raise_server_exceptions=False)
+            # Convergence Phase 4 adaptation (CP1-02): both requests carry a durable key, so the
+            # offset-time refusal under test is reached (an unkeyed booking command is a 428).
             bad = c.post(f"/leads/{self.lead_id}/revisions",
-                         json={"turno_fecha": D.isoformat(), "turno_hora": "11:00:00-03:00"})
+                         json={"turno_fecha": D.isoformat(), "turno_hora": "11:00:00-03:00"},
+                         headers={"Idempotency-Key": "r7pg-07-bad"})
             self.assertEqual(bad.status_code, 422, bad.text)
             self.assertNotIn("DB_42883", bad.text)
             ok = c.post(f"/leads/{self.lead_id}/revisions",
-                        json={"turno_fecha": D.isoformat(), "turno_hora": "11:00:00"})
+                        json={"turno_fecha": D.isoformat(), "turno_hora": "11:00:00"},
+                        headers={"Idempotency-Key": "r7pg-07-ok"})
             self.assertEqual(ok.status_code, 200, ok.text)
         finally:
             s.close()

@@ -343,16 +343,24 @@ class R7_Callers(unittest.TestCase):
         app.dependency_overrides[get_db] = lambda: db
         app.dependency_overrides[api.get_db] = lambda: db
         c = TestClient(app, raise_server_exceptions=False)
-        for body in ({"turno_fecha": D.isoformat(), "turno_hora": "11:00:00-03:00"},           # booking path
-                     {"turno_hora": "11:00:00Z"},                                             # partial: direct path
-                     {"turno_fecha": D.isoformat(), "turno_hora": "11:00:00+00:00",
-                      "estado_revision": "CANCELADO"}):                                       # non-occupying
-            r = c.post(f"/leads/{lead.id}/revisions", json=body)
+        # Convergence Phase 4 adaptation (CP1-02): every request carries an Idempotency-Key —
+        # an unkeyed booking command is now refused 428 before the temporal check this test
+        # is about. The invariant (an offset time is a 422 on every path, nothing shifted or
+        # written) is asserted unchanged.
+        for i, body in enumerate((
+                {"turno_fecha": D.isoformat(), "turno_hora": "11:00:00-03:00"},           # booking path
+                {"turno_hora": "11:00:00Z"},                                             # partial: direct path
+                {"turno_fecha": D.isoformat(), "turno_hora": "11:00:00+00:00",
+                 "estado_revision": "CANCELADO"})):                                       # non-occupying
+            r = c.post(f"/leads/{lead.id}/revisions", json=body,
+                       headers={"Idempotency-Key": f"r7-12-offset-{i}"})
             self.assertEqual(r.status_code, 422, (body, r.text))
             self.assertIn("turno_hora", r.text)
-        ok = c.post(f"/leads/{lead.id}/revisions", json={"turno_fecha": D.isoformat(), "turno_hora": "11:00:00"})
+        ok = c.post(f"/leads/{lead.id}/revisions", json={"turno_fecha": D.isoformat(), "turno_hora": "11:00:00"},
+                    headers={"Idempotency-Key": "r7-12-ok"})
         self.assertEqual(ok.status_code, 200, ok.text)
-        r = c.patch(f"/leads/{lead.id}/revisions/latest", json={"turno_hora": "12:00:00-03:00"})
+        r = c.patch(f"/leads/{lead.id}/revisions/latest", json={"turno_hora": "12:00:00-03:00"},
+                    headers={"Idempotency-Key": "r7-12-patch"})
         self.assertEqual(r.status_code, 422, r.text)
         db.expire_all()
         self.assertEqual(db.query(Revision).one().turno_hora, time(11))

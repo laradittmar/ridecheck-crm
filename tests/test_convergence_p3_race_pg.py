@@ -487,9 +487,16 @@ class P3R_Contention(_Race):
                          (None, False, "CONSULTA_NUEVA", w.token))
         self.assertEqual(f["offers"][0][0], "ISSUED")
         self.assertEqual(m.sent, [])
-        # Phase 4 dimension: no durable attempt event is claimed — there is no such table.
+        # Convergence Phase 4 adaptation. OLD: "no durable attempt event is claimed — there is
+        # no such table" (Phase 3 recorded this dimension as Phase 4). NEW: the contention IS
+        # durable, as exactly one RETRYABLE authority-stage event — and still nothing else was
+        # written (asserted above). WHY: Phase 4 built the table. PROOF: absent on the parent.
         with self.engine.connect() as c:
-            self.assertIsNone(c.execute(text("SELECT to_regclass('booking_attempt_events')")).scalar())
+            evs = c.execute(text("SELECT source, stage, outcome, reason FROM "
+                                 "booking_attempt_events WHERE hist_thread_id = :t"),
+                            {"t": w.thread_id}).all()
+        self.assertEqual([tuple(e) for e in evs], [("CONVERSATION_ENGINE", "AUTHORITY",
+                                                    "RETRYABLE", "THREAD_STATE_CONTENDED")])
         with H.Meta() as m2:
             out2 = self.ce(w)()                                  # after release
         self.assertEqual(out2.action, "booking_created")

@@ -137,6 +137,8 @@ def _post_n8n_event(webhook_url: str, payload: dict[str, object]) -> None:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
+    from ..services.booking_authority import forbid_external_io  # convergence Phase 4 (P2R-05)
+    forbid_external_io("n8n_webhook")
     with urllib_request.urlopen(req, timeout=3) as response:
         status_code = getattr(response, "status", response.getcode())
         if not 200 <= status_code < 300:

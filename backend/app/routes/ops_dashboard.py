@@ -1031,8 +1031,14 @@ _BOOKING_RECOVERY = {
     "ACK_DUPLICATE_RISK": "OPERATOR_REVIEW",
     "ACK_HELD": "OPERATOR_REVIEW",
     "IDENTITY_CONFLICT": "OPERATOR_REVIEW",
+    # Convergence Phase 4 (SB2B-RV-04): the booking stands; the team was not told by e-mail.
+    "OPERATOR_NOTIFICATION_PENDING": "NOTIFY_TEAM_MANUALLY",
+    "OPERATOR_NOTIFICATION_FAILED": "NOTIFY_TEAM_MANUALLY",
 }
-_RECOVERY_RANK = ("OPERATOR_REVIEW", "STORED_INBOUND_REPLAY", "LEDGER_ACK_RECOVERY")
+_RECOVERY_RANK = ("OPERATOR_REVIEW", "STORED_INBOUND_REPLAY", "LEDGER_ACK_RECOVERY",
+                  "NOTIFY_TEAM_MANUALLY")
+#: Customer booking sources whose committed booking is owed an operator e-mail.
+_NOTIFIED_SOURCES = ("CONVERSATION_ENGINE", "WHATSAPP_FLOW")
 
 
 def _inbound_correlation(wamid: str) -> str:
@@ -1069,6 +1075,17 @@ def booking_attention(db: Session, *, now: Optional[datetime] = None,
     IN_FLIGHT or HELD), `ack_attempts`, and `ack_identity` — a 20-character prefix of the
     command-bound delivery identity, whose per-attempt fingerprints are the outbound rows'
     `content_fingerprint` (`/security/outbound-ledger?fingerprint=`).
+
+    Convergence Phase 4 (SB2B-RV-04) — the OPERATOR notification (the team's booking e-mail),
+    kept distinct from the customer acknowledgement above. Every customer booking row also
+    states `notification_state`: SENT (`thread_revisions.notification_sent_at` — a column the
+    application adds at start-up, read here only where it exists), FAILED or
+    HELD (a `booking_attempt_events` NOTIFICATION row: send failed / not configured), or
+    PENDING (no e-mail recorded — a Data Exchange booking, or one whose sender died); with
+    `notification_attempts`, `notification_last_reason` and `notification_next_action`. A
+    committed customer booking whose e-mail is not SENT once `pending_older_than_seconds` has
+    passed is listed with `OPERATOR_NOTIFICATION_PENDING` / `_FAILED`. The next action is to
+    tell the team by hand: the booking itself stands and is never recreated from here.
 
     `CE_SYNC_INCOMPLETE` is detectable for Conversation-Engine rows only: their
     `correlation_id` names the causal inbound (`in:<sha256>`), so the inbound's `ai_event`
@@ -1115,6 +1132,8 @@ def booking_attention(db: Session, *, now: Optional[datetime] = None,
         row = rows.setdefault(r.id, {**dict(r._mapping), "reasons": []})
         row["reasons"].append("CE_SYNC_INCOMPLETE")
 
+    notification = _notification_truth(db, now=now, settled=settled, rows=rows)
+
     out = []
     for r in sorted(rows.values(), key=lambda x: x["id"]):
         kind, _, digest = (r.get("idempotency_key") or "").partition(":")
@@ -1149,11 +1168,77 @@ def booking_attention(db: Session, *, now: Optional[datetime] = None,
             "ack_error_category": r.get("ack_last_error"),
             "ack_transport_tail": transport[-6:] if transport else None,
             "identity_outcome": r.get("identity_outcome"),
+            **notification.get(r["id"], _NO_NOTIFICATION),
             "reasons": list(r["reasons"]),
             "recovery": next(x for x in _RECOVERY_RANK if x in recoveries),
             "thread_url": (f"/whatsapp/thread/{r['thread_id']}"
                            if r.get("thread_id") is not None else None),
         })
+    return out
+
+
+_NO_NOTIFICATION = {"notification_state": "NOT_APPLICABLE", "notification_attempts": 0,
+                    "notification_last_reason": None, "notification_next_action": None}
+
+
+def _notification_truth(db: Session, *, now: datetime, settled: datetime, rows: dict) -> dict:
+    """SB2B-RV-04: the operator e-mail state of every customer booking in the lookback, read
+    from durable fields only (no write). Adds an OPERATOR_NOTIFICATION_* reason, and the row,
+    to `rows` when a settled booking's e-mail is not SENT. Returns {ledger id: fields}."""
+    from sqlalchemy import bindparam, inspect as _inspect, text as _text
+    from ..models import BookingAttemptEvent as E
+    from ..models import BookingCommandRecord as R
+    booked = db.execute(
+        select(R.id, R.idempotency_key, R.source, R.operation, R.revision_id,
+               R.thread_revision_id, R.thread_id, R.lead_id, R.occupying, R.committed_at,
+               R.correlation_id, R.ack_status, R.ack_attempts, R.ack_duplicate_risk,
+               R.ack_last_error, R.ack_transport_id, R.identity_outcome,
+               R.ack_lease_expires_at)
+        .where(R.command_state == "COMMITTED", R.occupying.is_(True),
+               R.source.in_(_NOTIFIED_SOURCES), R.thread_revision_id.is_not(None),
+               R.committed_at >= now - timedelta(days=BOOKING_SYNC_LOOKBACK_DAYS))
+    ).all()
+    if not booked:
+        return {}
+    sent: set = set()
+    try:
+        cols = {c["name"] for c in _inspect(db.get_bind()).get_columns("thread_revisions")}
+    except Exception:
+        cols = set()
+    if "notification_sent_at" in cols:
+        sent = set(db.execute(
+            _text("SELECT id FROM thread_revisions WHERE notification_sent_at IS NOT NULL "
+                  "AND id IN :ids").bindparams(bindparam("ids", expanding=True)),
+            {"ids": [b.thread_revision_id for b in booked]}).scalars().all())
+    evidence: dict[int, list] = {}
+    for ev in db.execute(select(E.hist_thread_revision_id, E.outcome, E.reason, E.occurred_at)
+                         .where(E.stage == "NOTIFICATION",
+                                E.hist_thread_revision_id.in_(
+                                    [b.thread_revision_id for b in booked]))
+                         .order_by(E.occurred_at, E.id)).all():
+        evidence.setdefault(ev.hist_thread_revision_id, []).append(ev)
+    out = {}
+    for b in booked:
+        evs = evidence.get(b.thread_revision_id, [])
+        if b.thread_revision_id in sent:
+            state = "SENT"
+        elif evs:
+            state = "FAILED" if any(e.outcome == "FAILED" for e in evs) else "HELD"
+        else:
+            state = "PENDING"
+        out[b.id] = {
+            "notification_state": state,
+            "notification_attempts": len(evs) + (1 if state == "SENT" else 0),
+            "notification_last_reason": evs[-1].reason if evs else None,
+            "notification_next_action": (None if state == "SENT" else "NOTIFY_TEAM_MANUALLY"),
+        }
+        committed = b.committed_at
+        if committed is not None and committed.tzinfo is None:
+            committed = committed.replace(tzinfo=timezone.utc)
+        if state != "SENT" and (state == "FAILED" or committed is None or committed <= settled):
+            row = rows.setdefault(b.id, {**dict(b._mapping), "reasons": []})
+            row["reasons"].append("OPERATOR_NOTIFICATION_FAILED" if state == "FAILED"
+                                  else "OPERATOR_NOTIFICATION_PENDING")
     return out
 
 
@@ -1163,7 +1248,8 @@ def get_booking_attention(
     _operator: str = Depends(require_crm_session),
 ) -> dict:
     """Booking ledger rows needing a person: stale or failed acknowledgements, ambiguous
-    transport, duplicate risk, identity conflicts and CE synchronizations that never
-    finished. Read-only, behind the same signed CRM session as `/control`."""
+    transport, duplicate risk, identity conflicts, CE synchronizations that never finished,
+    and (convergence Phase 4) committed customer bookings whose operator e-mail was not sent.
+    Read-only, behind the same signed CRM session as `/control`."""
     rows = booking_attention(db)
     return {"count": len(rows), "rows": rows}

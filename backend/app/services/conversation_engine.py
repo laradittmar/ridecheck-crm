@@ -4177,17 +4177,50 @@ class ConversationEngine:
         self._sb_note(lookup_hit=True)
         return self._sb_finish_committed(ctx, hit, replayed=True)
 
-    def _sb_refusal(self, ctx, key, *, reason: str, outcome: str,
-                    manual=None) -> ConversationHandleOut:
+    def _sb_refusal(self, ctx, key, *, reason: str, outcome: str, manual=None,
+                    token=None, finalise: bool = True, **bindings) -> ConversationHandleOut:
         """Every terminal non-booking answer goes through here: the ledger is re-read FIRST
         (SB2B-RV-01). A hit — a concurrent writer committed this very submission — completes
-        as a replay; only a miss becomes the truthful handoff."""
+        as a replay; only a miss becomes the truthful handoff.
+
+        Convergence Phase 4 (P2R-10): on a miss the refusal is made DURABLE before the
+        handoff — on its offer by the canonical finaliser (`booking_refusal`, its own session,
+        K1 then K2), or, for a refusal that concerns no offer (the OFF switch, the guard), as
+        a pre-execute attempt event. Neither changes the customer outcome decided here."""
         hit = self._sb_ledger_hit(key)
         if hit is not None:
             self._sb_note(lookup_hit=True)
             return self._sb_finish_committed(ctx, hit, replayed=True)
+        self._sb_refusal_evidence(ctx, key, reason=reason, token=token, finalise=finalise,
+                                stage="PRE_EXECUTE" if outcome == "NOT_ATTEMPTED"
+                                else "AUTHORITY", **bindings)
         return self._sb_handoff(ctx, action=self.SB_ACTION_REFUSED, reason=reason,
                                 outcome=outcome, manual=manual)
+
+    def _sb_refusal_evidence(self, ctx, key, *, reason: str, token=None, finalise: bool = True,
+                           stage: str = "PRE_EXECUTE", outcome: str = "REFUSED",
+                           **bindings) -> None:
+        """P2R-10: the durable evidence of a refused Flow submission. Never raises."""
+        from .booking_attempt_events import record_attempt_event
+        from .booking_refusal import finalise_offer_refusal
+        tid = int(ctx.thread.id)
+        attempt = getattr(ctx, "inbound_wa_message_id", None)
+        try:
+            if finalise and type(token) is str and token.strip():
+                # A turn that already holds the thread state (the cycle reset ran in this
+                # transaction) finalises inside it; otherwise in the finaliser's own session.
+                fin = finalise_offer_refusal(
+                    self.db, source="CONVERSATION_ENGINE", thread_id=tid, token=token,
+                    observed_reason=reason, attempt_ref=attempt, command_key=key,
+                    in_caller_transaction=not self._sb_transaction_clean(), **bindings)
+                self._sb_note(refusal_finalised=fin.finalised, refusal_reason=fin.reason)
+            else:
+                record_attempt_event(self.db, source="CONVERSATION_ENGINE", stage=stage,
+                                     outcome=outcome, reason=reason, command_key=key,
+                                     attempt_ref=attempt, thread_id=tid)
+        except Exception as exc:                 # evidence never changes the outcome
+            logger.error("SB2B refusal evidence failed thread_id=%s: %s", tid,
+                         type(exc).__name__)
 
     def _sb_transient(self, ctx, result) -> ConversationHandleOut:
         """CD-04 → Track A's contention contract. A RETRYABLE authority result (K1/K2
@@ -4235,14 +4268,14 @@ class ConversationEngine:
         # §13: OFF means no automatic booking writer is reachable — never the old one.
         if not self._smart_booking_ce_on():
             return self._sb_refusal(ctx, key, reason="SMART_BOOKING_DISABLED",
-                                    outcome="NOT_ATTEMPTED")
+                                    outcome="NOT_ATTEMPTED", finalise=False)
 
         # The transport mirror can REFUSE, never permit (SB2B; the Data Exchange endpoint's
         # `resolve_context` asks the same): a token the thread no longer holds books nothing.
         expected = (state.flow_booking_token or "").strip() or None
         if submitted is not None and submitted != expected:
             return self._sb_refusal(ctx, key, reason="FLOW_TOKEN_NOT_ACTIVE",
-                                    outcome="NOT_ATTEMPTED")
+                                    outcome="NOT_ATTEMPTED", token=submitted)
 
         # ── admission, as a READ: does the token match an ISSUED offer for this thread? ──
         # The offer table is the admission authority, not the transport mirror (G3-7R/S2).
@@ -4252,22 +4285,30 @@ class ConversationEngine:
         self._turn_offer_admission = adm
         if not adm.granted:
             reason = adm.refusal or OfferRefusal.OFFER_ALREADY_ACCEPTED
-            return self._sb_refusal(ctx, key, reason=reason, outcome="NOT_ATTEMPTED")
+            return self._sb_refusal(ctx, key, reason=reason, outcome="NOT_ATTEMPTED",
+                                    token=submitted)
         # The offer-bound candidate (S3), never `_focus_candidate`; it must be committed,
         # because the authority reads in its own session.
         focus = self._offer_bound_candidate(ctx, adm)
         if focus is None or not self._sb_row_committed(WhatsAppThreadCandidate, focus.id):
             return self._sb_refusal(ctx, key, reason=OfferRefusal.OFFER_CANDIDATE_CHANGED,
-                                    outcome="NOT_ATTEMPTED")
+                                    outcome="NOT_ATTEMPTED", token=submitted,
+                                    candidate_id=None)
         sched_date, sched_time = self._submitted_booking_slot(state)
         if sched_date is None or sched_time is None:
             return self._sb_refusal(ctx, key, reason=OfferRefusal.NO_SUBMITTED_SLOT,
-                                    outcome="NOT_ATTEMPTED")
+                                    outcome="NOT_ATTEMPTED", token=submitted,
+                                    candidate_id=int(focus.id),
+                                    tipo_vehiculo=focus.tipo_vehiculo,
+                                    cycle_key=int(self._clarification_cycle_key(state)))
         # P2-04: the canonical location of the OFFER-BOUND candidate, by CE's own precedence.
         zone_group, zone_detail = self._inspection_location_for(focus, state)
         if not zone_group and not zone_detail:
             return self._sb_refusal(ctx, key, reason=OfferRefusal.NO_CANONICAL_LOCATION,
-                                    outcome="NOT_ATTEMPTED")
+                                    outcome="NOT_ATTEMPTED", token=submitted,
+                                    candidate_id=int(focus.id),
+                                    tipo_vehiculo=focus.tipo_vehiculo,
+                                    cycle_key=int(self._clarification_cycle_key(state)))
 
         # Inputs — the fields the Flow submitted, as typed data only.
         is_website = getattr(state, "is_website_lead", False)
@@ -4327,7 +4368,7 @@ class ConversationEngine:
         # B-3, immediately before delegation: CE has written nothing and holds no lock.
         if not self._sb_transaction_clean():
             return self._sb_refusal(ctx, key, reason="CE_TRANSACTION_NOT_CLEAN",
-                                    outcome="NOT_ATTEMPTED")
+                                    outcome="NOT_ATTEMPTED", finalise=False)
         self._sb_note(authority_called=True)
         try:
             result = book_from_flow_response(self.db, req)
@@ -4348,7 +4389,26 @@ class ConversationEngine:
                 self._sb_note(lookup_hit=True)
                 return self._sb_finish_committed(ctx, hit, replayed=True)
             if result.outcome is BookingOutcome.RETRYABLE_FAILURE:
+                self._sb_refusal_evidence(ctx, key, reason=result.reason or "RETRYABLE",
+                                        finalise=False, stage="AUTHORITY",
+                                        outcome="RETRYABLE")
                 return self._sb_transient(ctx, result)
+            # P2R-10: a refusal of the offer or of its slot is made durable on that offer;
+            # any other failed outcome is recorded as authority-stage evidence.
+            if result.outcome in (BookingOutcome.OFFER_REFUSED, BookingOutcome.SLOT_CONFLICT,
+                                  BookingOutcome.CALENDAR_EXCEPTION):
+                self._sb_refusal_evidence(
+                    ctx, key, token=submitted, stage="AUTHORITY",
+                    reason=(result.reason if result.outcome is BookingOutcome.OFFER_REFUSED
+                            else result.outcome.value),
+                    candidate_id=int(focus.id), tipo_vehiculo=focus.tipo_vehiculo,
+                    zone_group=zone_group, zone_detail=zone_detail,
+                    cycle_key=acceptance.cycle_key)
+            else:
+                from .booking_attempt_events import outcome_for
+                self._sb_refusal_evidence(ctx, key, reason=result.reason or result.outcome.value,
+                                        finalise=False, stage="AUTHORITY",
+                                        outcome=outcome_for(result.outcome))
         if result.ok and result.occupying:
             out = self._sb_finish_committed(
                 ctx, result, replayed=result.outcome is BookingOutcome.IDEMPOTENT_REPLAY)
@@ -4622,6 +4682,19 @@ class ConversationEngine:
         except Exception as exc:
             logger.error("SB2B booking notification failed thread_id=%s: %s — booking stands",
                          ctx.thread.id, type(exc).__name__)
+            self._notification_evidence(result.thread_revision_id, result.revision_id,
+                                        outcome="FAILED", reason="NOTIFICATION_EXCEPTION")
+
+    def _notification_evidence(self, thread_rev_id, crm_rev_id, *, outcome: str,
+                               reason: str) -> None:
+        """Convergence Phase 4 (SB2B-RV-04): an operator booking e-mail that was not sent is
+        recorded durably (stage NOTIFICATION) so the operator surface can tell NOT SENT from
+        FAILED. Evidence only — after every commit, never touching the booking."""
+        from .booking_attempt_events import record_attempt_event
+        record_attempt_event(self.db, source="CONVERSATION_ENGINE", stage="NOTIFICATION",
+                             outcome=outcome, reason=reason,
+                             attempt_ref=f"operator-notification:tr{thread_rev_id}",
+                             revision_id=crm_rev_id, thread_revision_id=thread_rev_id)
 
     def _sb_escalation(self, ctx, state, last_message: str) -> ConversationHandleOut:
         """CE-W2 under Option B. CE already set the handoff (lead, state, token withdrawal)
@@ -14022,6 +14095,8 @@ Respondé SOLO con JSON válido:
         )
 
         try:
+            from .booking_authority import forbid_external_io  # convergence Phase 4 (P2R-05)
+            forbid_external_io("openai")
             with urlrequest.urlopen(req, timeout=30) as resp:
                 response_body = resp.read().decode("utf-8", errors="replace")
         except urlerror.HTTPError as exc:
@@ -15869,6 +15944,8 @@ Respondé SOLO con JSON válido:
         settings = self.settings
         if not settings.resend_api_key:
             logger.warning("M18 RESEND_API_KEY missing — booking notification skipped")
+            self._notification_evidence(thread_rev_id, crm_rev_id, outcome="HELD",
+                                        reason="NOTIFICATION_NOT_CONFIGURED")
             return
 
         try:
@@ -15938,3 +16015,5 @@ Respondé SOLO con JSON válido:
                 logger.warning("M18 could not mark notification_sent_at: %s", exc)
         else:
             logger.error("M18 notification send failed thread_rev=%s", thread_rev_id)
+            self._notification_evidence(thread_rev_id, crm_rev_id, outcome="FAILED",
+                                        reason="NOTIFICATION_SEND_FAILED")

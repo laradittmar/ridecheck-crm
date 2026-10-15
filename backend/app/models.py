@@ -694,6 +694,53 @@ class ThreadRevision(Base):
     )
 
 
+#: Convergence Phase 4 — the stage and outcome vocabularies of a booking-attempt event.
+BOOKING_ATTEMPT_STAGES = ("PRE_EXECUTE", "AUTHORITY", "FINALISE", "NOTIFICATION")
+BOOKING_ATTEMPT_OUTCOMES = ("REFUSED", "RETRYABLE", "CONTENDED", "INTERNAL", "FAILED", "HELD")
+
+
+class BookingAttemptEvent(Base):
+    """Convergence Phase 4 — durable, append-only EVIDENCE of a booking attempt that produced
+    no committed command (a refusal, a contention, an internal failure) and of an operator
+    notification that was not delivered. Never authority.
+
+    * No foreign key, by design: an FK to an offer would take `FOR KEY SHARE` on a row a
+      contender holds `FOR UPDATE` (the very wait this must not have), and an FK to any
+      business row would block a tester reset or a deletion. It survives both.
+    * The `hist_*` ids are HISTORICAL and NON-AUTHORITATIVE: scalar copies of what the
+      attempt referred to at the time, never joined for a decision, possibly reused later.
+    * Nothing here is a raw Flow token, a raw command key, a phone number, customer text, a
+      secret or a model payload: keys and attempt references are stored only as 16-hex
+      SHA-256 prefixes, reasons only as typed codes.
+    * Append-only: the application never updates or deletes a row (PostgreSQL enforces it
+      with a trigger). `event_uid` is the idempotency rule — see
+      `services.booking_attempt_events.event_uid`.
+    * Read by nobody on a decision path: not admission, replay, locking, pricing,
+      availability or any customer response.
+    """
+    __tablename__ = "booking_attempt_events"
+    __table_args__ = (
+        CheckConstraint("stage IN ('PRE_EXECUTE', 'AUTHORITY', 'FINALISE', 'NOTIFICATION')",
+                        name="ck_booking_attempt_events_stage"),
+        CheckConstraint("outcome IN ('REFUSED', 'RETRYABLE', 'CONTENDED', 'INTERNAL', "
+                        "'FAILED', 'HELD')", name="ck_booking_attempt_events_outcome"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True)
+    event_uid: Mapped[str] = mapped_column(String(40), nullable=False, unique=True)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    stage: Mapped[str] = mapped_column(String(16), nullable=False)
+    outcome: Mapped[str] = mapped_column(String(16), nullable=False)
+    reason: Mapped[str] = mapped_column(String(64), nullable=False)
+    command_key_hash: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    attempt_ref_hash: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    hist_thread_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    hist_offer_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    hist_revision_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    hist_thread_revision_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
 class WhatsAppMessage(Base):
     __tablename__ = "whatsapp_messages"
     __table_args__ = (
@@ -1118,4 +1165,15 @@ Index("uq_thread_revision_one_booking_per_offer", ThreadRevision.offer_id,
       sqlite_where=text("offer_id IS NOT NULL"))
 
 
+Index("ix_booking_attempt_events_occurred", BookingAttemptEvent.occurred_at)
+Index("ix_booking_attempt_events_thread", BookingAttemptEvent.hist_thread_id)
+Index("ix_booking_attempt_events_thread_revision", BookingAttemptEvent.hist_thread_revision_id)
+
 Index("ix_dedup_wa_kind_fp_created", WhatsAppOutboundDedup.wa_id, WhatsAppOutboundDedup.message_kind, WhatsAppOutboundDedup.content_fingerprint, WhatsAppOutboundDedup.created_at)
+
+
+# Convergence Phase 4 (CD-07): rule K-E — a thread state is taken before a lead, for every
+# Session (see `services.flush_order`).
+from .services.flush_order import install as _install_k_e  # noqa: E402
+
+_install_k_e()

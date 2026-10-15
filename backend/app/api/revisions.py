@@ -83,16 +83,20 @@ def create_revision(lead_id: int, payload: RevisionCreate, db: Session = Depends
         db.refresh(rev)
         return rev
 
+    key = _api_idempotency_key(idempotency_key)
+    if key is None:
+        # Convergence Phase 4 (CP1-02): a booking command is idempotent or not executed.
+        return _key_required(db, "POST", lead_id=lead_id)
     command = BookingCommand(
         operation=BookingOperation.CREATE, source=BookingSource.API,
-        idempotency_key=_api_idempotency_key(idempotency_key), lead_id=lead_id,
+        idempotency_key=key, lead_id=lead_id,
         requested_date=turno_fecha, requested_time=turno_hora, target_status=status,
         revision_fields=fields)
     # SB2A-R3: the price is a typed attachment the authority performs, not a callback.
     result = BookingAuthority(db).execute(
         command, attachments=BookingAttachmentPlan(price=PriceRecalculation()))
     if not result.ok:
-        return _refusal_response(result)
+        return _refusal_response(result, db=db, command=command)
     return db.get(Revision, result.revision_id)
 
 
@@ -160,10 +164,15 @@ def update_latest_revision(lead_id: int, payload: RevisionUpdate, db: Session = 
         commit_or_400(db, detail="No se pudo actualizar la revisión: revisá longitudes y valores permitidos")
         db.refresh(latest)
         return latest
+    if command.idempotency_key is None:
+        # Convergence Phase 4 (CP1-02): neither If-Match nor Idempotency-Key — there is no
+        # stable identity for this change, so it is refused rather than executed unkeyed.
+        db.rollback()
+        return _key_required(db, "PATCH", lead_id=lead_id, revision_id=latest.id)
 
     result = BookingAuthority(db).execute(command)
     if not result.ok:
-        return _refusal_response(result)
+        return _refusal_response(result, db=db, command=command)
     return db.get(Revision, result.revision_id)
 
 
@@ -180,7 +189,31 @@ _REFUSAL_STATUS = {
 }
 
 
-def _refusal_response(result) -> JSONResponse:
+def _key_required(db: Session, method: str, *, lead_id: int, revision_id=None) -> JSONResponse:
+    """CP1-02: a booking change without a durable identity is refused (428), never run with
+    `idempotency_key=None`. Recorded as pre-execute evidence."""
+    from ..services.booking_attempt_events import record_attempt_event
+    record_attempt_event(db, source="API", stage="PRE_EXECUTE", outcome="REFUSED",
+                         reason="IDEMPOTENCY_KEY_REQUIRED",
+                         attempt_ref=f"api:{method}:lead{lead_id}:rev{revision_id}",
+                         revision_id=revision_id)
+    return JSONResponse(status_code=428, content={"detail": {
+        "code": "IDEMPOTENCY_KEY_REQUIRED",
+        "message": ("Un cambio de turno necesita una identidad estable: enviá Idempotency-Key "
+                    "(o If-Match con la versión del turno al editar)."),
+        "retryable": False}})
+
+
+def _refusal_response(result, *, db: Session | None = None, command=None) -> JSONResponse:
+    if db is not None:
+        # Convergence Phase 4: the refused or failed command leaves durable evidence after
+        # the authority's rollback (the ledger records only what committed).
+        from ..services.booking_attempt_events import outcome_for, record_attempt_event
+        key = getattr(command, "idempotency_key", None)
+        record_attempt_event(db, source="API", stage="AUTHORITY",
+                             outcome=outcome_for(result.outcome),
+                             reason=result.reason or result.outcome.value, command_key=key,
+                             attempt_ref=key, revision_id=getattr(command, "revision_id", None))
     body = {"detail": {
         "code": result.outcome.value,
         "reason": result.reason,

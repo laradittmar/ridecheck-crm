@@ -350,7 +350,12 @@ _MESSAGES: dict[BookingOutcome, str] = {
     BookingOutcome.RETRYABLE_FAILURE: "La agenda está ocupada en este momento. Volvé a intentar.",
     BookingOutcome.INTERNAL_FAILURE: "No se pudo registrar el turno.",
     BookingOutcome.OFFER_REFUSED: "La propuesta de turno ya no es válida. Pedí un horario nuevo.",
-    BookingOutcome.COMMAND_DETACHED: "Este registro de turno fue anulado y ya no tiene efecto.",
+    # Convergence Phase 4 (P2R-02): truthful DETACHED wording — the command is kept only as
+    # history, the booking it produced was removed by a reset, and it can never be repeated.
+    BookingOutcome.COMMAND_DETACHED: ("Este pedido de turno quedó solo como historial: el turno "
+                                      "original fue eliminado en un reinicio y este pedido ya no "
+                                      "puede repetirse ni reactivarse. No hay un turno vigente "
+                                      "asociado."),
 }
 
 _OUTCOMES_OK = frozenset({BookingOutcome.COMMITTED, BookingOutcome.IDEMPOTENT_REPLAY})
@@ -564,8 +569,16 @@ def booking_transaction_active() -> Optional[str]:
 
 
 def forbid_external_io(channel: str) -> None:
-    """Called by external transports (the outbound gate). While a booking transaction is open
-    in this context nothing may leave the process — the booking may still roll back."""
+    """Called by external transports. While a booking transaction is open in this context
+    nothing may leave the process — the booking may still roll back.
+
+    Convergence Phase 4 (P2R-05): called immediately before the network call by the outbound
+    gate, the four raw Meta Graph senders, Meta media downloads, the four Resend e-mail
+    senders, the security-alert SMTP send, the n8n webhook post, and the OpenAI reply and
+    transcription calls. The ONE exception is the semantic interpreter's OpenAI call, whose
+    source is frozen by the semantic-stack scope lock; it runs only on an inbound turn before
+    any booking decision, never inside a booking transaction. It is cooperative: it governs code that
+    calls it, not a raw socket opened by code that does not."""
     if _TXN_SCOPE.get() is not None:
         raise ExternalIOInsideBookingTransaction(channel)
 
@@ -1608,6 +1621,10 @@ class BookingAuthority:
             raise
         if state is None:
             raise _Refused(_result(BookingOutcome.INTERNAL_FAILURE, "THREAD_STATE_UNAVAILABLE"))
+        # Convergence Phase 4 (K-E): K1 is held — the flush-order guard may let this
+        # transaction write the state after the lead (K8).
+        from .flush_order import note_thread_states_locked
+        note_thread_states_locked(self.db, [thread_id])
         return state
 
     def _db_now(self) -> datetime:

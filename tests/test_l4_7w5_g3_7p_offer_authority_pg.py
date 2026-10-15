@@ -1436,16 +1436,45 @@ class G7PR3TransactionDurability(G7POfferAuthorityPG):
                     token=token, day=day, hhmm=hhmm)
 
     def test_g7p_r3_09_the_ce_winner_leaves_the_dx_writer_a_typed_refusal(self):
+        # Convergence Phase 4 — CORRECTED ORACLE (the test was defective, not production).
+        # OLD: the DX loser raised BookingTokenError and the offer recorded
+        #      last_refusal = OFFER_CONTENDED (Track A's out-of-band contention recorder).
+        # NEW: the DX loser gets the RETRYABLE answer (BookingSlotConflictError carrying the
+        #      "try again in a few seconds" screen), the ACCEPTED offer carries NO refusal,
+        #      the contention is durable as a booking_attempt_events row (WHATSAPP_FLOW,
+        #      RETRYABLE, THREAD_STATE_CONTENDED), and a DX retry after the winner committed
+        #      returns SUCCESS from the ledger.
+        # WHY: both writers submit the SAME token, i.e. the SAME ledger command
+        #      (`flow_idempotency_key`): the loser is that booking a moment early, not a
+        #      refused one. BookingTokenError renders "Tu sesión de reserva expiró"
+        #      (routes/flow_data_exchange.py) — false for a booking that is about to commit.
+        #      An ACCEPTED offer that also says it was refused is the shape `record_replay`'s
+        #      docstring names a defect, and contention is not a refusal (the design audit
+        #      §9 rejects mutating the offer after a contended rollback; it prescribes this
+        #      oracle: the attempt event and the untouched offer row).
+        # PRESERVED: one booking, no deadlock, a typed (never 500) answer to the loser, and
+        #      durable evidence of the contention — now stronger, since the retry is proven.
+        from sqlalchemy import text as _sql
         r = self._run_contended("CE")
         self.assertEqual(self._counts(), (1, 1),
                          f"not exactly one booking: {r['out']}")
         self.assertNotIn("40P01", r["sqlstates"],
                          "the writers still deadlock — the lock order is not canonical")
-        self.assertEqual(r["out"]["B"], "EXC:BookingTokenError",
-                         "the loser did not get a typed domain outcome")
-        self.assertEqual(self._offer_row()["last_refusal"], "OFFER_CONTENDED",
-                         "the contention refusal was not recorded durably")
-        self.assertEqual(self._offer_row()["status"], "ACCEPTED")
+        self.assertEqual(r["out"]["B"], "EXC:BookingSlotConflictError",
+                         "the loser did not get the typed retryable outcome")
+        row = self._offer_row()
+        self.assertEqual((row["status"], row["last_refusal"], row["refused_count"]),
+                         ("ACCEPTED", None, 0),
+                         "contention must not be recorded as a refusal of the accepted offer")
+        with self.engine.connect() as c:
+            events = c.execute(_sql(
+                "SELECT source, stage, outcome, reason FROM booking_attempt_events "
+                "WHERE hist_thread_id = :t ORDER BY id"), {"t": self.thread_id}).all()
+        self.assertIn(("WHATSAPP_FLOW", "AUTHORITY", "RETRYABLE", "THREAD_STATE_CONTENDED"),
+                      [tuple(e) for e in events], "the contention left no durable evidence")
+        self.assertEqual(self._dx_confirm(r["token"], r["day"], r["hhmm"]), ("ok", "SUCCESS"),
+                         "the same command did not replay as the committed booking")
+        self.assertEqual(self._counts(), (1, 1))
 
     def test_g7p_r3_10_the_dx_winner_leaves_the_ce_turn_a_typed_outcome(self):
         """The interleaving the G3-7P review surfaced as `internal_error`."""
