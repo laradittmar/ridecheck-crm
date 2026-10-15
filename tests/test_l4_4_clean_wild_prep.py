@@ -141,7 +141,15 @@ class TestRuntimeReadinessInvariants(unittest.TestCase):
         self.assertIn(OutboundPathId.BOOKING_FLOW, AUTHORIZED_PATHS)
 
     def test_l44_08_no_text_only_booking_path(self):
+        # Convergence Phase 3 adaptation. OLD: Track A's in-session writer in the Conversation
+        # Engine (`_process_flow_response`) / Data Exchange (`handle_confirm_booking`) built the
+        # booked ThreadRevision and called `self._sched.check(...)` itself. NEW: both transports
+        # DELEGATE one typed command; `BookingAuthority` alone derives the "booked" status and
+        # revalidates the slot under its locks. WHY: the legacy writers are deleted (no third
+        # state where both are reachable). The invariant — one booking authority, reached only
+        # from the Flow path, never from text — is asserted on the code that now holds it.
         import inspect
+        from app.services.booking_authority import BookingAuthority
         from app.services.conversation_engine import ConversationEngine
         creators = []
         for name, member in inspect.getmembers(ConversationEngine, inspect.isfunction):
@@ -149,9 +157,13 @@ class TestRuntimeReadinessInvariants(unittest.TestCase):
                 src = inspect.getsource(member)
             except (OSError, TypeError):
                 continue
-            if 'ThreadRevision(' in src and 'status="booked"' in src:
+            if 'ThreadRevision(' in src or 'status="booked"' in src:
                 creators.append(name)
-        self.assertEqual(creators, ["_process_flow_response"])
+        self.assertEqual(creators, [], "no Conversation Engine method builds a booking row")
+        self.assertIn("book_from_flow_response(self.db, req)",
+                      inspect.getsource(ConversationEngine._converged_flow_book))
+        self.assertIn("ThreadRevision(", inspect.getsource(BookingAuthority._apply_attachments))
+        self.assertIn('"booked"', inspect.getsource(BookingAuthority._apply_attachments))
 
     def test_l44_09_ordered_scheduling_still_in_force(self):
         """The L4.3 semantics must survive the reset — Wild B depends on them."""

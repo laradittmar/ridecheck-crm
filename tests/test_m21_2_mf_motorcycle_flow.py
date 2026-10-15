@@ -353,11 +353,14 @@ class TestMF03FlowResponse(unittest.TestCase):
 class TestMF04OtherCallerUnchanged(unittest.TestCase):
 
     def setUp(self):
-        # G3-7P: MagicMock session — see `offer_fixture.start_offer_claim_stub`.
-        # This class asserts ROUTING (a booking token must not reach the moto
-        # handler and vice versa), not whether the offer is acceptable.
-        from offer_fixture import start_offer_claim_stub
-        start_offer_claim_stub(self)
+        # G3-7P: MagicMock session. This class asserts ROUTING (a booking token must not
+        # reach the moto handler and vice versa), not whether the offer is acceptable.
+        # Convergence Phase 3 adaptation: the booking handler is the converged path, which
+        # delegates to the booking authority — `start_converged_flow_stub` captures that
+        # delegation (and turns the flag on) instead of letting the deleted in-session
+        # writer run. The routing assertions are unchanged.
+        from offer_fixture import start_converged_flow_stub
+        self.booked = start_converged_flow_stub(self)
 
     def test_mf04_booking_response_routes_to_booking_handler(self):
         """MF04: Booking flow response (no moto-handoff token) routes to booking handler."""

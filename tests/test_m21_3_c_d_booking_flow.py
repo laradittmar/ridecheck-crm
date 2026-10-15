@@ -57,7 +57,8 @@ def _pragmas(conn, _rec):
 
 import app.models  # noqa: F401
 
-from offer_fixture import seed_live_offer  # noqa: E402
+from offer_fixture import (ensure_launch_professional, route_authority_availability,  # noqa: E402
+                           seed_live_offer)
 from app.models import (
     Lead,
     Revision,
@@ -98,6 +99,29 @@ def _wipe():
     with _engine.begin() as conn:
         for tbl in reversed(app.models.Base.metadata.sorted_tables):
             conn.execute(tbl.delete())
+
+
+# ── Convergence Phase 3 (adaptation, whole module) ────────────────────────────
+# `handle_confirm_booking` no longer books in the request session: it delegates to
+# `BookingAuthority`, which (a) is reachable only with SMART_BOOKING_CE_ENABLED on — the OFF
+# switch for both Flow transports — (b) books against the launch professional, and (c) runs
+# the availability check ITSELF, under its locks (B-7). So, for this module only:
+#   * the flag is ON (the Data Exchange reads it per request from `get_settings()`);
+#   * `_make_world` provisions a fixture launch professional;
+#   * `_mock_sched_valid` / `_mock_sched_invalid` control the AUTHORITY's availability reader
+#     as well as the service's own (screens still use `svc._sched`), so every test keeps
+#     deciding availability exactly as before.
+_MODULE_PATCHES = []
+
+
+def setUpModule():
+    from offer_fixture import start_converged_booking
+    _MODULE_PATCHES.extend(start_converged_booking())
+
+
+def tearDownModule():
+    from offer_fixture import stop_converged_booking
+    stop_converged_booking(_MODULE_PATCHES)
 
 
 def _fresh_db() -> Session:
@@ -144,7 +168,9 @@ def _make_world(db: Session) -> tuple[WhatsAppThread, WhatsAppThreadState, Whats
         needs_human=False,
     )
     db.add(state)
+    ensure_launch_professional(db)
     db.commit()
+    route_authority_availability(None)
     # G3-7P: a hand-set token is no longer an offer. Authority is
     # `whatsapp_booking_offers` and an absent row is a refusal, so a fixture that
     # wants a bookable offer issues one through the authority.
@@ -169,6 +195,7 @@ def _mock_sched_valid(svc: BookingFlowService, slots=None) -> None:
         business_hours="09:00-18:00",
         slots=slots,
     )
+    route_authority_availability(svc._sched)
     svc._sched.check.return_value = ScheduleCheckOut(
         valid=True,
         suggested_slots=slots,
@@ -186,6 +213,7 @@ def _mock_sched_invalid(svc: BookingFlowService) -> None:
         business_hours="09:00-18:00",
         slots=[],
     )
+    route_authority_availability(svc._sched)
     svc._sched.check.return_value = ScheduleCheckOut(
         valid=False,
         suggested_slots=[],
@@ -654,12 +682,16 @@ class TestBF18_AdvisoryLockSkipOnSQLite(unittest.TestCase):
         self.db.close()
 
     def test_bf18_lock_skip_does_not_raise(self):
-        """On SQLite, _acquire_advisory_lock catches the exception and proceeds."""
+        """Convergence Phase 3 adaptation. OLD: `_acquire_advisory_lock` (the one-argument
+        `pg_try_advisory_xact_lock(sha256(date)[:8])`) no-ops on SQLite. NEW: that lock is
+        DELETED — date coordination is the booking authority's two-argument shared/exclusive
+        (-1, yyyymmdd) / (professional, yyyymmdd) locks (design Decision B). WHY: the two key
+        spaces never coordinated (R3RV-10). The SQLite confirm below still completes."""
         svc = BookingFlowService(self.db)
         _mock_sched_valid(svc)
-        lock_key = int(hashlib.sha256(_FUTURE.isoformat().encode()).hexdigest()[:8], 16) & 0x7FFFFFFF
-        # Should not raise despite SQLite not supporting pg_try_advisory_xact_lock
-        svc._acquire_advisory_lock(lock_key, _FUTURE.isoformat())
+        self.assertFalse(hasattr(svc, "_acquire_advisory_lock"))
+        result = svc.handle_confirm_booking(self.token, _confirm_data(self.token))
+        self.assertEqual(result["screen"], "SUCCESS")
 
     def test_bf18_full_confirm_works_on_sqlite(self):
         """Confirm booking completes end-to-end on SQLite (lock no-ops silently)."""
@@ -818,7 +850,6 @@ class TestBF23_TokenConsumed(unittest.TestCase):
         Flow is shown its completion instead of a false expiry. Asserting the old exception
         would be asserting the defect.
         """
-        from app.services.booking_flow_service import BookingAlreadyCompletedError
         svc = BookingFlowService(self.db)
         _mock_sched_valid(svc)
         svc.handle_confirm_booking(self.token, _confirm_data(self.token))
@@ -827,25 +858,29 @@ class TestBF23_TokenConsumed(unittest.TestCase):
             thread_id=self.thread.id, status="booked").all()
         self.assertEqual(len(first), 1)
 
-        with self.assertRaises(BookingAlreadyCompletedError) as caught:
-            svc.handle_confirm_booking(self.token, _confirm_data(self.token))
-        # The authoritative booking is RETURNED, not invented and not re-created.
-        self.assertEqual(caught.exception.thread_revision_id, first[0].id)
-        self.assertNotIsInstance(caught.exception, BookingTokenError,
-                                 "a replay must not be reported as an expired session")
+        # Convergence Phase 3 adaptation. OLD: the second confirm raised
+        # `BookingAlreadyCompletedError` (detected from the ACCEPTED offer row) and the replay
+        # was counted on the OFFER (`replay_count == 1`). NEW: the booking LEDGER answers
+        # first — the second confirm returns the same SUCCESS screen directly, the replay is
+        # counted on the ledger row, and the offer row is admission evidence only (design §8:
+        # the offer projection is never a replay authority). Still asserted: one booking, no
+        # refusal recorded, never an expired-session answer.
+        again = svc.handle_confirm_booking(self.token, _confirm_data(self.token))
+        self.assertEqual(again["screen"], "SUCCESS")
 
         self.db.expire_all()
         after = self.db.query(ThreadRevision).filter_by(
             thread_id=self.thread.id, status="booked").all()
         self.assertEqual(len(after), 1, "no second booking may exist")
-        # And it is recorded as a REPLAY, never as a refusal.
+        self.assertEqual(after[0].id, first[0].id)
         import app.models as _M
+        rows = self.db.query(_M.BookingCommandRecord).all()
+        self.assertEqual([(r.thread_revision_id, r.replay_count) for r in rows],
+                         [(first[0].id, 1)])
         offer = self.db.query(_M.WhatsAppBookingOffer).filter_by(
             thread_id=self.thread.id).order_by(_M.WhatsAppBookingOffer.id.desc()).first()
-        if offer is not None:
-            self.assertEqual(offer.replay_count, 1)
-            self.assertEqual(offer.refused_count, 0)
-            self.assertIsNone(offer.last_refusal)
+        self.assertEqual((offer.status, offer.refused_count, offer.last_refusal),
+                         ("ACCEPTED", 0, None))
 
 
 class TestBF24_LastStageBooked(unittest.TestCase):

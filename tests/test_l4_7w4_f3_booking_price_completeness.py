@@ -46,7 +46,8 @@ from sqlalchemy.orm import sessionmaker
 
 import app.models
 
-from offer_fixture import seed_live_offer  # noqa: E402
+from offer_fixture import (ensure_launch_professional, route_authority_availability,  # noqa: E402
+                           seed_live_offer, start_converged_booking, stop_converged_booking)
 from app.models import (Lead, Revision, ThreadRevision, ViaticosZone, WhatsAppContact,
                         WhatsAppThread, WhatsAppThreadCandidate, WhatsAppThreadState)
 from app.schemas.schedule import ScheduleCheckOut, ScheduleSlotsOut, ScheduleSlotOut
@@ -82,6 +83,20 @@ def _wipe():
             conn.execute(tbl.delete())
 
 
+# Convergence Phase 3 (adaptation, whole module): `handle_confirm_booking` books through
+# `BookingAuthority` only — flag ON, a launch professional, and the authority's own
+# availability check (routed to `_sched_ok`'s double). See `offer_fixture`.
+_MODULE_PATCHES = []
+
+
+def setUpModule():
+    _MODULE_PATCHES.extend(start_converged_booking())
+
+
+def tearDownModule():
+    stop_converged_booking(_MODULE_PATCHES)
+
+
 def _world(db, *, tipo=W4_TIPO, group=W4_GROUP, detail=W4_DETAIL, seed_zone=True):
     if seed_zone:
         db.add(ViaticosZone(zone_group=group, zone_detail=detail, viaticos=W4_VIATICOS))
@@ -99,7 +114,10 @@ def _world(db, *, tipo=W4_TIPO, group=W4_GROUP, detail=W4_DETAIL, seed_zone=True
     db.add(cand); db.flush()
     state = WhatsAppThreadState(thread_id=thread.id, flow_booking_token=token,
                                 needs_human=False)
-    db.add(state); db.commit()
+    db.add(state)
+    ensure_launch_professional(db)
+    db.commit()
+    route_authority_availability(None)
     # G3-7P: a hand-set token is no longer an offer. Authority is
     # `whatsapp_booking_offers` and an absent row is a refusal, so a fixture that
     # wants a bookable offer issues one through the authority.
@@ -109,6 +127,7 @@ def _world(db, *, tipo=W4_TIPO, group=W4_GROUP, detail=W4_DETAIL, seed_zone=True
 
 def _sched_ok(svc):
     svc._sched = MagicMock()
+    route_authority_availability(svc._sched)
     svc._sched.list_slots.return_value = ScheduleSlotsOut(
         preferred_day=FUTURE, business_hours="09:30-14:00", slots=[SLOT])
     svc._sched.check.return_value = ScheduleCheckOut(
@@ -213,7 +232,14 @@ class TestPriceIntegrity(_Base):
                           "a total without a real viaticos figure would be fabricated")
 
     def test_bookprice_05_booking_owns_no_second_pricing_authority(self):
-        """BOOKPRICE-05 — the service must delegate, never compute."""
+        """BOOKPRICE-05 — the service must delegate, never compute.
+
+        Convergence Phase 3 adaptation. OLD: the Data Exchange source itself called
+        `self._pricing.recalculate_revision_if_possible`. NEW: the booking authority stamps the
+        price (`PriceRecalculation` plan → `PricingService.recalculate_revision_if_possible`),
+        and the Data Exchange only DESCRIBES it. WHY: the in-session writer is deleted. The
+        invariant — one pricing authority, never a total computed here — is now proven by
+        behaviour: the one PricingService call happens, inside the authority's transaction."""
         tree = ast.parse(BFS_SOURCE)
         for node in ast.walk(tree):
             if isinstance(node, ast.FunctionDef):
@@ -222,18 +248,33 @@ class TestPriceIntegrity(_Base):
                                  f"{node.name} computes a total itself")
                 self.assertNotIn("PRECIO_BASE_BY_TIPO", body,
                                  f"{node.name} reads a second price table")
-        self.assertIn("self._pricing.recalculate_revision_if_possible", BFS_SOURCE)
+        from app.services.booking_authority import booking_transaction_active
+        from app.services.pricing import PricingService
+        real = PricingService.recalculate_revision_if_possible
+        scopes = []
+
+        def spy(self_, *, db, revision):
+            scopes.append(booking_transaction_active())
+            return real(self_, db=db, revision=revision)
+        with patch.object(PricingService, "recalculate_revision_if_possible", spy):
+            rev = self.book()
+        self.assertEqual((scopes, rev.precio_total), (["BOOKING"], W4_TOTAL))
 
     def test_mismatched_commercial_inputs_are_recorded_and_not_priced(self):
-        """Defence in depth: the live cycle-bounded candidate makes this unreachable
-        today, so it is asserted structurally rather than simulated."""
-        fn = next(ast.unparse(n) for n in ast.walk(ast.parse(BFS_SOURCE))
-                  if isinstance(n, ast.FunctionDef) and n.name == "handle_confirm_booking")
-        self.assertIn("BOOKING_PRICE_INPUT_MISMATCH", fn)
-        self.assertIn("price_inputs_ok", fn)
-        i_guard = fn.index("price_inputs_ok =")
-        i_price = fn.index("recalculate_revision_if_possible")
-        self.assertLess(i_guard, i_price, "the guard must precede the stamp")
+        """Defence in depth. Convergence Phase 3 adaptation: OLD — a source scan of the Data
+        Exchange's `price_inputs_ok` guard. NEW — the guard lives in the booking authority's
+        `PriceRecalculation(require_inputs=...)` and is exercised: inputs that disagree with
+        the Revision are logged BOOKING_PRICE_INPUT_MISMATCH and the price is left unset,
+        never computed from mismatched commercial inputs. WHY: the in-session writer is
+        deleted; the same guard now stands in the one booking transaction."""
+        from app.services.booking_authority import BookingAuthority, PriceRecalculation
+        rev = Revision(lead_id=1, tipo_vehiculo=W4_TIPO, zone_group=W4_GROUP,
+                       zone_detail=W4_DETAIL)
+        with self.assertLogs("app.services.booking_authority", "WARNING") as logs:
+            BookingAuthority(self.db)._recalculate_price(
+                PriceRecalculation(require_inputs=("OTRO", W4_GROUP, W4_DETAIL)), rev)
+        self.assertIn("BOOKING_PRICE_INPUT_MISMATCH", "\n".join(logs.output))
+        self.assertIsNone(rev.precio_total)
 
 
 class TestAtomicity(_Base):
@@ -249,54 +290,35 @@ class TestAtomicity(_Base):
         self.assertEqual(self.db.query(ThreadRevision).count(), 0)
 
     def test_bookprice_10_price_and_booking_land_in_the_same_commit(self):
-        """BOOKPRICE-10 — no window where a booked Revision exists without its price."""
-        node = next(n for n in ast.walk(ast.parse(BFS_SOURCE))
-                    if isinstance(n, ast.FunctionDef) and n.name == "handle_confirm_booking")
+        """BOOKPRICE-10 — no window where a booked Revision exists without its price.
 
-        def _success_path(stmts):
-            """Unparse the function's SUCCESS path: everything except `except` handlers.
+        Convergence Phase 3 adaptation. OLD: an AST oracle over the Data Exchange function
+        located the price stamp between the booked ThreadRevision and the request session's
+        commit. NEW: the booking is the authority's ONE transaction; the oracle is behaviour —
+        the price is stamped while the authority's transaction scope is open, and a failure
+        AFTER the stamp but before the commit leaves neither booking nor price. WHY: the
+        in-session writer whose text the oracle read is deleted."""
+        from app.services.booking_authority import BookingAuthority, booking_transaction_active
+        from app.services.pricing import PricingService
+        real = PricingService.recalculate_revision_if_possible
+        scopes = []
 
-            G3-7R translates the booking projection's uniqueness violation inside an
-            `except` around the booking flush, and that handler commits a REPLAY. An oracle
-            that reads the function as flat text sees that commit sitting between the
-            booking row and the price stamp and concludes the price is stamped too late —
-            about a path on which no booking is created at all. The handler bodies are
-            therefore excluded, which is also the honest reading: BOOKPRICE-10 is a claim
-            about the commit that CREATES a booking.
-            """
-            out = []
-            for stmt in stmts:
-                if isinstance(stmt, ast.Try):
-                    out.append(_success_path(stmt.body))
-                    out.append(_success_path(stmt.orelse))
-                    out.append(_success_path(stmt.finalbody))
-                elif isinstance(stmt, (ast.If, ast.For, ast.While, ast.With)):
-                    out.append(_success_path(stmt.body))
-                    out.append(_success_path(getattr(stmt, "orelse", [])))
-                else:
-                    out.append(ast.unparse(stmt))
-            return "\n".join(out)
-
-        fn = _success_path(node.body)
-        # ── the oracle is ANCHORED to the booking, not to a commit count (G3-7R) ──
-        # This used to take the LAST commit and require there be exactly two, on the
-        # reasoning that G3-7P-R3's refusal commit was the only other one. G3-7R added two
-        # more — an admission refusal and a replay — and the count assertion then failed on
-        # a function whose invariant was untouched: it was counting commits, not locating
-        # the one that matters.
-        #
-        # So the booking commit is now IDENTIFIED: it is the first commit after the booked
-        # ThreadRevision is built. BOOKPRICE-10 is the claim that the price is stamped
-        # between those two points, and that is what is asserted — which also means a
-        # future commit added anywhere else in this function cannot weaken or break it.
-        i_booking = fn.index("thread_rev = ThreadRevision(")
-        i_commit = fn.index("self.db.commit()", i_booking)
-        i_price = fn.index("recalculate_revision_if_possible", i_booking)
-        self.assertLess(i_booking, i_price,
-                        "the price is stamped on the Revision the booking created")
-        self.assertLess(i_price, i_commit,
-                        "the price must be stamped before the booking commit, so there is "
-                        "no window where a booked Revision exists without it")
+        def spy(self_, *, db, revision):
+            scopes.append(booking_transaction_active())
+            return real(self_, db=db, revision=revision)
+        with patch.object(PricingService, "recalculate_revision_if_possible", spy), \
+                patch.object(BookingAuthority, "_record", side_effect=RuntimeError("after")):
+            self.thread, self.state, self.cand, self.lead, self.token = _world(self.db)
+            svc = BookingFlowService(self.db)
+            _sched_ok(svc)
+            from app.services.booking_flow_service import BookingSlotConflictError
+            with self.assertRaises(BookingSlotConflictError):
+                svc.handle_confirm_booking(self.token, _confirm(self.token))
+        self.assertEqual(scopes, ["BOOKING"])           # stamped inside the transaction
+        self.db.expire_all()
+        self.assertEqual((self.db.query(Revision).count(), self.db.query(ThreadRevision).count()),
+                         (0, 0), "a failure after the stamp must leave no priced row behind")
+        _wipe()
         rev = self.book()
         tr = self.db.query(ThreadRevision).one()
         self.assertEqual(tr.status, "booked")

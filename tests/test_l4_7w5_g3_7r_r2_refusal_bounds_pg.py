@@ -47,6 +47,25 @@ from sqlalchemy import create_engine, text  # noqa: E402
 from sqlalchemy.orm import sessionmaker  # noqa: E402
 
 PG_URL = os.environ.get("G37R_PG_URL", "")
+# ── Convergence Phase 3 (adaptation, whole module) ─────────────────────────────────────────
+# The Conversation Engine and the Data Exchange no longer book in their own sessions: both
+# delegate to `BookingAuthority`, which (a) is reachable only with SMART_BOOKING_CE_ENABLED on
+# — the OFF switch for both Flow transports, now read from `get_settings()` — and (b) books
+# against the launch professional. These suites prove the offer authority's and the booking
+# projection's guarantees, so they run the converged writer: the flag is ON for this module
+# and every fixture world has a (synthetic) launch professional. Nothing else changes.
+_P3_PATCHES = []
+
+
+def setUpModule():
+    from offer_fixture import start_converged_booking
+    _P3_PATCHES.extend(start_converged_booking())
+
+
+def tearDownModule():
+    from offer_fixture import stop_converged_booking
+    stop_converged_booking(_P3_PATCHES)
+
 
 WA = "549110000781"
 BOOKING_PAYLOAD = {
@@ -104,6 +123,8 @@ class G37RR2RefusalBoundsPG(unittest.TestCase):
                       "whatsapp_contacts"):
                 c.execute(text(f"TRUNCATE {t} RESTART IDENTITY CASCADE"))
         db = self.SF()
+        from offer_fixture import ensure_launch_professional
+        ensure_launch_professional(db)   # Convergence Phase 3: the authority books against it
         ct = M.WhatsAppContact(wa_id=WA, display_name="Bound"); db.add(ct); db.flush()
         lead = M.Lead(nombre="Bound", apellido="Probe", telefono=WA,
                       estado="CONSULTA_NUEVA", flag="ACEPTADO", necesita_humano=False)
@@ -331,7 +352,34 @@ class G37RR2RefusalBoundsPG(unittest.TestCase):
         db.execute(text("UPDATE whatsapp_thread_states SET needs_human=false "
                         "WHERE thread_id=:t"), {"t": self.thread_id})
         db.commit(); db.close()
-        self._assert_contention_contract("replay", token, expect_bookings=1)
+        # Convergence Phase 3 adaptation. OLD: the redelivered completion waited on the
+        # turn-entry acquisition and answered `thread_contended`, writing and sending nothing.
+        # NEW: there is no turn-entry acquisition; the booking LEDGER answers the replay
+        # without resource 1 ("booking_replayed"), the still-owed acknowledgement is retried
+        # through its lease (here blocked by the kill switch, as every send in this suite),
+        # and the CE synchronisation — the only part that needs resource 1 — takes it bounded
+        # and is DEFERRED on contention, so the cursor is not consumed. Still asserted: inside
+        # the bound, no second booking, the offer untouched, no handoff, nothing sent to Meta.
+        before = self._snapshot()
+        self.sends.clear()
+        holder, release = self._hold_resource_1()
+        try:
+            action, detail, elapsed = self._submit(token, "replay")
+            during = self._snapshot()
+            sent_during = list(self.sends)
+        finally:
+            release.set(); holder.join(timeout=30)
+        self.assertLess(elapsed, BOUND_ALLOWANCE_S,
+                        f"replay: waited {elapsed:.3f}s against a {HOLD_SECONDS}s hold")
+        self.assertEqual(action, "booking_replayed", f"replay: answered {action!r}/{detail!r}")
+        self.assertIn("sync:deferred", detail)
+        self.assertEqual(during["cursor"], before["cursor"],
+                         "replay: the cursor was consumed while resource 1 was held")
+        self.assertEqual(during["offers"], before["offers"], "replay: the offer was mutated")
+        self.assertEqual((during["bookings"], during["revisions"]),
+                         (1, before["revisions"]))
+        self.assertEqual(during["needs_human"], before["needs_human"])
+        self.assertEqual(sent_during, [], f"replay: sent {sent_during} while contended")
 
     # ══ R6: the turn is declined, not lost ══════════════════════════════════
 
@@ -464,6 +512,7 @@ class G37RR2RefusalBoundsPG(unittest.TestCase):
     def test_r2_pg_09_the_data_exchange_command_answers_inside_the_bound(self):
         """The other transport. Both writers must answer, or only half the pair is fixed."""
         from app.services.booking_flow_service import (BookingFlowService,
+                                                       BookingSlotConflictError,
                                                        BookingTokenError)
         token = self._issue()
         day, hhmm = self._open_slots(1)[0]
@@ -481,6 +530,10 @@ class G37RR2RefusalBoundsPG(unittest.TestCase):
             outcome = "completed"
         except BookingTokenError as exc:
             outcome = "refused:%s" % str(exc)[:60]
+        except BookingSlotConflictError as exc:
+            # Convergence Phase 3: the authority's RETRYABLE answer (K1 contention) is the
+            # typed retry screen, never the false "sesión expiró" of a token refusal.
+            outcome = "refused:%s" % exc.refreshed_data["data"].get("slot_conflict_message", "")
         except Exception as exc:
             outcome = "EXC:%s" % type(exc).__name__
         elapsed = _t.perf_counter() - started
@@ -496,6 +549,8 @@ class G37RR2RefusalBoundsPG(unittest.TestCase):
                         f"{HOLD_SECONDS}s hold — the bound is not in force")
         self.assertTrue(outcome.startswith("refused:"),
                         f"the DX command answered {outcome!r} instead of refusing")
+        self.assertIn("Volvé a intentarlo", outcome,
+                      "contention must be the transient retry answer, not a terminal one")
         after = self._snapshot()
         self.assertEqual(after["offers"], before["offers"],
                          "contention mutated the offer on the DX path")

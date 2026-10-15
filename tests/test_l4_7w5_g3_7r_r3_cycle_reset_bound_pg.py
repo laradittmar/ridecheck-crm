@@ -56,6 +56,25 @@ from sqlalchemy import create_engine, text  # noqa: E402
 from sqlalchemy.orm import sessionmaker  # noqa: E402
 
 PG_URL = os.environ.get("G37R_PG_URL", "")
+# ── Convergence Phase 3 (adaptation, whole module) ─────────────────────────────────────────
+# The Conversation Engine and the Data Exchange no longer book in their own sessions: both
+# delegate to `BookingAuthority`, which (a) is reachable only with SMART_BOOKING_CE_ENABLED on
+# — the OFF switch for both Flow transports, now read from `get_settings()` — and (b) books
+# against the launch professional. These suites prove the offer authority's and the booking
+# projection's guarantees, so they run the converged writer: the flag is ON for this module
+# and every fixture world has a (synthetic) launch professional. Nothing else changes.
+_P3_PATCHES = []
+
+
+def setUpModule():
+    from offer_fixture import start_converged_booking
+    _P3_PATCHES.extend(start_converged_booking())
+
+
+def tearDownModule():
+    from offer_fixture import stop_converged_booking
+    stop_converged_booking(_P3_PATCHES)
+
 
 #: A SECOND disposable database, built by Alembic rather than by `create_all()`. Only the
 #: foreign-key name agreement test needs it, and it skips without it — the two schemas have
@@ -120,6 +139,8 @@ class _PGBase(unittest.TestCase):
                       "whatsapp_contacts"):
                 c.execute(text(f"TRUNCATE {t} RESTART IDENTITY CASCADE"))
         db = self.SF()
+        from offer_fixture import ensure_launch_professional
+        ensure_launch_professional(db)   # Convergence Phase 3: the authority books against it
         ct = M.WhatsAppContact(wa_id=WA, display_name="Reset"); db.add(ct); db.flush()
         lead = M.Lead(nombre="Reset", apellido="Probe", telefono=WA,
                       estado="CONSULTA_NUEVA", flag="ACEPTADO", necesita_humano=False)
@@ -681,18 +702,18 @@ class G37RR3BookingProjectionReplayPG(_PGBase):
         box = {}
 
         def run():
+            # Convergence Phase 3 adaptation: the winner books THROUGH THE AUTHORITY (the
+            # Data Exchange confirmation of the same token), because after the cutover that
+            # is the only writer that can produce a booking for an offer. A raw ORM write of
+            # a booked ThreadRevision is no longer a production writer, and against one the
+            # authority correctly fails closed (`PROJECTION_WINNER_UNPROVEN`, Phase 2 P2-09).
             when_ready.wait(timeout=60)
             db = self.SF()
             try:
-                rev = self.M.Revision(lead_id=self.lead_id,
-                                      created_at=datetime.now())
-                db.add(rev); db.flush()
-                db.add(self.M.ThreadRevision(
-                    thread_id=self.thread_id, candidate_id=self.cand_a,
-                    offer_id=offer_id, status="booked",
-                    scheduled_date=date.fromisoformat(self.day2),
-                    scheduled_time=time.fromisoformat(self.hhmm2)))
-                db.commit()
+                from app.services.booking_flow_service import BookingFlowService
+                BookingFlowService(db).handle_confirm_booking(self._token, {
+                    "date": self.day2, "time": self.hhmm2, "name": "Reset Probe",
+                    "email": "r@example.test", "inspection_address": "Palermo 123"})
                 box["thread_revision_id"] = int(db.execute(text(
                     "SELECT id FROM thread_revisions WHERE offer_id=:o"),
                     {"o": offer_id}).scalar())
@@ -714,6 +735,7 @@ class G37RR3BookingProjectionReplayPG(_PGBase):
         from app.services.offer_lifecycle import OfferLifecycle
 
         db, eng = self._engine_for()
+        self._token = token
         admitted = threading.Event()
         holder_state = {"acquired": False}
         original = OfferLifecycle.admit
@@ -735,7 +757,8 @@ class G37RR3BookingProjectionReplayPG(_PGBase):
             def holder():
                 hdb = self.SF()
                 try:
-                    admitted.wait(timeout=60)
+                    # Phase 3: enqueue once the WINNER has committed (it needs K1 itself).
+                    go.wait(timeout=60)
                     hdb.execute(text(
                         "SELECT 1 FROM whatsapp_thread_states WHERE thread_id=:t "
                         "FOR NO KEY UPDATE"), {"t": self.thread_id}).fetchall()
@@ -748,9 +771,13 @@ class G37RR3BookingProjectionReplayPG(_PGBase):
                                              daemon=True)
             holder_thread.start()
 
+        loser_thread = threading.get_ident()
+
         def patched(self_lc, *a, **kw):
             out = original(self_lc, *a, **kw)
-            if getattr(out, "granted", False):
+            # Phase 3: the winner (a Data Exchange confirmation) also admits; only the
+            # LOSER's admission releases it.
+            if getattr(out, "granted", False) and threading.get_ident() == loser_thread:
                 admitted.set()
                 # Let the winner COMMIT, and release its foreign-key lock, before this
                 # turn claims and inserts.
@@ -768,6 +795,10 @@ class G37RR3BookingProjectionReplayPG(_PGBase):
                 wa_id=WA, message_type="flow_response",
                 flow_response=dict(BOOKING_PAYLOAD), flow_token=token))
             action, detail = out.action, (getattr(out, "detail", "") or "")
+            # Phase 3: the replayed booking is named in the turn's booking trace block.
+            _tr = (eng._sb_trace_payload() or {}).get("thread_revision_id")
+            if _tr is not None:
+                detail = str(_tr)
         except Exception as exc:
             action, detail = "EXCEPTION:%s" % type(exc).__name__, str(exc)[:200]
         finally:
@@ -787,7 +818,12 @@ class G37RR3BookingProjectionReplayPG(_PGBase):
 
     def test_r3_pg_09_the_index_rejects_the_loser_and_the_loser_returns_the_winners_booking(self):
         """§6B, uncontended: one booking, one revision, the authoritative result returned."""
-        from app.services.conversation_engine import ACTION_BOOKING_REPLAY
+        # Convergence Phase 3 adaptation: the converged loser is answered by the booking
+        # LEDGER under K1 (the winner's committed command), before its insert — the index
+        # is the authority's last line (proven in the G3-7R projection suite and Phase 2).
+        # The loser's action is the converged replay ("booking_replayed"), and the replay
+        # is counted on the ledger row.
+        ACTION_BOOKING_REPLAY = "booking_replayed"
         token = self._issue()
         before = self._snapshot()
         self.sends.clear()
@@ -816,11 +852,21 @@ class G37RR3BookingProjectionReplayPG(_PGBase):
         self.assertEqual([k for k, _v in self.sends], [],
                          "the replaying turn sent %r — the customer is acknowledged twice"
                          % (self.sends,))
-        self.assertFalse(after["needs_human"],
-                         "the replaying turn raised a human handoff")
-        self.assertEqual(after["offers"][0][5], "1",
-                         "the replay was not counted: replay_count=%s"
-                         % after["offers"][0][5])
+        # Convergence Phase 3 adaptation: the winner now books through the authority, whose
+        # canonical booking state sets `needs_human=True` (an operator approves every
+        # booking) — the raw-ORM winner this test used to fake did not. The property is that
+        # the REPLAYING turn raises no handoff of its own: it answered the replay, sent
+        # nothing, and left the stage the winner's booking wrote.
+        self.assertTrue(after["needs_human"], "the winner's booking awaits operator approval")
+        db = self.SF()
+        stage = db.execute(text("SELECT last_stage FROM whatsapp_thread_states "
+                                "WHERE thread_id=:t"), {"t": self.thread_id}).scalar()
+        db.close()
+        self.assertEqual(stage, "BOOKED", "the replaying turn raised a human handoff")
+        db = self.SF()
+        replays = db.execute(text("SELECT replay_count FROM booking_commands")).scalars().all()
+        db.close()
+        self.assertEqual(replays, [1], "the replay was not counted: replay_count=%s" % replays)
 
     def test_r3_pg_10_the_replay_re_entry_is_bounded(self):
         """MUTATION ORACLE for required mutation 9 (RVR2-03 / `rv3`).
@@ -831,7 +877,12 @@ class G37RR3BookingProjectionReplayPG(_PGBase):
         fact the customer depends on, the counter is bookkeeping, and the authoritative
         booking must still be returned inside the bound with the counter SKIPPED.
         """
-        from app.services.conversation_engine import ACTION_BOOKING_REPLAY
+        # Convergence Phase 3 adaptation: no re-entry exists any more — the authority's
+        # replay is a read, and only the CE synchronisation needs resource 1, bounded (K1,
+        # 4 s) and DEFERRED on contention. The property is the same: the booking is
+        # returned inside the bound while another writer holds resource 1, and nothing that
+        # needs that row is written meanwhile (the sync, and with it the cursor, is deferred).
+        ACTION_BOOKING_REPLAY = "booking_replayed"
         token = self._issue()
         action, detail, elapsed, offer_id, acquired, winner_id = self._loser_turn(
             token, hold_resource_1_after_claim=True)
@@ -853,9 +904,8 @@ class G37RR3BookingProjectionReplayPG(_PGBase):
         db.close()
         self.assertEqual(len(rows), 1)
         self.assertEqual(detail, str(rows[0]))
-        self.assertEqual(after["offers"][0][5], "0",
-                         "the counter was moved while resource 1 was held by another "
-                         "writer — the re-entry is not bounded, it is absent")
+        self.assertNotIn("wamid.loser", str(after["cursor"]),
+                         "the synchronisation was not deferred while resource 1 was held")
 
 
 @unittest.skipUnless(PG_URL, "G37R_PG_URL not set — no disposable PostgreSQL; nothing proven")

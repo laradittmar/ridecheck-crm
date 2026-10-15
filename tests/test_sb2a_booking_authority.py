@@ -449,8 +449,15 @@ class FlowCutover(unittest.TestCase):
             tree = ast.parse(open(os.path.join(_BACKEND, path)).read())
             return next(ast.unparse(n) for n in ast.walk(tree)
                         if isinstance(n, ast.FunctionDef) and n.name == name)
-        confirm = fn_src("app/services/booking_flow_service.py", "handle_confirm_booking")
-        self.assertIn("self._authority.execute(", confirm)
+        # Convergence Phase 3 (resolves the Phase 1 deferral of this identity): the Data
+        # Exchange confirmation is `_confirm_booking`, which delegates ONE command through
+        # `_execute_isolated` — `BookingAuthority(session).execute(` on its own session — and
+        # neither builds a Revision nor commits the request session. At `870b4e3` the same
+        # delegation was spelled `self._authority.execute(` on the request session.
+        confirm = fn_src("app/services/booking_flow_service.py", "_confirm_booking")
+        self.assertIn("_execute_isolated(self.db, command, availability, attachments)", confirm)
+        self.assertIn("BookingAuthority(session).execute(command",
+                      fn_src("app/services/booking_flow_service.py", "_execute_isolated"))
         self.assertNotIn("Revision(", confirm.replace("ThreadRevision(", ""))
         self.assertNotIn("self.db.commit()", confirm)
         crm = fn_src("app/ui/kanban_actions.py", "ui_revision_latest_update")
@@ -476,7 +483,15 @@ class CeContract(unittest.TestCase):
                    and "Revision(" in ast.unparse(n).replace("ThreadRevision(", "")
                    .replace("FeedbackPostRevision(", "")}
         sites = {s["function"]: s for s in m["sites"]}
-        self.assertEqual(writers, set(sites))                    # no unmapped CE writer
+        # Convergence Phase 3 adaptation. OLD: the manifest's sites WERE the CE functions that
+        # constructed a Revision (`_process_flow_response`, `_handle_scheduling_escalation`).
+        # NEW: no CE function constructs one any more (both legacy writers are deleted); the
+        # sites are the functions that DELEGATE to the adapter, and every CE call of an
+        # adapter writer is one of them. WHY: Phase 3 cuts CE over to the authority.
+        self.assertEqual(writers, set(), "a Conversation Engine function builds a Revision")
+        delegators = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+                      and any(f"{site['adapter']}(" in ast.unparse(n) for site in m["sites"])}
+        self.assertEqual(delegators, set(sites))                 # no unmapped CE writer
         for fname, site in sites.items():
             body = next(ast.get_source_segment(ce_src, n) for n in ast.walk(tree)
                         if isinstance(n, ast.FunctionDef) and n.name == fname)
@@ -537,8 +552,13 @@ class Scope(unittest.TestCase):
                 for node in ast.walk(fn):
                     if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "_smart_booking_ce_on":
                         gated[fn.name] = gated.get(fn.name, 0) + 1
-        self.assertEqual(gated, {"_handle": 1, "_process_flow_response": 1,
-                                 "_handle_scheduling_escalation": 1})
+        # Convergence Phase 3 adaptation. OLD: three gates — the ledger entry in `_handle`,
+        # the CE-W1 branch in `_process_flow_response`, the CE-W2 branch. NEW: two — the
+        # converged Flow path (`_converged_flow_book`: OFF means a truthful handoff, never a
+        # writer) and CE-W2. The ledger READ in `_handle` is no longer gated: a booking that
+        # exists is answered truthfully under either flag (design §8, B-2). WHY: the legacy
+        # writers the flag used to select are deleted.
+        self.assertEqual(gated, {"_converged_flow_book": 1, "_handle_scheduling_escalation": 1})
 
     def test_sb2a_32_sqlite_is_not_concurrency_evidence(self):
         db = _db()

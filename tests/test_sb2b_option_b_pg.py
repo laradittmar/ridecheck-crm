@@ -122,7 +122,9 @@ class PostgresOnly(unittest.TestCase):
             out, eng = H.run_turn(self.engine, H.flow_event(w))
         elapsed = _time.monotonic() - t0
         self.assertEqual(out.action, "booking_created")
-        self.assertEqual(seen, [None, None])                 # entry + call site: no txid
+        # Convergence Phase 3 adaptation: the guard runs ONCE, immediately before delegation
+        # (design §12 stage 5) — the earlier "entry" call is gone with the code it guarded.
+        self.assertEqual(seen, [None])                       # at the call site: no txid
         self.assertLess(elapsed, 3.0)                        # lock_timeout is 5 s: no wait
         self.assertNotIn("LOCK_TIMEOUT", str(eng._sb_trace_payload()))
         self.assertEqual(m.sent, [(w.wa_id, H.OWNER_TEXT)])
@@ -134,12 +136,19 @@ class PostgresOnly(unittest.TestCase):
         w = H.seed(self.engine)
         txids = []
 
-        def flushing_attribution(eng, ctx, state):
+        # Convergence Phase 3 adaptation: attribution is now written AFTER the booking
+        # decision on a booking-shaped turn, so it can no longer flush before delegation.
+        # The "something earlier in the turn flushed the lead row" premise is reproduced at a
+        # step that still precedes delegation (the offer-bound candidate resolution).
+        real_bound = ConversationEngine._offer_bound_candidate
+
+        def flushing_attribution(eng, ctx, adm):
             ctx.lead.flag = "ACEPTADO"
             ctx.lead.canal = "fixture"
             eng.db.flush()
             txids.append(eng.db.execute(text("SELECT txid_current_if_assigned()")).scalar())
-        with mock.patch.object(ConversationEngine, "_maybe_set_attribution", flushing_attribution), \
+            return real_bound(eng, ctx, adm)
+        with mock.patch.object(ConversationEngine, "_offer_bound_candidate", flushing_attribution), \
                 _Spy("execute", BookingAuthority) as ex, H.Meta() as m:
             t0 = _time.monotonic()
             out, eng = H.run_turn(self.engine, H.flow_event(w))
@@ -197,10 +206,14 @@ class PostgresOnly(unittest.TestCase):
         finally:
             tx.rollback(); holder.close()
         f = H.facts(self.engine, w)
+        # Convergence Phase 3 adaptation (CD-04): a real lock timeout is TRANSIENT — Track A's
+        # contention contract: `thread_contended`, reply_required, nothing written, nothing
+        # sent, the cursor not consumed, no handoff — never a terminal handoff.
         self.assertEqual((out.action, eng._sb_trace_payload()["reason"]),
-                         ("booking_retry_required", "LOCK_TIMEOUT"))
+                         ("thread_contended", "LOCK_TIMEOUT"))
+        self.assertTrue(out.reply_required)
         self.assertEqual((f["ledger"], f["occupying"]), ([], 0))
-        self.assertEqual([t for _w, t in m.sent], [H.HANDOFF_TEXT])
+        self.assertEqual((m.sent, f["cursor"], f["needs_human"]), ([], None, False))
 
     def _race(self, *, other_day: bool):
         """CE-W1 and the Data Exchange confirmation of ONE Flow submission, released together.
@@ -214,7 +227,11 @@ class PostgresOnly(unittest.TestCase):
         from datetime import timedelta
         w = H.seed(self.engine)
         gate = threading.Barrier(2, timeout=20)
-        point = "_apply_attachments" if other_day else "execute"
+        # Convergence Phase 3 adaptation: since Phase 2 the authority takes the thread-state
+        # row FIRST (K1), so two writers of one thread serialise there before either writes —
+        # the "both hold an uncommitted booking" interleaving no longer exists on any day.
+        # Both cases therefore rendezvous at `execute` and K1 orders them.
+        point = "execute"
         real = getattr(BookingAuthority, point)
         results, errors = {}, []
 

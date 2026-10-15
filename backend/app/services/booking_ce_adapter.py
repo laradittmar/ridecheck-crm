@@ -9,8 +9,11 @@ It is NOT a second authority. Both functions build a `BookingCommand` and call
 `docs/architecture/SB2B_CE_INTEGRATION_MANIFEST.json` maps each CE call site to its function
 here, and a test keeps the mapping mechanically true.
 
-CE-W1  `_process_flow_response`        → `book_from_flow_response`
-CE-W2  `_handle_scheduling_escalation` → `request_manual_scheduling`
+CE-W1  `_process_flow_response` → `_converged_flow_book` → `book_from_flow_response`
+CE-W2  `_handle_scheduling_escalation` → `_sb_escalation` → `request_manual_scheduling`
+
+Convergence Phase 3: these are the ONLY Conversation Engine booking writers. The Data
+Exchange confirmation calls `BookingAuthority.execute` directly with the same `flow:` key.
 
 SB2A-R2 corrections:
 
@@ -234,7 +237,12 @@ def inbound_correlation(inbound_event_id: Optional[str]) -> Optional[str]:
 
 def _fields_refusal(fields: dict) -> Optional[BookingResult]:
     """R7-O1 / R7RV-04: refuse any Revision field outside `CE_REVISION_FIELDS`, before SQL."""
-    for k in fields:                     # our own copy of exact str keys: runs no caller code
+    for k in fields:
+        # SB2B-RV-02 (convergence Phase 3): a key is admitted by EXACT type before any use. A
+        # `str` subclass would run its own `__hash__`/`__eq__` inside the membership test and
+        # its own `__format__` in the reason, so it is refused unread.
+        if type(k) is not str:
+            return refuse(BookingOutcome.VALIDATION_FAILED, "CE_FIELD_KEY_NOT_STR")
         if k not in CE_REVISION_FIELDS:
             return refuse(BookingOutcome.VALIDATION_FAILED, f"CE_FIELD_NOT_ALLOWED:{k}"[:64])
     return None

@@ -293,15 +293,26 @@ class TestAuthorityBoundaries(unittest.TestCase):
             and not state.flow_booking_token""", CE_SOURCE)
 
     def test_booking_write_authority_is_untouched(self):
-        """MAY_CREATE_OR_CONFIRM_BOOKING stays with BookingFlowService."""
+        """MAY_CREATE_OR_CONFIRM_BOOKING is the booking authority's (Convergence Phase 3:
+        BookingFlowService no longer writes a booking at all — it delegates)."""
+        # Convergence Phase 3 adaptation. OLD: Track A's in-session writer in the Conversation
+        # Engine (`_process_flow_response`) / Data Exchange (`handle_confirm_booking`) built the
+        # booked ThreadRevision and called `self._sched.check(...)` itself. NEW: both transports
+        # DELEGATE one typed command; `BookingAuthority` alone derives the "booked" status and
+        # revalidates the slot under its locks. WHY: the legacy writers are deleted (no third
+        # state where both are reachable). The invariant — one booking authority, reached only
+        # from the Flow path, never from text — is asserted on the code that now holds it.
+        import inspect
+        from app.services.booking_authority import BookingAuthority
         bfs = (ROOT / "backend" / "app" / "services"
                / "booking_flow_service.py").read_text(encoding="utf-8-sig")
-        self.assertIn("BOOKING_REVALIDATION_PASS", bfs)
-        self.assertIn("self._sched.check(check_in)", bfs)
         writers = {n.name for n in ast.walk(ast.parse(bfs))
                    if isinstance(n, ast.FunctionDef)
                    and 'status="booked"' in ast.unparse(n).replace("'", '"')}
-        self.assertTrue(writers <= {"handle_confirm_booking", "_create_booking"}, writers)
+        self.assertEqual(writers, set(), writers)
+        self.assertIn("_execute_isolated(self.db, command, availability, attachments)", bfs)
+        self.assertIn("self._availability_service().check(",
+                      inspect.getsource(BookingAuthority._revalidate_availability))
 
     def test_the_withdrawal_is_one_explicit_transition(self):
         """G3-7P: still ONE explicit transition, but through the one lifecycle authority.

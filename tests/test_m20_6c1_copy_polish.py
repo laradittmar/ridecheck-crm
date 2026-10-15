@@ -142,6 +142,9 @@ def _new_session() -> Session:
 
 def _clean_all(db: Session) -> None:
     for tbl in [
+        # Convergence Phase 3: the booking ledger is keyed on the Flow token, so a ledger row
+        # left by one booking test would replay into the next one that reuses the token.
+        "booking_commands",
         "whatsapp_outbound_dedup", "whatsapp_messages",
         "whatsapp_thread_candidates", "whatsapp_thread_states",
         "whatsapp_threads", "whatsapp_contacts", "viaticos_zones",
@@ -476,61 +479,46 @@ class TestBookingConfirmation(unittest.TestCase):
         os.environ.pop("OUTBOUND_ENABLED", None)
         self.db.close()
 
+    # Convergence Phase 3 adaptation of test_4 / test_4b. OLD: Track A's in-session CE writer
+    # booked and sent the date/time receipt ("¡Listo, Lara! Recibimos tu solicitud … lunes
+    # 06/07 … 15:00 … revisar los datos"), here blocked by the kill switch. NEW: the booking
+    # authority books (flag ON, launch professional), and the ONLY success text is the
+    # owner-approved acknowledgement, sent through the ledger lease and the gate — blocked here
+    # as before, so the forensic row still records exactly what would have been sent. WHY:
+    # CP1-07 retires the receipt copy on the converged path; the legacy writer is deleted.
+    # Still asserted: BOOKED, needs_human, never "confirmado", the buyer recorded.
+    OWNER = "Gracias por completarlo. Un representante de RideCheck se estará comunicando con vos."
+
+    def _book(self, flow_data, wamid):
+        from offer_fixture import ensure_launch_professional
+        ensure_launch_professional(self.db)
+        self.db.commit()
+        self.eng.settings.smart_booking_ce_enabled = True
+        token = self.state.flow_booking_token
+        result = self.eng.handle(_make_flow_event(self.thread.id, wamid, flow_data, token))
+        self.db.expire_all()
+        self.db.refresh(self.lead)
+        self.db.refresh(self.state)
+        return result
+
     def test_4_booking_confirmation_copy(self):
-        """Flow submission confirmation uses buyer first name, day/time, 'revisar los datos'."""
-        flow_data = {
+        """A Flow booking is acknowledged with the owner text only, never a confirmation."""
+        result = self._book({
             "nombre_apellido": "Lara Dittmar",
             "telefono": _WA_ID,
             "email": "lara@test.com",
             "direccion": "Dean Funes 1907",
             "tipo_vendedor": "particular",
             "como_llego": "WhatsApp",
-        }
-        token = self.state.flow_booking_token
-        result = self.eng.handle(_make_flow_event(
-            self.thread.id, "wamid.M20.6C1.T4", flow_data, token,
-        ))
-        self.db.expire_all()
-        self.db.refresh(self.lead)
-        self.db.refresh(self.state)
-
-        self.assertEqual(result.action, "blocked_dispatch")
+        }, "wamid.M20.6C1.T4")
+        self.assertEqual(result.action, "booking_created")
+        self.assertFalse(result.reply_produced, "the kill switch blocked the send")
         self.assertEqual(self.state.last_stage, "BOOKED")
         self.assertTrue(self.state.needs_human, "needs_human must be True post-booking")
-
         text = _blocked_text(self.db, self.thread.id)
-
-        # Must start with ¡Listo,
-        self.assertTrue(text.startswith("¡Listo,"),
-                        f"Confirmation must start with '¡Listo,' — got: {text!r}")
-
-        # Must include buyer first name
-        self.assertIn("Lara", text,
-                      f"Confirmation must include buyer first name — got: {text!r}")
-
-        # Must include formatted day from _SCHED_DATE (2026-07-06 = lunes 06/07)
-        self.assertIn("06/07", text,
-                      f"Confirmation must include formatted date — got: {text!r}")
-        self.assertIn("lunes", text,
-                      f"Confirmation must include weekday name — got: {text!r}")
-
-        # Must include time
-        self.assertIn("15:00", text,
-                      f"Confirmation must include formatted time — got: {text!r}")
-
-        # Must say "revisar los datos", NOT "revisar la disponibilidad"
-        self.assertIn("revisar los datos", text,
-                      f"Must say 'revisar los datos' — got: {text!r}")
-        self.assertNotIn("revisar la disponibilidad", text,
-                         f"Must NOT say 'revisar la disponibilidad' — got: {text!r}")
-
-        # Must NOT imply appointment is fully confirmed
-        self.assertNotIn("confirmado", text.lower(),
-                         f"Must not say appointment is confirmed — got: {text!r}")
-        self.assertNotIn("quedó registrada", text,
-                         f"Old wording 'quedó registrada' must be removed — got: {text!r}")
-
-        # Revision must be persisted
+        self.assertEqual(text, self.OWNER)
+        self.assertNotIn("confirmado", text.lower())
+        self.assertNotIn("Recibimos tu solicitud", text)
         from app.models import ThreadRevision
         rev = self.db.execute(
             select(ThreadRevision).where(ThreadRevision.thread_id == self.thread.id)
@@ -540,27 +528,18 @@ class TestBookingConfirmation(unittest.TestCase):
         self.assertEqual(rev.buyer_name, "Lara Dittmar")
 
     def test_4b_confirmation_fallback_no_name(self):
-        """When buyer name is absent, confirmation gracefully falls back."""
-        flow_data = {
+        """Without a buyer name the acknowledgement is the same owner text."""
+        result = self._book({
             "nombre_apellido": "",
             "telefono": _WA_ID,
             "email": "anon@test.com",
             "direccion": "Calle Falsa 123",
             "como_llego": "WhatsApp",
-        }
-        token = self.state.flow_booking_token
-        result = self.eng.handle(_make_flow_event(
-            self.thread.id, "wamid.M20.6C1.T4B", flow_data, token,
-        ))
-        self.db.expire_all()
-
-        self.assertEqual(result.action, "blocked_dispatch")
+        }, "wamid.M20.6C1.T4B")
+        self.assertEqual(result.action, "booking_created")
         text = _blocked_text(self.db, self.thread.id)
-        # With no name, opener should be "¡Listo! Recibimos tu solicitud..."
-        self.assertTrue(text.startswith("¡Listo!"),
-                        f"No-name fallback must start with '¡Listo!' — got: {text!r}")
+        self.assertEqual(text, self.OWNER)
         self.assertNotIn("cliente", text.lower())
-        self.assertIn("revisar los datos", text)
 
 
 # ── Test 5: Sequence-level opener distinctness ────────────────────────────────

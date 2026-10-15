@@ -289,26 +289,50 @@ _NEUTRAL_MODULES = ("test_l4_7w5_g3_7r_unification", "test_m21_3_c_d_booking_flo
 
 class P2U_FlagOffNeutrality(unittest.TestCase):
     """Track A's own CE and Data Exchange booking tests, with the flag at its default (off),
-    must never reach the Smart Booking authority, its adapter or CE's SB2B methods."""
+    must never reach a booking WRITER.
+
+    Convergence Phase 3 adaptation. OLD: zero calls of ANY authority surface, including the
+    ledger reads, because with the flag off CE and Data Exchange were Track A's in-session
+    writers and never consulted the ledger. NEW: zero calls of every booking WRITER (`execute`,
+    both adapter writers, the acknowledgement lease, CE-W2) and of the replay counter; the
+    ledger READS (`lookup`, `lookup_booking`) are now made by every booking-shaped submission
+    under either flag, because a booking that exists must be answered truthfully (design §8,
+    B-2). WHY: Phase 3 deletes the legacy writers and makes the flag an OFF switch. The
+    `flag_off_ledger_reachable` mutation's successor here is a flag-off WRITE, which this
+    guard still refuses."""
 
     def test_p2u_30_active_flag_off_paths_make_zero_authority_calls(self):
+        """Convergence Phase 3 adaptation (continued). Several of these modules now ALSO
+        exercise the converged path with the flag deliberately ON (their booking tests were
+        adapted to the authority), so a call is counted only when it is reached from a
+        Conversation Engine or Data Exchange frame whose flag reads OFF at that moment —
+        which is exactly the state in which no booking writer may be reachable."""
+        import inspect as _inspect
+        from app.services import booking_flow_service as BFm
         from app.services import conversation_engine as CEm
         from app.settings import get_settings
         self.assertIs(get_settings().smart_booking_ce_enabled, False)
         calls = []
 
+        def _flag_off_frame():
+            for frame in _inspect.stack(context=0)[2:]:
+                owner = frame.frame.f_locals.get("self")
+                if isinstance(owner, CEm.ConversationEngine):
+                    return not owner._smart_booking_ce_on()
+                if isinstance(owner, BFm.BookingFlowService):
+                    return not BFm._smart_booking_enabled()
+            return False
+
         def spy(name, real):
             def wrapper(*a, **k):
-                calls.append(name)
+                if _flag_off_frame():
+                    calls.append(name)
                 return real(*a, **k)
             wrapper.__wrapped__ = real
             return wrapper
-        targets = [(BookingAuthority, n) for n in ("execute", "lookup", "claim_acknowledgement",
-                                                   "record_acknowledgement", "note_replay")]
-        targets += [(ce, n) for n in ("book_from_flow_response", "request_manual_scheduling",
-                                      "lookup_booking")]
-        targets += [(CEm.ConversationEngine, n) for n in ("_sb_flow_book", "_sb_flow_ledger_entry",
-                                                          "_sb_escalation")]
+        targets = [(BookingAuthority, "execute")]
+        targets += [(ce, n) for n in ("book_from_flow_response", "request_manual_scheduling")]
+        targets += [(CEm.ConversationEngine, n) for n in ("_sb_escalation", "_sb_manual_request")]
         patches = [mock.patch.object(obj, n, spy(f"{getattr(obj, '__name__', obj)}.{n}",
                                                  getattr(obj, n))) for obj, n in targets]
         loader = unittest.TestLoader()
@@ -322,7 +346,7 @@ class P2U_FlagOffNeutrality(unittest.TestCase):
             for p in patches:
                 p.stop()
         self.assertGreater(result.testsRun, 100)
-        self.assertEqual(calls, [], f"flag-off paths reached the authority: {sorted(set(calls))}")
+        self.assertEqual(calls, [], f"flag-off paths reached a booking writer: {sorted(set(calls))}")
 
 
 if __name__ == "__main__":                                  # pragma: no cover

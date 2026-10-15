@@ -187,34 +187,33 @@ class G7N_Withdrawal(unittest.TestCase):
 class G7N_Revocation(unittest.TestCase):
 
     def test_g7n_11_a_withdrawn_offer_is_refused_before_any_write(self):
-        """Still true, and G3-7R made the order it is asserted on STRONGER.
-
-        This used to require `_offers.claim(` before `buyer_email` — acceptance decided
-        before a booking field is read. G3-7R split that one decision into two: ADMISSION,
-        which is the boundary and now happens before ANY field is parsed, and the claim,
-        which is the terminal transition and happens after the final availability
-        revalidation. So the assertion moves to the boundary, where it belongs, and gains a
-        second clause: nothing may be WRITTEN before the claim either.
-
-        The reordering is why revalidation can leave a refused offer ISSUED instead of
-        relying on a rollback to undo an acceptance it should never have made. The only
-        parsed field revalidation receives is the address, and `ScheduleService.check()`
-        does not read it — so no customer-supplied value influences admission or
-        availability.
-
-        The BEHAVIOUR is proven in `test_l4_7w5_g3_7p_offer_authority_pg.py::test_g7p_pg_07`.
-        """
-        src = inspect.getsource(CE._process_flow_response)
-        self.assertLess(src.index("_offers.admit("), src.index("buyer_email"),
+        """A withdrawn offer is refused before any booking field is read or row is built."""
+        # Convergence Phase 3 adaptation: Track A's in-session writer (`_process_flow_response`'s
+        # booking body: admit → claim → ThreadRevision) is deleted. The same ordering is now
+        # asserted on `_converged_flow_book`, where admission is a READ before any field is
+        # parsed and NOTHING is built in CE at all — the authority claims the offer (K2) before
+        # it writes any booking row (asserted on `_execute_snapshot`).
+        from app.services.booking_authority import BookingAuthority
+        src = inspect.getsource(CE._converged_flow_book)
+        self.assertLess(src.index(".admit(thread_id=tid, token=submitted)"),
+                        src.index("buyer_email"),
                         "admission must be decided before a booking field is read")
-        self.assertLess(src.index("_offers.claim("), src.index("thread_rev = ThreadRevision("),
+        self.assertNotIn("ThreadRevision(", src, "CE builds no booking row")
+        auth = inspect.getsource(BookingAuthority._execute_snapshot)
+        self.assertLess(auth.index("self._claim_offer(acceptance, state)"),
+                        auth.index("self._write(cmd, revision"),
                         "acceptance must be decided before a booking row is built")
 
     def test_g7n_12_the_refusal_precedes_booking_processing(self):
-        src = inspect.getsource(CE._process_flow_response)
-        self.assertLess(src.index("if not _adm.granted:"), src.index("buyer_email"))
-        self.assertLess(src.index("if not _claim.ok:"),
-                        src.index("thread_rev = ThreadRevision("))
+        # Convergence Phase 3 adaptation: Track A's in-session writer (`_process_flow_response`'s
+        # booking body: admit → claim → ThreadRevision) is deleted. The same ordering is now
+        # asserted on `_converged_flow_book`, where admission is a READ before any field is
+        # parsed and NOTHING is built in CE at all — the authority claims the offer (K2) before
+        # it writes any booking row (asserted on `_execute_snapshot`).
+        src = inspect.getsource(CE._converged_flow_book)
+        self.assertLess(src.index("if not adm.granted:"), src.index("buyer_email"))
+        self.assertLess(src.index("if not adm.granted:"),
+                        src.index("book_from_flow_response(self.db, req)"))
 
     def test_g7n_13_a_foreign_token_is_refused_not_warned(self):
         """Superseded by behavioural proof: `test_g7p_pg_06` (foreign thread) and
@@ -228,19 +227,18 @@ class G7N_Revocation(unittest.TestCase):
         self.assertEqual(OfferRefusal.SUPERSEDED_OFFER, "SUPERSEDED_OFFER")
 
     def test_g7n_15_no_warn_only_path_remains(self):
-        """The old comparison only logged, which is why an old token regained authority
-        once a new offer overwrote the tombstone. There is now no path where a mismatched
-        token is merely warned about."""
-        src = inspect.getsource(CE._process_flow_response)
+        """There is no path where a mismatched token is merely warned about."""
+        # Convergence Phase 3 adaptation: Track A's in-session writer (`_process_flow_response`'s
+        # booking body: admit → claim → ThreadRevision) is deleted. The same ordering is now
+        # asserted on `_converged_flow_book`, where admission is a READ before any field is
+        # parsed and NOTHING is built in CE at all — the authority claims the offer (K2) before
+        # it writes any booking row (asserted on `_execute_snapshot`).
+        src = inspect.getsource(CE._converged_flow_book)
         self.assertNotIn("flow token mismatch", src)
-        # G3-7P: there is no comparison left to warn about. G3-7R: and there is no
-        # turn-entry prediction left either. The boundary is one typed admission that
-        # either grants, replays or refuses, decided before any booking field is parsed,
-        # and the terminal claim happens before any booking row is built. Neither path can
-        # fall through to the booking code.
-        self.assertLess(src.index("_offers.admit("), src.index("buyer_email"))
-        self.assertIn("if not _adm.granted:", src)
-        self.assertIn("if not _claim.ok:", src)
+        self.assertIn('reason="FLOW_TOKEN_NOT_ACTIVE"', src)
+        self.assertLess(src.index(".admit(thread_id=tid, token=submitted)"),
+                        src.index("buyer_email"))
+        self.assertIn("if not adm.granted:", src)
 
     def test_g7n_16_the_refusal_survives_a_reload(self):
         """The durable half moved from a string in one column to a row with a status. Proven
@@ -340,36 +338,36 @@ class G7N_Acknowledgement(unittest.TestCase):
                 "se estará comunicando con vos.")
 
     def test_g7n_23_the_copy_is_exactly_the_owner_approved_sentence(self):
-        """Owner policy, G3-7N §13: Track A's successful-completion acknowledgement is
-        this sentence verbatim. The previous "se va a comunicar" variant is retired."""
-        src = inspect.getsource(CE)
-        self.assertIn("se estará comunicando con vos.", src)
-        self.assertNotIn("Un representante de RideCheck se va a comunicar", src)
+        """Owner policy, G3-7N §13: the successful-completion acknowledgement is this
+        sentence verbatim. Convergence Phase 3 adaptation: CE no longer carries the literal —
+        `_FLOW_COMPLETION_ACK` IS the one canonical constant (CP1-07)."""
+        from app.services.booking_acknowledgement import BOOKING_FLOW_RECEIPT_TEXT
+        self.assertIs(CE._FLOW_COMPLETION_ACK, BOOKING_FLOW_RECEIPT_TEXT)
+        self.assertEqual(BOOKING_FLOW_RECEIPT_TEXT, self.APPROVED)
+        self.assertNotIn("Un representante de RideCheck se va a comunicar", inspect.getsource(CE))
 
     def test_g7n_24_it_appears_exactly_once(self):
-        src = inspect.getsource(CE)
-        self.assertEqual(src.count("Gracias por completarlo"), 1)
+        """Convergence Phase 3 adaptation: the sentence lives in exactly one module."""
+        from pathlib import Path
+        app_dir = Path(inspect.getfile(CE)).resolve().parents[1]
+        holders = [p.name for p in sorted(app_dir.rglob("*.py"))
+                   if "Gracias por completarlo" in p.read_text(encoding="utf-8-sig")]
+        self.assertEqual(holders, ["booking_acknowledgement.py"])
 
     def test_g7n_25_the_ack_is_not_used_for_a_refused_submission(self):
-        src = inspect.getsource(CE._process_flow_response)
-        # The slice must START at the refusal branch and END at the first `replied` return
-        # AFTER it. G3-7P-R3 added an earlier `replied` return — the typed outcome for a
-        # submission that lost the lock race — and an unanchored `index` picked that one up,
-        # producing an EMPTY slice that asserted nothing at all.
-        # G3-7R routed EVERY refusal on this path — admission, contention, revalidation
-        # and acceptance — through one helper, so the property is asserted on that helper
-        # rather than on a source slice. One place to read means the four refusals cannot
-        # drift into different customer experiences, which is what a slice-based oracle
-        # could never have noticed.
-        for branch in ("if not _adm.granted:", "if not _claim.ok:",
-                       "_refuse_booking_submission("):
-            self.assertIn(branch, src, branch)
-        refusal = inspect.getsource(CE._refuse_booking_submission)
-        self.assertNotIn("_FLOW_COMPLETION_ACK", refusal)
-        self.assertIn("_FALLBACK_WARM_HANDOFF", refusal)
-        # And the completion acknowledgement is planned only on the path that committed.
-        self.assertIn("_plan_flow_completion_ack", src)
-        self.assertNotIn("_plan_flow_completion_ack", refusal)
+        """Convergence Phase 3 adaptation. OLD: every refusal went through
+        `_refuse_booking_submission` (warm handoff, never the ack) and the ack was PLANNED only
+        on the committed path. NEW: every refusal goes through `_sb_refusal` → `_sb_handoff`
+        (the handoff copy, never the ack); the ack is sent only from `_sb_finish_committed`,
+        i.e. only for a committed or replayed booking. Behaviour: sb2b_23..28 assert the
+        handoff text and the absence of the owner text on every refusal outcome."""
+        for fn in (CE._sb_refusal, CE._sb_handoff, CE._sb_transient):
+            src = inspect.getsource(fn)
+            self.assertNotIn("_FLOW_COMPLETION_ACK", src)
+            self.assertNotIn("_sb_acknowledge(", src)
+            self.assertNotIn("acknowledge_committed_booking", src)
+        self.assertIn("BOOKING_HANDOFF_TEXT", inspect.getsource(CE._sb_handoff))
+        self.assertIn("self._sb_acknowledge(", inspect.getsource(CE._sb_finish_committed))
 
 class G7N_PreservedSafety(unittest.TestCase):
 

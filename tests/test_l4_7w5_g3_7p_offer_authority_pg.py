@@ -33,6 +33,25 @@ from sqlalchemy import create_engine, text  # noqa: E402
 from sqlalchemy.orm import sessionmaker  # noqa: E402
 
 PG_URL = os.environ.get("G7P_PG_URL", "")
+# ── Convergence Phase 3 (adaptation, whole module) ─────────────────────────────────────────
+# The Conversation Engine and the Data Exchange no longer book in their own sessions: both
+# delegate to `BookingAuthority`, which (a) is reachable only with SMART_BOOKING_CE_ENABLED on
+# — the OFF switch for both Flow transports, now read from `get_settings()` — and (b) books
+# against the launch professional. These suites prove the offer authority's and the booking
+# projection's guarantees, so they run the converged writer: the flag is ON for this module
+# and every fixture world has a (synthetic) launch professional. Nothing else changes.
+_P3_PATCHES = []
+
+
+def setUpModule():
+    from offer_fixture import start_converged_booking
+    _P3_PATCHES.extend(start_converged_booking())
+
+
+def tearDownModule():
+    from offer_fixture import stop_converged_booking
+    stop_converged_booking(_P3_PATCHES)
+
 
 WA = "549110000777"
 BOOKING_PAYLOAD = {
@@ -97,6 +116,8 @@ class G7POfferAuthorityPG(unittest.TestCase):
                       "whatsapp_contacts"):
                 c.execute(text(f"TRUNCATE {t} RESTART IDENTITY CASCADE"))
         db = self.SF()
+        from offer_fixture import ensure_launch_professional
+        ensure_launch_professional(db)   # Convergence Phase 3: the authority books against it
         ct = M.WhatsAppContact(wa_id=WA, display_name="Probe"); db.add(ct); db.flush()
         lead = M.Lead(nombre="Probe", apellido="Cliente", telefono=WA,
                       estado="CONSULTA_NUEVA", flag="ACEPTADO"); db.add(lead); db.flush()
@@ -324,23 +345,30 @@ class G7POfferAuthorityPG(unittest.TestCase):
         A replay is not a refusal. It is counted as a replay, and asserting the old
         counters would be asserting the defect.
         """
-        from app.schemas.conversation import ACTION_BOOKING_REPLAY
+        # Convergence Phase 3 adaptation. OLD: the replay was answered from the ACCEPTED
+        # offer row (`ACTION_BOOKING_REPLAY` = "booking_replay") and counted on the OFFER
+        # (`replay_count`). NEW: the booking LEDGER answers first ("booking_replayed", the
+        # converged CE replay action, also in HANDLED_ACTIONS) and counts the replay on the
+        # ledger row; the offer row is admission evidence only (design §8). Still asserted:
+        # no second booking, and a replay writes no refusal.
+        from app.schemas.conversation import HANDLED_ACTIONS
         token = self._issue()
         self._submit(token, tag="first")
         before = self._counts()
         out = self._submit(token, tag="replay")
         self.assertNotEqual(out.action, "booking_created")
-        self.assertEqual(out.action, ACTION_BOOKING_REPLAY)
+        self.assertEqual(out.action, "booking_replayed")
+        self.assertIn(out.action, HANDLED_ACTIONS)
         self.assertEqual(self._counts(), before, "no second booking")
         offer = self._offers()[0]
         self.assertIsNone(offer[7], "a replay must not write last_refusal")
         self.assertEqual(offer[6], 0, "a replay must not increment refused_count")
         db = self.SF()
         replays = db.execute(text(
-            "SELECT replay_count FROM whatsapp_booking_offers WHERE thread_id=:t "
-            "ORDER BY id"), {"t": self.thread_id}).scalars().first()
+            "SELECT replay_count FROM booking_commands WHERE thread_id=:t "
+            "ORDER BY id"), {"t": self.thread_id}).scalars().all()
         db.close()
-        self.assertEqual(replays, 1, "a replay must be distinguishable in evidence")
+        self.assertEqual(replays, [1], "a replay must be distinguishable in evidence")
 
     # ── 2. every refusal creates nothing ─────────────────────────────────────
 
@@ -638,28 +666,37 @@ class G7POfferAuthorityPG(unittest.TestCase):
         the commit is made to fail once: the offer must come back ISSUED, no booking may
         exist, and the retry must complete the operation.
         """
+        # Convergence Phase 3 adaptation. OLD: the failure was injected into the Conversation
+        # Engine session's FIRST commit, which WAS the booking commit. NEW: the booking commit
+        # is the authority's own (isolated session); the CE session no longer commits a
+        # booking at all. So the failure is injected at the authority's commit — the moment
+        # after the offer was claimed and every booking row written — and the same
+        # invariant is asserted: nothing survives, the offer is ISSUED, the retry books.
+        import app.services.booking_authority as BA
         token = self._issue()
         self._clear_human()
         db, eng = self._engine()
-        real_commit = db.commit
+        real_verify = BA.BookingAuthority._verify_before_commit
         calls = {"n": 0}
 
-        def fail_first(*a, **kw):
+        def fail_first(auth, *a, **kw):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise RuntimeError("induced failure at the booking commit")
-            return real_commit(*a, **kw)
+            return real_verify(auth, *a, **kw)
 
-        db.commit = fail_first
+        from unittest import mock as _mock
         from app.schemas.conversation import ConversationHandleIn
-        try:
-            eng.handle(ConversationHandleIn(
-                thread_id=self.thread_id, wa_message_id="wamid.precommit", wa_id=WA,
-                message_type="flow_response", flow_response=dict(BOOKING_PAYLOAD),
-                flow_token=token))
-        except Exception:
-            pass
+        with _mock.patch.object(BA.BookingAuthority, "_verify_before_commit", fail_first):
+            try:
+                eng.handle(ConversationHandleIn(
+                    thread_id=self.thread_id, wa_message_id="wamid.precommit", wa_id=WA,
+                    message_type="flow_response", flow_response=dict(BOOKING_PAYLOAD),
+                    flow_token=token))
+            except Exception:
+                pass
         db.close()
+        self.assertEqual(calls["n"], 1, "the failure was injected at the authority's commit")
         self.assertEqual(self._counts(), (0, 0), "a booking survived a failed commit")
         self.assertEqual([o[1] for o in self._offers()], ["ISSUED"],
                          "the acceptance was not rolled back with the booking")
@@ -1276,8 +1313,11 @@ class G7PR3TransactionDurability(G7POfferAuthorityPG):
         day, hhmm = self._open_slot(); self._arm_preference(day, hhmm)
         token = self._issue()
         self.assertEqual(self._dx_confirm(token, day, hhmm)[0], "ok")
+        # Convergence Phase 3 adaptation: OLD — a replayed confirmation raised (the token was
+        # consumed, `resolve_context` refused). NEW — the booking ledger answers first and the
+        # replay returns the SAME SUCCESS screen; still nothing more is booked.
         for _ in range(3):
-            self.assertEqual(self._dx_confirm(token, day, hhmm)[0], "exc")
+            self.assertEqual(self._dx_confirm(token, day, hhmm), ("ok", "SUCCESS"))
         self.assertEqual(self._counts(), (1, 1), "a replay booked a second time")
 
     def test_g7p_r3_08_each_dx_binding_is_enforced_at_confirmation(self):
@@ -1315,11 +1355,19 @@ class G7PR3TransactionDurability(G7POfferAuthorityPG):
 
     def _gate_one_writer(self):
         """Hold ONE writer inside its transaction between step 1 and step 2 of the lock
-        order, so the interleaving is chosen rather than hoped for."""
+        order, so the interleaving is chosen rather than hoped for.
+
+        Convergence Phase 3 adaptation: the booking transaction is `BookingAuthority`'s, so
+        the gate is its K2 entry (`_claim_offer`, K1 already held) — the same point between
+        step 1 and step 2 that `OfferLifecycle.claim` was in the deleted in-session writers.
+        A K1 contention the authority answers (`THREAD_STATE_CONTENDED`) is recorded as the
+        `55P03` it is, alongside the offer lifecycle's own spy."""
+        import app.services.booking_authority as BA
         import app.services.offer_lifecycle as OL
         state = {"name": None, "entered": threading.Event(), "hold": threading.Event(),
                  "sqlstates": []}
-        original = OL.OfferLifecycle.claim
+        original = BA.BookingAuthority._claim_offer
+        original_k1 = BA.BookingAuthority._lock_thread_state
         original_cs = OL.OfferLifecycle.contention_sqlstate
 
         def gated(inner_self, *a, **kw):
@@ -1328,6 +1376,14 @@ class G7PR3TransactionDurability(G7POfferAuthorityPG):
                 state["hold"].wait(timeout=40)
             return original(inner_self, *a, **kw)
 
+        def k1_spy(inner_self, *a, **kw):
+            try:
+                return original_k1(inner_self, *a, **kw)
+            except BA._Refused as refused:
+                if refused.result.reason == "THREAD_STATE_CONTENDED":
+                    state["sqlstates"].append("55P03")
+                raise
+
         def spy(exc):
             sqlstate = (getattr(getattr(exc, "orig", None), "sqlstate", None)
                         or getattr(exc, "sqlstate", None))
@@ -1335,9 +1391,11 @@ class G7PR3TransactionDurability(G7POfferAuthorityPG):
                 state["sqlstates"].append(sqlstate)
             return original_cs(exc)
 
-        OL.OfferLifecycle.claim = gated
+        BA.BookingAuthority._claim_offer = gated
+        BA.BookingAuthority._lock_thread_state = k1_spy
         OL.OfferLifecycle.contention_sqlstate = staticmethod(spy)
-        self.addCleanup(setattr, OL.OfferLifecycle, "claim", original)
+        self.addCleanup(setattr, BA.BookingAuthority, "_claim_offer", original)
+        self.addCleanup(setattr, BA.BookingAuthority, "_lock_thread_state", original_k1)
         self.addCleanup(setattr, OL.OfferLifecycle, "contention_sqlstate",
                         staticmethod(original_cs))
         return state
@@ -1690,9 +1748,11 @@ class G7PR3AConversationScope(G7POfferAuthorityPG):
         out[key] = res[1] if res[0] == "ok" else f"EXC:{res[1]}"
 
     def _hold_at_claim(self, thread_name):
-        """Suspend ONE writer between step 1 and step 2 of the lock order."""
-        import app.services.offer_lifecycle as lifecycle_module
-        original = lifecycle_module.OfferLifecycle.claim
+        """Suspend ONE writer between step 1 and step 2 of the lock order. (Convergence
+        Phase 3 adaptation: at the booking authority's K2 entry, K1 held — see
+        `_gate_one_writer`.)"""
+        import app.services.booking_authority as BA
+        original = BA.BookingAuthority._claim_offer
         entered, release = threading.Event(), threading.Event()
 
         def gated(inner_self, *a, **kw):
@@ -1701,8 +1761,8 @@ class G7PR3AConversationScope(G7POfferAuthorityPG):
                 release.wait(timeout=60)
             return original(inner_self, *a, **kw)
 
-        lifecycle_module.OfferLifecycle.claim = gated
-        self.addCleanup(setattr, lifecycle_module.OfferLifecycle, "claim", original)
+        BA.BookingAuthority._claim_offer = gated
+        self.addCleanup(setattr, BA.BookingAuthority, "_claim_offer", original)
         return entered, release
 
     def _armed_offer(self):
@@ -1920,9 +1980,14 @@ class G7PR3AConversationScope(G7POfferAuthorityPG):
 
         at_claim = {}
         model_calls = []
-        original_claim = lifecycle_module.OfferLifecycle.claim
         original_semantic = interpreter_module.SemanticTurnInterpreter._call_openai
         original_reply = ConversationEngine._call_openai
+
+        # Convergence Phase 3 adaptation: the booking turn's step 1 is taken by the booking
+        # AUTHORITY on its own session (K1, explicit, bounded) — observed at its K2 entry,
+        # where the in-session writer's `claim()` used to be.
+        import app.services.booking_authority as BA
+        original_claim = BA.BookingAuthority._claim_offer
 
         def observing_claim(inner_self, *a, **kw):
             at_claim.update(zip(("bound", "locks"),
@@ -1937,10 +2002,10 @@ class G7PR3AConversationScope(G7POfferAuthorityPG):
             model_calls.append("reply")
             return '{"reply": "hola"}'
 
-        lifecycle_module.OfferLifecycle.claim = observing_claim
+        BA.BookingAuthority._claim_offer = observing_claim
         interpreter_module.SemanticTurnInterpreter._call_openai = forbid_semantic
         ConversationEngine._call_openai = forbid_reply
-        self.addCleanup(setattr, lifecycle_module.OfferLifecycle, "claim", original_claim)
+        self.addCleanup(setattr, BA.BookingAuthority, "_claim_offer", original_claim)
         self.addCleanup(setattr, interpreter_module.SemanticTurnInterpreter,
                         "_call_openai", original_semantic)
         self.addCleanup(setattr, ConversationEngine, "_call_openai", original_reply)
@@ -2018,9 +2083,15 @@ class G7PR3AConversationScope(G7POfferAuthorityPG):
                 #
                 # What the property still demands, and what is asserted above, is that the
                 # loser is TYPED and that exactly one booking exists.
+                # Convergence Phase 3 adaptation: the converged writers' typed losers are
+                # `thread_contended` (CE, K1 contention: nothing written, cursor kept),
+                # `booking_replayed` (CE, the ledger answered) and the Data Exchange's typed
+                # retry screen (`BookingSlotConflictError` carrying "Volvé a intentarlo" for
+                # a RETRYABLE authority result). The legacy names stay admitted.
                 self.assertIn(out.get("loser"),
                               (ACTION_THREAD_CONTENDED, "EXC:BookingTokenError",
-                               ACTION_BOOKING_REPLAY, "EXC:BookingAlreadyCompletedError"),
+                               ACTION_BOOKING_REPLAY, "EXC:BookingAlreadyCompletedError",
+                               "booking_replayed", "EXC:BookingSlotConflictError"),
                               f"the losing booking writer was not typed: {out}")
                 self.assertLess(waited, bound * 2.5,
                                 f"the losing booking writer waited {waited:.2f}s")

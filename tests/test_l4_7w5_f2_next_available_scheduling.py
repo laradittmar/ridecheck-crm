@@ -328,15 +328,23 @@ class TestHandoffRouting(unittest.TestCase):
 
     def test_handoff_06_to_12_reuse_the_existing_escalation_mechanism(self):
         """The escalation already persists context, flags human and emails — it is reused,
-        not reimplemented, so those guarantees are inherited rather than duplicated."""
+        not reimplemented, so those guarantees are inherited rather than duplicated.
+
+        Convergence Phase 3 adaptation (HANDOFF-06): OLD — the escalation priced a provisional
+        Revision it wrote itself (`recalculate_revision_if_possible`). NEW — the request is
+        recorded, and priced, by the booking authority from a `PriceRecalculation` plan
+        (`_sb_escalation`); the in-session PENDIENTE writer is deleted."""
         fn = next(ast.unparse(n) for n in ast.walk(ast.parse(CE_SOURCE))
                   if isinstance(n, ast.FunctionDef)
                   and n.name == "_handle_scheduling_escalation")
+        w2 = next(ast.unparse(n) for n in ast.walk(ast.parse(CE_SOURCE))
+                  if isinstance(n, ast.FunctionDef) and n.name == "_sb_escalation")
         self.assertIn("lead.necesita_humano = True", fn)          # HANDOFF-08
         self.assertIn("state.needs_human = True", fn)             # HANDOFF-07
         self.assertIn("STAGE_HUMAN", fn)
         self.assertIn("ATENCION_HUMANA", fn)
-        self.assertIn("recalculate_revision_if_possible", fn)     # HANDOFF-06 price
+        self.assertIn("self._sb_escalation(", fn)                 # HANDOFF-06 price ↓
+        self.assertIn("PriceRecalculation(", w2)
         self.assertIn("_send_scheduling_handoff_email", fn)       # HANDOFF-10
         self.assertNotIn("_send_flow_button", fn)                 # HANDOFF-11
         self.assertNotIn('status="booked"', fn.replace("'", '"')) # HANDOFF-12

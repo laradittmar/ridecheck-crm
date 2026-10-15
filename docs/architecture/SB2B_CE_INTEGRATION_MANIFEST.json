@@ -1,20 +1,19 @@
 {
   "schema": "sb2b-ce-integration-manifest/1",
   "milestone": "PRELAUNCH-SB2A-BOOKING-AUTHORITY-CORE + SB2A-R2 + PRELAUNCH-SB2A-R3-CALLBACK-AND-LEASE-CLOSURE",
-  "status": "CONTRACT ONLY — conversation_engine.py is not modified in SB2A, R2 or R3; SB2B wires these sites",
+  "status": "CONVERGED (convergence Phase 3): the Conversation Engine constructs no Revision or ThreadRevision; each site below DELEGATES one typed command to the booking authority through its adapter",
   "source_file": "backend/app/services/conversation_engine.py",
   "adapter_module": "app.services.booking_ce_adapter",
   "sites": [
     {
       "id": "CE-W1",
-      "function": "_process_flow_response",
+      "function": "_converged_flow_book",
       "anchors": [
-        "crm_rev = Revision(",
-        "status=\"booked\"",
-        "turno_fecha=sched_date",
-        "turno_hora=sched_time"
+        "book_from_flow_response(self.db, req)",
+        "offer_acceptance=acceptance",
+        "availability=AvailabilityRevalidation("
       ],
-      "current_operation": "Writes ThreadRevision(status='booked') and an occupying Revision at state.preferred_day/preferred_time, then self.db.commit(). No advisory lock, no revalidation, no calendar check, no professional, no idempotency; under SB1 an overlap raises 23P01 inside CE.",
+      "current_operation": "Convergence Phase 3: admission as a READ against the offer table, the offer-bound candidate and its canonical location, then ONE CeFlowBookingRequest carrying the frozen OfferAcceptance; BookingAuthority claims the offer (K2), books, projects and records the ledger in one commit. Track A's in-session writer is deleted.",
       "adapter": "book_from_flow_response",
       "request": "CeFlowBookingRequest",
       "command": {
@@ -45,13 +44,12 @@
     },
     {
       "id": "CE-W2",
-      "function": "_handle_scheduling_escalation",
+      "function": "_sb_escalation",
       "anchors": [
-        "crm_rev = Revision(",
-        "status=\"provisional\"",
-        "turno_notas=\"Pendiente coordinación manual"
+        "request_manual_scheduling(self.db, req)",
+        "non_occupying_status=\"provisional\""
       ],
-      "current_operation": "Writes an OCCUPYING Revision (default PENDIENTE) at the time the customer insists on after CE judged it unavailable. Under SB1 an overlap raises 23P01, CE's catch-all rolls back the entire turn and returns action='error' (handled=True): no reply, and the escalation, needs_human and handoff e-mail are lost.",
+      "current_operation": "Convergence Phase 3: a NON-occupying REPROGRAMAR request through the authority (flag on); with the flag off nothing is recorded and the human handoff stands. The in-session PENDIENTE writer is deleted.",
       "adapter": "request_manual_scheduling",
       "request": "CeSchedulingEscalationRequest",
       "command": {
@@ -80,6 +78,24 @@
         "cycle_key": "COALESCE(state.current_cycle_start_message_db_id, 0)",
         "inbound_event_id": "ctx.inbound_wa_message_id"
       }
+    },
+    {
+      "id": "CE-W1-B6",
+      "function": "_sb_manual_request",
+      "anchors": [
+        "request_manual_scheduling(self.db, CeSchedulingEscalationRequest(",
+        "non_occupying_status=\"provisional\""
+      ],
+      "current_operation": "Convergence Phase 3 (SB2B B-6): after a CE-W1 SLOT_CONFLICT or CALENDAR_EXCEPTION, and only after the ledger re-read missed, a NON-occupying manual-scheduling request keyed on the Flow submission, recorded by the authority.",
+      "adapter": "request_manual_scheduling",
+      "request": "CeSchedulingEscalationRequest",
+      "expected_results": [
+        "COMMITTED",
+        "IDEMPOTENT_REPLAY",
+        "VALIDATION_FAILED (EVENT_IDENTITY_REQUIRED, IDEMPOTENCY_KEY_REUSED, ATTACHMENT_*)",
+        "RETRYABLE_FAILURE",
+        "INTERNAL_FAILURE"
+      ]
     }
   ],
   "session_contract": "Each adapter call runs in its OWN short-lived session (isolated_session) on its own connection and commits or rolls back only that session; the caller's session is never flushed, committed, rolled back or closed by the adapter. There is NO callback (SB2A-R3): CE describes its associated writes as a typed BookingAttachmentPlan (ThreadRevisionAttachment, LeadUpdate, ThreadStateUpdate, PriceRecalculation) — plain data the booking authority executes in its own transaction. The ThreadRevision's status and slot are derived from the booking, never supplied.",

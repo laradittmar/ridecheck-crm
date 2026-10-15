@@ -8,14 +8,13 @@ Handles the complete data exchange lifecycle for the RideCheck Booking Meta Flow
   prepare_summary → SUMMARY screen
   confirm_booking → atomic booking + SUCCESS
 
-Outbound is NOT triggered here.  The data exchange endpoint receives and responds
-to Flow interaction; any eventual WhatsApp messages (confirmation, conflict) are
-emitted by CE through the normal gate when outbound is enabled.
+Convergence Phase 3: confirm_booking books through `BookingAuthority` only. After the
+authority commit, the one success acknowledgement is sent through the booking ledger's lease
+and the outbound safety gate (`booking_acknowledgement.acknowledge_committed_booking`).
 """
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import logging
 import os
@@ -41,6 +40,7 @@ from ..repositories.pricing_repository import PricingRepository
 from ..schemas.schedule import ScheduleCheckIn
 from ..services.pricing import PricingService
 from ..services.schedule import ScheduleService
+from .booking_authority import BookingOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -319,8 +319,8 @@ class BookingFlowService:
         # reported both as an expired session. The offer row can tell them apart: ACCEPTED
         # with a recorded ThreadRevision is a replay and nothing else is.
         # R2/RV-07. `admit()` is a read and this method stays one: it DETECTS the replay
-        # and reports it, and the bookkeeping happens at the command boundary
-        # (`handle_confirm_booking`) where a transaction may legitimately be committed.
+        # and reports it. Convergence Phase 3: `handle_confirm_booking` asks the booking
+        # ledger first and counts a replay there; this detection only serves the screens.
         # G3-7R counted and committed here, which meant resolving a context could commit
         # whatever the caller had pending — a durable side effect in a method named for
         # resolution, reachable from `handle_init`, `handle_date_selected` and
@@ -745,93 +745,88 @@ class BookingFlowService:
         }
 
     def handle_confirm_booking(self, booking_token: str, data: dict) -> dict:
-        """Handle confirm_booking: revalidate slot, atomic booking, consume token.
-
-        Sequence (per milestone spec):
-        1. resolve token → active context
-        2. parse selected date/time
-        3. acquire advisory lock (PostgreSQL) scoped to date
-        4. ScheduleService.check() again
-        5. if valid: create booking atomically
-        6. consume token
-        7. return SUCCESS response
-
-        Raises BookingSlotConflictError with refreshed data if slot is gone.
-        """
-        # ── R2/RV-07: the replay is COUNTED here, at the command boundary ─────────
-        # `resolve_context` detects it and stays read-only. This is the only caller that
-        # is a command, so this is the only place a transaction may be committed for it.
-        # On contention the counter is skipped and the replay is still reported: the
-        # booking is the fact the Flow needs, the counter is bookkeeping, and waiting for
-        # it would reintroduce the unbounded wait this milestone closes.
+        """confirm_booking. See `_confirm_booking`; a refusal branch that finds the submission
+        booked on its ledger re-read answers that booking's SUCCESS instead."""
         try:
-            ctx = self.resolve_context(booking_token)
-        except BookingAlreadyCompletedError as _replay:
-            self._count_replay_at_command_boundary(_replay, booking_token)
-            raise
+            return self._confirm_booking(booking_token, data)
+        except _LedgerReplay as replay:
+            return replay.response
 
-        # ── G3-7R/S2: DATABASE-FIRST ADMISSION, the same question the engine asks ──
-        # `resolve_context` has checked the token's shape, its age and the transport
-        # mirror — none of which is the authority. The authority is the offer row, and the
-        # question is the same one `ConversationEngine` asks through the same method: does
-        # this token match an ISSUED offer for this thread? Asked before any lock is taken
-        # and before anything is written, so a refusal costs nothing and serialises nothing.
+    def _confirm_booking(self, booking_token: str, data: dict) -> dict:
+        """confirm_booking — convergence Phase 3: THE BOOKING AUTHORITY BOOKS, nothing here.
+
+        Track A's in-session writer that stood here (bounded entry → admission → one-argument
+        advisory lock → revalidation → claim → ThreadRevision → Revision → consume → one
+        request-session commit → date/time receipt) is deleted. Track B's Data Exchange
+        authority path (`870b4e3`), reconciled onto the Phase 2 authority, replaces it:
+
+        1. the ledger, FIRST, by the same `flow:` key the Conversation Engine derives for this
+           very submission — a hit is the booking: its SUCCESS, its acknowledgement only if
+           still owed, nothing re-admitted;
+        2. SMART_BOOKING_CE_ENABLED off → nothing books; a person is handed the thread;
+        3. context and admission as READS (offer table, offer-bound candidate, canonical
+           location) — the request session writes nothing, and is proven clean at the call;
+        4. ONE `BookingAuthority.execute` in its own session, carrying the frozen
+           `OfferAcceptance` (the authority re-derives every binding under K1/K2);
+        5. every refusal re-reads the ledger before it is answered;
+        6. only after the commit: the ledger-leased acknowledgement, exactly one success copy.
+
+        Raises BookingSlotConflictError (a refreshed APPOINTMENT screen) when nothing was
+        booked, BookingTokenError when the offer may not be accepted.
+        """
+        from .booking_authority import (AvailabilityRevalidation, BookingAttachmentPlan,
+                                        BookingCommand, BookingOperation,
+                                        BookingSource, LeadIdentity, LeadUpdate,
+                                        OfferAcceptance, PriceRecalculation,
+                                        ThreadRevisionAttachment, ThreadStateUpdate,
+                                        flow_idempotency_key)
         from .clarification_attempt import cycle_key as _cycle_key
         from .offer_lifecycle import OfferLifecycle, OfferRefusal
 
-        _offers = OfferLifecycle(self.db)
+        token = booking_token if type(booking_token) is str else ""
+        if not token.strip():
+            raise BookingTokenError("token missing")
+        key = flow_idempotency_key(token)
 
-        # ── R2/RV-01: the bounded entry comes BEFORE any refusal writes ───────────
-        # Same correction as the conversation engine: a refusal persists a counter, so it
-        # is a writer, and a writer enters the canonical order before it writes. Entering
-        # here also means the typed contention answer is reached without touching the
-        # offer at all.
-        _contended = _offers.begin_offer_transaction(ctx.thread.id)
-        if _contended is not None:
-            # R3/RVR2-07: the transaction is already rolled back, so NOTHING durable is
-            # written here and nothing pretends to be. `_booking_event` takes no session
-            # and persists nothing; the typed error below is what the caller is told.
-            logger.warning("BOOKING_OFFER_CONTENDED thread_id=%s reason=%s — nothing "
-                           "written", ctx.thread.id, _contended)
-            _booking_event(ctx.thread.id, "BOOKING_OFFER_CONTENDED",
-                           booking_token=booking_token, extra={"reason": _contended})
-            raise BookingTokenError(f"offer not acceptable: {_contended}")
+        # ── 1. the ledger speaks first ───────────────────────────────────────────
+        hit = self._ledger_hit(key)
+        if hit is not None:
+            return self._replayed_success(token, key, hit)
 
-        _adm = _offers.admit(thread_id=ctx.thread.id, token=booking_token)
-        if not _adm.granted:
-            # Durable, not a screen with a rollback behind it. The R2 review measured the
-            # defect that pattern caused: `claim()` terminalised the stale offer, cleared
-            # the mirror and recorded the refusal, and this path raised straight away — so
-            # the route returned an error screen WITHOUT committing and every one of those
-            # side effects was rolled back. The offer stayed ISSUED, `last_refusal` stayed
-            # NULL, the mirror stayed truthy, and the L4.7W5-F7A scheduling gate stayed
-            # CLOSED on a thread whose offer could never be accepted again.
-            _offers.finalise_admission_refusal(ctx.state, thread_id=ctx.thread.id,
-                                               admission=_adm)
-            logger.warning(
-                "BOOKING_OFFER_REFUSED thread_id=%s reason=%s offer_id=%s — no booking",
-                ctx.thread.id, _adm.refusal, _adm.offer_id)
-            _booking_event(ctx.thread.id, "BOOKING_OFFER_REFUSED",
-                           booking_token=booking_token,
-                           extra={"reason": _adm.refusal, "offer_id": _adm.offer_id})
+        # ── 2. the OFF switch: no automatic booking writer is reachable ─────────────
+        if not _smart_booking_enabled():
             try:
-                self.db.commit()
-            except Exception:                       # pragma: no cover - defensive
-                logger.exception(
-                    "BOOKING_OFFER_REFUSED thread_id=%s — the refusal could not be "
-                    "committed; falling back to an out-of-band record", ctx.thread.id)
-                self.db.rollback()
-                _offers.record_refusal_out_of_band(booking_token, _adm.refusal)
-            raise BookingTokenError(f"offer not acceptable: {_adm.refusal}")
+                ctx = self.resolve_context(token)
+            except BookingAlreadyCompletedError:
+                ctx = None
+            self._refusal_reread(token, key)
+            if ctx is not None:
+                self._handoff_to_person(ctx, "SMART_BOOKING_DISABLED")
+            _booking_event(getattr(getattr(ctx, "thread", None), "id", 0) or 0,
+                           "BOOKING_REFUSED", booking_token=token,
+                           extra={"reason": "SMART_BOOKING_DISABLED"})
+            raise BookingSlotConflictError(self._refusal_screen(
+                ctx, str(data.get("date", "")).strip(), BOOKING_HANDOFF_TEXT))
 
-        # R3/A4 + S1 + R2/RV-01: resource 1 is already held — the bounded entry moved
-        # above admission so that a refusal, which persists a counter, could not reach its
-        # first write outside the bound. Taking it twice in one transaction is free; it is
-        # not taken twice, because this is the one acquisition and it happens up there.
+        # ── 3. context and admission, as READS ───────────────────────────────────
+        try:
+            ctx = self.resolve_context(token)
+        except BookingAlreadyCompletedError:
+            # The offer table says ACCEPTED and names a booking, but the ledger missed above.
+            # The offer projection is never a replay authority (design §8): re-read the
+            # ledger; a miss is refused, never confirmed.
+            self._refusal_reread(token, key)
+            raise BookingTokenError(f"offer not acceptable: {OfferRefusal.OFFER_ALREADY_ACCEPTED}")
+        adm = OfferLifecycle(self.db).admit(thread_id=ctx.thread.id, token=token)
+        if not adm.granted:
+            self._refusal_reread(token, key)
+            reason = adm.refusal or OfferRefusal.OFFER_ALREADY_ACCEPTED
+            _booking_event(ctx.thread.id, "BOOKING_OFFER_REFUSED", booking_token=token,
+                           extra={"reason": reason, "offer_id": adm.offer_id})
+            raise BookingTokenError(f"offer not acceptable: {reason}")
 
         date_str = str(data.get("date", "")).strip()
         time_str = str(data.get("time", "")).strip()
-
         try:
             selected_date = date.fromisoformat(date_str)
             selected_time = time.fromisoformat(time_str)
@@ -847,316 +842,134 @@ class BookingFlowService:
         email = str(data.get("email", "")).strip()
         inspection_address = str(data.get("inspection_address", "")).strip()
         seller_name = str(data.get("seller_name", "")).strip()
-        seller_phone = str(data.get("seller_phone", "")).strip()
         listing_url = str(data.get("listing_url", "")).strip()
 
-        # ── owner booking-slot policy (2026-10-13) ───────────────────────────────
-        # The Flow may legitimately offer the customer a slot other than the representative
-        # one the offer recorded, so `offered_date`/`offered_time` are historical metadata
-        # and are NOT compared against the submission. What the policy does require is that
-        # the SUBMITTED slot pass authoritative final revalidation — which is what follows.
-
-        # ── the bindings come FIRST, then availability (S3/S5) ───────────────────
-        # The same order as the conversation engine, for the same reason: a submission that
-        # is both stale-slot and category-changed must be reported as the category change,
-        # because a moved category invalidates the accepted quote and must terminalise the
-        # offer — while a vanished slot invalidates nothing about the offer and leaves it
-        # ISSUED for another attempt.
-        _binding = _offers.verify_bindings(
-            ctx.state, thread_id=ctx.thread.id, token=booking_token,
-            candidate_id=getattr(ctx.candidate, "id", None),
-            tipo_vehiculo=getattr(ctx.candidate, "tipo_vehiculo", None),
-            cycle_key=_cycle_key(ctx.state),
-            zone_group=ctx.zone_group, zone_detail=ctx.zone_detail)
-        if _binding is not None:
-            logger.warning(
-                "BOOKING_OFFER_REFUSED thread_id=%s reason=%s offer_id=%s — no booking",
-                ctx.thread.id, _binding, _adm.offer_id)
-            _booking_event(ctx.thread.id, "BOOKING_OFFER_REFUSED",
-                           booking_token=booking_token,
-                           extra={"reason": _binding, "offer_id": _adm.offer_id})
-            try:
-                self.db.commit()
-            except Exception:                       # pragma: no cover - defensive
-                self.db.rollback()
-                _offers.record_refusal_out_of_band(booking_token, _binding)
-            raise BookingTokenError(f"offer not acceptable: {_binding}")
-
-        # Acquire advisory lock to prevent double-booking the same date.
-        # Key is deterministic: hash of ISO date string → 32-bit signed int.
-        lock_key = int(hashlib.sha256(date_str.encode()).hexdigest()[:8], 16) & 0x7FFFFFFF
-        self._acquire_advisory_lock(lock_key, date_str)
-
-        # Revalidate slot
-        check_in = ScheduleCheckIn(
-            address=inspection_address or "-",
-            preferred_day=selected_date,
-            preferred_time=selected_time,
-            zone_group=ctx.zone_group,
-            is_holiday=False,
-        )
-        check_out = self._sched.check(check_in)
-
-        if not check_out.valid:
-            _booking_event(ctx.thread.id, "BOOKING_REVALIDATION_FAIL",
-                           booking_token=booking_token,
-                           extra={"date": date_str, "time": time_str, "reasons": check_out.reasons},
-            )
-            # Refresh available slots for conflict recovery
-            refreshed_time_items = self._slots_for_date(selected_date, ctx.zone_group)
-            raise BookingSlotConflictError({
-                "version": FLOW_VERSION,
-                "screen": "APPOINTMENT",
-                "data": {
-                    **self._appointment_screen_data(ctx, selected_date_str=date_str),
-                    # the time they picked is exactly what became unavailable
-                    "selected_time": "",
-                    "slot_conflict_message": (
-                        "Justo ese horario dejó de estar disponible. "
-                        "Elegí otro de los horarios actualizados."
-                    ),
-                },
-            })
-
-        _booking_event(ctx.thread.id, "BOOKING_REVALIDATION_PASS",
-                       booking_token=booking_token,
-                       extra={"date": date_str, "time": time_str},
-        )
-
-        # Create booking atomically
+        # The offer-bound candidate (G3-7R/S3) and ITS canonical location, as resolved.
         candidate = ctx.candidate
-        zone_group = ctx.zone_group
-        zone_detail = ctx.zone_detail
-
-        # L4.7W5-F4: a booking with no canonical inspection location cannot be priced, and an
-        # appointment in the CRM with no money attached is a commercial defect — the operator
-        # sees a job and no figure, and the amount the customer was quoted lives nowhere.
-        # Better to send the customer back one screen than to write that record.
+        zone_group, zone_detail = ctx.zone_group, ctx.zone_detail
+        if candidate is None:
+            self._refusal_reread(token, key)
+            _booking_event(ctx.thread.id, "BOOKING_OFFER_REFUSED", booking_token=token,
+                           extra={"reason": OfferRefusal.OFFER_CANDIDATE_CHANGED,
+                                  "offer_id": adm.offer_id})
+            raise BookingTokenError(
+                f"offer not acceptable: {OfferRefusal.OFFER_CANDIDATE_CHANGED}")
+        # L4.7W4-F4: a booking with no canonical inspection location cannot be priced, and an
+        # appointment in the CRM with no money attached is a commercial defect. The message
+        # promises an advisor, so a person is handed the thread.
         if not zone_group and not zone_detail:
+            self._refusal_reread(token, key)
             _booking_event(ctx.thread.id, "BOOKING_REFUSED_NO_CANONICAL_LOCATION",
-                           booking_token=booking_token,
+                           booking_token=token,
                            extra={"date": date_str, "time": time_str,
-                           "candidate_id": getattr(candidate, "id", None)},
-            )
-            logger.error(
-                "BOOKING_REFUSED_NO_CANONICAL_LOCATION thread_id=%s — refusing to create "
-                "an unpriced booking", ctx.thread.id,
-            )
-            raise BookingSlotConflictError({
-                "version": FLOW_VERSION,
-                "screen": "APPOINTMENT",
-                "data": {
-                    **self._appointment_screen_data(ctx, selected_date_str=date_str),
-                    "slot_conflict_message": (
-                        "Necesitamos confirmar la zona donde está el vehículo antes de "
-                        "reservar el turno. Un asesor se contacta a la brevedad."
-                    ),
-                },
-            })
+                                  "candidate_id": candidate.id})
+            self._handoff_to_person(ctx, OfferRefusal.NO_CANONICAL_LOCATION)
+            raise BookingSlotConflictError(self._refusal_screen(
+                ctx, date_str,
+                "Necesitamos confirmar la zona donde está el vehículo antes de "
+                "reservar el turno. Un asesor se contacta a la brevedad."))
 
-        # ── acceptance: the terminal transition, AFTER revalidation ──────────────
-        # G3-7R moved `claim()` to here, below the availability check. A slot that has gone
-        # is a fact about the CALENDAR and not about the offer: nothing on the offer became
-        # invalid, so it must stay ISSUED and the customer must stay able to pick another
-        # slot with the same token. Claiming first and relying on a rollback to undo the
-        # acceptance is the pattern a durability review has already found on this path once.
-        #
-        # `claim()` is the coordination — a row lock and a conditional UPDATE off 'ISSUED',
-        # which is what makes a duplicate confirmation a typed answer instead of an
-        # exception. The GUARANTEE that this offer yields at most one booking is the partial
-        # unique index on `thread_revisions.offer_id`, enforced at the insert below.
-        _claim = _offers.claim(
-            ctx.state, thread_id=ctx.thread.id, token=booking_token,
-            # `ctx.candidate` is the candidate the offer itself is bound to (S3), which is
-            # the SAME candidate the conversation engine resolves — and R2 binds its
-            # CATEGORY too, because that category is what `PricingService.quote()` prices
-            # the booking with.
-            candidate_id=getattr(candidate, "id", None),
-            tipo_vehiculo=getattr(candidate, "tipo_vehiculo", None),
-            cycle_key=_cycle_key(ctx.state),
+        name_parts = name.split()
+        acceptance = OfferAcceptance(
+            token_fingerprint=adm.fingerprint, thread_id=int(ctx.thread.id),
+            cycle_key=int(_cycle_key(ctx.state)), candidate_id=int(candidate.id),
+            tipo_vehiculo=candidate.tipo_vehiculo,
             zone_group=zone_group, zone_detail=zone_detail)
-        if not _claim.ok:
-            logger.warning(
-                "BOOKING_OFFER_REFUSED thread_id=%s reason=%s offer_id=%s — no booking",
-                ctx.thread.id, _claim.refusal, _claim.offer_id)
-            _booking_event(ctx.thread.id, "BOOKING_OFFER_REFUSED",
-                           booking_token=booking_token,
-                           extra={"reason": _claim.refusal, "offer_id": _claim.offer_id})
-            try:
-                self.db.commit()
-            except Exception:                       # pragma: no cover - defensive
-                logger.exception(
-                    "BOOKING_OFFER_REFUSED thread_id=%s — the refusal could not be "
-                    "committed; falling back to an out-of-band record", ctx.thread.id)
-                self.db.rollback()
-                _offers.record_refusal_out_of_band(booking_token, _claim.refusal)
-            raise BookingTokenError(f"offer not acceptable: {_claim.refusal}")
+        attachments = BookingAttachmentPlan(
+            thread_revision=ThreadRevisionAttachment(
+                thread_id=int(ctx.thread.id), candidate_id=int(candidate.id),
+                buyer_name=name or None, buyer_phone=phone or None, buyer_email=email or None,
+                seller_type=None, seller_name=seller_name or None,
+                address=inspection_address or None,
+                tipo_vehiculo=candidate.tipo_vehiculo, marca=candidate.marca,
+                modelo=candidate.modelo, anio=candidate.anio,
+                publication_url=listing_url or None, zone_group=zone_group,
+                request_approval=True),
+            # L4.7W4-F3 (preserved): the price is stamped only from the accepted quote's
+            # inputs; a mismatch leaves it unset rather than invent one.
+            price=PriceRecalculation(require_inputs=(candidate.tipo_vehiculo, zone_group,
+                                                     zone_detail)),
+            # SB2A-R4 (R3A-03): the submitted person is ONE identity bundle.
+            lead=LeadUpdate(
+                estado="COORDINAR_DISPONIBILIDAD", flag="ACEPTADO", necesita_humano=True,
+                identity=LeadIdentity(nombre=name_parts[0],
+                                      apellido=" ".join(name_parts[1:]) or None,
+                                      email=email or None) if name_parts else None),
+            thread_state=ThreadStateUpdate(link_current_revision=True,
+                                           last_stage=STAGE_BOOKED, needs_human=True,
+                                           consume_flow_token=True),
+            offer_acceptance=acceptance)
+        command = BookingCommand(
+            operation=BookingOperation.CREATE, source=BookingSource.WHATSAPP_FLOW,
+            idempotency_key=key, lead_id=int(ctx.lead.id), thread_id=int(ctx.thread.id),
+            requested_date=selected_date, requested_time=selected_time,
+            correlation_id=key[:64], tracks_acknowledgement=True,
+            revision_fields={
+                "tipo_vehiculo": candidate.tipo_vehiculo, "marca": candidate.marca,
+                "modelo": candidate.modelo, "anio": candidate.anio,
+                "zone_group": zone_group, "zone_detail": zone_detail,
+                "direccion_texto": inspection_address or candidate.direccion_texto,
+                "vendedor_tipo": None, "tipo_vendedor": None,
+            })
+        # Revalidation is the AUTHORITY's, under its own locks (B-7).
+        availability = AvailabilityRevalidation(
+            address=inspection_address or "-", zone_group=zone_group, is_holiday=False)
 
-        thread_rev = ThreadRevision(
-            thread_id=ctx.thread.id,
-            candidate_id=candidate.id if candidate else None,
-            # ── S1: the booking names the offer that authorized it ───────────────
-            # The partial unique index on this column is what makes "one offer, at most one
-            # booking" a GUARANTEE rather than a convention, and it is why BOTH transports
-            # must write it: a constraint that only one of two writers participates in
-            # guarantees nothing about the pair.
-            offer_id=_claim.offer_id,
-            status="booked",
-            buyer_name=name or None,
-            buyer_phone=phone or None,
-            buyer_email=email or None,
-            seller_type=None,
-            seller_name=seller_name or None,
-            address=inspection_address or None,
-            scheduled_date=selected_date,
-            scheduled_time=selected_time,
-            tipo_vehiculo=candidate.tipo_vehiculo if candidate else None,
-            marca=candidate.marca if candidate else None,
-            modelo=candidate.modelo if candidate else None,
-            anio=candidate.anio if candidate else None,
-            publication_url=listing_url or None,
-            zone_group=zone_group,
-            appointment_approval_status="PENDING",
-            appointment_approval_token=secrets.token_urlsafe(32),
-        )
-        self.db.add(thread_rev)
-        # ── S1: the guarantee fires HERE, and is translated, never leaked ────────
-        # A raw `IntegrityError`, a SQLSTATE or a constraint name must never reach a
-        # customer, and the honest meaning of THIS violation is not "error": the
-        # authoritative booking already exists, so this is a replay and the Flow must be
-        # shown its completion.
-        try:
-            self.db.flush()
-        except Exception as _integrity:
-            if not _offers.is_booking_projection_violation(_integrity):
-                raise
-            self.db.rollback()
-            _tr_id, _rv_id = _offers.authoritative_booking(_claim.offer_id)
-            # R2/RV-01+RV-02: the rollback released resource 1, so it is re-entered
-            # through the bounded helper before the counter is touched; on contention the
-            # counter is skipped and the authoritative booking is still returned.
-            if _offers.begin_offer_transaction(ctx.thread.id) is None:
-                _offers.record_replay(_claim.offer_id, thread_id=ctx.thread.id)
-                try:
-                    self.db.commit()
-                except Exception:                   # pragma: no cover - defensive
-                    self.db.rollback()
-            else:
-                logger.warning("BOOKING_REPLAY thread_id=%s replay not counted — "
-                               "contended; the booking is still returned", ctx.thread.id)
-            logger.warning(
-                "BOOKING_REPLAY thread_id=%s the booking projection refused a second "
-                "booking for offer_id=%s — returning thread_rev=%s",
-                ctx.thread.id, _claim.offer_id, _tr_id)
-            _booking_event(ctx.thread.id, "BOOKING_REPLAY",
-                           booking_token=booking_token,
-                           extra={"offer_id": _claim.offer_id, "thread_rev_id": _tr_id})
-            raise BookingAlreadyCompletedError(
-                offer_id=_claim.offer_id, thread_revision_id=_tr_id, revision_id=_rv_id)
+        # ── 4. clean request session, then ONE authority transaction ─────────────
+        if not _session_clean(self.db):
+            self._refusal_reread(token, key)
+            logger.error("BOOKING_REFUSED thread_id=%s — the request session holds a "
+                         "transaction id; the authority is not called", ctx.thread.id)
+            self._handoff_to_person(ctx, "DX_TRANSACTION_NOT_CLEAN")
+            raise BookingSlotConflictError(self._refusal_screen(ctx, date_str,
+                                                                BOOKING_HANDOFF_TEXT))
+        result = _execute_isolated(self.db, command, availability, attachments)
+        if result.reason == "SCHEDULE_REVALIDATION":
+            _booking_event(ctx.thread.id, "BOOKING_REVALIDATION_FAIL", booking_token=token,
+                           extra={"date": date_str, "time": time_str})
 
-        crm_rev = Revision(
-            lead_id=ctx.lead.id,
-            tipo_vehiculo=candidate.tipo_vehiculo if candidate else None,
-            marca=candidate.marca if candidate else None,
-            modelo=candidate.modelo if candidate else None,
-            anio=candidate.anio if candidate else None,
-            zone_group=zone_group,
-            zone_detail=zone_detail,
-            direccion_texto=inspection_address or (candidate.direccion_texto if candidate else None),
-            vendedor_tipo=None,
-            tipo_vendedor=None,
-            turno_fecha=selected_date,
-            turno_hora=selected_time,
-        )
-        self.db.add(crm_rev)
-        self.db.flush()
+        if result.outcome is BookingOutcome.IDEMPOTENT_REPLAY:
+            return self._replayed_success(token, key, result, note=False)
+        if result.outcome is not BookingOutcome.COMMITTED:
+            # ── 5. SB2B B-1: a committed booking always wins (CE may have booked this very
+            # submission while this request was in flight) ─────────────────────────
+            raced = self._ledger_hit(key)
+            if raced is not None:
+                _booking_event(ctx.thread.id, "BOOKING_IDEMPOTENT_REPLAY", booking_token=token,
+                               extra={"crm_rev_id": raced.revision_id, "after": result.reason})
+                return self._replayed_success(token, key, raced, note=False)
+            _booking_event(ctx.thread.id, "BOOKING_REFUSED", booking_token=token,
+                           extra={"outcome": result.outcome.value, "reason": result.reason,
+                                  "date": date_str, "time": time_str})
+            if result.outcome is BookingOutcome.OFFER_REFUSED:
+                raise BookingTokenError(f"offer not acceptable: {result.reason}")
+            message = _FLOW_REFUSAL_MESSAGES.get(result.outcome, BOOKING_HANDOFF_TEXT)
+            if message == BOOKING_HANDOFF_TEXT:
+                # the screen promises an advisor, so a person is handed the thread
+                self._handoff_to_person(ctx, result.reason)
+            # Transient contention and a vanished slot write nothing: the customer picks
+            # again, or retries in a moment, from what is free now.
+            raise BookingSlotConflictError(self._refusal_screen(ctx, date_str, message))
 
-        # ── L4.7W4-F3: preserve the accepted commercial quote ──────────────────
-        # W4-F2 produced a correct booking with "Total presupuestado: -": the Revision was
-        # created without precio_base/viaticos/precio_total, so the price the customer had
-        # already accepted existed nowhere in the CRM.
-        #
-        # The quote has no stored identity — it is a deterministic function of
-        # (tipo_vehiculo, zone_group, zone_detail) over the pricing catalog, and the
-        # Revision persists all three beside the price. So the quote identity IS those
-        # inputs, and stamping from them through the same PricingService reproduces the
-        # accepted amount exactly rather than inventing or re-estimating one.
-        #
-        # The inputs are read from the live cycle-bounded focus candidate (resolve_context),
-        # which is the same candidate CE priced. The check below is defence in depth: if the
-        # Revision were ever built from something other than that candidate, the price must
-        # not be written at all rather than written from mismatched commercial inputs.
-        price_inputs_ok = candidate is not None and (
-            crm_rev.tipo_vehiculo == candidate.tipo_vehiculo
-            and crm_rev.zone_group == zone_group
-            and crm_rev.zone_detail == zone_detail
-        )
-        if not price_inputs_ok:
-            _booking_event(ctx.thread.id, "BOOKING_PRICE_INPUT_MISMATCH",
-                           booking_token=booking_token,
-                           extra={"crm_rev_id": crm_rev.id,
-                           "rev_tipo": crm_rev.tipo_vehiculo,
-                           "rev_zone_group": crm_rev.zone_group,
-                           "rev_zone_detail": crm_rev.zone_detail},
-            )
-        else:
-            self._pricing.recalculate_revision_if_possible(db=self.db, revision=crm_rev)
-            if crm_rev.precio_total is None:
-                # Priceable inputs that the catalog cannot price is a real commercial gap,
-                # not a silent "-". Recorded so it is visible without reading the booking.
-                _booking_event(ctx.thread.id, "BOOKING_PRICE_UNRESOLVED",
-                               booking_token=booking_token,
-                               extra={"crm_rev_id": crm_rev.id,
-                               "tipo_vehiculo": crm_rev.tipo_vehiculo,
-                               "zone_group": crm_rev.zone_group,
-                               "zone_detail": crm_rev.zone_detail},
-                )
-            self.db.flush()
+        _booking_event(ctx.thread.id, "BOOKING_CREATED", booking_token=token,
+                       extra={"thread_rev_id": result.thread_revision_id,
+                              "crm_rev_id": result.revision_id, "date": date_str,
+                              "time": time_str, "profesional_id": result.profesional_id,
+                              "lock_mode": result.lock_mode})
+        logger.info("BOOKING_CREATED thread_id=%s thread_rev=%s crm_rev=%s date=%s time=%s",
+                    ctx.thread.id, result.thread_revision_id, result.revision_id,
+                    date_str, time_str)
+        if result.identity_outcome == "CONFLICT":
+            _booking_event(ctx.thread.id, "BOOKING_IDENTITY_CONFLICT", booking_token=token,
+                           extra={"crm_rev_id": result.revision_id, "lead_id": ctx.lead.id})
+        # ── 6. after the commit: the one acknowledgement, through the ledger lease ──
+        self._acknowledge(key, result, wa_id=ctx.contact.wa_id, thread_id=int(ctx.thread.id))
+        return self._success_response(token)
 
-        # Lead state
-        lead = ctx.lead
-        lead.estado = "COORDINAR_DISPONIBILIDAD"
-        lead.flag = "ACEPTADO"
-        lead.necesita_humano = True
-        if name and not lead.nombre:
-            parts = name.split()
-            lead.nombre = parts[0] if parts else name
-            lead.apellido = " ".join(parts[1:]) if len(parts) > 1 else None
+    # ── convergence Phase 3 helpers ───────────────────────────────────────────
 
-        # Thread state — the offer was ACCEPTED above, in this same transaction
-        state = ctx.state
-        state.current_revision_id = thread_rev.id
-        state.last_stage = STAGE_BOOKED
-        state.needs_human = True
-        # G3-7P: record which revision the accepted offer became, and clear the transport
-        # mirror through the one authority rather than by hand.
-        _offers.consume(state, thread_id=ctx.thread.id, revision_id=crm_rev.id,
-                        thread_revision_id=thread_rev.id)
-
-        self.db.commit()
-
-        _booking_event(ctx.thread.id, "BOOKING_CREATED",
-                       booking_token=booking_token,
-                       extra={
-                       "thread_rev_id": thread_rev.id,
-                       "crm_rev_id": crm_rev.id,
-                       "date": date_str,
-                       "time": time_str,
-                       "precio_total": crm_rev.precio_total,
-                       },
-        )
-
-        logger.info(
-            "BOOKING_CREATED thread_id=%s thread_rev=%s crm_rev=%s date=%s time=%s",
-            ctx.thread.id, thread_rev.id, crm_rev.id, date_str, time_str,
-        )
-
-        # The booking is committed above. The acknowledgement is best-effort BY DESIGN:
-        # a delivery problem must never roll back or cast doubt on a booking that exists.
-        self._send_booking_receipt(ctx, name=name, selected_date=selected_date,
-                                   selected_time=selected_time)
-
-        # Return Flow SUCCESS completion
+    @staticmethod
+    def _success_response(booking_token: str) -> dict:
         return {
             "version": FLOW_VERSION,
             "screen": "SUCCESS",
@@ -1169,145 +982,167 @@ class BookingFlowService:
             },
         }
 
-    def _count_replay_at_command_boundary(self, replay, booking_token: str) -> None:
-        """Count a detected replay, at the one caller that is a command (R2/RV-07).
+    def _ledger_hit(self, key: str):
+        """The committed, replayable ledger result for `key` (isolated read), or None. A
+        DETACHED key is never a hit."""
+        from .booking_ce_adapter import lookup_booking
+        return lookup_booking(self.db, key)
 
-        `resolve_context` detects the replay and stays read-only; this runs only from
-        `handle_confirm_booking`, where committing a transaction is legitimate. The screen
-        handlers — `handle_init`, `handle_date_selected`, `handle_prepare_summary` — are
-        resolutions, not commands, and deliberately count nothing: a customer reopening a
-        completed Flow should not move an operator-facing counter.
+    def _refusal_reread(self, token: str, key: str) -> None:
+        """SB2B-RV-01: every refusal re-reads the ledger before it is answered. A hit means a
+        concurrent writer committed this very submission: the refusal is replaced by that
+        booking's SUCCESS (raised, so every refusal branch inherits it)."""
+        hit = self._ledger_hit(key)
+        if hit is not None:
+            raise _LedgerReplay(self._replayed_success(token, key, hit))
 
-        Enters the canonical lock order first, bounded. On contention it records nothing and
-        returns: the replay is still reported to the Flow, because the committed booking is
-        the fact that matters and the counter is bookkeeping.
-        """
-        from .offer_lifecycle import OfferLifecycle
+    def _replayed_success(self, token: str, key: str, hit, *, note: bool = True) -> dict:
+        """A committed booking for this submission: its SUCCESS; its acknowledgement only if
+        the ledger says one is still owed (SENT, a live lease, exhausted → silence)."""
+        if note:
+            try:
+                from .booking_ce_adapter import isolated_session
+                from .booking_authority import BookingAuthority
+                with isolated_session(self.db) as s:
+                    BookingAuthority(s).note_replay(key)
+            except Exception as exc:                 # bookkeeping only
+                logger.warning("BOOKING_REPLAY not counted: %s", type(exc).__name__)
+        _booking_event(0, "BOOKING_IDEMPOTENT_REPLAY", booking_token=token,
+                       extra={"crm_rev_id": hit.revision_id,
+                              "thread_rev_id": hit.thread_revision_id,
+                              "ack_status": hit.ack_status})
+        wa_id, thread_id = self._recipient_for(hit)
+        if wa_id is not None:
+            self._acknowledge(key, hit, wa_id=wa_id, thread_id=thread_id)
+        return self._success_response(token)
 
-        offer_id = getattr(replay, "offer_id", None)
-        thread_id = getattr(replay, "thread_id", None)
-        if offer_id is None or thread_id is None:
-            return
-        offers = OfferLifecycle(self.db)
-        if offers.begin_offer_transaction(int(thread_id)) is not None:
-            logger.warning("BOOKING_REPLAY thread_id=%s not counted — contended; nothing "
-                           "written, the booking is still returned", thread_id)
-            return
-        offers.record_replay(offer_id, thread_id=int(thread_id))
+    def _recipient_for(self, hit) -> tuple:
+        """The customer of a committed booking, read from its ThreadRevision."""
+        tr = self.db.get(ThreadRevision, hit.thread_revision_id) \
+            if hit.thread_revision_id else None
+        thread = self.db.get(WhatsAppThread, tr.thread_id) if tr is not None else None
+        contact = self.db.get(WhatsAppContact, thread.contact_id) if thread is not None else None
+        if contact is None:
+            return None, None
+        return contact.wa_id, int(thread.id)
+
+    def _acknowledge(self, key: str, result, *, wa_id, thread_id: int) -> None:
+        """B-5 through the ONE shared sequence (lease → gate → record). The Data Exchange
+        request has no causal inbound message; the ledger lease is what makes it once."""
+        from .booking_acknowledgement import acknowledge_committed_booking
         try:
+            acknowledge_committed_booking(self.db, key=key, ack_status=result.ack_status,
+                                          wa_id=wa_id, thread_id=thread_id)
+        except Exception as exc:
+            # The booking is committed; nothing here may undo it. The ledger still says the
+            # acknowledgement is owed, so a replay or /control recovers it.
+            logger.error("BOOKING_ACK failed thread_id=%s: %s", thread_id, type(exc).__name__)
+
+    def _refusal_screen(self, ctx, date_str: str, message: str) -> dict:
+        """The APPOINTMENT screen with what is free now and the reason nothing was booked."""
+        if ctx is None:
+            return {"version": FLOW_VERSION, "screen": "APPOINTMENT",
+                    "data": {"selected_date": "", "selected_time": "",
+                             "slot_conflict_message": message}}
+        return {
+            "version": FLOW_VERSION,
+            "screen": "APPOINTMENT",
+            "data": {
+                **self._appointment_screen_data(ctx, selected_date_str=date_str),
+                # the time they picked is exactly what was not booked
+                "selected_time": "",
+                "slot_conflict_message": message,
+            },
+        }
+
+    def _handoff_to_person(self, ctx, reason: str) -> None:
+        """A refusal whose screen promises an advisor hands the thread to a person: the
+        `needs_human` flags, in a short transaction that takes the thread-state row FIRST
+        and bounded (K1 before the lead, CD-07). No booking row, no offer row, no ledger row
+        is touched. On contention nothing is written and the refusal stands."""
+        from .offer_lifecycle import OfferLifecycle
+        tid = int(ctx.thread.id)
+        try:
+            self.db.rollback()                        # the request session only ever read
+            with self.db.no_autoflush:
+                contended = OfferLifecycle(self.db).begin_offer_transaction(tid)
+            if contended is not None:
+                logger.warning("BOOKING_HANDOFF thread_id=%s contended (%s) — not recorded",
+                               tid, contended)
+                return
+            state = self.db.execute(select(WhatsAppThreadState).where(
+                WhatsAppThreadState.thread_id == tid)).scalar_one_or_none()
+            if state is not None:
+                state.needs_human = True
+            lead = self.db.get(Lead, ctx.lead.id) if ctx.lead is not None else None
+            if lead is not None:
+                lead.necesita_humano = True
             self.db.commit()
-        except Exception:                           # pragma: no cover - defensive
-            logger.warning("BOOKING_REPLAY thread_id=%s counter not committed",
-                           thread_id, exc_info=True)
+            _booking_event(tid, "BOOKING_HANDOFF", extra={"reason": reason})
+        except Exception as exc:
+            logger.error("BOOKING_HANDOFF thread_id=%s failed: %s", tid, type(exc).__name__)
             try:
                 self.db.rollback()
             except Exception:
                 pass
-        _booking_event(int(thread_id), "BOOKING_REPLAY",
-                       booking_token=booking_token,
-                       extra={"offer_id": offer_id,
-                       "thread_rev_id": getattr(replay, "thread_revision_id", None)})
 
-    def _send_booking_receipt(
-        self, ctx: BookingContext, *, name: str, selected_date: date, selected_time: time
-    ) -> None:
-        """Send the single canonical booking acknowledgement.
 
-        Exactly-once comes from the booking itself, not from a flag: the token is consumed
-        inside the same transaction that creates the booking, so a Meta retry or a duplicate
-        confirm_booking raises BookingTokenError in resolve_context and never reaches here.
-        The outbound gate's dedup window is a second line of defence, not the mechanism.
+class _LedgerReplay(Exception):
+    """Internal: a refusal branch found the submission booked on re-read."""
+    def __init__(self, response: dict):
+        super().__init__("ledger replay")
+        self.response = response
 
-        Routed through OutboundSafetyGate on the registered BOOKING_FLOW path — the same
-        path that dispatched the Flow — so the acknowledgement is attributed to the booking
-        that caused it and can never appear as MANUAL_CRM or unattributed.
-        """
-        from datetime import datetime as _dt
-        from zoneinfo import ZoneInfo
 
-        from ..ui.whatsapp_ui import MetaSendError, _send_whatsapp_cloud_text
-        from .outbound_path_registry import OutboundPathId, get_deployment_id
-        from .outbound_safety_gate import GateOutcome, OutboundSafetyGate
+#: What the customer sees when the authority refuses a confirmation (Track B `870b4e3`).
+#: Nothing is booked and nothing is acknowledged; the APPOINTMENT screen comes back with what
+#: is free now. Any other outcome shows `BOOKING_HANDOFF_TEXT`, which promises an advisor, and
+#: is therefore backed by a recorded handoff.
+_FLOW_REFUSAL_MESSAGES: dict = {
+    BookingOutcome.SLOT_CONFLICT: ("Justo ese horario dejó de estar disponible. "
+                                   "Elegí otro de los horarios actualizados."),
+    BookingOutcome.CALENDAR_EXCEPTION: ("Ese día u horario ya no está disponible en la "
+                                        "agenda. Elegí otro de los horarios actualizados."),
+    BookingOutcome.RETRYABLE_FAILURE: ("No pudimos confirmar el turno en este momento. "
+                                       "Volvé a intentarlo en unos segundos."),
+}
 
-        first_name = (name or "").strip().split(" ")[0] if name else ""
-        text = build_booking_receipt_message(
-            first_name or None, _date_title(selected_date),
-            selected_time.strftime("%H:%M"),
-        )
-        try:
-            gate = OutboundSafetyGate(self.db)
-            result = gate.attempt(
-                wa_id=ctx.contact.wa_id, thread_id=ctx.thread.id, text=text,
-                now=_dt.now(ZoneInfo("America/Argentina/Buenos_Aires")),
-                path_id=OutboundPathId.BOOKING_FLOW.value,
-                deployment_id=get_deployment_id(),
-            )
-            if result.outcome != GateOutcome.ALLOWED:
-                logger.warning(
-                    "BOOKING_RECEIPT not sent thread_id=%s outcome=%s — booking stands",
-                    ctx.thread.id, result.outcome.value)
-                return
-            try:
-                wa_message_id, _ = _send_whatsapp_cloud_text(
-                    to_wa_id=ctx.contact.wa_id, text=text)
-                gate.mark_sent(result.message_id, wa_message_id)
-                logger.info("BOOKING_RECEIPT sent thread_id=%s wamid=%s",
-                            ctx.thread.id, wa_message_id)
-            except MetaSendError as exc:
-                gate.mark_failed(result.message_id, meta_http_status=exc.http_status,
-                                 meta_error_payload=exc.to_payload())
-                logger.error("BOOKING_RECEIPT Meta send failed thread_id=%s: %s",
-                             ctx.thread.id, exc)
-            except Exception as exc:
-                gate.mark_failed(result.message_id)
-                logger.error("BOOKING_RECEIPT send failed thread_id=%s: %s",
-                             ctx.thread.id, exc)
-        except Exception as exc:
-            # The booking is already committed; nothing here may undo it.
-            logger.error("BOOKING_RECEIPT unexpected failure thread_id=%s: %s",
-                         ctx.thread.id, exc)
 
-    # ── Concurrency / advisory lock ───────────────────────────────────────────
+def _smart_booking_enabled() -> bool:
+    """SMART_BOOKING_CE_ENABLED, read per request with the same exact `is True` test the
+    Conversation Engine applies: a missing, malformed or merely truthy value is OFF."""
+    from ..settings import get_settings
+    return getattr(get_settings(), "smart_booking_ce_enabled", False) is True
 
-    def _acquire_advisory_lock(self, lock_key: int, date_str: str) -> None:
-        """Acquire a PostgreSQL advisory transaction lock for the booking date.
 
-        On SQLite (tests) this is a no-op — SQLite serializes writes natively.
-        On PostgreSQL, two simultaneous confirmations for the same date compete;
-        the loser receives an immediate BLOCKER response before revalidation runs.
-        """
-        try:
-            result = self.db.execute(
-                text("SELECT pg_try_advisory_xact_lock(:key)"),
-                {"key": lock_key},
-            ).scalar()
-            if result is False:
-                # Another transaction holds the lock — slot contention
-                _booking_event(0, "BOOKING_CONCURRENCY_CONFLICT",
-                               extra={"date": date_str, "lock_key": lock_key},
-                )
-                # GATE A: hand-built response — it must still satisfy the candidate schema,
-                # so the selection keys are present and empty (nothing is selected during a
-                # conflict, and a stale init-value pointing at a vanished option would be
-                # worse than none).
-                raise BookingSlotConflictError({
-                    "version": FLOW_VERSION,
-                    "screen": "APPOINTMENT",
-                    "data": {
-                        "selected_date": "",
-                        "selected_time": "",
-                        "slot_conflict_message": (
-                            "Justo ese horario dejó de estar disponible. "
-                            "Elegí otro de los horarios actualizados."
-                        ),
-                    },
-                })
-        except BookingSlotConflictError:
-            raise
-        except Exception:
-            # On SQLite or any unsupported backend, skip the lock.
-            pass
+def _session_clean(db: Session) -> bool:
+    """B-3 for the Data Exchange request: may it delegate now? Only when its own session has
+    written nothing — `txid_current_if_assigned() IS NULL` on PostgreSQL, the driver's
+    `in_transaction` on SQLite; any other dialect, or a failure to ask, is refused."""
+    try:
+        dialect = db.get_bind().dialect.name
+        if dialect == "postgresql":
+            return db.execute(text("SELECT txid_current_if_assigned()")).scalar() is None
+        if dialect == "sqlite":
+            raw = db.connection().connection
+            return not bool(getattr(getattr(raw, "driver_connection", raw),
+                                    "in_transaction", True))
+    except Exception as exc:
+        logger.error("BOOKING txid guard failed: %s", type(exc).__name__)
+    return False
 
+
+def _execute_isolated(db: Session, command, availability, attachments):
+    """ONE authority transaction on its own session and connection (never the request's)."""
+    from .booking_authority import BookingAuthority, refuse
+    from .booking_ce_adapter import isolated_session
+    try:
+        with isolated_session(db) as session:
+            return BookingAuthority(session).execute(command, availability=availability,
+                                                     attachments=attachments)
+    except Exception as exc:                          # the authority returns typed results
+        logger.error("BOOKING authority raised: %s", type(exc).__name__)
+        return refuse(BookingOutcome.INTERNAL_FAILURE, "AUTHORITY_EXCEPTION")
 
 
 # ── Observability helpers ─────────────────────────────────────────────────────
@@ -1356,9 +1191,10 @@ def health_response() -> dict:
     return {"version": FLOW_VERSION, "data": {"status": "active"}}
 
 
-# ── SB2B dormant capability (integration Phase 1) ──────────────────────────────
-# Re-exported for the dormant SB2B callers (CE-W1 behind SMART_BOOKING_CE_ENABLED, and
-# booking_recovery), which import them from here. Nothing on this module's active Data
-# Exchange path uses them; see `booking_acknowledgement`.
+# ── the ledger-driven acknowledgement and the handoff copy (convergence Phase 3) ─────────
+# Re-exported for callers that import them from here (CE's handoff, booking_recovery). The
+# Data Exchange confirmation above uses `BOOKING_HANDOFF_TEXT` for refusal screens that
+# promise an advisor, and sends its success acknowledgement through
+# `booking_acknowledgement.acknowledge_committed_booking`.
 from .booking_acknowledgement import (  # noqa: E402,F401
     BOOKING_FLOW_RECEIPT_TEXT, BOOKING_HANDOFF_TEXT, ReceiptOutcome, send_booking_acknowledgement)

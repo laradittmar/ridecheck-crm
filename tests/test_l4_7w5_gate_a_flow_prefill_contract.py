@@ -41,7 +41,8 @@ from sqlalchemy.orm import sessionmaker
 
 import app.models
 
-from offer_fixture import seed_live_offer  # noqa: E402
+from offer_fixture import (ensure_launch_professional, route_authority_availability,  # noqa: E402
+                           seed_live_offer, start_converged_booking, stop_converged_booking)
 from app.models import (Lead, ThreadRevision, ViaticosZone, WhatsAppContact, WhatsAppThread,
                         WhatsAppThreadCandidate, WhatsAppThreadState)
 from app.schemas.schedule import ScheduleCheckOut, ScheduleSlotOut, ScheduleSlotsOut
@@ -67,6 +68,20 @@ def _pragmas(conn, _rec):
 
 app.models.Base.metadata.create_all(_engine)
 _Session = sessionmaker(bind=_engine, autoflush=False, autocommit=False)
+
+# Convergence Phase 3 (adaptation, whole module): confirm_booking books through
+# `BookingAuthority` only — flag ON, a launch professional, and the authority's own
+# availability check (routed to `_mock_schedule`'s double). See `offer_fixture`.
+_MODULE_PATCHES = []
+
+
+def setUpModule():
+    _MODULE_PATCHES.extend(start_converged_booking())
+
+
+def tearDownModule():
+    stop_converged_booking(_MODULE_PATCHES)
+
 
 WA_ID = "5491100000001"
 FUTURE = date.today() + timedelta(days=3)
@@ -108,7 +123,9 @@ class _World(unittest.TestCase):
         self.db.add(self.cand); self.db.flush()
         self.state = WhatsAppThreadState(thread_id=self.thread.id,
                                          flow_booking_token=self.token, needs_human=False)
-        self.db.add(self.state); self.db.commit()
+        self.db.add(self.state)
+        ensure_launch_professional(self.db)
+        self.db.commit()
         # G3-7P: a hand-set token is no longer an offer. Authority is
         # `whatsapp_booking_offers` and an absent row is a refusal, so a fixture that
         # wants a bookable offer issues one through the authority.
@@ -128,6 +145,7 @@ class _World(unittest.TestCase):
             valid=valid, suggested_slots=slots, approval_tag="",
             requested_slot=ScheduleSlotOut(start=slots[0] if slots else "10:00", end="11:00"),
             business_hours="09:00-18:00", reasons=[] if valid else ["OCCUPIED"])
+        route_authority_availability(self.svc._sched)
 
     def agree(self, day=None, hhmm="11:00"):
         self.state.preferred_day = (day or FUTURE).isoformat()
@@ -197,12 +215,17 @@ class TestDateTimeSelection(_World):
         self.assertIn("selected_date", data)
 
     def test_date_time_08_confirm_still_revalidates(self):
-        """DATE-TIME-08 — prefill is UX; safety is unchanged."""
-        fn = next(ast.unparse(n) for n in ast.walk(ast.parse(BFS_SOURCE))
-                  if isinstance(n, ast.FunctionDef) and n.name == "handle_confirm_booking")
-        self.assertIn("self._sched.check(check_in)", fn)
-        self.assertIn("BOOKING_REVALIDATION_FAIL", fn)
+        """DATE-TIME-08 — prefill is UX; safety is unchanged.
 
+        Convergence Phase 3 adaptation: OLD — a source scan for `self._sched.check(check_in)`
+        in the Data Exchange writer. NEW — behaviour: the booking authority revalidates the
+        SUBMITTED slot itself, and an invalid one books nothing. WHY: the in-session writer
+        that called the check is deleted; revalidation is the authority's (B-7)."""
+        self._mock_schedule(valid=False)
+        with self.assertRaises(BookingSlotConflictError):
+            self.svc.handle_confirm_booking(self.token, self.confirm_payload())
+        self.svc._sched.check.assert_called_once()
+        self.assertEqual(self.db.query(ThreadRevision).count(), 0)
 
 class TestCanonicalPhone(_World):
 
@@ -333,16 +356,21 @@ class TestFlowContract(unittest.TestCase):
         self.assertEqual(cand["SUMMARY"].get("terminal"), True)
 
     def test_flow_04_05_06_booking_authority_is_untouched(self):
+        """Convergence Phase 3 adaptation: OLD — `handle_confirm_booking` was the only writer
+        of `status="booked"` here and it priced the revision itself. NEW — NOTHING in this
+        module writes a booked ThreadRevision: the booking authority does, from a plan the
+        confirm path describes (the price included). The FLOW-04 and location guards hold."""
         prep = next(ast.unparse(n) for n in ast.walk(ast.parse(BFS_SOURCE))
                     if isinstance(n, ast.FunctionDef) and n.name == "handle_prepare_summary")
         self.assertNotIn('status="booked"', prep.replace("'", '"'))      # FLOW-04
         writers = {n.name for n in ast.walk(ast.parse(BFS_SOURCE))
                    if isinstance(n, ast.FunctionDef)
                    and 'status="booked"' in ast.unparse(n).replace("'", '"')}
-        self.assertTrue(writers <= {"handle_confirm_booking", "_create_booking"}, writers)
+        self.assertEqual(writers, set(), writers)
+        self.assertNotIn("ThreadRevision(", BFS_SOURCE.split("def _recipient_for")[0])
         confirm = next(ast.unparse(n) for n in ast.walk(ast.parse(BFS_SOURCE))
-                       if isinstance(n, ast.FunctionDef) and n.name == "handle_confirm_booking")
-        self.assertIn("recalculate_revision_if_possible", confirm)       # FLOW-06
+                       if isinstance(n, ast.FunctionDef) and n.name == "_confirm_booking")
+        self.assertIn("price=PriceRecalculation(", confirm)                # FLOW-06
         self.assertIn("BOOKING_REFUSED_NO_CANONICAL_LOCATION", confirm)
 
     def test_the_candidate_declares_no_secret_bearing_field(self):

@@ -218,12 +218,22 @@ class E_ConcurrencyPosture(unittest.TestCase):
     """Addendum §7 — audited, and not weakened by G3-4."""
 
     def test_own_19_the_slot_is_revalidated_before_a_booking_is_created(self):
-        body = inspect.getsource(bfs.BookingFlowService.handle_confirm_booking)
-        self.assertIn("_acquire_advisory_lock", body)
-        self.assertIn("ScheduleCheckIn", body)
+        # Convergence Phase 3 adaptation: OLD — the Data Exchange took the one-argument
+        # advisory lock and built `ScheduleCheckIn` itself. NEW — the booking authority takes
+        # the two-argument date/professional locks and revalidates under them (B-7); the
+        # one-argument lock is deleted (R3RV-10). The policy is unchanged.
+        body = inspect.getsource(bfs.BookingFlowService._confirm_booking)
+        self.assertIn("AvailabilityRevalidation(", body)
+        self.assertNotIn("_acquire_advisory_lock", body)
+        from app.services.booking_authority import BookingAuthority
+        src = inspect.getsource(BookingAuthority._execute_snapshot)
+        self.assertLess(src.index("self._acquire_locks(keys)"),
+                        src.index("self._revalidate_availability("))
+        self.assertLess(src.index("self._revalidate_availability("), src.index("self._write("))
 
     def test_own_20_a_lost_slot_raises_a_conflict_rather_than_booking_anyway(self):
-        body = inspect.getsource(bfs.BookingFlowService.handle_confirm_booking)
+        # Convergence Phase 3 adaptation: the confirm body is `_confirm_booking`.
+        body = inspect.getsource(bfs.BookingFlowService._confirm_booking)
         self.assertIn("BookingSlotConflictError", body)
 
     def test_own_21_displayed_availability_is_never_recorded_as_a_booking(self):

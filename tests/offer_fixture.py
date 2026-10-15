@@ -130,9 +130,8 @@ def start_offer_claim_stub(test_case):
                                           `db.get()`, so the field-mapping assertions still
                                           mean something. Cycle-window and deleted-row
                                           refusals -> the PG suites.
-      `_revalidate_booking_slot` (G3-7R/S5) final availability. Needs a real
-                                          `ScheduleService` over real occupying rows
-                                          -> test_l4_7w5_g3_7r_booking_projection_pg.py P7
+      (`_revalidate_booking_slot`, deleted by convergence Phase 3: final availability is
+       the booking authority's own revalidation under its locks.)
 
     Registers its own cleanup on `test_case`.
     """
@@ -181,12 +180,13 @@ def start_offer_claim_stub(test_case):
     test_case.addCleanup(bindings.stop)
     bound = mock.patch.object(ConversationEngine, "_offer_bound_candidate", autospec=True,
                               side_effect=_bound_candidate)
-    revalidate = mock.patch.object(ConversationEngine, "_revalidate_booking_slot",
-                                   autospec=True, return_value=None)
-    admit.start(); bound.start(); revalidate.start()
-    test_case.addCleanup(admit.stop)
-    test_case.addCleanup(bound.stop)
-    test_case.addCleanup(revalidate.stop)
+    # Convergence Phase 3: `_revalidate_booking_slot` (and its one-argument advisory lock) is
+    # deleted — revalidation is the booking authority's, under its own locks — so it is no
+    # longer stubbed. Each patch registers its cleanup the moment it starts, so a patch that
+    # cannot start can never leave an earlier one installed for the rest of the process.
+    for p in (admit, bound):
+        p.start()
+        test_case.addCleanup(p.stop)
 
     claim = mock.patch.object(
         OfferLifecycle, "claim",
@@ -202,6 +202,130 @@ def start_offer_claim_stub(test_case):
 
     consume = mock.patch.object(OfferLifecycle, "consume", autospec=True,
                                 side_effect=_consume)
-    claim.start(); consume.start()
-    test_case.addCleanup(claim.stop)
-    test_case.addCleanup(consume.stop)
+    for p in (claim, consume):
+        p.start()
+        test_case.addCleanup(p.stop)
+
+
+# ── Convergence Phase 3: the booking authority is the only Flow booking writer ─────────────
+#
+# Suites that book through `handle_confirm_booking` or a CE Flow turn now reach
+# `BookingAuthority`, which (a) runs only with SMART_BOOKING_CE_ENABLED on — the OFF switch for
+# both Flow transports — (b) books against the launch professional, and (c) revalidates
+# availability ITSELF, under its locks (B-7). These helpers state those three facts once, for
+# the suites whose subject is the booking itself rather than the switch.
+
+_AUTHORITY_SCHED = [None]
+
+
+def route_authority_availability(sched) -> None:
+    """Make the authority's availability reader `sched` (a test's ScheduleService double), or
+    the real ScheduleService again with None — so a suite keeps deciding availability exactly
+    as it did when the in-session writer called `svc._sched.check` itself."""
+    _AUTHORITY_SCHED[0] = sched
+
+
+def start_converged_booking(*, flag: bool = True) -> list:
+    """Module-level: the Data Exchange reads the flag per request from `get_settings()`, and the
+    authority's availability reader follows `route_authority_availability`. Returns the started
+    patches for `stop_converged_booking`."""
+    import dataclasses
+    from unittest import mock
+    from app.services.booking_authority import BookingAuthority
+    from app.settings import get_settings
+    real_settings = get_settings()
+    real_service = BookingAuthority._availability_service
+
+    def _availability(self):
+        return _AUTHORITY_SCHED[0] if _AUTHORITY_SCHED[0] is not None else real_service(self)
+    started = []
+    for p in (mock.patch("app.settings.get_settings",
+                         lambda: dataclasses.replace(real_settings,
+                                                     smart_booking_ce_enabled=flag)),
+              mock.patch.object(BookingAuthority, "_availability_service", _availability)):
+        p.start()
+        started.append(p)
+    return started
+
+
+def stop_converged_booking(started: list) -> None:
+    _AUTHORITY_SCHED[0] = None
+    while started:
+        started.pop().stop()
+
+
+def ensure_launch_professional(db) -> None:
+    """One synthetic launch-default professional (fixture identity only, never a real one)."""
+    from app.models import Profesional
+    from app.services.booking_representation import LAUNCH_PROFESSIONAL_KEY
+    if db.query(Profesional).filter(Profesional.is_launch_default.is_(True)).first() is None:
+        db.add(Profesional(nombre="Fixture", apellido="CONV-FIXTURE",
+                           email="conv@example.invalid", resource_key=LAUNCH_PROFESSIONAL_KEY,
+                           is_launch_default=True, is_active=True))
+        db.flush()
+
+
+def start_converged_flow_stub(test_case, *, outcome: str = "COMMITTED") -> list:
+    """Let a MagicMock-session unit test reach the CONVERGED CE Flow booking path (Phase 3).
+
+    The legacy in-session writer these suites used to drive is deleted; CE now adjudicates as
+    reads and DELEGATES one typed command to `BookingAuthority`, which cannot run on a
+    MagicMock session. So — in one declared place, as `start_offer_claim_stub` did for the
+    legacy writer — the database decisions are stubbed and the DELEGATED COMMAND is captured:
+    the field mapping these suites assert on is now the mapping into that command, which is
+    exactly what the authority writes. Turns the flag ON for the engine under test.
+
+    Stubbed (each proven for real elsewhere): admission (`OfferLifecycle.admit`, the real
+    fingerprint of the submitted token), the offer-bound candidate, the committed-row and
+    clean-transaction checks (`test_sb2b_option_b*`, PostgreSQL race suite), the ledger reads,
+    and `book_from_flow_response` itself, which returns `outcome` for the captured request.
+
+    Returns the list the captured `CeFlowBookingRequest`s are appended to.
+    """
+    from unittest import mock
+    from app.services.booking_authority import BookingOutcome, BookingResult
+    from app.services.conversation_engine import ConversationEngine
+    from app.services.offer_lifecycle import (AdmissionOutcome, OfferAdmission, OfferLifecycle,
+                                              OfferRefusal, token_fingerprint)
+    captured: list = []
+
+    def _admit(self, *, thread_id, token):
+        if not token or not isinstance(token, str) or not token.strip():
+            return OfferAdmission(AdmissionOutcome.REFUSED, OfferRefusal.NO_TOKEN)
+        return OfferAdmission(AdmissionOutcome.GRANTED, None, offer_id=1,
+                              fingerprint=token_fingerprint(token), status="ISSUED",
+                              candidate_id=_STUB_CANDIDATE, tipo_vehiculo=None,
+                              zone_group=None, zone_detail=None, cycle_key=0)
+
+    def _bound_candidate(self, ctx, admission):
+        candidates = list(getattr(ctx, "candidates", None) or ())
+        focus_id = getattr(getattr(ctx, "state", None), "current_focus_candidate_id", None)
+        for candidate in candidates:
+            if getattr(candidate, "id", None) == focus_id:
+                return candidate
+        return candidates[0] if len(candidates) == 1 else None
+
+    def _book(db, req, **kw):
+        captured.append(req)
+        out = BookingOutcome(outcome)
+        if out is BookingOutcome.COMMITTED:
+            return BookingResult(outcome=out, reason="COMMITTED", message="", revision_id=1,
+                                 thread_revision_id=1, occupying=True,
+                                 idempotency_key="flow:stub", ack_status="SENT")
+        return BookingResult(outcome=out, reason=outcome, message="",
+                             retryable=out is BookingOutcome.RETRYABLE_FAILURE)
+
+    patches = [
+        mock.patch.object(OfferLifecycle, "admit", autospec=True, side_effect=_admit),
+        mock.patch.object(ConversationEngine, "_offer_bound_candidate", autospec=True,
+                          side_effect=_bound_candidate),
+        mock.patch.object(ConversationEngine, "_sb_row_committed", lambda self, m, i: True),
+        mock.patch.object(ConversationEngine, "_sb_transaction_clean", lambda self: True),
+        mock.patch.object(ConversationEngine, "_smart_booking_ce_on", lambda self: True),
+        mock.patch.object(ConversationEngine, "_sb_ledger_hit", lambda self, key: None),
+        mock.patch("app.services.booking_ce_adapter.book_from_flow_response", _book),
+    ]
+    for p in patches:
+        p.start()
+        test_case.addCleanup(p.stop)
+    return captured

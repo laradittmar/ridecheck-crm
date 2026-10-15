@@ -23,6 +23,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+from unittest import mock
 import time as _t
 import unittest
 from datetime import date, time, timedelta
@@ -36,6 +37,25 @@ from sqlalchemy import create_engine, text  # noqa: E402
 from sqlalchemy.orm import sessionmaker  # noqa: E402
 
 PG_URL = os.environ.get("G37R_PG_URL", "")
+# ── Convergence Phase 3 (adaptation, whole module) ─────────────────────────────────────────
+# The Conversation Engine and the Data Exchange no longer book in their own sessions: both
+# delegate to `BookingAuthority`, which (a) is reachable only with SMART_BOOKING_CE_ENABLED on
+# — the OFF switch for both Flow transports, now read from `get_settings()` — and (b) books
+# against the launch professional. These suites prove the offer authority's and the booking
+# projection's guarantees, so they run the converged writer: the flag is ON for this module
+# and every fixture world has a (synthetic) launch professional. Nothing else changes.
+_P3_PATCHES = []
+
+
+def setUpModule():
+    from offer_fixture import start_converged_booking
+    _P3_PATCHES.extend(start_converged_booking())
+
+
+def tearDownModule():
+    from offer_fixture import stop_converged_booking
+    stop_converged_booking(_P3_PATCHES)
+
 
 WA = "549110000778"
 BOOKING_PAYLOAD = {
@@ -120,6 +140,8 @@ class G37RBookingProjectionPG(unittest.TestCase):
                       "whatsapp_contacts"):
                 c.execute(text(f"TRUNCATE {t} RESTART IDENTITY CASCADE"))
         db = self.SF()
+        from offer_fixture import ensure_launch_professional
+        ensure_launch_professional(db)   # Convergence Phase 3: the authority books against it
         ct = M.WhatsAppContact(wa_id=WA, display_name="Probe"); db.add(ct); db.flush()
         lead = M.Lead(nombre="Probe", apellido="Cliente", telefono=WA,
                       estado="CONSULTA_NUEVA", flag="ACEPTADO"); db.add(lead); db.flush()
@@ -285,24 +307,37 @@ class G37RBookingProjectionPG(unittest.TestCase):
         """
         results = {}
         gate = _gate("GATE_A")
+        # Convergence Phase 3: ONE bypass around the whole race (never nested), and the
+        # index's translation is observed so a loser's SUCCESS is attributable to it.
+        import app.services.booking_authority as BA
+        translated = []
+        real_replay = BA.BookingAuthority._projection_winner_replay
+
+        def observe(auth, offer_id, cmd):
+            r = real_replay(auth, offer_id, cmd)
+            translated.append((threading.current_thread().name, r.outcome.value, r.reason))
+            return r
         try:
-            def run_a():
-                results["a"] = self._dx_confirm(token, *slot_a, bypass=True)
+            with _Bypass(enabled=True), \
+                    mock.patch.object(BA.BookingAuthority, "_projection_winner_replay", observe):
+                def run_a():
+                    results["a"] = self._dx_confirm(token, *slot_a)
 
-            def run_b():
-                results["b"] = self._dx_confirm(token, *slot_b, bypass=True)
+                def run_b():
+                    results["b"] = self._dx_confirm(token, *slot_b)
 
-            a = threading.Thread(target=run_a, name="GATE_A")
-            a.start()
-            self.assertTrue(gate["arrived"].wait(timeout=60),
-                            "the held writer never reached its claim")
-            b = threading.Thread(target=run_b, name="GATE_B")
-            b.start()
-            b.join(timeout=60)
-            gate["release"].set()
-            a.join(timeout=60)
+                a = threading.Thread(target=run_a, name="GATE_A")
+                a.start()
+                self.assertTrue(gate["arrived"].wait(timeout=60),
+                                "the held writer never reached its claim")
+                b = threading.Thread(target=run_b, name="GATE_B")
+                b.start()
+                b.join(timeout=60)
+                gate["release"].set()
+                a.join(timeout=60)
         finally:
             _clear_gates()
+        results["translated"] = translated
         return results
 
     # ══ P1 — the database guarantee BENEATH the application locks ════════════
@@ -332,18 +367,19 @@ class G37RBookingProjectionPG(unittest.TestCase):
         self.assertEqual(self._revisions(), 1, "exactly one CRM Revision")
         self.assertIsNotNone(bookings[0][1], "the booking must name the offer that authorized it")
 
-        # The loser must be refused BECAUSE of the offer, not because of the calendar.
-        losers = [r for r in results.values() if r[0] == "exc"]
-        self.assertEqual(len(losers), 1, f"exactly one loser expected: {results}")
-        kind, detail = losers[0][1], losers[0][2]
-        self.assertIn(kind, ("BookingTokenError", "BookingAlreadyCompletedError"),
-                      f"the loser must get a typed offer outcome, not {kind}: {detail}")
-        self.assertNotIn("Justo ese horario", detail,
-                         "a slot-conflict refusal would mean the calendar caught it, not "
-                         "the offer projection")
-        # And nothing leaked.
+        # Convergence Phase 3 adaptation. OLD: the loser raised `BookingTokenError` /
+        # `BookingAlreadyCompletedError` (the in-session writer's translation). NEW: the
+        # authority translates the index violation into a PROVEN replay of the winner
+        # (`_projection_winner_replay`, Phase 2), so the held writer — the loser — answers the
+        # winner's SUCCESS. The attribution is the same: it was the INDEX that stopped it,
+        # never the calendar, and nothing internal reached the Flow.
+        translated = results.pop("translated")
+        self.assertEqual(translated, [("GATE_A", "IDEMPOTENT_REPLAY", "PROJECTION_WINNER_REPLAY")],
+                         f"the index did not decide the loser: {results} {translated}")
+        self.assertEqual((results["a"], results["b"]), (("ok", "SUCCESS"), ("ok", "SUCCESS")),
+                         f"both answers are the one booking's SUCCESS: {results}")
         for forbidden in ("IntegrityError", "23505", "uq_thread_revision", "psycopg"):
-            self.assertNotIn(forbidden, detail,
+            self.assertNotIn(forbidden, str(results),
                              f"the loser was shown database internals: {forbidden}")
 
     # ══ P2 — guard attribution ══════════════════════════════════════════════
@@ -365,13 +401,17 @@ class G37RBookingProjectionPG(unittest.TestCase):
         first = self._dx_confirm(token, d1, t1)
         self.assertEqual(first[0], "ok", first)
         second = self._dx_confirm(token, d2, t2)
-        self.assertEqual(second[0], "exc", second)
+        # Convergence Phase 3 adaptation: the application layer that answers is now the
+        # booking LEDGER (asked first), so the second confirmation returns the committed
+        # booking's SUCCESS and the replay is counted on the ledger row, not the offer.
+        self.assertEqual(second, ("ok", "SUCCESS"), second)
         self.assertEqual(len(self._bookings()), 1)
-        # The offer row says which: ACCEPTED, and the second attempt is a REPLAY, because
-        # the first one's booking exists. That is the application layer answering.
         offers = self._offers()
         self.assertEqual(offers[-1]["status"], "ACCEPTED")
-        self.assertEqual(offers[-1]["replay_count"], 1,
+        db = self.SF()
+        ledger_replays = db.execute(text("SELECT replay_count FROM booking_commands")).scalars().all()
+        db.close()
+        self.assertEqual(ledger_replays, [1],
                          "the second confirmation was a replay of a committed booking")
         self.assertEqual(offers[-1]["refused_count"], 0,
                          "a replay must never be counted as a refusal")
@@ -389,9 +429,9 @@ class G37RBookingProjectionPG(unittest.TestCase):
         raced = self._race_for_the_index(token, (d1, t1), (d2, t2))
         self.assertEqual(len(self._bookings()), 1,
                          f"the projection index must stop the second booking: {raced}")
-        losers = [r for r in raced.values() if r[0] == "exc"]
-        self.assertEqual(len(losers), 1, f"exactly one loser expected: {raced}")
-        self.assertEqual(losers[0][1], "BookingAlreadyCompletedError",
+        # Convergence Phase 3 adaptation: translated by the authority into a proven replay.
+        self.assertEqual(raced["translated"],
+                         [("GATE_A", "IDEMPOTENT_REPLAY", "PROJECTION_WINNER_REPLAY")],
                          f"the index violation must be translated, not leaked: {raced}")
 
         # ── (c) the CALENDAR, for contrast: same slot, guards in place ───────
@@ -473,11 +513,38 @@ class G37RBookingProjectionPG(unittest.TestCase):
                     "SELECT 1 FROM pg_indexes WHERE indexname = :n"), {"n": INDEX}).scalar()
             self.assertTrue(restored, "the disposable mutation must be put back")
 
+        # Convergence Phase 3 adaptation. OLD: with the index dropped, TWO bookings appeared.
+        # NEW: the authority records every command in the booking LEDGER in the same
+        # transaction, and both confirmations of one Flow token carry the same `flow:` key —
+        # so the ledger's UNIQUE key is a SECOND database guarantee, and with only the
+        # projection index dropped there is still ONE booking. Dropping BOTH is what produces
+        # the duplicate, which proves each is sufficient on its own and that neither is
+        # vacuous. (Strictly stronger than the parent: two independent oracles, not one.)
+        self.assertEqual(len(without_index), 1,
+                         f"the ledger key must still stop the duplicate: {without_index}")
+        LEDGER = "uq_booking_commands_idempotency_key"
+        with self.engine.begin() as c:
+            c.execute(text(f"DROP INDEX {INDEX}"))
+            c.execute(text(f"ALTER TABLE booking_commands DROP CONSTRAINT {LEDGER}"))
+        try:
+            without_both = run_once()
+        finally:
+            with self.engine.begin() as c:
+                c.execute(text("TRUNCATE thread_revisions RESTART IDENTITY CASCADE"))
+                c.execute(text("TRUNCATE booking_commands RESTART IDENTITY CASCADE"))
+                c.execute(text(ddl))
+                c.execute(text(f"ALTER TABLE booking_commands ADD CONSTRAINT {LEDGER} "
+                               "UNIQUE (idempotency_key)"))
+            with self.engine.begin() as c:
+                restored = c.execute(text(
+                    "SELECT count(*) FROM pg_constraint WHERE conname = :n"),
+                    {"n": LEDGER}).scalar()
+            self.assertEqual(restored, 1, "the disposable mutation must be put back")
         self.assertEqual(
-            len(without_index), 2,
-            "with the index dropped and both application guards bypassed, TWO bookings must "
-            f"appear — if they do not, this suite cannot see the guarantee: {without_index}")
-        self.assertNotEqual(without_index[0][2], without_index[1][2],
+            len(without_both), 2,
+            "with BOTH database guarantees dropped and the application guards bypassed, TWO "
+            f"bookings must appear — otherwise this suite cannot see them: {without_both}")
+        self.assertNotEqual(without_both[0][2], without_both[1][2],
                             "the two bookings must be at two different dates, so no "
                             "calendar conflict could have been involved")
 
@@ -756,10 +823,21 @@ class G37RBookingProjectionPG(unittest.TestCase):
         self.assertNotEqual(out.action, "booking_created",
                             "CE created a booking the availability authority refused")
         self.assertEqual(len(self._bookings()), 0, "no occupying booking may be created")
-        self.assertEqual(self._revisions(), before,
-                         "no second occupying Revision at the same slot")
-        # The customer was not told it succeeded.
-        self.assertIn(out.action, ("replied",), out.action)
+        # Convergence Phase 3 adaptation: the refusal now also records the ratified B-6
+        # NON-occupying manual-scheduling request (REPROGRAMAR), so the Revision count grows
+        # by exactly that one non-occupying row; the occupying count at the slot is still 1.
+        db = self.SF()
+        rows = db.execute(text(
+            "SELECT estado_revision, turno_fecha = :d AND turno_hora = :t FROM revisions "
+            "ORDER BY id"), {"d": d1, "t": t1}).fetchall()
+        db.close()
+        self.assertEqual(self._revisions(), before + 1)
+        self.assertEqual([tuple(r) for r in rows][1:], [("REPROGRAMAR", True)],
+                         "the only new Revision is the non-occupying manual request")
+        # The customer was not told it succeeded: a typed, truthful handoff.
+        self.assertEqual(out.action, "booking_refused_handoff")
+        self.assertIn(out.detail, ("OVERLAP", "SCHEDULE_REVALIDATION", "EXCLUSION_CONSTRAINT"),
+                      "the authority's SLOT_CONFLICT reason")
         # And the offer was NOT accepted: the slot went, the offer did not.
         offers = self._offers()
         self.assertNotEqual(offers[-1]["status"], "ACCEPTED",
@@ -795,10 +873,20 @@ class G37RBookingProjectionPG(unittest.TestCase):
         offer_before = self._offers()[-1]
 
         out = self._ce_submit(token, tag="replay")
-        self.assertEqual(out.action, ACTION_BOOKING_REPLAY,
+        # Convergence Phase 3 adaptation: the ledger answers first ("booking_replayed").
+        self.assertEqual(out.action, "booking_replayed",
                          f"the completion of a committed booking is a replay: {out.action}")
-        self.assertFalse(out.reply_required,
-                         "no duplicate acknowledgement is owed for a replay")
+        # Convergence Phase 3 adaptation: an acknowledgement is owed by the LEDGER, not
+        # assumed sent by "the transport that created the booking". Here the Data Exchange's
+        # attempt was blocked by the kill switch (FAILED, bounded retries), so the replay
+        # truthfully still owes it and re-attempts it ONCE through the lease; were it SENT,
+        # the replay would owe nothing (asserted in the Phase 3 race suite, p3r_09/p3r_13).
+        db = self.SF()
+        ack = db.execute(text("SELECT ack_status, ack_attempts FROM booking_commands")).one()
+        db.close()
+        self.assertEqual((ack[0], ack[1]), ("FAILED", 2),
+                         "one blocked attempt by the Data Exchange, one by the replay")
+        self.assertTrue(out.reply_required, "the owed acknowledgement was re-attempted")
         self.assertEqual(self._bookings(), booking, "no duplicate booking")
         self.assertEqual(self._revisions(), 1)
         after = self._offers()[-1]
@@ -806,8 +894,11 @@ class G37RBookingProjectionPG(unittest.TestCase):
                          "a replay must not increment refused_count")
         self.assertIsNone(after["last_refusal"],
                           "a replay must not write last_refusal")
-        self.assertEqual(after["replay_count"], 1,
-                         "a replay must be distinguishable in operator evidence")
+        db = self.SF()
+        ledger_replays = db.execute(text("SELECT replay_count FROM booking_commands")).scalars().all()
+        db.close()
+        self.assertEqual(ledger_replays, [1],
+                         "a replay must be distinguishable in operator evidence (the ledger)")
         # No contradictory human state written merely because a completion arrived twice.
         db = self.SF()
         needs_human = db.execute(text(
@@ -836,16 +927,18 @@ class G37RBookingProjectionPG(unittest.TestCase):
         self.assertEqual(len(booking), 1)
 
         again = self._dx_confirm(token, d2, t2)
-        self.assertEqual(again[0], "exc", again)
-        self.assertEqual(again[1], "BookingAlreadyCompletedError",
+        # Convergence Phase 3 adaptation: the ledger answers the replay with the committed
+        # booking's SUCCESS screen — never an error, never the false-expiry wording.
+        self.assertEqual(again, ("ok", "SUCCESS"),
                          f"a replay must not be reported as an expired session: {again}")
-        self.assertNotIn("expiró", again[2],
-                         "the false-expiry wording must not reach a replay")
         self.assertEqual(self._bookings(), booking, "no duplicate booking")
         after = self._offers()[-1]
         self.assertEqual(after["refused_count"], 0)
         self.assertIsNone(after["last_refusal"])
-        self.assertGreaterEqual(after["replay_count"], 1)
+        db = self.SF()
+        self.assertGreaterEqual(db.execute(text(
+            "SELECT replay_count FROM booking_commands")).scalar(), 1)
+        db.close()
         self.assertTrue(issubclass(BookingAlreadyCompletedError, Exception))
         self.assertFalse(issubclass(BookingAlreadyCompletedError, BookingTokenError))
 
@@ -853,39 +946,28 @@ class G37RBookingProjectionPG(unittest.TestCase):
 class _Bypass:
     """THE DECLARED TEST-ONLY BYPASS of the upper application serialization.
 
-    P1 and P3 ask what stands between one offer and two bookings when the application layer
-    is not helping. Answering that honestly means removing the application layer, and
-    removing it in a way a reader can audit — so exactly three things are removed, by name,
-    and nothing else:
+    Convergence Phase 3 adaptation. The booking writers this bypass used to open up — the
+    Conversation Engine's and the Data Exchange's in-session writers, with `OfferLifecycle`'s
+    `begin_offer_transaction` / `claim()` — are deleted; both transports now delegate to
+    `BookingAuthority`. So the SAME four items are applied to the authority, by name, and
+    nothing else:
 
-        1. `_acquire_thread_state` AND `begin_offer_transaction` — resource 1 of
-           OFFER_LOCK_ORDER (S1), in both of the places that take it
-        2. the offer row's `SELECT ... FOR UPDATE`
-        3. the conditional `UPDATE ... WHERE status = 'ISSUED'`
-    and ONE coordination point is added:
+        1. K1 — the thread-state row lock (`_lock_thread_state` reads the row, locks nothing)
+        2. K2's `SELECT ... FOR UPDATE` on the offer row
+        3. K2's conditional `UPDATE ... WHERE status = 'ISSUED'` (and with it the offer
+           projection UPDATE and its pre-commit check, which require ACCEPTED), plus the
+           ledger replay checks — under the authority a replay check on the shared `flow:` key
+           would otherwise stop the second writer before its insert, which is an application
+           guard above the index
+        4. an optional gate that holds a named thread inside K2, after the bindings were
+           checked and before anything is inserted
 
-        4. an optional gate that holds a named thread inside `claim()`, after it has
-           accepted and before it inserts
+    What is deliberately NOT removed: the authority's binding comparisons against the offer
+    row, `ScheduleService`, the date/professional advisory locks, the ledger's UNIQUE key and
+    the booking projection index. The point is to isolate the database guarantees.
 
-    (4) is what makes the probe deterministic, and it replaces an earlier attempt that was
-    not. Stubbing out more and more copies of the status check — in `verify_bindings`, then
-    in `admit` — looked like the way to reach the index, and it is a trap: with the winner
-    already COMMITTED, the loser is stopped by the transport's own mirror check long before
-    the insert, so the probe passed or failed depending on which thread won. A probe whose
-    result depends on an interleaving is not a probe.
-
-    The index is reachable only if BOTH writers pass admission before EITHER commits, so
-    that is arranged explicitly rather than hoped for. The winner is held inside `claim()`;
-    the loser then sees a live ISSUED offer and an intact mirror through the REAL admission
-    and the REAL bindings, reaches its own insert, and the index — with the two application
-    guards removed — is the only thing left that can refuse one of them.
-
-    What is deliberately NOT removed: `ScheduleService`, the per-date advisory lock, the
-    binding comparisons, and the booking projection index. The point is to isolate the
-    index, not to disable every control at once.
-
-    It exists only in this file, is a context manager so it cannot leak past the block that
-    opens it, and restores the real methods in `finally`.
+    One instance wraps a whole race (`_race_for_the_index`), so it is never nested, and it
+    restores the real methods in `__exit__`.
     """
 
     def __init__(self, enabled: bool = True):
@@ -897,77 +979,58 @@ class _Bypass:
             return self
         from sqlalchemy import select
 
-        from app.services import offer_lifecycle as OL
+        from app.services import booking_authority as BA
+        A = BA.BookingAuthority
+        for name in ("_lock_thread_state", "_claim_offer", "_accepted_offer_id",
+                     "_apply_canonical_state", "_verify_offer_projection", "_check_replay"):
+            self._saved[name] = getattr(A, name)
+        saved = self._saved
 
-        self._saved["_acquire_thread_state"] = OL.OfferLifecycle._acquire_thread_state
-        self._saved["begin_offer_transaction"] = OL.OfferLifecycle.begin_offer_transaction
-        self._saved["claim"] = OL.OfferLifecycle.claim
-        OL.OfferLifecycle._acquire_thread_state = lambda self, thread_id, **kw: None
-        # `begin_offer_transaction` takes resource 1 DIRECTLY rather than through the
-        # helper, so stubbing only the helper leaves the acquisition standing — and the
-        # loser then waits its bounded 4s on the winner's state-row lock and answers
-        # OFFER_CONTENDED without ever inserting. Measured.
-        OL.OfferLifecycle.begin_offer_transaction = lambda self, thread_id, **kw: None
+        def no_k1(auth, thread_id, cmd, attachments):
+            from app.models import WhatsAppThreadState as S
+            return auth.db.execute(select(S).where(S.thread_id == thread_id)
+                                   .execution_options(populate_existing=True)).scalar_one()
 
-        def unguarded_claim(self, state, *, thread_id, token, candidate_id=None,
-                            tipo_vehiculo=None, zone_group=None, zone_detail=None,
-                            cycle_key=None):
-            """`claim()` with guards 2 and 3 removed and every BINDING check intact."""
+        def unguarded_claim(auth, acceptance, state):
+            """K2 with guards 2 and 3 removed and every BINDING check intact."""
             from app.models import WhatsAppBookingOffer as O
-            if not token:
-                return OL.OfferClaim(False, OL.OfferRefusal.NO_TOKEN)
-            fp = OL.token_fingerprint(token)
-            # (2) removed: no `with_for_update()`.
-            offer = self.db.execute(
-                select(O).where(O.token_fingerprint == fp)
-                .execution_options(populate_existing=True)).scalars().first()
-            if offer is None:
-                return OL.OfferClaim(False, OL.OfferRefusal.UNKNOWN_TOKEN, fingerprint=fp)
-            if offer.thread_id != thread_id:
-                return OL.OfferClaim(False, OL.OfferRefusal.FOREIGN_OFFER, fingerprint=fp)
-            if offer.candidate_id != candidate_id:
-                return OL.OfferClaim(False, OL.OfferRefusal.OFFER_CANDIDATE_CHANGED,
-                                     offer_id=offer.id, fingerprint=fp)
-            if offer.tipo_vehiculo != tipo_vehiculo or tipo_vehiculo is None:
-                return OL.OfferClaim(False, OL.OfferRefusal.OFFER_VEHICLE_CATEGORY_CHANGED,
-                                     offer_id=offer.id, fingerprint=fp)
-            if (offer.zone_group, offer.zone_detail) != (zone_group, zone_detail):
-                return OL.OfferClaim(False, OL.OfferRefusal.OFFER_LOCATION_CHANGED,
-                                     offer_id=offer.id, fingerprint=fp)
-            # (3) removed ENTIRELY, not merely made unconditional. Dropping the `WHERE
-            # status = 'ISSUED'` is not enough: the acceptance UPDATE itself takes a row
-            # lock on the offer, so two writers serialise on it whether or not the
-            # condition is there and whether or not `FOR UPDATE` was asked for. Measured:
-            # with the condition gone but the write kept, the loser sat in `Lock` on
-            # `UPDATE whatsapp_booking_offers` until the winner committed — so the two
-            # inserts could never overlap and the index was unreachable.
-            #
-            # So the bypassed claim writes nothing to the offer table. What remains between
-            # one offer and two bookings is the partial unique index, which is the whole
-            # point of P1 and P3.
-            # (4) the gate. Holds THIS thread between acceptance and its insert, so the
-            # other writer can reach its own insert while this transaction is still open.
-            _gate = CLAIM_GATES.get(threading.current_thread().name)
-            if _gate is not None:
-                _gate["arrived"].set()
-                _gate["release"].wait(timeout=60)
-            return OL.OfferClaim(True, None, offer_id=offer.id, fingerprint=fp,
-                                 status=OL.OfferStatus.ACCEPTED,
-                                 offered_date=offer.offered_date,
-                                 offered_time=offer.offered_time)
+            offer = auth.db.execute(select(O).where(
+                O.token_fingerprint == acceptance.token_fingerprint)
+                .execution_options(populate_existing=True)).scalar_one_or_none()
+            refusal = auth._offer_refusal(offer, acceptance, state)
+            if refusal is not None:
+                raise BA._Refused(BA._result(BA.BookingOutcome.OFFER_REFUSED, refusal))
+            gate = CLAIM_GATES.get(threading.current_thread().name)
+            if gate is not None:
+                gate["arrived"].set()
+                gate["release"].wait(timeout=60)
+            return int(offer.id)
 
-        OL.OfferLifecycle.claim = unguarded_claim
+        def accepted_any(auth, acceptance):
+            if acceptance is None:
+                return None
+            from app.models import WhatsAppBookingOffer as O
+            return int(auth.db.execute(select(O.id).where(
+                O.token_fingerprint == acceptance.token_fingerprint)).scalar())
+
+        def no_projection(auth, cmd, plan, revision, tr_id, state, offer_id):
+            return saved["_apply_canonical_state"](auth, cmd, plan, revision, tr_id, state, None)
+
+        A._lock_thread_state = no_k1
+        A._claim_offer = unguarded_claim
+        A._accepted_offer_id = accepted_any
+        A._apply_canonical_state = no_projection
+        A._verify_offer_projection = lambda auth, *a, **k: None
+        A._check_replay = lambda auth, key, fingerprint: None
         return self
 
     def __exit__(self, *exc):
         if not self.enabled:
             return False
-        from app.services import offer_lifecycle as OL
-        for name, original in self._saved.items():
-            setattr(OL.OfferLifecycle, name, original)
-        self._saved.clear()
+        from app.services import booking_authority as BA
+        for name, fn in self._saved.items():
+            setattr(BA.BookingAuthority, name, fn)
         return False
-
 
 if __name__ == "__main__":        # pragma: no cover
     unittest.main(verbosity=2)

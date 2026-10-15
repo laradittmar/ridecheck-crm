@@ -530,11 +530,15 @@ class R3_Receipt(unittest.TestCase):
 
     APPROVED = "Gracias por completarlo. Un representante de RideCheck se estará comunicando con vos."
 
+    # Convergence Phase 3 (resolves the Phase 1 deferral of r3_28/29/30): the receipt sender
+    # this class exercises is `booking_acknowledgement._send_ledger_acknowledgement` — the
+    # SAME code that was `BookingFlowService._send_booking_receipt` at `870b4e3`, carried
+    # verbatim by Phase 1 and now the only success sender of both Flow transports. The
+    # assertions (exact copy, outcome classification, ledger recording) are unchanged.
     def _send(self, *, gate_ok=True, effect=None, ret=None):
-        from app.services import booking_flow_service as bfs
+        from app.services import booking_acknowledgement as ack
         from app.services.outbound_safety_gate import GateOutcome
-        svc = bfs.BookingFlowService.__new__(bfs.BookingFlowService)
-        svc.db = mock.MagicMock()
+        db = mock.MagicMock()
         ctx = mock.MagicMock(); ctx.contact.wa_id = "549"; ctx.thread.id = 1
         sent_texts = []
         with mock.patch("app.services.outbound_safety_gate.OutboundSafetyGate") as G, \
@@ -546,7 +550,8 @@ class R3_Receipt(unittest.TestCase):
                 T.side_effect = effect
             else:
                 T.return_value = (ret, 200)
-            out = svc._send_booking_receipt(ctx, name="Julián", selected_date=D, selected_time=time(10))
+            out = ack._send_ledger_acknowledgement(db, ctx, name="Julián", selected_date=D,
+                                                   selected_time=time(10))
         return out, sent_texts
 
     def test_r3_28_receipt_is_exactly_the_approved_copy(self):
@@ -572,12 +577,21 @@ class R3_Receipt(unittest.TestCase):
             self.assertEqual((out.sent, out.ambiguous, out.error), expected, kw)
 
     def test_r3_30_flow_records_ambiguity_into_the_ledger(self):
-        from app.services import booking_flow_service as bfs
-        svc = bfs.BookingFlowService.__new__(bfs.BookingFlowService)
-        svc._authority = mock.MagicMock()
+        import contextlib
+        from app.services import booking_acknowledgement as ack
+        from app.services import booking_ce_adapter as adapter
         claim = ba.AckClaim("k", "t", 1, False)
-        svc._record_receipt(claim, bfs.ReceiptOutcome(False, None, "AMBIGUOUS_NETWORK_OR_TIMEOUT", True))
-        svc._authority.record_acknowledgement.assert_called_once_with(
+        authority = mock.MagicMock()
+        authority.return_value.claim_acknowledgement.return_value = claim
+        with mock.patch.object(ba, "BookingAuthority", authority), \
+                mock.patch.object(adapter, "isolated_session",
+                                  lambda db: contextlib.nullcontext(mock.MagicMock())), \
+                mock.patch.object(adapter, "lookup_booking", lambda db, key: None), \
+                mock.patch.object(ack, "send_booking_acknowledgement", return_value=ack.ReceiptOutcome(
+                    False, None, "AMBIGUOUS_NETWORK_OR_TIMEOUT", True)):
+            ack.acknowledge_committed_booking(mock.MagicMock(), key="k", ack_status="PENDING",
+                                              wa_id="549", thread_id=1)
+        authority.return_value.record_acknowledgement.assert_called_once_with(
             claim, sent=False, transport_id=None, error="AMBIGUOUS_NETWORK_OR_TIMEOUT", ambiguous=True)
 
     def test_r3_31_track_a_builder_is_unchanged(self):

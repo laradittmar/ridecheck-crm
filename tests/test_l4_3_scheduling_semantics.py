@@ -569,35 +569,67 @@ class TestBookingFlowWiring(unittest.TestCase):
         self.assertEqual(state.last_stage, "SCHEDULING")
 
     def test_flow_07_booking_service_revalidates_before_confirmation(self):
-        """FLOW-07 BookingFlowService re-checks the slot inside handle_confirm_booking."""
+        """FLOW-07 the slot is re-checked inside the confirmation, before anything is booked."""
+        # Convergence Phase 3 adaptation. OLD: Track A's in-session writer in the Conversation
+        # Engine (`_process_flow_response`) / Data Exchange (`handle_confirm_booking`) built the
+        # booked ThreadRevision and called `self._sched.check(...)` itself. NEW: both transports
+        # DELEGATE one typed command; `BookingAuthority` alone derives the "booked" status and
+        # revalidates the slot under its locks. WHY: the legacy writers are deleted (no third
+        # state where both are reachable). The invariant — one booking authority, reached only
+        # from the Flow path, never from text — is asserted on the code that now holds it.
         import inspect
+        from app.services.booking_authority import BookingAuthority
         from app.services.booking_flow_service import BookingFlowService
-        source = inspect.getsource(BookingFlowService.handle_confirm_booking)
-        self.assertIn("self._sched.check(", source)
-        self.assertIn("check_out.valid", source)
+        source = inspect.getsource(BookingFlowService._confirm_booking)
+        self.assertIn("AvailabilityRevalidation(", source)
         self.assertIn("BookingSlotConflictError", source)
+        auth = inspect.getsource(BookingAuthority._revalidate_availability)
+        self.assertIn("self._availability_service().check(", auth)
+        self.assertIn("out.valid", auth)
 
     def test_flow_08_text_path_cannot_create_a_booking(self):
         """FLOW-08 only the Flow response path creates a booked ThreadRevision."""
+        # Convergence Phase 3 adaptation. OLD: Track A's in-session writer in the Conversation
+        # Engine (`_process_flow_response`) / Data Exchange (`handle_confirm_booking`) built the
+        # booked ThreadRevision and called `self._sched.check(...)` itself. NEW: both transports
+        # DELEGATE one typed command; `BookingAuthority` alone derives the "booked" status and
+        # revalidates the slot under its locks. WHY: the legacy writers are deleted (no third
+        # state where both are reachable). The invariant — one booking authority, reached only
+        # from the Flow path, never from text — is asserted on the code that now holds it.
         import inspect
+        from app.services.booking_authority import BookingAuthority
         from app.services.conversation_engine import ConversationEngine
-        booked_creators = []
+        creators = []
         for name, member in inspect.getmembers(ConversationEngine, inspect.isfunction):
             try:
                 src = inspect.getsource(member)
             except (OSError, TypeError):
                 continue
-            if 'ThreadRevision(' in src and 'status="booked"' in src:
-                booked_creators.append(name)
-        self.assertEqual(booked_creators, ["_process_flow_response"])
+            if 'ThreadRevision(' in src or 'status="booked"' in src:
+                creators.append(name)
+        self.assertEqual(creators, [], "no Conversation Engine method builds a booking row")
+        self.assertIn("book_from_flow_response(self.db, req)",
+                      inspect.getsource(ConversationEngine._converged_flow_book))
+        self.assertIn("ThreadRevision(", inspect.getsource(BookingAuthority._apply_attachments))
+        self.assertIn('"booked"', inspect.getsource(BookingAuthority._apply_attachments))
 
     def test_flow_08b_scheduling_escalation_is_provisional_only(self):
         """FLOW-08 the human-handoff path creates a provisional record, never a booking."""
+        # Convergence Phase 3 adaptation. OLD: Track A's in-session writer in the Conversation
+        # Engine (`_process_flow_response`) / Data Exchange (`handle_confirm_booking`) built the
+        # booked ThreadRevision and called `self._sched.check(...)` itself. NEW: both transports
+        # DELEGATE one typed command; `BookingAuthority` alone derives the "booked" status and
+        # revalidates the slot under its locks. WHY: the legacy writers are deleted (no third
+        # state where both are reachable). The invariant — one booking authority, reached only
+        # from the Flow path, never from text — is asserted on the code that now holds it.
         import inspect
         from app.services.conversation_engine import ConversationEngine
         src = inspect.getsource(ConversationEngine._handle_scheduling_escalation)
-        self.assertIn('status="provisional"', src)
+        self.assertIn("self._sb_escalation(", src)
         self.assertNotIn('status="booked"', src)
+        w2 = inspect.getsource(ConversationEngine._sb_escalation)
+        self.assertIn('non_occupying_status="provisional"', w2)
+        self.assertNotIn('"booked"', w2)
 
     def test_booking_flow_prerequisites_block_dispatch(self):
         """No candidate / no zone → no Flow (prerequisites are not duplicated in CE)."""

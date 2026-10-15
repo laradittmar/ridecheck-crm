@@ -192,30 +192,44 @@ class TestCanonicalBookingLocation(_Base):
                          ("Sur", "Berazategui"))
 
     def test_booking_and_ce_now_share_one_hierarchy(self):
-        """The two implementations disagreed; they must not again."""
+        """The two implementations disagreed; they must not again. (Convergence Phase 3: CE's
+        precedence now lives in `_inspection_location_for`, which the booking path calls with
+        the OFFER-BOUND candidate and `_get_active_inspection_location` with the focus.)"""
         bfs = _fn(BFS_SOURCE, "_location_from_candidate")
-        ce = _fn(CE_SOURCE, "_get_active_inspection_location")
+        ce = _fn(CE_SOURCE, "_inspection_location_for")
         for source in (bfs, ce):
             self.assertIn("zone_group or", source)
             self.assertIn("home_zone_group", source)
         self.assertIn("if cand_group or cand_detail:", bfs)
+        self.assertIn("self._inspection_location_for(",
+                      _fn(CE_SOURCE, "_get_active_inspection_location"))
 
     def test_bookctx_03_no_canonical_location_refuses_the_booking(self):
         """BOOKCTX-03 — an unpriced booking is worse than no booking."""
-        fn = _fn(BFS_SOURCE, "handle_confirm_booking")
+        # Convergence Phase 3 adaptation: the Data Exchange's in-session writer is deleted;
+        # the confirm path is `_confirm_booking`, which describes ONE command and the booking
+        # authority writes, prices, revalidates and consumes in its own transaction.
+        fn = _fn(BFS_SOURCE, "_confirm_booking")
         self.assertIn("BOOKING_REFUSED_NO_CANONICAL_LOCATION", fn)
         i_guard = fn.index("BOOKING_REFUSED_NO_CANONICAL_LOCATION")
-        i_write = fn.index("thread_rev = ThreadRevision(")
-        self.assertLess(i_guard, i_write, "the refusal must precede the write")
+        i_write = fn.index("_execute_isolated(self.db, command, availability, attachments)")
+        self.assertLess(i_guard, i_write, "the refusal must precede the booking")
 
     def test_bookctx_04_05_the_quote_and_the_booking_share_inputs(self):
         """BOOKCTX-04/05 — same tipo + zone, priced by the one PricingService."""
+        # Convergence Phase 3 adaptation: the Data Exchange's in-session writer is deleted;
+        # the confirm path is `_confirm_booking`, which describes ONE command and the booking
+        # authority writes, prices, revalidates and consumes in its own transaction.
         svc = PricingService(repository=self.repo)
         q = svc.quote(db=self.db, tipo_vehiculo="SUV/4x4",
                       zone_group="CABA", zone_detail="La Paternal")
         self.assertEqual(q.precio_total, q.precio_base + q.viaticos)
-        fn = _fn(BFS_SOURCE, "handle_confirm_booking")
-        self.assertIn("self._pricing.recalculate_revision_if_possible", fn)
+        fn = _fn(BFS_SOURCE, "_confirm_booking")
+        self.assertIn("price=PriceRecalculation(require_inputs=(candidate.tipo_vehiculo, "
+                      "zone_group, zone_detail))", fn)
+        auth = (ROOT / "backend" / "app" / "services" / "booking_authority.py").read_text(
+            encoding="utf-8-sig")
+        self.assertIn("recalculate_revision_if_possible", _fn(auth, "_recalculate_price"))
 
     def test_bookctx_06_the_exact_wild_case_now_prices(self):
         """BOOKCTX-06 — Peugeot 3008 in 'paternal' resolves and prices. No hardcoded total:
@@ -257,16 +271,24 @@ class TestFlowPrefillWithinPublishedLimits(unittest.TestCase):
 
     def test_flow_prefill_07_08_a_stale_agreement_falls_back_and_is_revalidated(self):
         """FLOW-PREFILL-07/08 — narrowing is UX only; safety is unchanged."""
+        # Convergence Phase 3 adaptation: the Data Exchange's in-session writer is deleted;
+        # the confirm path is `_confirm_booking`, which describes ONE command and the booking
+        # authority writes, prices, revalidates and consumes in its own transaction.
         fn = _fn(BFS_SOURCE, "_appointment_screen_data")
         self.assertIn("still_free", fn)
-        confirm = _fn(BFS_SOURCE, "handle_confirm_booking")
-        self.assertIn("self._sched.check(check_in)", confirm)
+        confirm = _fn(BFS_SOURCE, "_confirm_booking")
+        self.assertIn("availability = AvailabilityRevalidation(", confirm)
         self.assertIn("BOOKING_REVALIDATION_FAIL", confirm)
 
     def test_flow_prefill_10_no_duplicate_booking(self):
-        confirm = _fn(BFS_SOURCE, "handle_confirm_booking")
-        # G3-7P: see `offer_lifecycle.consume` — the mirror follows the authority.
-        self.assertIn("_offers.consume(", confirm)
+        # Convergence Phase 3 adaptation: the Data Exchange's in-session writer is deleted;
+        # the confirm path is `_confirm_booking`, which describes ONE command and the booking
+        # authority writes, prices, revalidates and consumes in its own transaction.
+        confirm = _fn(BFS_SOURCE, "_confirm_booking")
+        self.assertIn("consume_flow_token=True", confirm)
+        self.assertIn("offer_acceptance=acceptance", confirm)
+        self.assertLess(confirm.index("hit = self._ledger_hit(key)"),
+                        confirm.index("self.resolve_context(token)"))
 
     def test_flow_prefill_04_05_06_phone_and_name_are_blocked_by_the_published_flow(self):
         """FLOW-PREFILL-04/05/06 — recorded as an external constraint, not silently skipped.
@@ -303,15 +325,20 @@ class TestExactRejectFlowFirst(unittest.TestCase):
 
     def test_exact_reject_03_human_rescue_is_untouched(self):
         """EXACT-REJECT-03 / Part 17 — the rescue branch is still unproven live and must
-        remain intact for the next Wild."""
+        remain intact for the next Wild.
+
+        Convergence Phase 3 adaptation. OLD: the rescue priced a provisional Revision it
+        wrote itself (`recalculate_revision_if_possible`). NEW: the handoff is unchanged, and
+        the request is recorded through the booking authority (`_sb_escalation`, a
+        PriceRecalculation plan) — the in-session PENDIENTE writer is deleted."""
         fn = _fn(CE_SOURCE, "_handle_scheduling_escalation")
         self.assertIn("lead.necesita_humano = True", fn)
         self.assertIn("state.needs_human = True", fn)
         self.assertIn("_send_scheduling_handoff_email", fn)
-        self.assertIn("recalculate_revision_if_possible", fn)
+        self.assertIn("self._sb_escalation(", fn)
+        self.assertIn("PriceRecalculation(", _fn(CE_SOURCE, "_sb_escalation"))
         nxt = _fn(CE_SOURCE, "_handle_next_available_request")
         self.assertIn("_handle_scheduling_escalation", nxt)
-
 
 if __name__ == "__main__":       # pragma: no cover
     unittest.main()

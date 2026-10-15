@@ -55,6 +55,24 @@ from sqlalchemy.orm import sessionmaker  # noqa: E402
 
 PG_URL = os.environ.get("RV03_PG_URL", "") or os.environ.get("G37R_PG_URL", "")
 
+# ── Convergence Phase 3 (adaptation, whole module) ─────────────────────────────────────────
+# The tester's REAL acceptance path is now the converged one: the Conversation Engine and the
+# Data Exchange delegate to `BookingAuthority`, reachable only with SMART_BOOKING_CE_ENABLED on
+# (read from `get_settings()`) and booking against the launch professional. The reset under
+# test is unchanged; the bookings it resets are made by the authority.
+_P3_PATCHES = []
+
+
+def setUpModule():
+    from offer_fixture import start_converged_booking
+    _P3_PATCHES.extend(start_converged_booking())
+
+
+def tearDownModule():
+    from offer_fixture import stop_converged_booking
+    stop_converged_booking(_P3_PATCHES)
+
+
 BOOKING_FLOW_ID = "28104222025943520"
 PROJECTION_REVISION = "20261013_booking_projection"
 PROJECTION_FK = "fk_thread_revisions_offer_id"
@@ -170,6 +188,13 @@ class _ResetHarness(unittest.TestCase):
 
     def setUp(self):
         self.truncate()
+        from offer_fixture import ensure_launch_professional
+        db = self.Session()
+        try:
+            ensure_launch_professional(db)   # Convergence Phase 3: the authority books against it
+            db.commit()
+        finally:
+            db.close()
 
     def slots(self, n=2):
         if len(type(self)._slots) >= n:

@@ -373,9 +373,14 @@ class TestSchedF07FlowCompletionCreatesBooking(unittest.TestCase):
     """F07: _process_flow_response sets COORDINAR_DISPONIBILIDAD + creates ThreadRevision."""
 
     def setUp(self):
-        # G3-7P: MagicMock session — see `offer_fixture.start_offer_claim_stub`.
-        from offer_fixture import start_offer_claim_stub
-        start_offer_claim_stub(self)
+        # Convergence Phase 3 adaptation. OLD: `start_offer_claim_stub` let the deleted
+        # in-session writer run on this MagicMock session and the tests read the lead it
+        # mutated and the rows it added. NEW: CE delegates ONE command to the booking
+        # authority; the stub captures it (`self.booked`) and the same facts are asserted on
+        # what the authority will write: lead COORDINAR_DISPONIBILIDAD, a booked
+        # ThreadRevision with the buyer and the slot.
+        from offer_fixture import start_converged_flow_stub
+        self.booked = start_converged_flow_stub(self)
 
     def _make_engine_for_flow_response(self):
         eng = _make_engine()
@@ -421,7 +426,7 @@ class TestSchedF07FlowCompletionCreatesBooking(unittest.TestCase):
         )
 
         self.assertEqual(
-            ctx.lead.estado, "COORDINAR_DISPONIBILIDAD",
+            self.booked[-1].attachments.lead.estado, "COORDINAR_DISPONIBILIDAD",
             "F07: lead.estado must be COORDINAR_DISPONIBILIDAD after _process_flow_response",
         )
 
@@ -443,14 +448,13 @@ class TestSchedF07FlowCompletionCreatesBooking(unittest.TestCase):
             flow_token="thread-1-12345",
         )
 
-        revision_like = [
-            r for r in revisions
-            if hasattr(r, "buyer_name") or hasattr(r, "scheduled_date")
-        ]
-        self.assertGreater(
-            len(revision_like), 0,
-            "F07: At least one ThreadRevision must be created by _process_flow_response",
-        )
+        self.assertEqual(revisions, [], "CE adds no row itself")
+        req = self.booked[-1]
+        tr = req.attachments.thread_revision
+        self.assertEqual((tr.buyer_name, tr.request_approval), ("Juan García", True))
+        self.assertEqual((str(req.requested_date), str(req.requested_time)),
+                         ("2026-08-22", "11:00:00"),
+                         "F07: the booked ThreadRevision carries the agreed slot")
 
 
 # ── SCHED-F08 ─────────────────────────────────────────────────────────────────

@@ -269,7 +269,11 @@ class R4_PreDispatch(unittest.TestCase):
     def _send(self, *, token="real-token", phone="", wa_id="5491100000000", transport_effect=None):
         from app.services import booking_flow_service as bfs
         from app.services.outbound_safety_gate import GateOutcome
-        svc = bfs.BookingFlowService.__new__(bfs.BookingFlowService); svc.db = mock.MagicMock()
+        # Convergence Phase 3 (resolves the Phase 1 deferral of r4_11): the receipt sender is
+        # `booking_acknowledgement._send_ledger_acknowledgement`, `870b4e3`'s
+        # `_send_booking_receipt` carried verbatim — the only success sender now.
+        from app.services import booking_acknowledgement as ack
+        db = mock.MagicMock()
         ctx = mock.MagicMock(); ctx.contact.wa_id = wa_id; ctx.thread.id = 1
         settings = mock.MagicMock(whatsapp_token=token, whatsapp_phone_number_id=phone)
         with mock.patch("app.settings.get_settings", return_value=settings), \
@@ -280,7 +284,8 @@ class R4_PreDispatch(unittest.TestCase):
                 T.side_effect = transport_effect
             else:
                 T.return_value = ("wamid.1", 200)
-            out = svc._send_booking_receipt(ctx, name="", selected_date=D, selected_time=time(10))
+            out = ack._send_ledger_acknowledgement(db, ctx, name="", selected_date=D,
+                                                   selected_time=time(10))
             return out, G.return_value.attempt.called, T.called
 
     def test_r4_11_configuration_known_before_dispatch_is_definitive(self):

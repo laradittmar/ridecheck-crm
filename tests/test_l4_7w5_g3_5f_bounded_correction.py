@@ -169,19 +169,27 @@ class A_TransactionIdentity(unittest.TestCase):
             len(ConversationEngine._flow_transaction_key(2 ** 31 - 1)), width)
 
     def test_bc_07_the_turn_correlation_becomes_the_transaction_key_before_the_send(self):
-        body = inspect.getsource(ConversationEngine._process_flow_response)
-        self.assertLess(body.index("self.db.commit()"),
-                        body.index("_txn_key = self._flow_transaction_key("))
-        # G3-7N: the anchor is the send that FOLLOWS the transaction, not the first send
-        # anywhere in the method. The key is derived from a committed `ThreadRevision.id`,
-        # so it cannot exist before one — and G3-7N added legitimately earlier sends on
-        # paths that book nothing (a withdrawn, foreign or superseded offer is refused and
-        # handed to a person). Those have no transaction to key. The invariant this guards
-        # is unchanged: the ledger row for a BOOKING CONFIRMATION must carry its key.
-        _txn_at = body.index("_txn_key = self._flow_transaction_key(")
-        self.assertLess(body.index("self._correlation_id = _txn_key"),
-                        body.index("sent_id = self._send_text_to_wa(", _txn_at),
-                        "the ledger row would not carry the transaction key")
+        # Convergence Phase 3 adaptation (CP1-06/CP1-07). OLD: the CE in-session writer
+        # PLANNED the completion acknowledgement (`_plan_flow_completion_ack`) after its own
+        # commit, keyed the outbound row `flow-txn:<ThreadRevision.id>`, and held the only
+        # literal of the sentence. NEW: that writer is deleted; the acknowledgement is owed by
+        # the booking LEDGER row and sent only by `acknowledge_committed_booking` after the
+        # authority's commit, under the ledger lease (claim → gate → record), with the turn's
+        # correlation id and causal inbound. The sentence lives in exactly one module and
+        # `ConversationEngine._FLOW_COMPLETION_ACK` IS that object. `_plan_flow_completion_ack`
+        # remains as a pinned evidence evaluator but has NO production caller (asserted by
+        # `test_convergence_p3_cutover`). Behaviour: sb2b_01/06..22 and the PG race suite.
+        # The transaction identity a BOOKING CONFIRMATION carries is now the ledger key of
+        # the committed command, and the outbound row carries the turn's correlation and the
+        # causal inbound — passed before the send, never after.
+        body = inspect.getsource(ConversationEngine._sb_acknowledge)
+        self.assertIn("key=result.idempotency_key", body)
+        self.assertIn("correlation_id=self._turn_correlation_id()", body)
+        self.assertIn('causal_inbound_wa_message_id=getattr(ctx, "inbound_wa_message_id", None)',
+                      body)
+        book = inspect.getsource(ConversationEngine._converged_flow_book)
+        self.assertLess(book.index("book_from_flow_response(self.db, req)"),
+                        book.index("self._sb_finish_committed(ctx, result"))
 
     def test_bc_08_the_sentence_is_no_longer_an_idempotency_key(self):
         body = inspect.getsource(ConversationEngine._flow_ack_already_sent)
@@ -422,12 +430,33 @@ class C_SafetyConditionsIntact(unittest.TestCase):
         self.assertEqual(composed.count(ConversationEngine._FLOW_COMPLETION_ACK), 1)
 
     def test_bc_27_the_copy_exists_in_exactly_one_place(self):
-        self.assertEqual(ENGINE_SRC.count("Gracias por completarlo"), 1)
-        emitters = [n for n, fn in vars(ConversationEngine).items()
-                    if inspect.isfunction(fn)
-                    and "_FLOW_COMPLETION_ACK" in inspect.getsource(fn)]
-        self.assertEqual(sorted(emitters), ["_plan_flow_completion_ack"])
-
+        # Convergence Phase 3 adaptation (CP1-06/CP1-07). OLD: the CE in-session writer
+        # PLANNED the completion acknowledgement (`_plan_flow_completion_ack`) after its own
+        # commit, keyed the outbound row `flow-txn:<ThreadRevision.id>`, and held the only
+        # literal of the sentence. NEW: that writer is deleted; the acknowledgement is owed by
+        # the booking LEDGER row and sent only by `acknowledge_committed_booking` after the
+        # authority's commit, under the ledger lease (claim → gate → record), with the turn's
+        # correlation id and causal inbound. The sentence lives in exactly one module and
+        # `ConversationEngine._FLOW_COMPLETION_ACK` IS that object. `_plan_flow_completion_ack`
+        # remains as a pinned evidence evaluator but has NO production caller (asserted by
+        # `test_convergence_p3_cutover`). Behaviour: sb2b_01/06..22 and the PG race suite.
+        import pathlib as _pl
+        from app.services import booking_acknowledgement as _ack
+        from app.services.conversation_engine import ConversationEngine as _CE
+        app_dir = _pl.Path(_ack.__file__).resolve().parents[1]
+        holders = [p.name for p in sorted(app_dir.rglob("*.py"))
+                   if "Gracias por completarlo" in p.read_text(encoding="utf-8-sig")]
+        self.assertEqual(holders, ["booking_acknowledgement.py"],
+                         "the acknowledgement copy exists in more than one place")
+        self.assertIs(_CE._FLOW_COMPLETION_ACK, _ack.BOOKING_FLOW_RECEIPT_TEXT)
+        sends = [n for n, fn in vars(_CE).items() if inspect.isfunction(fn)
+                 and "acknowledge_committed_booking" in inspect.getsource(fn)]
+        self.assertEqual(sends, ["_sb_acknowledge"],
+                         f"the acknowledgement is reachable elsewhere: {sends}")
+        seq = inspect.getsource(_ack.acknowledge_committed_booking)
+        self.assertLess(seq.index(".claim_acknowledgement(key)"),
+                        seq.index("send_booking_acknowledgement("),
+                        "the send is conditional on holding the ledger lease")
 
 # ══ D — Inspector truth ════════════════════════════════════════════════════
 

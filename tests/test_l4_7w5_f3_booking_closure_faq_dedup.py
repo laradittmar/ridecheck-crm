@@ -96,14 +96,27 @@ def _compose_via_plan(engine, primary, burst, *, topics=None):
 
 class TestBookingReceipt(unittest.TestCase):
 
+    # Convergence Phase 3 adaptation of BOOK-END-01, 03/04, 05/06, 07/08, the delivery-failure
+    # test and TestOneCanonicalWording. OLD: the Data Exchange's in-session writer committed
+    # the booking and then called `self._send_booking_receipt(...)` with the date/time
+    # receipt; exactly-once came from the consumed token. NEW: the booking authority commits
+    # (its own transaction), then `acknowledge_committed_booking` — the ONE sequence shared
+    # with CE — claims the ledger lease, sends the owner-approved text through the gate on
+    # BOOKING_FLOW and records the outcome; exactly-once comes from the ledger lease, and a
+    # replay asks the ledger first. WHY: the in-session writer and its receipt are deleted.
+    # Behaviour is proven by BF30 (blocked send recorded, booking stands), sb2b_06..22 and
+    # the PostgreSQL race suite; these remain the sealed structural witnesses.
+    ACK = (ROOT / "backend" / "app" / "services"
+           / "booking_acknowledgement.py").read_text(encoding="utf-8-sig")
+
     def test_book_end_01_a_successful_booking_sends_one_receipt(self):
         """BOOK-END-01 — the send happens after the commit, inside the confirm handler."""
-        fn = _fn(BFS_SOURCE, "handle_confirm_booking")
-        self.assertIn("self._send_booking_receipt(", fn)
-        i_commit = fn.index("self.db.commit()")
-        i_send = fn.index("_send_booking_receipt")
+        fn = _fn(BFS_SOURCE, "_confirm_booking")
+        i_commit = fn.index("_execute_isolated(self.db, command, availability, attachments)")
+        i_send = fn.rindex("self._acknowledge(key, result")
         self.assertLess(i_commit, i_send,
                         "the booking must be durable before we acknowledge it")
+        self.assertIn("acknowledge_committed_booking(", _fn(BFS_SOURCE, "_acknowledge"))
 
     def test_book_end_02_it_never_claims_the_appointment_is_confirmed(self):
         """BOOK-END-02 — approval is PENDING; saying 'turno confirmado' would be false."""
@@ -126,31 +139,29 @@ class TestBookingReceipt(unittest.TestCase):
         self.assertIn("Lara", build_booking_receipt_message("Lara", None, None))
 
     def test_book_end_03_04_a_failed_booking_sends_no_receipt(self):
-        """BOOK-END-03/04 — revalidation failure raises before the write and the send."""
-        fn = _fn(BFS_SOURCE, "handle_confirm_booking")
-        i_fail = fn.index("BOOKING_REVALIDATION_FAIL")
-        i_send = fn.index("_send_booking_receipt")
-        self.assertLess(i_fail, i_send)
-        self.assertIn("raise BookingSlotConflictError", fn)
-        # the conflict raise sits between them, so the send is unreachable on failure
-        self.assertLess(i_fail, fn.index("raise BookingSlotConflictError"))
+        """BOOK-END-03/04 — a refusal raises before the send."""
+        fn = _fn(BFS_SOURCE, "_confirm_booking")
+        i_fail = fn.index("if result.outcome is not BookingOutcome.COMMITTED:")
+        i_raise = fn.index("raise BookingSlotConflictError(self._refusal_screen(ctx, date_str, message))")
+        i_send = fn.rindex("self._acknowledge(key, result")
+        self.assertLess(i_fail, i_raise)
+        self.assertLess(i_raise, i_send, "the send is unreachable on a refusal")
 
     def test_book_end_05_06_exactly_once_comes_from_the_consumed_token(self):
-        """BOOK-END-05/06 — a Meta retry or duplicate confirm cannot reach the send."""
-        confirm = _fn(BFS_SOURCE, "handle_confirm_booking")
-        # G3-7P: consumption goes through the one lifecycle authority, which records
-        # WHICH revision the accepted offer became instead of only nulling a mirror.
-        self.assertIn("_offers.consume(", confirm)
-        resolve = _fn(BFS_SOURCE, "resolve_context")
-        self.assertIn("token invalid or already consumed", resolve)
-        self.assertIn("raise BookingTokenError", resolve)
-        # and the receipt itself documents that it relies on this, not on a flag
-        receipt = _fn(BFS_SOURCE, "_send_booking_receipt")
-        self.assertIn("BookingTokenError", receipt)
+        """BOOK-END-05/06 — a Meta retry or duplicate confirm cannot send twice: the ledger
+        is asked first, and only the holder of the ledger lease sends."""
+        confirm = _fn(BFS_SOURCE, "_confirm_booking")
+        self.assertLess(confirm.index("hit = self._ledger_hit(key)"),
+                        confirm.index("self.resolve_context(token)"))
+        ack = _fn(self.ACK, "acknowledge_committed_booking")
+        self.assertLess(ack.index(".claim_acknowledgement(key)"),
+                        ack.index("send_booking_acknowledgement("))
+        self.assertIn("if claim is None:", ack)
+        self.assertIn(".record_acknowledgement(", ack)
 
     def test_book_end_07_08_attribution_is_the_registered_booking_path(self):
         """BOOK-END-07/08 — never MANUAL_CRM, never unattributed."""
-        receipt = _fn_code(BFS_SOURCE, "_send_booking_receipt")
+        receipt = _fn_code(self.ACK, "_send_ledger_acknowledgement")
         self.assertIn("OutboundPathId.BOOKING_FLOW.value", receipt)
         self.assertIn("OutboundSafetyGate", receipt)
         self.assertIn("get_deployment_id()", receipt)
@@ -158,10 +169,13 @@ class TestBookingReceipt(unittest.TestCase):
             self.assertNotIn(wrong, receipt)
 
     def test_a_delivery_failure_never_undoes_the_booking(self):
-        receipt = _fn(BFS_SOURCE, "_send_booking_receipt")
+        receipt = _fn(self.ACK, "_send_ledger_acknowledgement")
         self.assertIn("except Exception", receipt)
         self.assertNotIn("rollback", receipt)
         self.assertNotIn("db.delete", receipt)
+        dx = _fn(BFS_SOURCE, "_acknowledge")
+        self.assertIn("except Exception", dx)
+        self.assertNotIn("rollback", dx)
 
     def test_book_end_10_a_normal_booking_is_not_a_rescue(self):
         """BOOK-END-10 — needs_human on a booking means 'operator must approve', which is
@@ -182,15 +196,22 @@ class TestBookingReceipt(unittest.TestCase):
 class TestOneCanonicalWording(unittest.TestCase):
 
     def test_ce_and_the_flow_service_share_a_single_builder(self):
-        """The wording lived in CE and was stranded; both paths now call one function,
-        so they cannot drift into competing copy."""
-        self.assertIn("from .booking_flow_service import build_booking_receipt_message",
+        """One acknowledgement sequence and one success copy for both transports, so they
+        cannot drift into competing copy (Convergence Phase 3 adaptation — see above)."""
+        self.assertIn("from .booking_acknowledgement import acknowledge_committed_booking",
                       CE_SOURCE)
-        self.assertIn("build_booking_receipt_message(", CE_SOURCE)
-        # the literal opener must exist in exactly one place
+        self.assertIn("from .booking_acknowledgement import acknowledge_committed_booking",
+                      BFS_SOURCE)
+        owner = "Gracias por completarlo. Un representante de RideCheck se estará comunicando con vos."
+        app_dir = ROOT / "backend" / "app"
+        holders = [p.name for p in sorted(app_dir.rglob("*.py"))
+                   if owner in p.read_text(encoding="utf-8-sig")]
+        self.assertEqual(holders, ["booking_acknowledgement.py"],
+                         "the success copy must live in exactly one module")
         self.assertEqual(CE_SOURCE.count("Recibimos tu solicitud"), 0,
                          "CE must not carry its own copy of the wording")
-        self.assertEqual(BFS_SOURCE.count("Un asesor va a revisar los datos"), 1)
+        self.assertNotIn("build_booking_receipt_message(", CE_SOURCE,
+                         "the date/time receipt is no longer a booking acknowledgement")
 
 
 class TestRootCauseIsRecorded(unittest.TestCase):

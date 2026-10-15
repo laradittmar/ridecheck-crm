@@ -199,51 +199,61 @@ class ApplicationGuardsAreVisible(unittest.TestCase):
     def test_g37r_guard_04_both_acceptance_writers_record_the_offer(self):
         """A constraint only one of two writers participates in guarantees nothing about
         the pair."""
+        # Convergence Phase 3 adaptation — see `_P3_ADAPTED` at the end of this module for the
+        # old assertion, the new one, and why the old mechanism no longer exists.
+        from app.services.booking_authority import BookingAuthority
         from app.services.booking_flow_service import BookingFlowService
         from app.services.conversation_engine import ConversationEngine
 
-        ce = _code(ConversationEngine._process_flow_response)
-        dx = _code(BookingFlowService.handle_confirm_booking)
+        ce = _code(ConversationEngine._converged_flow_book)
+        dx = _code(BookingFlowService._confirm_booking)
         for label, src in (("ConversationEngine", ce), ("DataExchange", dx)):
-            self.assertIn("offer_id=_claim.offer_id", src,
-                          f"{label} must write the claimed offer onto the booking")
+            self.assertIn("offer_acceptance=acceptance", src,
+                          f"{label} must hand the offer it accepts to the authority")
+        att = _code(BookingAuthority._apply_attachments)
+        self.assertIn("offer_id=offer_id", att,
+                      "the authority must write the accepted offer onto the booking")
+        self.assertIn("self._accepted_offer_id(", att)
 
     def test_g37r_guard_05_the_violation_is_translated_and_never_leaked(self):
         """A raw `IntegrityError`, a SQLSTATE or a constraint name must not reach a
         customer, and this violation's honest meaning is a replay."""
+        # Convergence Phase 3 adaptation — see `_P3_ADAPTED` at the end of this module for the
+        # old assertion, the new one, and why the old mechanism no longer exists.
+        from app.services import booking_authority as BA
         from app.services.booking_flow_service import BookingFlowService
         from app.services.conversation_engine import ConversationEngine
-        from app.services.offer_lifecycle import OfferLifecycle
 
-        for fn in (ConversationEngine._process_flow_response,
-                   BookingFlowService.handle_confirm_booking):
+        for fn in (ConversationEngine._converged_flow_book, BookingFlowService._confirm_booking):
             src = _code(fn)
-            self.assertIn("is_booking_projection_violation", src, fn.__qualname__)
-        translator = _code(OfferLifecycle.is_booking_projection_violation)
-        self.assertIn("23505", translator)
-        self.assertIn("BOOKING_PROJECTION_CONSTRAINT", translator,
+            self.assertNotIn("IntegrityError", src,
+                             f"{fn.__qualname__} handles a database error the authority owns")
+        translate = _code(BA.BookingAuthority._translate_integrity)
+        self.assertIn("_is_projection_violation(", translate)
+        self.assertIn("self._projection_winner_replay(", translate)
+        pv = _code(BA._is_projection_violation)
+        self.assertIn("23505", pv)
+        self.assertIn("BOOKING_PROJECTION_CONSTRAINT", pv,
                       "the constraint NAME must be matched, so an unrelated unique "
                       "violation is not reported as a duplicate booking")
-
 
 # ══ S3 — one candidate authority, resolved once ══════════════════════════════
 
 class OneCandidateAuthority(unittest.TestCase):
 
     def test_g37r_cand_01_CE_resolves_the_candidate_exactly_once(self):
-        """MUTATION ORACLE for required mutation 7.
-
-        This path used to resolve a focus candidate TWICE in one acceptance — once with
-        `repair=False` to bind the claim, and again, REPAIRING, to fill the booking's
-        vehicle fields. Two resolutions of one question inside one transaction can
-        disagree, and the second was allowed to mutate state the first had read.
-        """
+        """MUTATION ORACLE for required mutation 7: one resolution, the offer-bound one."""
+        # Convergence Phase 3 adaptation — see `_P3_ADAPTED` at the end of this module for the
+        # old assertion, the new one, and why the old mechanism no longer exists.
         from app.services.conversation_engine import ConversationEngine
-        src = _code(ConversationEngine._process_flow_response)
+        src = _code(ConversationEngine._converged_flow_book)
         self.assertEqual(src.count("self._offer_bound_candidate("), 1,
                          "the candidate must be resolved exactly once per acceptance")
         self.assertNotIn("self._focus_candidate(", src,
                          "the acceptance path must not resolve a focus of its own")
+        self.assertNotIn("self._get_active_inspection_location(", src,
+                         "P2-04: the location is the OFFER-BOUND candidate's, not the focus's")
+        self.assertIn("self._inspection_location_for(focus, state)", src)
 
     def test_g37r_cand_02_the_authority_is_the_offers_own_binding(self):
         from app.services.conversation_engine import ConversationEngine
@@ -318,60 +328,73 @@ class FinalRevalidation(unittest.TestCase):
     def test_g37r_reval_01_CE_revalidates_before_it_accepts(self):
         """MUTATION ORACLE for required mutation 8 (structural half; P7 is behavioural).
 
-        Revalidation must precede the claim: a slot that has gone is a fact about the
-        calendar, not about the offer, so the offer stays ISSUED and the customer keeps the
-        ability to book another slot with the same token.
+        A slot that has gone is a fact about the calendar, not about the offer, so the offer
+        stays ISSUED and the customer keeps the ability to book another slot with the same
+        token.
         """
-        from app.services.conversation_engine import ConversationEngine
-        src = _code(ConversationEngine._process_flow_response)
-        self.assertIn("self._revalidate_booking_slot(", src)
-        self.assertLess(src.index("self._revalidate_booking_slot("),
-                        src.index("_offers.claim("),
-                        "revalidation must run BEFORE acceptance, not be undone by a "
-                        "rollback afterwards")
-
-    def test_g37r_reval_02_the_per_date_advisory_coordination_is_taken(self):
-        """MUTATION ORACLE for required mutation 9. Keyed exactly as the Data Exchange
-        writer keys it, so the two writers contend on the SAME key rather than each
-        coordinating with itself."""
+        # Convergence Phase 3 adaptation — see `_P3_ADAPTED` at the end of this module for the
+        # old assertion, the new one, and why the old mechanism no longer exists.
+        from app.services.booking_authority import BookingAuthority
         from app.services.booking_flow_service import BookingFlowService
         from app.services.conversation_engine import ConversationEngine
-        ce = _code(ConversationEngine._revalidate_booking_slot)
-        self.assertIn("pg_try_advisory_xact_lock", ce)
-        self.assertIn("self._booking_dialect_is_postgres()", ce,
-                      "the advisory lock must be taken on PostgreSQL, not disabled")
-        self.assertIn("sha256", ce)
-        dx = _code(BookingFlowService.handle_confirm_booking)
-        self.assertIn("sha256", dx)
-        self.assertIn("_acquire_advisory_lock", dx)
-        # The same derivation, so the same date yields the same key in both writers.
-        # `0x7FFFFFFF` is compared as its decimal value: `ast.unparse` normalises the
-        # literal, and an oracle that only recognised the hex spelling would pass while
-        # the two writers drifted onto different masks.
-        for clause in ("hexdigest()[:8]", "2147483647"):
-            self.assertIn(clause, ce, f"CE: {clause}")
-            self.assertIn(clause, dx.replace("0x7FFFFFFF", "2147483647"), f"DX: {clause}")
+        for fn in (ConversationEngine._converged_flow_book, BookingFlowService._confirm_booking):
+            self.assertIn("AvailabilityRevalidation(address=", _code(fn),
+                          f"{fn.__qualname__} must hand the authority its revalidation")
+        src = _code(BookingAuthority._execute_snapshot)
+        self.assertIn("self._revalidate_availability(", src)
+        self.assertLess(src.index("self._revalidate_availability("), src.index("self._write("),
+                        "availability is revalidated before anything is booked")
+        self.assertLess(src.index("self._revalidate_availability("), src.index("self.db.commit()"),
+                        "a SLOT_CONFLICT rolls the offer acceptance back with everything else")
+
+    def test_g37r_reval_02_the_per_date_advisory_coordination_is_taken(self):
+        """MUTATION ORACLE for required mutation 9: both transports contend on the SAME key."""
+        # Convergence Phase 3 adaptation — see `_P3_ADAPTED` at the end of this module for the
+        # old assertion, the new one, and why the old mechanism no longer exists.
+        from app.services.booking_authority import BookingAuthority
+        locks = _code(BookingAuthority._acquire_locks)
+        self.assertIn("pg_advisory_xact_lock_shared(:ns, :d)", locks)
+        self.assertIn("pg_advisory_xact_lock(:p, :d)", locks)
+        # and no ONE-argument booking advisory lock survives anywhere in the application
+        for path in sorted((ROOT / "backend" / "app").rglob("*.py")):
+            text = path.read_text(encoding="utf-8-sig")
+            for one_arg in ("pg_try_advisory_xact_lock(:k)", "pg_try_advisory_xact_lock(:key)"):
+                self.assertNotIn(one_arg, text, f"{path.name}: a one-argument booking lock")
 
     def test_g37r_reval_03_the_same_authority_decides_for_both_writers(self):
+        # Convergence Phase 3 adaptation — see `_P3_ADAPTED` at the end of this module for the
+        # old assertion, the new one, and why the old mechanism no longer exists.
+        from app.services.booking_authority import BookingAuthority
+        from app.services.booking_flow_service import BookingFlowService
         from app.services.conversation_engine import ConversationEngine
-        src = _code(ConversationEngine._revalidate_booking_slot)
-        self.assertIn("self._schedule.check(", src,
+        src = _code(BookingAuthority._revalidate_availability)
+        self.assertIn("self._availability_service().check(", src,
                       "the one availability authority, not a second rule")
         self.assertIn("out.valid", src)
+        for fn in (ConversationEngine._converged_flow_book, BookingFlowService._confirm_booking):
+            self.assertNotIn(".check(", _code(fn), f"{fn.__qualname__} decides availability")
 
     def test_g37r_reval_04_an_unanswerable_check_refuses(self):
         """"We could not check" is never "it is free"."""
-        from app.services.conversation_engine import ConversationEngine
-        src = _code(ConversationEngine._revalidate_booking_slot)
-        self.assertIn("except Exception", src)
-        self.assertIn("SLOT_NO_LONGER_AVAILABLE", src)
+        # Convergence Phase 3 adaptation — see `_P3_ADAPTED` at the end of this module for the
+        # old assertion, the new one, and why the old mechanism no longer exists.
+        from app.services.booking_authority import BookingAuthority
+        src = _code(BookingAuthority._execute_snapshot)
+        tail = src[src.index("except Exception"):]
+        self.assertIn("self._safe_rollback()", tail)
+        self.assertIn("BookingOutcome.INTERNAL_FAILURE", tail,
+                      "an availability reader that raises refuses; it never books")
 
     def test_g37r_reval_05_a_missing_slot_or_location_refuses(self):
+        # Convergence Phase 3 adaptation — see `_P3_ADAPTED` at the end of this module for the
+        # old assertion, the new one, and why the old mechanism no longer exists.
+        from app.services.booking_flow_service import BookingFlowService
         from app.services.conversation_engine import ConversationEngine
         from app.services.offer_lifecycle import OfferRefusal
-        src = _code(ConversationEngine._revalidate_booking_slot)
-        self.assertIn("NO_SUBMITTED_SLOT", src)
-        self.assertIn("NO_CANONICAL_LOCATION", src)
+        src = _code(ConversationEngine._converged_flow_book)
+        self.assertIn("OfferRefusal.NO_SUBMITTED_SLOT", src)
+        self.assertIn("OfferRefusal.NO_CANONICAL_LOCATION", src)
+        self.assertIn("OfferRefusal.NO_CANONICAL_LOCATION", _code(BookingFlowService._confirm_booking))
         self.assertEqual(OfferRefusal.NO_SUBMITTED_SLOT, "NO_SUBMITTED_SLOT")
         self.assertEqual(OfferRefusal.NO_CANONICAL_LOCATION, "NO_CANONICAL_LOCATION")
 
@@ -469,12 +492,17 @@ class OneLockOrderForEveryWriter(unittest.TestCase):
                 self.assertNotIn(forbidden, src, f"{fn.__qualname__}: {forbidden}")
 
     def test_g37r_lock_06_external_io_stays_after_the_commit(self):
+        # Convergence Phase 3 adaptation — see `_P3_ADAPTED` at the end of this module for the
+        # old assertion, the new one, and why the old mechanism no longer exists.
         from app.services.conversation_engine import ConversationEngine
-        src = _code(ConversationEngine._process_flow_response)
-        self.assertLess(src.rindex("self.db.commit()"),
-                        src.index("self._send_booking_notification("),
+        src = _code(ConversationEngine._converged_flow_book)
+        self.assertLess(src.index("book_from_flow_response(self.db, req)"),
+                        src.index("self._sb_finish_committed("))
+        self.assertLess(src.index("self._sb_finish_committed(ctx, result"),
+                        src.index("self._sb_notify_booking("),
                         "no external I/O may happen inside the booking transaction")
-
+        fin = _code(ConversationEngine._sb_finish_committed)
+        self.assertLess(fin.index("self._sb_acknowledge("), fin.index("self._sb_synchronize("))
 
 # ══ R2 — the bound covers every exit, and the writer list is complete ════════
 
@@ -590,53 +618,46 @@ class R2BoundsCoverEveryExit(unittest.TestCase):
                          "a lock-only helper was classified as a writer")
 
     def test_r2_03_the_bounded_entry_precedes_EVERY_admission_outcome(self):
-        """MUTATION ORACLE for required mutation 3 (RV-01).
-
-        All three answers persist something — a refusal counter, a replay counter or a
-        booking — so all three are writers. G3-7R entered the order only for the granted
-        one, and the review measured the other two at 42s against a 12s hold.
-        """
+        """MUTATION ORACLE for required mutation 3 (RV-01): no admission outcome writes
+        outside the canonical order."""
+        # Convergence Phase 3 adaptation — see `_P3_ADAPTED` at the end of this module for the
+        # old assertion, the new one, and why the old mechanism no longer exists.
         from app.services.conversation_engine import ConversationEngine
-        src = _code(ConversationEngine._process_flow_response)
-        entry = src.index("begin_offer_transaction(")
-        for branch in ("if _adm.replay:", "if not _adm.granted:"):
-            with self.subTest(branch=branch):
-                self.assertLess(entry, src.index(branch),
-                                f"{branch} is reached before the bounded entry — its "
-                                f"first write would wait with no bound in force")
+        book = _code(ConversationEngine._converged_flow_book)
+        for writer in ("self.db.commit(", "self.db.flush(", "record_refusal", "record_replay",
+                       "finalise_admission_refusal", "begin_offer_transaction("):
+            self.assertNotIn(writer, book, f"admission must be a READ, found {writer}")
+        for fn in (ConversationEngine._sb_handoff, ConversationEngine._sb_synchronize):
+            src = _code(fn)
+            self.assertLess(src.index("self._sb_enter_thread_state("),
+                            src.index("self.db.commit()"),
+                            f"{fn.__name__} must take the thread state before it writes")
 
     def test_r2_04_a_contended_turn_mutates_nothing(self):
-        """Contention is not a refusal: no counter moves, and the cursor is not consumed.
-
-        R3 moved the contended answer into ONE method, `_contended_booking_turn`, because
-        there are now three entry points that can reach it — turn entry, the cycle reset
-        and admission — and three copies of a contract is three chances to answer
-        differently. So this oracle follows the delegation: every branch must delegate, and
-        the single handler is what carries the contract.
-        """
+        """Contention is not a refusal: no counter moves, and the cursor is not consumed."""
+        # Convergence Phase 3 adaptation — see `_P3_ADAPTED` at the end of this module for the
+        # old assertion, the new one, and why the old mechanism no longer exists.
         from app.services.conversation_engine import ConversationEngine
-        src = _code(ConversationEngine._process_flow_response)
-        head, _sep, tail = src.partition("if _contended is not None:")
-        contended_block = tail.split("if _adm.replay:")[0]
-        self.assertTrue(_sep, "the contended branch disappeared")
-        self.assertIn("_contended_booking_turn(", contended_block,
-                      "the admission branch no longer delegates to the one handler")
+        transient = _code(ConversationEngine._sb_transient)
+        self.assertLess(transient.index("self.db.rollback()"),
+                        transient.index("self._contended_booking_turn("),
+                        "a transient authority result must discard, then delegate")
+        book = _code(ConversationEngine._converged_flow_book)
+        self.assertIn("return self._sb_transient(ctx, result)", book)
         handler = _code(ConversationEngine._contended_booking_turn)
         for forbidden in ("record_refusal", "record_replay", "finalise_admission_refusal",
                           "needs_human", "self.db.commit(", "_send_text_to_wa",
                           "_send_fallback_human_review_notification",
                           "_execute_cycle_reset", "archived"):
-            self.assertNotIn(forbidden, handler,
-                             f"a contended turn must not {forbidden}")
-            self.assertNotIn(forbidden, contended_block,
-                             f"a contended turn must not {forbidden}")
+            self.assertNotIn(forbidden, handler, f"a contended turn must not {forbidden}")
+            self.assertNotIn(forbidden, transient, f"a contended turn must not {forbidden}")
         self.assertIn("ACTION_THREAD_CONTENDED", handler)
-        # Every entry point must reach the SAME handler, so none of them can drift.
         entry = _code(ConversationEngine._handle)
-        self.assertEqual(entry.count("_contended_booking_turn("), 2,
-                         "`_handle` has %d contended answers; there are two gated "
-                         "acquisitions, so there must be exactly two"
-                         % entry.count("_contended_booking_turn("))
+        # three gated acquisitions remain in `_handle`, each answering contention through the
+        # one handler: the cycle reset, and — booking-shaped turns only — the bounded K1 taken
+        # before the `no_lead` and the `skipped_human` cursor commits.
+        self.assertEqual(entry.count("_contended_booking_turn("), 3,
+                         "`_handle` must answer every gated acquisition through the handler")
 
     def test_r2_04b_the_data_exchange_event_claims_no_durability(self):
         """MUTATION ORACLE for required mutation 13 (RVR2-07). STRUCTURAL, deliberately.
@@ -683,21 +704,28 @@ class R2BoundsCoverEveryExit(unittest.TestCase):
             self.assertNotIn(forbidden, body,
                              f"_booking_event performs {forbidden} — it is a log line, and "
                              f"a writer here would run after a rollback")
-        # And the contended branch must not hand it a session either.
-        dx = _code(BF.BookingFlowService.handle_confirm_booking)
-        head, _sep, tail = dx.partition("if _contended is not None:")
-        self.assertTrue(_sep, "the DX contended branch disappeared")
-        contended = tail.split("_adm = ")[0]
-        self.assertNotIn("self.db", contended,
-                         "the DX contended branch touches the session after the rollback")
+        # Convergence Phase 3 adaptation: the DX contended branch (`begin_offer_transaction`
+        # in the request session) no longer exists — contention is the authority's
+        # RETRYABLE result. That answer must not write anything durable either: it only
+        # renders the retry screen.
+        dx = _code(BF.BookingFlowService._confirm_booking)
+        self.assertNotIn("if _contended is not None:", dx)
+        self.assertNotIn("RETRYABLE_FAILURE", dx.split("_FLOW_REFUSAL_MESSAGES.get(")[0].split(
+            "if result.outcome is not BookingOutcome.COMMITTED:")[-1])
 
     def test_r2_05_the_data_exchange_command_enters_the_order_before_refusing(self):
         """MUTATION ORACLE for required mutation 4. Both transports, or only half a fix."""
+        # Convergence Phase 3 adaptation — see `_P3_ADAPTED` at the end of this module for the
+        # old assertion, the new one, and why the old mechanism no longer exists.
         from app.services.booking_flow_service import BookingFlowService
-        src = _code(BookingFlowService.handle_confirm_booking)
-        self.assertLess(src.index("begin_offer_transaction("),
-                        src.index("if not _adm.granted:"),
-                        "the DX refusal path writes before the bound is in force")
+        src = _code(BookingFlowService._confirm_booking)
+        for writer in ("self.db.commit(", "record_refusal", "finalise_admission_refusal",
+                       "record_refusal_out_of_band"):
+            self.assertNotIn(writer, src, f"Data Exchange admission must be a READ: {writer}")
+        handoff = _code(BookingFlowService._handoff_to_person)
+        self.assertLess(handoff.index("begin_offer_transaction("),
+                        handoff.index("self.db.commit()"),
+                        "the Data Exchange handoff writes before the bound is in force")
 
     def test_r2_06_resolution_is_READ_ONLY(self):
         """MUTATION ORACLE for required mutation 9 (RV-07).
@@ -716,14 +744,14 @@ class R2BoundsCoverEveryExit(unittest.TestCase):
 
     def test_r2_07_the_command_boundary_is_where_the_replay_is_counted(self):
         """The other half of RV-07: moved, not dropped."""
+        # Convergence Phase 3 adaptation — see `_P3_ADAPTED` at the end of this module for the
+        # old assertion, the new one, and why the old mechanism no longer exists.
         from app.services.booking_flow_service import BookingFlowService
-        self.assertIn("_count_replay_at_command_boundary(",
-                      _code(BookingFlowService.handle_confirm_booking))
-        src = _code(BookingFlowService._count_replay_at_command_boundary)
-        self.assertIn("record_replay(", src)
-        self.assertIn("begin_offer_transaction(", src,
-                      "the counter must be written inside the canonical bounded order")
-        self.assertIn("thread_id", src)
+        from app.services.conversation_engine import ConversationEngine
+        self.assertIn("self._replayed_success(", _code(BookingFlowService._confirm_booking))
+        self.assertIn("note_replay(key)", _code(BookingFlowService._replayed_success))
+        self.assertIn("note_replay(key)", _code(ConversationEngine._sb_ledger_hit))
+        self.assertNotIn("record_replay(", _code(BookingFlowService.resolve_context))
 
     def test_r2_08_the_replay_carries_its_thread_so_the_boundary_can_enter_the_order(self):
         from app.services.booking_flow_service import BookingAlreadyCompletedError
@@ -776,13 +804,14 @@ class ReplayIsNotARefusal(unittest.TestCase):
 
     def test_g37r_replay_02_the_replay_path_touches_no_refusal_counter(self):
         """MUTATION ORACLE for required mutation 11 (structural; P8 is behavioural)."""
+        # Convergence Phase 3 adaptation — see `_P3_ADAPTED` at the end of this module for the
+        # old assertion, the new one, and why the old mechanism no longer exists.
         from app.services.conversation_engine import ConversationEngine
-        src = _code(ConversationEngine._booking_replay_outcome)
-        self.assertIn("record_replay(", src)
+        self.assertIn("note_replay(", _code(ConversationEngine._sb_ledger_hit))
+        src = _code(ConversationEngine._sb_finish_committed)
         for forbidden in ("record_refusal", "last_refusal", "refused_count",
                           "needs_human", "_FALLBACK_WARM_HANDOFF", "_send_text_to_wa"):
-            self.assertNotIn(forbidden, src,
-                             f"a replay must not {forbidden}")
+            self.assertNotIn(forbidden, src, f"a replay must not {forbidden}")
 
     def test_g37r_replay_03_the_data_exchange_replay_is_not_a_token_error(self):
         """The false-expiry wording must be unreachable for a replay."""
@@ -1097,3 +1126,17 @@ class SmartBookingCompatibility(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+#: Convergence Phase 3 — the adaptation record for this module. Every oracle above that read
+#: Track A's in-session booking writers (`ConversationEngine._process_flow_response`'s booking
+#: body, `BookingFlowService.handle_confirm_booking`, `_revalidate_booking_slot`,
+#: `_booking_replay_outcome`, `_count_replay_at_command_boundary`) now reads the code that
+#: replaced them. OLD: the claimed offer id, the projection translation, revalidation, the
+#: one-argument advisory lock, the bounded CE/DX entry and the offer-row replay counter were
+#: asserted inside those writers. NEW: `_converged_flow_book` / `_confirm_booking` describe one
+#: typed command; `BookingAuthority` performs every one of those controls in its single
+#: transaction (K1..K9); refusals and replays are reads plus a K1-first handoff, and replays
+#: are counted on the ledger. WHY: Phase 3 deletes the legacy writers (owner ruling). Each
+#: rewritten oracle fails against the parent `b856a2e`, where the converged methods do not exist.
+_P3_ADAPTED = True

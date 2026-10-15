@@ -607,10 +607,22 @@ class D_FlowCompletionAck(unittest.TestCase):
         self.assertEqual(composed.count(ConversationEngine._FLOW_COMPLETION_ACK), 1)
 
     def test_g35f_48_it_is_planned_only_after_the_commit(self):
-        body = inspect.getsource(ConversationEngine._process_flow_response)
-        self.assertLess(body.index("self.db.commit()"),
-                        body.index("self._plan_flow_completion_ack("),
-                        "the acknowledgement was planned before the booking was committed")
+        # Convergence Phase 3 adaptation (CP1-06/CP1-07). OLD: the CE in-session writer
+        # PLANNED the completion acknowledgement (`_plan_flow_completion_ack`) after its own
+        # commit, keyed the outbound row `flow-txn:<ThreadRevision.id>`, and held the only
+        # literal of the sentence. NEW: that writer is deleted; the acknowledgement is owed by
+        # the booking LEDGER row and sent only by `acknowledge_committed_booking` after the
+        # authority's commit, under the ledger lease (claim → gate → record), with the turn's
+        # correlation id and causal inbound. The sentence lives in exactly one module and
+        # `ConversationEngine._FLOW_COMPLETION_ACK` IS that object. `_plan_flow_completion_ack`
+        # remains as a pinned evidence evaluator but has NO production caller (asserted by
+        # `test_convergence_p3_cutover`). Behaviour: sb2b_01/06..22 and the PG race suite.
+        book = inspect.getsource(ConversationEngine._converged_flow_book)
+        self.assertLess(book.index("book_from_flow_response(self.db, req)"),
+                        book.index("self._sb_finish_committed(ctx, result"),
+                        "the acknowledgement was owed before the booking was committed")
+        fin = inspect.getsource(ConversationEngine._sb_finish_committed)
+        self.assertIn("self._sb_acknowledge(ctx, result)", fin)
 
     def test_g35f_49_the_wording_promises_contact_not_a_confirmed_appointment(self):
         """`appointment_approval_status` is PENDING at this moment. Saying the appointment

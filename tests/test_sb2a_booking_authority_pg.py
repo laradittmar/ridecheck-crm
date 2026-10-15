@@ -504,8 +504,15 @@ class SB2AAuthorityPostgres(unittest.TestCase):
                                       anio=2020, tipo_vehiculo="AUTO", zone_group="CABA",
                                       zone_detail="Palermo", status="current_focus"))
         token = make_booking_token(thread.id)
-        s.add(WhatsAppThreadState(thread_id=thread.id, flow_booking_token=token,
-                                  needs_human=False))
+        st = WhatsAppThreadState(thread_id=thread.id, flow_booking_token=token,
+                                 needs_human=False)
+        s.add(st)
+        s.flush()
+        # Convergence Phase 3 (adaptation): the Data Exchange admits the token against the
+        # OFFER TABLE (Track A's G3-7P rule, now shared by both transports), so the world
+        # issues its offer, bound to the thread's canonical values, as production does.
+        from offer_fixture import seed_live_offer
+        seed_live_offer(s, st, thread_id=thread.id, token=token, commit=False)
         s.commit()
         return thread.id, token
 
@@ -527,21 +534,36 @@ class SB2AAuthorityPostgres(unittest.TestCase):
                                 "inspection_address": "-", "booking_token": tok}
         results = {}
 
+        # Convergence Phase 3 (resolves the Phase 1 deferral of this identity): the Data
+        # Exchange books through `BookingAuthority` on its own session, reachable only with
+        # SMART_BOOKING_CE_ENABLED on; its availability reader is the authority's (patched on
+        # the class, since each confirmation builds its own authority), and the receipt is
+        # the shared ledger-leased acknowledgement.
+        import dataclasses
+        from app.services import booking_acknowledgement as _ack
+        from app.services.booking_authority import BookingAuthority as _BA
+        from app.settings import get_settings as _gs
+        _flag_on = dataclasses.replace(_gs(), smart_booking_ce_enabled=True)
+        sched = mock.MagicMock()
+        sched.check.return_value = ok
+        sched.list_slots.return_value = slots
+
         def confirm(tok, at, label):
             with Session(self.engine) as s:
                 svc = BookingFlowService(s)
-                svc._sched = mock.MagicMock()
-                # SB2A-R3 rewrite: revalidation is the authority's own reader.
-                svc._authority._availability_service = lambda: svc._sched
-                svc._sched.check.return_value = ok
-                svc._sched.list_slots.return_value = slots
-                with mock.patch.object(BookingFlowService, "_send_booking_receipt",
-                                       return_value=False):
-                    try:
-                        results[label] = svc.handle_confirm_booking(tok, data(tok, at))["screen"]
-                    except BookingSlotConflictError as exc:
-                        results[label] = "CONFLICT:" + exc.refreshed_data["screen"]
+                svc._sched = sched
+                try:
+                    results[label] = svc.handle_confirm_booking(tok, data(tok, at))["screen"]
+                except BookingSlotConflictError as exc:
+                    results[label] = "CONFLICT:" + exc.refreshed_data["screen"]
 
+        patches = [mock.patch("app.settings.get_settings", lambda: _flag_on),
+                   mock.patch.object(_BA, "_availability_service", lambda auth: sched),
+                   mock.patch.object(_ack, "send_booking_acknowledgement",
+                                     return_value=_ack.ReceiptOutcome(False, None, "NOT_SENT"))]
+        for p_ in patches:
+            p_.start()
+            self.addCleanup(p_.stop)
         a = threading.Thread(target=confirm, args=(tok1, "10:00", "a"))
         b = threading.Thread(target=confirm, args=(tok2, "10:30", "b"))
         a.start(); b.start(); a.join(20); b.join(20)
@@ -558,8 +580,15 @@ class SB2AAuthorityPostgres(unittest.TestCase):
         self.assertEqual(len(rec), 1)
         self.assertGreaterEqual(rec[0][0], 1)
         with self.engine.begin() as c:
+            # Convergence Phase 3: the worlds now carry offers. Offer → booking (accepted_*)
+            # and ThreadRevision → offer (offer_id) form the G37R-RV-03 cycle, so the offer's
+            # pointers are cleared first, then the bookings, then the offers.
+            c.execute(text("UPDATE whatsapp_booking_offers SET accepted_revision_id = NULL, "
+                           "accepted_thread_revision_id = NULL WHERE thread_id IN (:a, :b)"),
+                      {"a": t1, "b": t2})
             c.execute(text("DELETE FROM booking_commands"))
             c.execute(text("DELETE FROM thread_revisions WHERE thread_id IN (:a, :b)"), {"a": t1, "b": t2})
+            c.execute(text("DELETE FROM whatsapp_booking_offers WHERE thread_id IN (:a, :b)"), {"a": t1, "b": t2})
             c.execute(text("DELETE FROM whatsapp_thread_states WHERE thread_id IN (:a, :b)"), {"a": t1, "b": t2})
             c.execute(text("DELETE FROM whatsapp_thread_candidates WHERE thread_id IN (:a, :b)"), {"a": t1, "b": t2})
             c.execute(text("DELETE FROM whatsapp_threads WHERE id IN (:a, :b)"), {"a": t1, "b": t2})

@@ -623,7 +623,8 @@ class G37RAdmissionScope(unittest.TestCase):
                              f"_handle must take no booking lock at turn entry: {forbidden}")
 
         ACQUIRE = ("begin_offer_transaction", "_enter_cycle_reset_bound",
-                   "_acquire_thread_state", "_require_thread_state")
+                   "_acquire_thread_state", "_require_thread_state",
+                   "_sb_enter_thread_state")
         fn = tree.body[0]
 
         def acquisitions(node):
@@ -644,25 +645,33 @@ class G37RAdmissionScope(unittest.TestCase):
                 "`_handle` acquires the booking lock OUTSIDE any guard — that is the "
                 "unconditional turn-entry gate, restored")
 
-        # (3) every guard is one of the two permitted predicates.
+        # (3) every acquisition sits under a permitted predicate. Convergence Phase 3
+        # adaptation: OLD — two guarded acquisitions (the booking-shaped turn ENTRY and the
+        # cycle reset). NEW — the turn-entry acquisition is DELETED (`BookingAuthority` takes
+        # K1 itself, explicitly and first, on its own connection; a CE-held K1 would make it
+        # wait on its own caller, CD-01). What remains: the cycle reset (a real writer), and on
+        # booking-shaped turns ONLY, the bounded K1 taken immediately before the `no_lead`
+        # and `skipped_human` cursor commits — never at turn entry, never for ordinary turns.
         permitted = ("_booking_shaped", "cycle_reset_pending")
-        guarded = 0
-        for stmt in fn.body:
-            if not isinstance(stmt, ast.If):
-                continue
-            if not acquisitions(stmt):
-                continue
-            guarded += 1
-            test_src = ast.unparse(stmt.test)
-            self.assertTrue(
-                any(p in test_src for p in permitted),
-                "`_handle` acquires the booking lock under the predicate %r, which is "
-                "neither the booking-shaped transport predicate nor cycle_reset_pending"
-                % test_src)
-        self.assertEqual(guarded, 2,
-                         "expected exactly two guarded acquisitions in `_handle` (the "
-                         "booking-shaped turn entry and the cycle reset), found %d"
-                         % guarded)
+
+        def guards_of(node, chain=()):
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, ast.Call):
+                    name = getattr(child.func, "attr", None) or getattr(child.func, "id", None)
+                    if name in ACQUIRE:
+                        yield name, chain
+                nxt = chain + ((ast.unparse(child.test),) if isinstance(child, ast.If) else ())
+                yield from guards_of(child, nxt)
+        found = list(guards_of(fn))
+        self.assertTrue(found)
+        for name, chain in found:
+            self.assertTrue(any(p in t for t in chain for p in permitted),
+                            "`_handle` calls %s under %r — neither the booking-shaped "
+                            "predicate nor cycle_reset_pending" % (name, chain))
+        self.assertEqual(sorted(n for n, _c in found),
+                         ["_enter_cycle_reset_bound", "_sb_enter_thread_state",
+                          "_sb_enter_thread_state"],
+                         "unexpected booking-lock acquisitions in `_handle`: %r" % found)
 
         # (4) the flag is derived from the declared predicate and nothing else.
         assigns = [ast.unparse(n.value) for n in ast.walk(fn)

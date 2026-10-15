@@ -1,14 +1,11 @@
-"""SB2B dormant capability, carried into the integration branch (convergence Phase 1).
+"""The ledger-driven booking acknowledgement (SB2B; carried in by convergence Phase 1).
 
 Track B's ledger-driven booking acknowledgement, verbatim from `870b4e3`
-(`booking_flow_service.py`), where it was the Data Exchange path's receipt sender. In Phase 1
-the active Data Exchange path is Track A's and keeps Track A's own receipt, so this code lives
-apart from it. The only callers are dormant:
+(`booking_flow_service.py`), where it was the Data Exchange path's receipt sender. Its callers:
 
-* the SB2B CE-W1 path, which runs only when SMART_BOOKING_CE_ENABLED is exactly True;
+* the Conversation Engine's Flow booking path and the Data Exchange confirmation, both
+  through `acknowledge_committed_booking` (convergence Phase 3 — the only success copy);
 * `booking_recovery.recover_acknowledgement`, which is operator-invoked and has no route.
-
-The Data Exchange cutover onto the booking authority is convergence Phase 3.
 """
 from __future__ import annotations
 
@@ -22,10 +19,10 @@ from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
 
-#: SB2A-R3 — the owner-approved successful-Flow acknowledgement (owner decision, final). It
-#: supersedes the earlier "Recibimos tu solicitud…" receipt on Track B's Flow confirmation
-#: path. `build_booking_receipt_message` below is left untouched because the Conversation
-#: Engine (Track A) still imports it; aligning CE copy is a Track A item.
+#: SB2A-R3 — the owner-approved successful-Flow acknowledgement (owner decision, final), and
+#: since convergence Phase 3 the ONLY success copy on either Flow booking transport. The
+#: date/time receipt (`booking_flow_service.build_booking_receipt_message`) is no longer sent
+#: by any booking path; `ConversationEngine._FLOW_COMPLETION_ACK` is this same object.
 BOOKING_FLOW_RECEIPT_TEXT = (
     "Gracias por completarlo. Un representante de RideCheck se estará comunicando con vos."
 )
@@ -176,6 +173,50 @@ def send_booking_acknowledgement(
     return _send_ledger_acknowledgement(
         db, ctx, name="", selected_date=None, selected_time=None, correlation_id=correlation_id,
         causal_inbound_wa_message_id=causal_inbound_wa_message_id)
+
+
+def acknowledge_committed_booking(
+    db: Session, *, key: Optional[str], ack_status: Optional[str], wa_id, thread_id: int,
+    correlation_id: Optional[str] = None,
+    causal_inbound_wa_message_id: Optional[str] = None,
+) -> "tuple[Optional[str], Optional[ReceiptOutcome]]":
+    """Convergence Phase 3 (B-5): THE one acknowledgement sequence for a committed or replayed
+    Flow booking, shared by the Conversation Engine and the Data Exchange endpoint.
+
+    1. the ledger lease is claimed in its own short transaction (isolated session) — SENT,
+       NOT_APPLICABLE, an active lease or an exhausted row → nothing is owed, nothing is sent;
+    2. the owner-approved text (`BOOKING_FLOW_RECEIPT_TEXT`, the only success copy) goes
+       through `OutboundSafetyGate` on the BOOKING_FLOW path, with the causal inbound where
+       one exists (CE; the Data Exchange request has none);
+    3. SENT / FAILED / AMBIGUOUS is recorded in its own short transaction.
+
+    It is called only after the booking transaction has committed, so no booking lock is held
+    across the send. Returns (ack status after, send outcome or None when nothing was sent)."""
+    from .booking_authority import BookingAuthority
+    from .booking_ce_adapter import isolated_session, lookup_booking
+    if type(key) is not str or not key or ack_status in (None, "SENT", "NOT_APPLICABLE"):
+        return ack_status, None
+    with isolated_session(db) as session:
+        claim = BookingAuthority(session).claim_acknowledgement(key)
+    if claim is None:                          # SENT meanwhile, a live lease, exhausted
+        after = lookup_booking(db, key)
+        return (after.ack_status if after else ack_status), None
+    outcome = send_booking_acknowledgement(
+        db, wa_id=wa_id, thread_id=thread_id, correlation_id=correlation_id,
+        causal_inbound_wa_message_id=causal_inbound_wa_message_id)
+    with isolated_session(db) as session:
+        recorded = BookingAuthority(session).record_acknowledgement(
+            claim, sent=bool(outcome), transport_id=getattr(outcome, "wamid", None),
+            error=getattr(outcome, "error", None) or (None if outcome else "NOT_SENT"),
+            ambiguous=bool(getattr(outcome, "ambiguous", False)))
+    if not recorded:
+        logger.warning("BOOKING_ACK outcome not recorded: lease reclaimed attempt=%s",
+                       claim.attempt)
+    if claim.duplicate_risk:
+        logger.warning("BOOKING_ACK attempt %s reclaimed an expired lease — the earlier "
+                       "attempt may have reached Meta; possible duplicate", claim.attempt)
+    after = lookup_booking(db, key)
+    return (after.ack_status if after else None), outcome
 
 
 def _receipt_pre_dispatch_error(ctx) -> Optional[str]:

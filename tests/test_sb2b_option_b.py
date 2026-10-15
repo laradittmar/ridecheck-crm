@@ -156,7 +156,26 @@ class OptionBCases:
         with _Spy("app.services.booking_ce_adapter.book_from_flow_response") as spy:
             out, eng, m = self.turn(w)
         f = self.f(w)
-        self.assertEqual((out.action, out.detail), ("booking_refused_handoff", "CE_TRANSACTION_NOT_CLEAN"))
+        # Convergence Phase 3 adaptation. OLD: detail == CE_TRANSACTION_NOT_CLEAN (the txid
+        # guard caught the reset's flush). NEW: the turn is refused EARLIER, as a read — the
+        # reset withdrew the offer through the offer authority and cleared its mirror, so the
+        # submitted token is no longer the thread's (design §12 stage 3: a reset turn never
+        # delegates). WHY: on the converged branch the token is checked before the guard. The
+        # invariant is stronger, not weaker: the authority is not called (spy 0), nothing is
+        # booked, the offer is WITHDRAWN for CYCLE_RESET, and the guard itself is still
+        # proven by sb2b_05 and pg_02. Under the old order (guard first) this assertion fails.
+        self.assertEqual((out.action, out.detail), ("booking_refused_handoff", "FLOW_TOKEN_NOT_ACTIVE"))
+        if self.engine.dialect.name == "postgresql":
+            # SQLite (StaticPool) shares ONE connection between CE and every "isolated"
+            # session, so the ledger re-read before the handoff rolls the reset's Core-level
+            # offer UPDATE back there — an artefact no real pool has. The durable withdrawal
+            # is asserted where sessions are real connections (the PostgreSQL twin).
+            with Session(self.engine) as db:
+                from app.models import WhatsAppBookingOffer
+                self.assertEqual(db.execute(select(WhatsAppBookingOffer.status,
+                                                   WhatsAppBookingOffer.terminal_reason).where(
+                    WhatsAppBookingOffer.thread_id == w.thread_id)).all(),
+                    [("WITHDRAWN", "CYCLE_RESET")])
         self.assertEqual(spy.calls, 0)
         self.assertEqual((f["ledger"], f["revisions"], f["occupying"]), ([], [], 0))
         self.assertEqual((f["cursor"], f["needs_human"], f["last_stage"]), (w.wamid, True, "HUMAN_REQUIRED"))
@@ -435,7 +454,15 @@ class OptionBCases:
         w = H.seed(self.engine)
         out, eng, m = self.turn(w)
         self.assertEqual([t for _w, t in m.sent], [H.OWNER_TEXT])
-        self.assertNotIn(ConversationEngine._FLOW_COMPLETION_ACK, [t for _w, t in m.sent])
+        # Convergence Phase 3 adaptation (CP1-07). OLD: `_FLOW_COMPLETION_ACK` (Track A's
+        # copy of the same sentence) was NOT among the sends. NEW: it IS the owner text — one
+        # object, `booking_acknowledgement.BOOKING_FLOW_RECEIPT_TEXT` — and it is sent exactly
+        # once. WHY: the two literals were unified so no second producer can drift; the old
+        # assertion could only pass while two copies existed. The invariant (one success text,
+        # the owner's, never the date receipt, never a `flow-txn:` correlation) is kept below.
+        from app.services.booking_acknowledgement import BOOKING_FLOW_RECEIPT_TEXT
+        self.assertIs(ConversationEngine._FLOW_COMPLETION_ACK, BOOKING_FLOW_RECEIPT_TEXT)
+        self.assertEqual([t for _w, t in m.sent].count(H.OWNER_TEXT), 1)
         from app.services.booking_flow_service import build_booking_receipt_message
         receipt = build_booking_receipt_message("Ana", "martes", "10:00")
         self.assertNotIn(receipt, [t for _w, t in m.sent])
@@ -477,8 +504,18 @@ class OptionBCases:
         self.assertEqual((out.action, trace["outcome"]), (expect_action, expect_outcome))
         self.assertIn(out.action, HANDLED_ACTIONS)
         self.assertEqual(f["occupying"], 0)
+        # Convergence Phase 3 adaptation. OLD: token None — SB2B cleared the transport
+        # mirror by hand at handoff while the offer row stayed ISSUED. NEW: the mirror is
+        # left exactly as the authority left it and AGREES with the offer row (ISSUED, this
+        # token). WHY: the by-hand clear split the mirror from the offer authority (G3-7P-R2,
+        # "the mirror never lies"); offer terminalisation at refusal is Phase 4 policy
+        # (P2R-10). Still asserted: the handoff, the cursor, no booking, no owner text.
         self.assertEqual((f["needs_human"], f["last_stage"], f["token"], f["cursor"]),
-                         (True, "HUMAN_REQUIRED", None, w.wamid))
+                         (True, "HUMAN_REQUIRED", w.token, w.wamid))
+        with Session(self.engine) as db:
+            from app.models import WhatsAppBookingOffer
+            self.assertEqual(db.execute(select(WhatsAppBookingOffer.status).where(
+                WhatsAppBookingOffer.thread_id == w.thread_id)).scalars().all(), ["ISSUED"])
         self.assertEqual((f["lead_necesita_humano"], f["lead_estado"]), (True, "ATENCION_HUMANA"))
         self.assertEqual([t for _w, t in m.sent], [H.HANDOFF_TEXT])   # never the owner text
         self.assertEqual(notified, [])                                # no booking e-mail
@@ -538,11 +575,30 @@ class OptionBCases:
             sqlstate = "55P03"
         w = H.seed(self.engine)
         boom = OperationalError("SELECT 1", {}, _Orig("lock timeout"))
-        f, trace = self._failure(
-            w, expect_action="booking_retry_required", expect_outcome="RETRYABLE_FAILURE",
-            manual=False, patches=[mock.patch.object(BookingAuthority, "_check_calendar",
-                                                     side_effect=boom)])
-        self.assertEqual(trace["reason"], "LOCK_TIMEOUT")
+        # Convergence Phase 3 adaptation (CD-04). OLD: `booking_retry_required` committed a
+        # TERMINAL handoff (cursor, needs_human, lead ATENCION_HUMANA, handoff text) for a
+        # transient lock wait. NEW: Track A's contention contract — `thread_contended`,
+        # reply_required, NOTHING written (no cursor, no needs_human, no offer change, no
+        # ledger), nothing sent — and a redelivery after the holder releases books once.
+        # WHY: the ratified design (§12 stage 12f) makes transient contention non-terminal.
+        # Under the old mapping the cursor/needs_human assertions below fail.
+        with mock.patch.object(BookingAuthority, "_check_calendar", side_effect=boom):
+            out, eng, m = self.turn(w)
+        f = self.f(w)
+        trace = eng._sb_trace_payload()
+        self.assertEqual((out.action, trace["outcome"], trace["reason"]),
+                         ("thread_contended", "RETRYABLE_FAILURE", "LOCK_TIMEOUT"))
+        self.assertIn(out.action, HANDLED_ACTIONS)
+        self.assertTrue(out.reply_required)
+        self.assertEqual((f["cursor"], f["needs_human"], f["token"], f["lead_estado"]),
+                         (None, False, w.token, "CONSULTA_NUEVA"))
+        self.assertEqual((f["ledger"], f["revisions"], f["thread_revisions"], m.sent),
+                         ([], [], [], []))
+        out2, eng2, m2 = self.turn(w)                       # redelivery after release
+        f2 = self.f(w)
+        self.assertEqual((out2.action, f2["occupying"], len(f2["ledger"])),
+                         ("booking_created", 1, 1))
+        self.assertEqual([t for _w, t in m2.sent], [H.OWNER_TEXT])
 
     def test_sb2b_28_internal_failure(self):
         w = H.seed(self.engine)
@@ -553,9 +609,14 @@ class OptionBCases:
     def test_sb2b_29_token_not_active_books_nothing(self):
         w = H.seed(self.engine)
         with Session(self.engine) as db:
+            # Convergence Phase 3 adaptation: the offer is withdrawn THROUGH the offer
+            # authority (which also clears the mirror), the only way production withdraws
+            # one; SB2B's by-hand mirror clear is gone (see `_failure`). Same refusal.
+            from app.services.offer_lifecycle import OfferLifecycle, WithdrawReason
             st = db.execute(select(WhatsAppThreadState).where(
                 WhatsAppThreadState.thread_id == w.thread_id)).scalar_one()
-            st.flow_booking_token = None                           # withdrawn at handoff
+            OfferLifecycle(db).withdraw(st, thread_id=w.thread_id,
+                                        reason=WithdrawReason.HUMAN_HANDOFF)
             db.commit()
         with _Spy("app.services.booking_ce_adapter.book_from_flow_response") as spy:
             out, eng, m = self.turn(w)
@@ -767,27 +828,37 @@ class FlagOff(unittest.TestCase):
     def setUp(self):
         self.engine = H.sqlite_engine()
 
-    def test_sb2b_41_flag_off_w1_is_the_legacy_writer(self):
+    # Convergence Phase 3 adaptation of sb2b_41 / 42 / 44. OLD: with the flag off CE-W1 and
+    # CE-W2 WERE Track A's legacy in-session writers (a booked Revision, the legacy copy; a
+    # provisional Revision written outside the authority). NEW: the flag is an emergency
+    # OFF switch — no automatic booking writer is reachable, a booking-shaped submission is a
+    # truthful handoff, and a booking that already exists is still answered from the ledger.
+    # WHY: Phase 3 deletes the legacy writers outright (design §16, owner ruling: the flag
+    # never restores them). Each assertion below fails against the parent's legacy writer.
+    def test_sb2b_41_flag_off_w1_is_a_truthful_handoff_never_a_writer(self):
         w = H.seed(self.engine)
         with _Spy("app.services.booking_ce_adapter.book_from_flow_response") as spy, \
-                _Spy("app.services.booking_ce_adapter.lookup_booking") as lk:
+                _Spy("execute", BookingAuthority) as ex:
             with H.Meta() as m:
                 out, eng = H.run_turn(self.engine, H.flow_event(w), cfg=H.settings(flag=False))
         f = H.facts(self.engine, w)
-        self.assertEqual((out.action, spy.calls, lk.calls, f["ledger"]), ("booking_created", 0, 0, []))
-        self.assertEqual(len(f["revisions"]), 1)
-        texts = [t for _w, t in m.sent]
-        self.assertEqual(len(texts), 1)
-        self.assertIn(ConversationEngine._FLOW_COMPLETION_ACK, texts[0])   # legacy copy
-        self.assertIsNone(eng._sb_trace_payload())
+        self.assertEqual((out.action, out.detail, spy.calls, ex.calls, f["ledger"]),
+                         ("booking_refused_handoff", "SMART_BOOKING_DISABLED", 0, 0, []))
+        self.assertEqual((f["revisions"], f["thread_revisions"], f["occupying"]), ([], [], 0))
+        self.assertEqual((f["cursor"], f["needs_human"], f["token"]), (w.wamid, True, w.token))
+        self.assertEqual([t for _w, t in m.sent], [H.HANDOFF_TEXT])       # never a success
+        self.assertNotIn(H.OWNER_TEXT, [t for _w, t in m.sent])
 
-    def test_sb2b_42_flag_off_needs_human_still_swallows(self):
+    def test_sb2b_42_flag_off_a_committed_booking_is_replayed_not_swallowed(self):
         w = H.seed(self.engine)
         with H.Meta():
-            H.dx_confirm(self.engine, w)
-        with H.Meta() as m:
+            H.dx_confirm(self.engine, w)                    # booked while the flag was ON
+        with _Spy("execute", BookingAuthority) as ex, H.Meta() as m:
             out, _ = H.run_turn(self.engine, H.flow_event(w), cfg=H.settings(flag=False))
-        self.assertEqual((out.action, m.sent), ("skipped_human", []))
+        f = H.facts(self.engine, w)
+        # the ledger read is not a writer: it answers truthfully under either flag
+        self.assertEqual((out.action, ex.calls, m.sent), ("booking_replayed", 0, []))
+        self.assertEqual((f["occupying"], len(f["ledger"]), f["cursor"]), (1, 1, w.wamid))
 
     def test_sb2b_43_flag_is_read_by_identity_not_truthiness(self):
         eng = ConversationEngine.__new__(ConversationEngine)
@@ -797,21 +868,30 @@ class FlagOff(unittest.TestCase):
         self.assertTrue(eng._smart_booking_ce_on())
         self.assertFalse(H.get_settings().smart_booking_ce_enabled)        # default OFF
 
-    def test_sb2b_44_flag_off_w2_is_the_legacy_writer(self):
+    def test_sb2b_44_flag_off_w2_writes_no_revision(self):
         w = H.seed(self.engine)
         db = H.session_factory(self.engine)()
+        order = []
         try:
             eng = ConversationEngine(db=db, settings=H.settings(flag=False))
             ctx = eng._load_context(w.thread_id)
             ctx.inbound_wa_message_id = "w2.legacy"
-            eng._send_scheduling_handoff_email = lambda **k: None
-            with _Spy("app.services.booking_ce_adapter.request_manual_scheduling") as spy, H.Meta():
-                eng._handle_scheduling_escalation(ctx, ctx.state, "x")
+
+            def email(**k):
+                with Session(self.engine) as other:          # committed before the e-mail?
+                    order.append(other.execute(select(WhatsAppThreadState.needs_human).where(
+                        WhatsAppThreadState.thread_id == w.thread_id)).scalar_one())
+            eng._send_scheduling_handoff_email = email
+            with _Spy("app.services.booking_ce_adapter.request_manual_scheduling") as spy, \
+                    H.Meta() as m:
+                out = eng._handle_scheduling_escalation(ctx, ctx.state, "x")
         finally:
             db.close()
         f = H.facts(self.engine, w)
-        self.assertEqual((spy.calls, f["ledger"], [s for _i, s in f["thread_revisions"]]),
-                         (0, [], ["provisional"]))
+        self.assertEqual((spy.calls, f["ledger"], f["thread_revisions"], f["revisions"]),
+                         (0, [], [], []))
+        self.assertEqual((out.action, f["needs_human"], order), ("replied", True, [True]))
+        self.assertEqual(len(m.sent), 1)
 
 
 class Endpoint(unittest.TestCase):

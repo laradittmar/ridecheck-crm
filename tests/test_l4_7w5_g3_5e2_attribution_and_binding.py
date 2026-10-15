@@ -639,35 +639,40 @@ class F_NonRegression(unittest.TestCase):
             t.close()
 
     def test_g35e2_35_the_flow_acknowledgement_is_never_unconditional(self):
-        """G3-5F §12 activates the acknowledgement. What may never return is a FREE one.
-
-        The G3-5E form of this test asserted the copy was absent. That guard has done its
-        job — the wording is live now — and the guarantee that replaces it is the one that
-        matters from here on: the sentence exists in exactly ONE place, it is reachable
-        only through the authorizer, and the authorizer is driven by the pinned condition
-        list rather than by a list written at the call site.
-        """
-        src = pathlib.Path(ce.__file__).read_text(encoding="utf-8")
-        self.assertEqual(src.count("Gracias por completarlo"), 1,
+        """What may never return is a FREE acknowledgement: one copy, one sender, and the
+        send is conditional on a committed booking's ledger lease."""
+        # Convergence Phase 3 adaptation (CP1-06/CP1-07). OLD: the CE in-session writer
+        # PLANNED the completion acknowledgement (`_plan_flow_completion_ack`) after its own
+        # commit, keyed the outbound row `flow-txn:<ThreadRevision.id>`, and held the only
+        # literal of the sentence. NEW: that writer is deleted; the acknowledgement is owed by
+        # the booking LEDGER row and sent only by `acknowledge_committed_booking` after the
+        # authority's commit, under the ledger lease (claim → gate → record), with the turn's
+        # correlation id and causal inbound. The sentence lives in exactly one module and
+        # `ConversationEngine._FLOW_COMPLETION_ACK` IS that object. `_plan_flow_completion_ack`
+        # remains as a pinned evidence evaluator but has NO production caller (asserted by
+        # `test_convergence_p3_cutover`). Behaviour: sb2b_01/06..22 and the PG race suite.
+        import pathlib as _pl
+        from app.services import booking_acknowledgement as _ack
+        from app.services.conversation_engine import ConversationEngine as _CE
+        app_dir = _pl.Path(_ack.__file__).resolve().parents[1]
+        holders = [p.name for p in sorted(app_dir.rglob("*.py"))
+                   if "Gracias por completarlo" in p.read_text(encoding="utf-8-sig")]
+        self.assertEqual(holders, ["booking_acknowledgement.py"],
                          "the acknowledgement copy exists in more than one place")
-        import app.services.booking_flow_service as bfs
-        self.assertNotIn("Gracias por completarlo",
-                         pathlib.Path(bfs.__file__).read_text(encoding="utf-8"),
-                         "the two booking paths hold competing acknowledgement copy")
+        self.assertIs(_CE._FLOW_COMPLETION_ACK, _ack.BOOKING_FLOW_RECEIPT_TEXT)
+        sends = [n for n, fn in vars(_CE).items() if inspect.isfunction(fn)
+                 and "acknowledge_committed_booking" in inspect.getsource(fn)]
+        self.assertEqual(sends, ["_sb_acknowledge"],
+                         f"the acknowledgement is reachable elsewhere: {sends}")
+        seq = inspect.getsource(_ack.acknowledge_committed_booking)
+        self.assertLess(seq.index(".claim_acknowledgement(key)"),
+                        seq.index("send_booking_acknowledgement("),
+                        "the send is conditional on holding the ledger lease")
         authorizer = inspect.getsource(ce.ConversationEngine._plan_flow_completion_ack)
         self.assertIn("flow_completion_ack_authorized(evidence)", authorizer)
-        # Every pinned condition is evidenced by name; none is assumed.
         for condition in ce.FLOW_COMPLETION_ACK_CONDITIONS:
             with self.subTest(condition=condition):
                 self.assertIn(f'"{condition}"', authorizer)
-        emitters = [n for n, fn in vars(ce.ConversationEngine).items()
-                    if inspect.isfunction(fn)
-                    and "_FLOW_COMPLETION_ACK" in inspect.getsource(fn)]
-        # G3-5F-BOUNDED-CORRECTION: `_flow_ack_already_sent` no longer names the sentence
-        # at all — it keys on the transaction — so the authorizer is now the only place
-        # that touches the copy. That is a strictly tighter result for this assertion.
-        self.assertEqual(sorted(emitters), ["_plan_flow_completion_ack"],
-                         f"the acknowledgement is reachable elsewhere: {sorted(emitters)}")
 
     def test_g35e2_36_f01_and_f02_remain_closed(self):
         for texts in ([Q, "¿Hay algo mañana?"], [Q, "¿Y el martes?"]):

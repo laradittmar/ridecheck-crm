@@ -104,6 +104,17 @@ ThreadRevision. That refusal is intended and must be preserved; do not restore t
 do not "fix" it in n8n. On Track A alone (`fix/m21.1.1-primary-flow-regression`, not merged)
 the paragraph below still describes the code.
 
+**Corrected a third time — convergence Phase 3 (integration branch).** The first two rows no
+longer write anything themselves. `ConversationEngine._process_flow_response` →
+`_converged_flow_book` and `BookingFlowService.handle_confirm_booking` both adjudicate as reads
+and DELEGATE one typed command (with an `OfferAcceptance`) to `BookingAuthority`, which is now
+the ONLY writer of a customer booking: it claims the offer, books, projects and records the
+ledger in one transaction, and the acknowledgement is the ledger's (one owner-approved text,
+`booking_acknowledgement.BOOKING_FLOW_RECEIPT_TEXT`). `SMART_BOOKING_CE_ENABLED` is an emergency
+OFF switch for both transports: off (the default) means no automatic booking writer at all and
+a truthful human handoff — never a legacy writer. The flag-off scheduling escalation no longer
+writes a Revision either.
+
 The third is **not** customer offer acceptance and must not be routed into it. It sits
 behind the `/api/revisions` MACHINE prefix — a shared secret, a trusted peer container, or a
 logged-in human session — and on Track A it accepts `status='booked'` with `scheduled_date` /

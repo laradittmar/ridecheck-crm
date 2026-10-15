@@ -136,6 +136,16 @@ def seed(engine, *, day: date | None = None, at: time = time(10, 0), zone=("Nort
             vehicle_clarification_sent=False, location_clarification_sent=False,
             vehicle_fallback_flow_sent=False, location_fallback_flow_sent=False)
         db.add(state)
+        db.flush()
+        if token:
+            # Convergence Phase 3 (adaptation): the Flow token is admitted against the OFFER
+            # TABLE, not the transport mirror, on every booking path — Track A's G3-7P rule,
+            # which the converged Conversation Engine and Data Exchange paths now share. A
+            # world that wants a bookable Flow therefore ISSUES its offer, bound to the
+            # thread's canonical values, exactly as production dispatch does.
+            from offer_fixture import seed_live_offer
+            seed_live_offer(db, state, thread_id=thread.id, token=token,
+                            candidate_id=cand.id, commit=False)
         wamid = f"wamid.SB2B.IN.{n:06d}"
         data = flow_payload(token, **(flow_data if flow_data is not None else
                                       {"nombre_apellido": "Ana Fixture",
@@ -268,10 +278,16 @@ def ledger_key(engine, w: World):
 
 
 def dx_confirm(engine, w: World, *, day: date | None = None, at: time | None = None,
-               name: str = "Ana Fixture"):
-    """The Data Exchange confirm_booking for this world's token (production service)."""
+               name: str = "Ana Fixture", flag: bool = True):
+    """The Data Exchange confirm_booking for this world's token (production service).
+
+    Convergence Phase 3 (adaptation): at `870b4e3` the endpoint booked through the authority
+    unconditionally; on the converged branch SMART_BOOKING_CE_ENABLED is the OFF switch for
+    BOTH transports, read from `get_settings()` per request. The harness therefore states the
+    flag it runs the endpoint under, exactly as `run_turn` does for CE (default: on)."""
     from app.services.booking_flow_service import BookingFlowService
-    with Session(engine) as db:
+    with Session(engine) as db, mock.patch("app.settings.get_settings",
+                                           lambda: settings(flag=flag)):
         return BookingFlowService(db).handle_confirm_booking(w.token, {
             "date": (day or w.day).isoformat(), "time": (at or w.at).strftime("%H:%M"),
             "name": name, "email": "ana@example.invalid",

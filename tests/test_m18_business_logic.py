@@ -2068,7 +2068,7 @@ class TestHandleSchedulingEscalation(unittest.TestCase):
         focus = _make_candidate(
             id=1, tipo_vehiculo="AUTO", marca="Chevrolet", modelo="Captiva", anio=2020,
         ) if with_focus else None
-        eng._focus_candidate = lambda ctx: focus
+        eng._focus_candidate = lambda ctx, repair=True: focus
 
         state = _make_state(
             last_stage="SCHEDULING",
@@ -2096,7 +2096,29 @@ class TestHandleSchedulingEscalation(unittest.TestCase):
         ctx.state = state
         ctx.contact = contact
 
-        result = eng._handle_scheduling_escalation(ctx, state, "solo puedo a las 12")
+        # Convergence Phase 3 adaptation. OLD: with the flag at its default (a MagicMock
+        # attribute reads OFF) this escalation wrote a provisional ThreadRevision plus a
+        # PENDIENTE — occupying — Revision in CE's own session, and the tests read them from
+        # `db.add`. NEW: that in-session writer is deleted; the manual-scheduling request is a
+        # NON-occupying booking command the authority records (CE-W2, flag ON), so the same
+        # facts are asserted on the request CE hands it (`self.manual_requests`). WHY: the
+        # legacy writer booked an occupying slot outside the authority. Flag OFF → no revision
+        # at all (`test_flag_off_escalation_writes_no_revision`).
+        from types import SimpleNamespace
+        from app.services.booking_authority import BookingOutcome
+        eng.settings.smart_booking_ce_enabled = True
+        for _attr in ("current_cycle_start_message_db_id", "customer_name"):
+            if not hasattr(state, _attr):
+                setattr(state, _attr, None)            # the stub state's missing columns
+        self.manual_requests = []
+
+        def _capture(db, req, **kw):
+            self.manual_requests.append(req)
+            return SimpleNamespace(ok=True, outcome=BookingOutcome.COMMITTED, reason="COMMITTED",
+                                   revision_id=501, thread_revision_id=77, occupying=False)
+        with patch("app.services.booking_ce_adapter.request_manual_scheduling", _capture), \
+                patch.object(type(eng), "_sb_row_committed", lambda self, model, rid: True):
+            result = eng._handle_scheduling_escalation(ctx, state, "solo puedo a las 12")
         return result, state, lead, added, sent
 
     def test_needs_human_set_on_state(self):
@@ -2116,27 +2138,53 @@ class TestHandleSchedulingEscalation(unittest.TestCase):
         self.assertEqual(lead.flag, "ACEPTADO")
 
     def test_provisional_revision_created(self):
-        from app.models import ThreadRevision
+        from app.models import Revision, ThreadRevision
         _, _, _, added, _ = self._run_escalation()
-        rev_objs = [o for o in added if isinstance(o, ThreadRevision)]
-        self.assertEqual(len(rev_objs), 1)
-        self.assertEqual(rev_objs[0].status, "provisional")
+        self.assertEqual([o for o in added if isinstance(o, (Revision, ThreadRevision))], [],
+                         "CE writes no revision itself")
+        self.assertEqual(len(self.manual_requests), 1)
+        tr = self.manual_requests[0].attachments.thread_revision
+        self.assertEqual(tr.non_occupying_status, "provisional")
+        self.assertFalse(tr.request_approval)
 
     def test_provisional_revision_has_vehicle_data(self):
-        from app.models import ThreadRevision
-        _, _, _, added, _ = self._run_escalation()
-        rev = next(o for o in added if isinstance(o, ThreadRevision))
-        self.assertEqual(rev.marca, "Chevrolet")
-        self.assertEqual(rev.modelo, "Captiva")
-        self.assertEqual(rev.anio, 2020)
+        _, _, _, _, _ = self._run_escalation()
+        req = self.manual_requests[0]
+        tr = req.attachments.thread_revision
+        self.assertEqual((tr.marca, tr.modelo, tr.anio), ("Chevrolet", "Captiva", 2020))
+        self.assertEqual((req.revision_fields["marca"], req.revision_fields["modelo"],
+                          req.revision_fields["anio"]), ("Chevrolet", "Captiva", 2020))
 
     def test_provisional_revision_has_requested_slot(self):
-        from app.models import ThreadRevision
         from datetime import date, time
-        _, _, _, added, _ = self._run_escalation()
-        rev = next(o for o in added if isinstance(o, ThreadRevision))
-        self.assertEqual(rev.scheduled_date, date(2026, 6, 19))
-        self.assertEqual(rev.scheduled_time, time(12, 0))
+        _, _, _, _, _ = self._run_escalation()
+        req = self.manual_requests[0]
+        self.assertEqual((req.requested_date, req.requested_time), (date(2026, 6, 19), time(12, 0)))
+
+    def test_flag_off_escalation_writes_no_revision(self):
+        """Convergence Phase 3: SMART_BOOKING_CE_ENABLED off — the human handoff stands and
+        NOTHING is booked or recorded: no Revision, no ThreadRevision, no authority call."""
+        from unittest.mock import patch
+        from app.models import Revision, ThreadRevision
+        calls = []
+        with patch("app.services.booking_ce_adapter.request_manual_scheduling",
+                   lambda *a, **k: calls.append(1)):
+            eng = _make_engine()
+            eng.settings.smart_booking_ce_enabled = False
+            added = []
+            eng.db.add = added.append
+            eng.db.commit = lambda: None
+            eng._send_text_to_wa = lambda ctx, txt: "msg-id"
+            eng._send_scheduling_handoff_email = lambda **kw: None
+            state = _make_state(last_stage="SCHEDULING", active_requested_date="2026-06-19",
+                                last_requested_time="12:00", current_revision_id=None)
+            ctx = _make_ctx(state=state)
+            ctx.state = state
+            out = eng._handle_scheduling_escalation(ctx, state, "solo puedo a las 12")
+        self.assertEqual((calls, [o for o in added if isinstance(o, (Revision, ThreadRevision))]),
+                         ([], []))
+        self.assertTrue(state.needs_human)
+        self.assertEqual(out.action, "replied")
 
     def test_no_flow_sent(self):
         result, _, _, _, _ = self._run_escalation()
@@ -4064,10 +4112,14 @@ class TestWebsiteFlowResponse(unittest.TestCase):
         return ctx, state
 
     def setUp(self):
-        # G3-7P: this class's session is a MagicMock, so the offer authority cannot be
-        # consulted here. See `offer_fixture.start_offer_claim_stub`.
-        from offer_fixture import start_offer_claim_stub
-        start_offer_claim_stub(self)
+        # Convergence Phase 3 adaptation. OLD: `start_offer_claim_stub` let Track A's
+        # in-session writer run on this MagicMock session, and the tests read the rows it
+        # added and the lead/state it mutated. NEW: that writer is deleted; CE delegates ONE
+        # typed command to the booking authority, so the stub captures that command
+        # (`self.booked`) and the field mapping is asserted on it — the authority writes
+        # exactly what it carries (lead identity/canal, thread state BOOKED, buyer fields).
+        from offer_fixture import start_converged_flow_stub
+        self.booked = start_converged_flow_stub(self)
 
     def _make_engine_for_flow_response(self):
         from unittest.mock import MagicMock
@@ -4155,7 +4207,8 @@ class TestWebsiteFlowResponse(unittest.TestCase):
             flow_token="tok-123",
         )
 
-        self.assertEqual(ctx.lead.canal, "Formulario web")
+        # Phase 3: `canal` is written by the authority, only if empty (`canal_if_empty`).
+        self.assertEqual(self.booked[-1].attachments.lead.canal_if_empty, "Formulario web")
 
     def test_generic_flow_response_still_reads_nombre_apellido(self):
         """For non-website leads, nombre_apellido must be read from Flow payload."""
@@ -4178,9 +4231,10 @@ class TestWebsiteFlowResponse(unittest.TestCase):
             flow_token="tok-123",
         )
 
-        self.assertEqual(ctx.lead.nombre, "Carlos")
-        self.assertEqual(ctx.lead.apellido, "Martínez")
-        self.assertEqual(ctx.lead.canal, "Instagram")
+        # Phase 3: the lead is the authority's to write; CE hands it the identity bundle.
+        lead = self.booked[-1].attachments.lead
+        self.assertEqual((lead.identity.nombre, lead.identity.apellido), ("Carlos", "Martínez"))
+        self.assertEqual(lead.canal_if_empty, "Instagram")
 
     def test_website_flow_creates_booking_action(self):
         """_process_flow_response must return booking_created action."""
@@ -4235,9 +4289,14 @@ class TestWebsiteFlowResponse(unittest.TestCase):
             flow_token="tok-123",
         )
 
-        self.assertEqual(state.last_stage, "BOOKED")
-        self.assertTrue(state.needs_human)
-        self.assertIsNone(state.flow_booking_token)
+        # Phase 3: BOOKED / needs_human / the consumed token are the authority's canonical
+        # state, written in the booking's own transaction from this plan (CE never writes
+        # them); the PostgreSQL race suite asserts the committed rows.
+        ts = self.booked[-1].attachments.thread_state
+        self.assertEqual((ts.last_stage, ts.needs_human, ts.consume_flow_token,
+                          ts.link_current_revision), ("BOOKED", True, True, True))
+        self.assertEqual(self.booked[-1].attachments.offer_acceptance.thread_id,
+                         self.booked[-1].thread_id)
 
 
 class TestWebsiteFlowInitialScreen(unittest.TestCase):

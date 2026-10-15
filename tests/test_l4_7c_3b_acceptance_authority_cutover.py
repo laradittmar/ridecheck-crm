@@ -319,12 +319,20 @@ class TestBoundaries(unittest.TestCase):
                              f"acceptance must not reach {forbidden}")
 
     def test_cut_18_acceptance_cannot_book(self):
+        # Convergence Phase 3 adaptation. OLD: Track A's in-session writer in the Conversation
+        # Engine (`_process_flow_response`) / Data Exchange (`handle_confirm_booking`) built the
+        # booked ThreadRevision and called `self._sched.check(...)` itself. NEW: both transports
+        # DELEGATE one typed command; `BookingAuthority` alone derives the "booked" status and
+        # revalidates the slot under its locks. WHY: the legacy writers are deleted (no third
+        # state where both are reachable). The invariant — one booking authority, reached only
+        # from the Flow path, never from text — is asserted on the code that now holds it.
         authorizer = (ROOT / "backend" / "app" / "services"
                       / "acceptance_authorizer.py").read_text()
         for forbidden in ("ThreadRevision", "booking", "scheduled_date", "STAGE_BOOKED"):
             self.assertNotIn(forbidden, authorizer)
-        self.assertIn("status=\"booked\"", CE_SOURCE,
+        self.assertIn("book_from_flow_response(self.db, req)", CE_SOURCE,
                       "booking still happens only on the Flow path")
+        self.assertNotIn('status="booked"', CE_SOURCE)
 
     def test_scheduling_interpretation_unchanged(self):
         """C3B gated progression without reading days differently.

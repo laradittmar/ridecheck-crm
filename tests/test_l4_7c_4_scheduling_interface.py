@@ -210,11 +210,18 @@ class TestStateSeparation(unittest.TestCase):
         self.assertTrue(to_record(decision)["requested_only"])
 
     def test_schedcut_09_available_is_not_booked(self):
+        # Convergence Phase 3 adaptation. OLD: Track A's in-session writer in the Conversation
+        # Engine (`_process_flow_response`) / Data Exchange (`handle_confirm_booking`) built the
+        # booked ThreadRevision and called `self._sched.check(...)` itself. NEW: both transports
+        # DELEGATE one typed command; `BookingAuthority` alone derives the "booked" status and
+        # revalidates the slot under its locks. WHY: the legacy writers are deleted (no third
+        # state where both are reachable). The invariant — one booking authority, reached only
+        # from the Flow path, never from text — is asserted on the code that now holds it.
         code = code_of(ROOT / "backend" / "app" / "services" / "scheduling_reconciler.py")
         for forbidden in ("booked", "ThreadRevision", "AVAILABLE", "CONFIRMED"):
             self.assertNotIn(forbidden, code,
                              f"the reconciler must not express {forbidden}")
-        self.assertIn('status="booked"', CE_SOURCE,
+        self.assertIn("book_from_flow_response(self.db, req)", CE_SOURCE,
                       "booking still happens only on the Flow path")
 
     def test_schedcut_11_future_intent_cannot_confirm_a_slot(self):
@@ -371,12 +378,19 @@ class TestCutover(unittest.TestCase):
                        / "acceptance_authorizer.py").read_text())
 
     def test_schedcut_20_booking_authority_unchanged(self):
+        # Convergence Phase 3 adaptation. OLD: Track A's in-session writer in the Conversation
+        # Engine (`_process_flow_response`) / Data Exchange (`handle_confirm_booking`) built the
+        # booked ThreadRevision and called `self._sched.check(...)` itself. NEW: both transports
+        # DELEGATE one typed command; `BookingAuthority` alone derives the "booked" status and
+        # revalidates the slot under its locks. WHY: the legacy writers are deleted (no third
+        # state where both are reachable). The invariant — one booking authority, reached only
+        # from the Flow path, never from text — is asserted on the code that now holds it.
         self.assertIn("_process_flow_response", CE_SOURCE)
-        self.assertIn('status="booked"', CE_SOURCE)
+        self.assertIn("book_from_flow_response(self.db, req)", CE_SOURCE)
+        self.assertNotIn('status="booked"', CE_SOURCE)
         self.assertNotIn("booked",
                          code_of(ROOT / "backend" / "app" / "services"
                                  / "scheduling_reconciler.py"))
-
 
 if __name__ == "__main__":
     unittest.main()
