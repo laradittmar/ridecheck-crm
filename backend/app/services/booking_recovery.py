@@ -87,7 +87,9 @@ def recover_acknowledgement(db: Session, idempotency_key: str) -> Optional[str]:
         if contact is None:
             auth.record_acknowledgement(claim, sent=False, error="CONTEXT_MISSING")
         else:
-            outcome = send_booking_acknowledgement(db, wa_id=contact.wa_id, thread_id=thread_id)
+            outcome = send_booking_acknowledgement(
+                db, wa_id=contact.wa_id, thread_id=thread_id,
+                delivery_fingerprint=claim.delivery_fingerprint)
             auth.record_acknowledgement(
                 claim, sent=bool(outcome), transport_id=outcome.wamid,
                 error=outcome.error or (None if outcome else "NOT_SENT"),

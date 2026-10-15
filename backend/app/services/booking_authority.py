@@ -206,17 +206,23 @@ class AckStatus(str, Enum):
     FAILED = "FAILED"
 
 
-#: SB2A-R2 acknowledgement lease. A SENDING claim older than this may be reclaimed.
+#: SB2A-R2 acknowledgement lease — CONCURRENT-claim exclusion only. Convergence Phase 3-R1:
+#: an expired lease never permits a resend. A SENDING row whose lease is gone had a sender
+#: that died somewhere between the claim and the record, possibly after the transport accepted
+#: the message, so it is held as UNCERTAIN (`_hold_lost_senders`), never reclaimed.
 ACK_LEASE_SECONDS = 120
-#: Bounded retries. A FAILED acknowledgement with this many attempts is TERMINAL: never claimed
-#: again, `ack_last_error` starts with `ACK_EXHAUSTED`, and it is listed for operators
-#: (`acknowledgements_needing_attention`). The booking itself is unaffected.
-ACK_MAX_ATTEMPTS = 5
+#: Owner delivery policy (Phase 3-R1): at most TWO automatic attempts per booking command — the
+#: initial one and ONE retry, admitted only after a DEFINITE non-delivery (transport never
+#: entered, or Meta rejected it without accepting it). An uncertain attempt is never retried.
+#: A FAILED acknowledgement with this many attempts is TERMINAL and held for an operator
+#: (`ack_last_error` starts with `ACK_EXHAUSTED`). The booking itself is unaffected.
+ACK_MAX_ATTEMPTS = 2
 ACK_EXHAUSTED_PREFIX = "ACK_EXHAUSTED"
-#: An SB2A-era SENDING row has no lease at all: its sender's fate is unknown.
-ACK_LEGACY_NO_LEASE = "LEGACY_SENDING_NO_LEASE"
-#: Transport outcome categories that leave the delivery unknown (SB2A-R3, R2A-06).
+#: Transport outcome categories that leave the delivery unknown (SB2A-R3, R2A-06). Since
+#: Phase 3-R1 an `AMBIGUOUS*` failure is held: it is never claimed again.
 ACK_AMBIGUOUS_PREFIX = "AMBIGUOUS"
+#: Phase 3-R1: a SENDING row whose lease is gone (expired, or an SB2A-era row with none).
+ACK_SENDER_LOST = f"{ACK_AMBIGUOUS_PREFIX}_SENDER_LOST"
 #: SB2B (D1-05): an acknowledgement still PENDING this long after its booking committed is
 #: listed for an operator. Five minutes = the existing unanswered-message CRITICAL threshold
 #: (`ops_dashboard.UNANSWERED_CRITICAL_SECONDS`); a live turn acknowledges within seconds.
@@ -229,18 +235,106 @@ def _app_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+#: Phase 3-R1: the acknowledgement's delivery identity namespace and version. Bump the
+#: version only with a new acknowledgement role; it is part of every attempt fingerprint.
+ACK_DELIVERY_NAMESPACE = "booking_ack:v1:"
+
+
+def acknowledgement_delivery_identity(idempotency_key: str) -> str:
+    """Convergence Phase 3-R1: the ONE delivery identity of a booking command's
+    acknowledgement — derived from the committed `booking_commands.idempotency_key` only, so it
+    is the same on the Conversation Engine and the Data Exchange endpoint, different for two
+    commands (even for one contact and one text), and stable across restarts, elapsed time and
+    a fresh inbound WAMID. It contains no token and no PII (the key never contains a token;
+    this hashes it again)."""
+    if type(idempotency_key) is not str or not idempotency_key:
+        raise ValueError("an acknowledgement identity needs a committed idempotency key")
+    return "bkack1:" + hashlib.sha256(
+        (ACK_DELIVERY_NAMESPACE + idempotency_key).encode()).hexdigest()[:40]
+
+
+def acknowledgement_attempt_fingerprint(idempotency_key: str, attempt: int) -> str:
+    """The identity of ONE attempt (64 hex): the gate's dedup identity and the outbound row's
+    `content_fingerprint` for that attempt, committed before the transport is entered. An
+    attempt number is issued once by `claim_acknowledgement`, so a fingerprint crosses the
+    gate at most once, ever (`OutboundSafetyGate.attempt(delivery_identity=...)`)."""
+    if type(attempt) is not int or isinstance(attempt, bool) or attempt < 1:
+        raise ValueError("an acknowledgement attempt is a positive int")
+    return hashlib.sha256(
+        f"{acknowledgement_delivery_identity(idempotency_key)}:attempt:{attempt}".encode()
+    ).hexdigest()
+
+
+class AckDelivery(str, Enum):
+    """Phase 3-R1 typed delivery state of one booking command's acknowledgement.
+
+    SENT_CONFIRMED       the transport accepted it and returned a WAMID; never resend
+    DEFINITELY_NOT_SENT  the last attempt never entered the transport, or Meta rejected it
+                         without accepting it; one retry may be admitted if none has occurred
+    UNCERTAIN            an attempt may have been accepted but was not durably confirmed
+                         (timeout, generic post-boundary exception, 5xx, 2xx without id, a
+                         sender that died); never retried automatically
+    HELD_OPERATOR        no automatic attempt remains (uncertain, or retry exhausted); the
+                         booking stands and the row is listed for an operator
+    RETRY_ADMITTED       the single safe retry, bound to the same command identity
+    IN_FLIGHT            a claim's lease is live: an attempt is in progress
+    NOT_ATTEMPTED        owed, no attempt yet
+    NOT_APPLICABLE       nothing is owed
+    """
+    SENT_CONFIRMED = "SENT_CONFIRMED"
+    DEFINITELY_NOT_SENT = "DEFINITELY_NOT_SENT"
+    UNCERTAIN = "UNCERTAIN"
+    HELD_OPERATOR = "HELD_OPERATOR"
+    RETRY_ADMITTED = "RETRY_ADMITTED"
+    IN_FLIGHT = "IN_FLIGHT"
+    NOT_ATTEMPTED = "NOT_ATTEMPTED"
+    NOT_APPLICABLE = "NOT_APPLICABLE"
+
+
+def acknowledgement_delivery_state(*, ack_status, ack_attempts, ack_duplicate_risk,
+                                   ack_last_error, lease_live) -> "tuple[AckDelivery, AckDelivery, str]":
+    """(state, last classified outcome, automatic resend) of one ledger row — a pure read of
+    durable fields. `automatic_resend` is NONE_OWED, PERMITTED, IN_FLIGHT or HELD."""
+    err = ack_last_error or ""
+    attempts = int(ack_attempts or 0)
+    if ack_status == AckStatus.SENT.value:
+        return AckDelivery.SENT_CONFIRMED, AckDelivery.SENT_CONFIRMED, "NONE_OWED"
+    if ack_status in (None, AckStatus.NOT_APPLICABLE.value):
+        return AckDelivery.NOT_APPLICABLE, AckDelivery.NOT_APPLICABLE, "NONE_OWED"
+    if ack_status == AckStatus.PENDING.value:
+        return AckDelivery.NOT_ATTEMPTED, AckDelivery.NOT_ATTEMPTED, "PERMITTED"
+    if ack_status == AckStatus.SENDING.value:
+        if lease_live:
+            return AckDelivery.IN_FLIGHT, AckDelivery.IN_FLIGHT, "IN_FLIGHT"
+        return AckDelivery.HELD_OPERATOR, AckDelivery.UNCERTAIN, "HELD"
+    if ack_duplicate_risk or ACK_AMBIGUOUS_PREFIX in err:
+        return AckDelivery.HELD_OPERATOR, AckDelivery.UNCERTAIN, "HELD"
+    if attempts >= ACK_MAX_ATTEMPTS:
+        return AckDelivery.HELD_OPERATOR, AckDelivery.DEFINITELY_NOT_SENT, "HELD"
+    return AckDelivery.DEFINITELY_NOT_SENT, AckDelivery.DEFINITELY_NOT_SENT, "PERMITTED"
+
+
 @dataclass(frozen=True)
 class AckClaim:
     """The right to send one acknowledgement attempt. Only its holder may record the outcome.
 
-    `duplicate_risk` is True when this claim reclaimed an expired SENDING lease: the earlier
-    attempt may already have reached Meta before its process died, so this send may
-    duplicate it. Exactly-once external delivery is NOT claimed.
+    Phase 3-R1: a claim is issued only for a PENDING row, or for a FAILED row whose last
+    attempt was DEFINITELY not sent and which has not used its one retry — never by reclaiming
+    a SENDING row, so `duplicate_risk` is always False on a new claim (the field is kept for
+    callers that log it). `delivery_fingerprint` is the attempt's command-bound identity.
     """
     idempotency_key: str
     token: str
     attempt: int
     duplicate_risk: bool
+
+    @property
+    def delivery_fingerprint(self) -> str:
+        return acknowledgement_attempt_fingerprint(self.idempotency_key, self.attempt)
+
+    @property
+    def delivery(self) -> AckDelivery:
+        return AckDelivery.RETRY_ADMITTED if self.attempt > 1 else AckDelivery.NOT_ATTEMPTED
 
 
 #: Operator/customer-safe Spanish messages. Never a database message.
@@ -993,27 +1087,28 @@ class BookingAuthority:
             return literal_column(f"clock_timestamp() + interval '{int(seconds)} seconds'")
         return _app_now() + timedelta(seconds=int(seconds))
 
-    def _terminalize_exhausted(self, key: Optional[str] = None) -> int:
-        """SENDING rows whose lease is gone (expired, or SB2A-era with none) and whose attempts
-        are exhausted can never be claimed again: make that explicit and terminal instead of
-        leaving them indistinguishable from an in-flight send (R2A-05). The dead attempt may
-        have reached Meta, so duplicate risk is recorded."""
+    def _hold_lost_senders(self, key: Optional[str] = None) -> int:
+        """Phase 3-R1: a SENDING row whose lease is gone (expired, or SB2A-era with none) had a
+        sender that died between its claim and its record — possibly AFTER the transport
+        accepted the message. Its delivery is UNCERTAIN: it is made terminal and held for an
+        operator (FAILED, `AMBIGUOUS_SENDER_LOST`, `ack_duplicate_risk` = delivery uncertain),
+        and it is never claimed again — whatever the attempt count, whatever time has passed."""
         from ..models import BookingCommandRecord as R
         now = self._clock()
         stmt = (update(R)
                 .where(R.command_state == LEDGER_COMMITTED)
                 .where(R.ack_status == AckStatus.SENDING.value)
-                .where(R.ack_attempts >= ACK_MAX_ATTEMPTS)
                 .where(or_(R.ack_lease_expires_at.is_(None), R.ack_lease_expires_at < now))
                 .values(ack_status=AckStatus.FAILED.value, ack_duplicate_risk=True,
-                        ack_last_error=f"{ACK_EXHAUSTED_PREFIX}_AFTER_CRASH",
+                        ack_last_error=ACK_SENDER_LOST,
                         ack_lease_expires_at=None, ack_updated_at=now)
                 .execution_options(synchronize_session=False))
         if key is not None:
             stmt = stmt.where(R.idempotency_key == key)
         res = self.db.execute(stmt)
         if res.rowcount:
-            logger.error("BOOKING_ACK_EXHAUSTED rows=%s key_prefix=%s — terminal, needs an operator",
+            logger.error("BOOKING_ACK_HELD_UNCERTAIN rows=%s key_prefix=%s — the sender died "
+                         "after its claim; delivery uncertain, automatic resend held",
                          res.rowcount, (key or "*")[:12])
         return res.rowcount
 
@@ -1021,32 +1116,32 @@ class BookingAuthority:
                               lease_seconds: int = ACK_LEASE_SECONDS) -> Optional[AckClaim]:
         """Atomically take a bounded lease to send the acknowledgement, or None.
 
-        Claimable: PENDING; FAILED below the attempt bound (retry); SENDING whose lease has
-        EXPIRED by the DATABASE clock (its claimant died), or an SB2A-era SENDING row with no
-        lease at all (one bounded recovery, recorded as LEGACY_SENDING_NO_LEASE). Never: SENT;
-        an active lease; exhausted attempts. Reclaiming any SENDING row records duplicate
-        risk. One UPDATE with the whole condition — PostgreSQL re-evaluates it after a
-        concurrent claimant commits, so exactly one wins.
+        Phase 3-R1 (owner delivery policy). Claimable ONLY:
+          * PENDING — the initial attempt;
+          * FAILED below `ACK_MAX_ATTEMPTS` whose last attempt was DEFINITELY not sent (no
+            delivery-uncertain mark, no `AMBIGUOUS*` category) — the one safe retry.
+        Never: SENT; SENDING (a live lease is an attempt in progress; an expired one is a lost
+        sender, held as UNCERTAIN by `_hold_lost_senders` first); an uncertain or exhausted
+        row. Lease expiry alone never admits a send. One UPDATE with the whole condition —
+        PostgreSQL re-evaluates it after a concurrent claimant commits, so exactly one wins.
         """
         from ..models import BookingCommandRecord as R
         now = self._clock()
         token = str(uuid.uuid4())
-        self._terminalize_exhausted(idempotency_key)
-        no_lease = and_(R.ack_status == AckStatus.SENDING.value, R.ack_lease_expires_at.is_(None))
+        self._hold_lost_senders(idempotency_key)
+        definite_retry = and_(R.ack_status == AckStatus.FAILED.value,
+                              R.ack_attempts < ACK_MAX_ATTEMPTS,
+                              R.ack_duplicate_risk.is_(False),
+                              or_(R.ack_last_error.is_(None),
+                                  ~R.ack_last_error.like(f"%{ACK_AMBIGUOUS_PREFIX}%")))
         res = self.db.execute(
             update(R)
             .where(R.idempotency_key == idempotency_key)
             # Convergence Phase 2: a DETACHED row's booking no longer exists — nothing is owed
             .where(R.command_state == LEDGER_COMMITTED)
             .where(R.ack_attempts < ACK_MAX_ATTEMPTS)
-            .where(or_(R.ack_status.in_((AckStatus.PENDING.value, AckStatus.FAILED.value)),
-                       and_(R.ack_status == AckStatus.SENDING.value,
-                            or_(R.ack_lease_expires_at.is_(None), R.ack_lease_expires_at < now))))
-            # every SET expression reads the OLD row: reclaiming SENDING ⇒ duplicate risk
-            .values(ack_duplicate_risk=or_(R.ack_duplicate_risk,
-                                           R.ack_status == AckStatus.SENDING.value),
-                    ack_last_error=case((no_lease, ACK_LEGACY_NO_LEASE), else_=R.ack_last_error),
-                    ack_status=AckStatus.SENDING.value,
+            .where(or_(R.ack_status == AckStatus.PENDING.value, definite_retry))
+            .values(ack_status=AckStatus.SENDING.value,
                     ack_attempts=R.ack_attempts + 1,
                     ack_claim_token=token, ack_claimed_at=now,
                     ack_lease_expires_at=self._clock_plus(lease_seconds),
@@ -1063,14 +1158,21 @@ class BookingAuthority:
     def record_acknowledgement(self, claim: AckClaim, *, sent: bool,
                                transport_id: Optional[str] = None,
                                error: Optional[str] = None, ambiguous: bool = False) -> bool:
-        """Record the outcome of THIS claim. A claimant whose lease was reclaimed by someone
-        else no longer owns the row and records nothing (returns False).
+        """Record the outcome of THIS claim. Only the claim's own token may record (returns
+        False otherwise).
+
+        Phase 3-R1: a claimant whose lease expired was held as UNCERTAIN (`_hold_lost_senders`)
+        — nobody reclaims its row. If it wakes and reports SENT with a transport id, that
+        confirmed truth replaces "uncertain" (the hold's `AMBIGUOUS_SENDER_LOST` row, same claim
+        token); any other late outcome records nothing, so a hold can never be turned back into
+        a retry.
 
         * SENT requires a non-empty transport identity (WAMID). A "success" without one is
           recorded as AMBIGUOUS — FAILED with duplicate risk — never as SENT.
         * An ambiguous outcome (e.g. a timeout after the request left, a 2xx without a usable
-          id) is FAILED with duplicate risk and an `AMBIGUOUS_*` category: retried only within
-          the attempt bound, never claimed as delivered or as not delivered.
+          id) is FAILED with the delivery-uncertain mark (`ack_duplicate_risk`) and an
+          `AMBIGUOUS_*` category: HELD — never retried automatically (Phase 3-R1), never
+          claimed as delivered or as not delivered.
         * A FAILED outcome on the last allowed attempt is terminal (`ACK_EXHAUSTED_*`).
         """
         from ..models import BookingCommandRecord as R
@@ -1091,11 +1193,15 @@ class BookingAuthority:
                 else_=category)
             if ambiguous:
                 values["ack_duplicate_risk"] = True
+        owner = R.ack_status == AckStatus.SENDING.value
+        if sent:
+            owner = or_(owner, and_(R.ack_status == AckStatus.FAILED.value,
+                                    R.ack_last_error == ACK_SENDER_LOST))
         res = self.db.execute(
             update(R)
             .where(R.idempotency_key == claim.idempotency_key)
             .where(R.ack_claim_token == claim.token)
-            .where(R.ack_status == AckStatus.SENDING.value)
+            .where(owner)
             .values(**values)
             .execution_options(synchronize_session=False))
         self.db.commit()
@@ -1103,22 +1209,24 @@ class BookingAuthority:
 
     def acknowledgements_needing_attention(self) -> list[dict]:
         """READ-ONLY operator view (SB2A-R4, R3A-07): terminal (exhausted) acknowledgements,
-        rows with duplicate risk, and SENDING rows whose lease is gone — the latter flagged
-        `pending_terminalization` when their attempts are exhausted. Performs no write and no
-        commit; terminalization is the explicit `terminalize_exhausted_acknowledgements()`."""
+        uncertain ones, and SENDING rows whose lease is gone — the latter flagged
+        `pending_terminalization` (Phase 3-R1: every lost sender is held, whatever its attempt
+        count). Performs no write and no commit; terminalization is the explicit
+        `terminalize_exhausted_acknowledgements()`."""
         from ..models import BookingCommandRecord as R
         now = self._clock()
         lease_gone = and_(R.ack_status == AckStatus.SENDING.value,
                           or_(R.ack_lease_expires_at.is_(None), R.ack_lease_expires_at < now))
         query = (select(R.idempotency_key, R.ack_status, R.ack_attempts, R.ack_duplicate_risk,
                         R.ack_last_error, R.ack_transport_id, R.revision_id, R.ack_updated_at,
-                        and_(lease_gone, R.ack_attempts >= ACK_MAX_ATTEMPTS)
-                        .label("pending_terminalization"))
+                        lease_gone.label("pending_terminalization"))
                  .where(R.command_state == LEDGER_COMMITTED)
                  .where(R.ack_status != AckStatus.NOT_APPLICABLE.value)
                  .where(or_(and_(R.ack_status == AckStatus.FAILED.value,
                                  R.ack_attempts >= ACK_MAX_ATTEMPTS),
-                            R.ack_duplicate_risk.is_(True), lease_gone))
+                            R.ack_duplicate_risk.is_(True), lease_gone,
+                            and_(R.ack_status == AckStatus.FAILED.value,
+                                 R.ack_last_error.like(f"%{ACK_AMBIGUOUS_PREFIX}%"))))
                  .order_by(R.id))
         with self.db.no_autoflush:                      # a read never flushes anything
             rows = self.db.execute(query).all()
@@ -1132,9 +1240,13 @@ class BookingAuthority:
           ACK_PENDING_STALE   the acknowledgement is still PENDING longer than the approved age
           ACK_FAILED          the last attempt failed (retryable or exhausted)
           ACK_AMBIGUOUS       the transport outcome is unknown (`AMBIGUOUS_*`)
-          ACK_DUPLICATE_RISK  a reclaimed lease may have sent twice
-          ACK_LEASE_GONE      SENDING with no live lease (its sender died)
+          ACK_DUPLICATE_RISK  delivery uncertain: an attempt may have reached Meta unconfirmed
+                              (Phase 3-R1: held, never resent — no second send happens)
+          ACK_LEASE_GONE      SENDING with no live lease (its sender died; held as uncertain)
+          ACK_HELD            no automatic attempt remains — uncertain, or the one retry used
           IDENTITY_CONFLICT   the submitted identity disagreed and was NOT applied
+        Each row also carries `ack_lease_live` so a reader can classify it with
+        `acknowledgement_delivery_state` without writing anything.
         A DETACHED row (tester reset, convergence Phase 2) is never listed: its booking no
         longer exists and nothing about it needs a person. Performs no write and no commit. Rows carry the raw key: callers that DISPLAY them
         must reduce it to its namespace and a hash prefix (the key never contains a token).
@@ -1152,6 +1264,11 @@ class BookingAuthority:
                                   R.ack_last_error.like(f"%{ACK_AMBIGUOUS_PREFIX}%")),
             "ACK_DUPLICATE_RISK": R.ack_duplicate_risk.is_(True),
             "ACK_LEASE_GONE": lease_gone,
+            "ACK_HELD": or_(lease_gone,
+                            and_(R.ack_status == AckStatus.FAILED.value,
+                                 or_(R.ack_duplicate_risk.is_(True),
+                                     R.ack_last_error.like(f"%{ACK_AMBIGUOUS_PREFIX}%"),
+                                     R.ack_attempts >= ACK_MAX_ATTEMPTS))),
             "IDENTITY_CONFLICT": R.identity_outcome == "CONFLICT",
         }
         query = (select(R.id, R.idempotency_key, R.source, R.operation, R.revision_id,
@@ -1159,6 +1276,10 @@ class BookingAuthority:
                         R.committed_at, R.correlation_id, R.ack_status, R.ack_attempts,
                         R.ack_duplicate_risk, R.ack_last_error, R.ack_transport_id,
                         R.identity_outcome,
+                        case((and_(R.ack_status == AckStatus.SENDING.value,
+                                   R.ack_lease_expires_at.is_not(None),
+                                   R.ack_lease_expires_at >= now), True),
+                             else_=False).label("ack_lease_live"),
                         *[case((c, True), else_=False).label(name) for name, c in conds.items()])
                  .where(R.command_state == LEDGER_COMMITTED)
                  .where(or_(*conds.values()))
@@ -1173,10 +1294,11 @@ class BookingAuthority:
         return out
 
     def terminalize_exhausted_acknowledgements(self) -> int:
-        """EXPLICIT write: move every exhausted SENDING row whose lease is gone to terminal
-        FAILED (ACK_EXHAUSTED_AFTER_CRASH, duplicate risk). Idempotent — a second call, or a
-        concurrent one, finds nothing left (the UPDATE re-checks SENDING). Returns the count."""
-        count = self._terminalize_exhausted(None)
+        """EXPLICIT write: hold every SENDING row whose lease is gone as UNCERTAIN (terminal
+        FAILED, `AMBIGUOUS_SENDER_LOST`, delivery-uncertain mark) — Phase 3-R1: regardless of
+        its attempt count. Idempotent — a second call, or a concurrent one, finds nothing left
+        (the UPDATE re-checks SENDING). Returns the count."""
+        count = self._hold_lost_senders(None)
         self.db.commit()
         return count
 

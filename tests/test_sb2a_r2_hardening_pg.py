@@ -326,7 +326,15 @@ class R2Postgres(unittest.TestCase):
         self.assertEqual(len(won), 1)
         self.assertFalse(won[0].duplicate_risk)
 
-    def test_pg_r2_15_concurrent_reclaimers_of_an_expired_lease_one_sender(self):
+    def test_pg_r2_15_concurrent_reclaimers_of_an_expired_lease_no_sender(self):
+        # Convergence Phase 3-R1 adaptation (renamed from `..._one_sender`). OLD: concurrent
+        # re-entrants after a dead lease raced, exactly ONE reclaimed it (attempt 2, duplicate
+        # risk) and sent again. NEW: NONE claims it — the lost sender is held as UNCERTAIN
+        # once, by whichever re-entrant gets there first; only the dead claimant's own late
+        # SENT may still record the truth. WHY: owner policy, the dead claimant may have been
+        # accepted by Meta (P3R-01/02). INVARIANT strengthened: concurrency still yields a
+        # single transition, and now zero resends. PROOF: under the old claim `won` has one
+        # element.
         key = f"ack-x-{self.lead}"
         self._tracked(key)
         with Session(self.engine) as s:                          # a claimant that died
@@ -336,18 +344,19 @@ class R2Postgres(unittest.TestCase):
         with self.engine.begin() as c:
             c.execute(text("UPDATE booking_commands SET ack_lease_expires_at = clock_timestamp() "
                            "- interval '5 seconds' WHERE idempotency_key=:k"), {"k": key})
-        won = self._race_claims(key)
-        self.assertEqual(len(won), 1)
-        self.assertTrue(won[0].duplicate_risk)
-        with Session(self.engine) as s:
-            auth = self.ba.BookingAuthority(s)
-            self.assertFalse(auth.record_acknowledgement(dead, sent=True))
-            self.assertTrue(auth.record_acknowledgement(won[0], sent=True, transport_id="wamid.T"))
+        self.assertEqual(self._race_claims(key), [], "an expired lease admitted a resend")
         with self.engine.connect() as c:
             row = c.execute(text("SELECT ack_status, ack_attempts, ack_duplicate_risk, "
-                                 "ack_transport_id FROM booking_commands WHERE idempotency_key=:k"),
+                                 "ack_last_error FROM booking_commands WHERE idempotency_key=:k"),
                             {"k": key}).one()
-        self.assertEqual(tuple(row), ("SENT", 2, True, "wamid.T"))
+        self.assertEqual(tuple(row), ("FAILED", 1, True, self.ba.ACK_SENDER_LOST))
+        with Session(self.engine) as s:
+            self.assertTrue(self.ba.BookingAuthority(s).record_acknowledgement(
+                dead, sent=True, transport_id="wamid.T"))
+        with self.engine.connect() as c:
+            row = c.execute(text("SELECT ack_status, ack_attempts, ack_transport_id FROM "
+                                 "booking_commands WHERE idempotency_key=:k"), {"k": key}).one()
+        self.assertEqual(tuple(row), ("SENT", 1, "wamid.T"))
 
     def test_pg_r2_16_active_lease_is_not_stolen_and_sent_is_final(self):
         key = f"ack-a-{self.lead}"

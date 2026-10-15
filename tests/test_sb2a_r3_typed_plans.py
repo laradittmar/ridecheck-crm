@@ -455,25 +455,40 @@ class R3_Ack(unittest.TestCase):
         r = self.db.query(BookingCommandRecord).filter_by(idempotency_key="ack").one()
         return (r.ack_status, r.ack_attempts, r.ack_duplicate_risk, r.ack_last_error, r.ack_transport_id)
 
-    def test_r3_22_crash_at_each_attempt_1_to_5(self):
+    def test_r3_22_a_crash_at_either_attempt_is_held_never_reclaimed(self):
+        # Convergence Phase 3-R1 adaptation (renamed from `test_r3_22_crash_at_each_attempt_
+        # 1_to_5`). OLD: each crash's dead lease was reclaimed, five times, before the row was
+        # exhausted. NEW: a crash at attempt 1 — or at the one retry after a definite failure —
+        # is held as UNCERTAIN at once and never claimed again. WHY: owner policy, no
+        # automatic retry after an uncertain attempt (P3R-01/02). INVARIANT kept: the row ends
+        # terminal and listed for an operator; strengthened: no send after a crash. PROOF:
+        # the old claim returns attempt 2 for the first `self.claim(t)` after the crash.
         t = T0
-        for attempt in range(1, ba.ACK_MAX_ATTEMPTS + 1):
-            c = self.claim(t)
-            self.assertIsNotNone(c, attempt)
-            self.assertEqual(c.attempt, attempt)
-            self.assertEqual(c.duplicate_risk, attempt > 1)       # every reclaim of a dead lease
-            t += timedelta(seconds=ba.ACK_LEASE_SECONDS + 1)      # …and this process dies
+        c = self.claim(t)
+        self.assertEqual((c.attempt, c.duplicate_risk), (1, False))
+        t += timedelta(seconds=ba.ACK_LEASE_SECONDS + 1)          # …and this process dies
         self.assertIsNone(self.claim(t))
-        status, attempts, risk, err, wamid = self.row()
-        self.assertEqual((status, attempts, risk, err, wamid),
-                         ("FAILED", 5, True, "ACK_EXHAUSTED_AFTER_CRASH", None))
+        self.assertEqual(self.row(), ("FAILED", 1, True, ba.ACK_SENDER_LOST, None))
         keys = [r["idempotency_key"] for r in self.auth.acknowledgements_needing_attention()]
         self.assertIn("ack", keys)
+        # the same at the retry: a definite failure, the one retry, a crash
+        self.db.query(BookingCommandRecord).update({"ack_status": "PENDING", "ack_attempts": 0,
+                                                    "ack_duplicate_risk": False,
+                                                    "ack_last_error": None})
+        self.db.commit()
+        self.auth.record_acknowledgement(self.claim(t), sent=False, error="META_REJECTED_400")
+        retry = self.claim(t)
+        self.assertEqual(retry.attempt, 2)
+        t += timedelta(seconds=ba.ACK_LEASE_SECONDS + 1)
+        self.assertIsNone(self.claim(t))
+        self.assertEqual(self.row()[:4], ("FAILED", 2, True, ba.ACK_SENDER_LOST))
 
     def test_r3_23_operator_view_terminalizes_without_a_claim(self):
+        # Convergence Phase 3-R1 adaptation: ONE claim whose sender dies (formerly one per
+        # allowed attempt, each reclaiming the last dead lease; a second claim would now hold
+        # the row itself, before the read this test is about).
         t = T0
-        for _ in range(ba.ACK_MAX_ATTEMPTS):
-            self.claim(t); t += timedelta(seconds=ba.ACK_LEASE_SECONDS + 1)
+        self.claim(t); t += timedelta(seconds=ba.ACK_LEASE_SECONDS + 1)
         # SB2A-R4 rewrite (R3A-07): the view is READ-ONLY and flags the row; terminalization
         # is the explicit, separate operation.
         with mock.patch.object(ba, "_app_now", return_value=t):
@@ -484,7 +499,13 @@ class R3_Ack(unittest.TestCase):
             self.assertEqual(self.auth.terminalize_exhausted_acknowledgements(), 0)
             rows = self.auth.acknowledgements_needing_attention()
         self.assertEqual([r["ack_status"] for r in rows], ["FAILED"])
-        self.assertTrue(rows[0]["ack_last_error"].startswith("ACK_EXHAUSTED"))
+        # Convergence Phase 3-R1 adaptation. OLD: the terminal category was `ACK_EXHAUSTED*`
+        # (reached after five reclaims). NEW: `AMBIGUOUS_SENDER_LOST` after ONE claim — the
+        # loop above now stops at the first lost sender, which is held, not reclaimed. The
+        # invariant this test owns (the view is read-only; terminalization is explicit and
+        # idempotent) is asserted unchanged above. PROOF: the old claim reclaims and the
+        # final category differs.
+        self.assertEqual(rows[0]["ack_last_error"], ba.ACK_SENDER_LOST)
 
     def test_r3_24_definitive_failure_on_last_attempt_is_marked_exhausted(self):
         t = T0
@@ -492,36 +513,55 @@ class R3_Ack(unittest.TestCase):
             c = self.claim(t)
             self.auth.record_acknowledgement(c, sent=False, error="META_REJECTED_400")
             t += timedelta(seconds=1)
-        self.assertEqual(self.row()[:4], ("FAILED", 5, False, "ACK_EXHAUSTED:META_REJECTED_400"))
+        # Convergence Phase 3-R1 adaptation: the bound is `ACK_MAX_ATTEMPTS` (now 2, the owner's
+        # initial + one retry), not the literal 5; the behaviour asserted is unchanged.
+        self.assertEqual(self.row()[:4], ("FAILED", ba.ACK_MAX_ATTEMPTS, False,
+                                          "ACK_EXHAUSTED:META_REJECTED_400"))
         self.assertIsNone(self.claim(t))
 
-    def test_r3_25_legacy_sending_without_lease_gets_one_recorded_recovery(self):
+    def test_r3_25_legacy_sending_without_lease_is_held_never_recovered(self):
+        # Convergence Phase 3-R1 adaptation (renamed from `..._gets_one_recorded_recovery`).
+        # OLD: an SB2A-era SENDING row with no lease got one automatic recovery send (attempt
+        # 2, duplicate risk). NEW: its sender's fate is unknown, so it is UNCERTAIN — held,
+        # never sent again. WHY: owner policy (no automatic retry after an uncertain attempt).
+        # INVARIANT strengthened: no send whose predecessor may have been accepted. PROOF: the
+        # old claim returns a claim here.
         self.db.query(BookingCommandRecord).update({"ack_status": "SENDING", "ack_attempts": 1,
                                                     "ack_lease_expires_at": None})
         self.db.commit()
-        c = self.claim(T0)
-        self.assertIsNotNone(c)
-        self.assertTrue(c.duplicate_risk)
-        self.assertEqual(self.row()[:4], ("SENDING", 2, True, "LEGACY_SENDING_NO_LEASE"))
+        self.assertIsNone(self.claim(T0))
+        self.assertEqual(self.row()[:4], ("FAILED", 1, True, ba.ACK_SENDER_LOST))
 
     def test_r3_26_legacy_sending_without_lease_at_the_bound_is_terminal(self):
         self.db.query(BookingCommandRecord).update({"ack_status": "SENDING", "ack_attempts": 5,
                                                     "ack_lease_expires_at": None})
         self.db.commit()
         self.assertIsNone(self.claim(T0))
-        self.assertEqual(self.row()[:4], ("FAILED", 5, True, "ACK_EXHAUSTED_AFTER_CRASH"))
+        # Convergence Phase 3-R1 adaptation: a lost sender is held as `AMBIGUOUS_SENDER_LOST`
+        # whatever its attempt count (formerly `ACK_EXHAUSTED_AFTER_CRASH` only at the bound);
+        # terminal and never claimed, as before.
+        self.assertEqual(self.row()[:4], ("FAILED", 5, True, ba.ACK_SENDER_LOST))
 
     def test_r3_27_ambiguous_outcomes_record_duplicate_risk(self):
+        # Convergence Phase 3-R1 adaptation. OLD: after an ambiguous outcome the row was
+        # claimed again (attempts 2 and 3) until one reported SENT. NEW: an ambiguous outcome
+        # is HELD — never claimed again; each ambiguity category is shown on its own row.
+        # WHY: owner policy, an uncertain attempt is never retried automatically. INVARIANT
+        # kept: ambiguity is recorded with the delivery-uncertain mark and never as SENT.
+        # PROOF: under the old claim the second `self.claim` returns a claim.
         c = self.claim(T0)
         self.assertTrue(self.auth.record_acknowledgement(c, sent=False, error="NETWORK_OR_TIMEOUT",
                                                          ambiguous=True))
         self.assertEqual(self.row()[:4], ("FAILED", 1, True, "AMBIGUOUS_NETWORK_OR_TIMEOUT"))
-        c = self.claim(T0 + timedelta(seconds=1))
-        self.assertTrue(self.auth.record_acknowledgement(c, sent=True, transport_id="  "))
-        self.assertEqual(self.row()[:4], ("FAILED", 2, True, "AMBIGUOUS_SENT_WITHOUT_TRANSPORT_ID"))
+        self.assertIsNone(self.claim(T0 + timedelta(seconds=1)), "an uncertain send was retried")
+        self.db.query(BookingCommandRecord).update({"ack_status": "PENDING", "ack_attempts": 0,
+                                                    "ack_duplicate_risk": False,
+                                                    "ack_last_error": None})
+        self.db.commit()
         c = self.claim(T0 + timedelta(seconds=2))
-        self.assertTrue(self.auth.record_acknowledgement(c, sent=True, transport_id="wamid.OK"))
-        self.assertEqual(self.row(), ("SENT", 3, True, "AMBIGUOUS_SENT_WITHOUT_TRANSPORT_ID", "wamid.OK"))
+        self.assertTrue(self.auth.record_acknowledgement(c, sent=True, transport_id="  "))
+        self.assertEqual(self.row()[:4], ("FAILED", 1, True, "AMBIGUOUS_SENT_WITHOUT_TRANSPORT_ID"))
+        self.assertIsNone(self.claim(T0 + timedelta(seconds=3)), "an uncertain send was retried")
 
 
 # ══ 7. Receipt: approved copy and transport classification ═══════════════════════════

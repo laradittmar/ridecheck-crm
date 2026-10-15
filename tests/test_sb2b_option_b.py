@@ -248,10 +248,23 @@ class OptionBCases:
         self.assertEqual(f["cursor"], w.wamid)
         self._expire_lease(w)
         self.assertIn("ACK_LEASE_GONE", [x for r in self.attention_rows_before(w) for x in r])
-        # after expiry: one bounded reclaim, flagged duplicate-risk, recorded SENT
-        status = self._recover(w)
+        # Convergence Phase 3-R1 adaptation. OLD: after expiry, one bounded reclaim sent the
+        # acknowledgement (duplicate risk) and recorded SENT. NEW: the lost sender is HELD as
+        # uncertain — recovery sends nothing, the row is FAILED with the uncertainty mark and
+        # listed as ACK_HELD. WHY: owner policy; the claimant may have died after Meta accepted
+        # the message, so a resend is the duplicate P3R-01/02 measured. This crash happened
+        # before the gate, so this acknowledgement is lost — the owner's accepted trade-off
+        # (a rare missing acknowledgement, never a duplicate). INVARIANT kept: the booking
+        # stands and an operator sees the row. PROOF: the old claim recovers with "SENT".
+        with H.Meta() as m:
+            with Session(self.engine) as db:
+                key = db.execute(select(BookingCommandRecord.idempotency_key).where(
+                    BookingCommandRecord.thread_id == w.thread_id)).scalar_one()
+                status = recover_acknowledgement(db, key)
         f = self.f(w)
-        self.assertEqual((status, f["ledger"][0][3], f["ledger"][0][5]), ("SENT", "SENT", True))
+        self.assertEqual((status, f["ledger"][0][3], f["ledger"][0][5]), ("FAILED", "FAILED", True))
+        self.assertEqual(self.owner_sends(m), [])
+        self.assertIn("ACK_HELD", [x for r in self.attention_rows_before(w) for x in r])
 
     def _expire_lease(self, w):
         with Session(self.engine) as db:

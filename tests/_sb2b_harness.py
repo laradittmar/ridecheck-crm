@@ -185,10 +185,13 @@ class Meta:
     def _send(self, *, to_wa_id, text):
         from app.ui.whatsapp_ui import MetaSendError
         self.sent.append((to_wa_id, text))
+        # Convergence Phase 3-R1: the real constructor is (http_status, raw_body, ...). The
+        # old `MetaSendError("rejected", http_status=400)` raised TypeError instead, so these
+        # two modes silently exercised the generic-exception branch, never the 4xx/timeout one.
         if self.mode == "4xx":
-            raise MetaSendError("rejected", http_status=400)
+            raise MetaSendError(400, '{"error": {"code": 100, "message": "rejected"}}')
         if self.mode == "timeout":
-            raise MetaSendError("timeout", http_status=None)
+            raise MetaSendError(None, "timed out")
         if self.mode == "raise":
             raise RuntimeError("transport exploded")
         return f"wamid.SB2B.OUT.{next(_SEQ):06d}", {}

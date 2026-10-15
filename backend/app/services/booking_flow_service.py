@@ -962,7 +962,7 @@ class BookingFlowService:
         if result.identity_outcome == "CONFLICT":
             _booking_event(ctx.thread.id, "BOOKING_IDENTITY_CONFLICT", booking_token=token,
                            extra={"crm_rev_id": result.revision_id, "lead_id": ctx.lead.id})
-        # ── 6. after the commit: the one acknowledgement, through the ledger lease ──
+        # ── 6. after the commit: the one acknowledgement, through the ledger's claim ──
         self._acknowledge(key, result, wa_id=ctx.contact.wa_id, thread_id=int(ctx.thread.id))
         return self._success_response(token)
 
@@ -1027,8 +1027,10 @@ class BookingFlowService:
         return contact.wa_id, int(thread.id)
 
     def _acknowledge(self, key: str, result, *, wa_id, thread_id: int) -> None:
-        """B-5 through the ONE shared sequence (lease → gate → record). The Data Exchange
-        request has no causal inbound message; the ledger lease is what makes it once."""
+        """B-5 through the ONE shared sequence (claim → gate → record). The Data Exchange
+        request has no causal inbound message and needs none: at most once comes from the
+        command-bound delivery identity and the ledger's two-attempt policy (Phase 3-R1), the
+        same for both transports — not from the lease, which only excludes concurrent claims."""
         from .booking_acknowledgement import acknowledge_committed_booking
         try:
             acknowledge_committed_booking(self.db, key=key, ack_status=result.ack_status,

@@ -1025,9 +1025,11 @@ _BOOKING_RECOVERY = {
     "CE_SYNC_INCOMPLETE": "STORED_INBOUND_REPLAY",
     "ACK_PENDING_STALE": "LEDGER_ACK_RECOVERY",
     "ACK_FAILED": "LEDGER_ACK_RECOVERY",
-    "ACK_LEASE_GONE": "LEDGER_ACK_RECOVERY",
+    # Phase 3-R1: a lost sender is UNCERTAIN — held, never resent; a person decides.
+    "ACK_LEASE_GONE": "OPERATOR_REVIEW",
     "ACK_AMBIGUOUS": "OPERATOR_REVIEW",
     "ACK_DUPLICATE_RISK": "OPERATOR_REVIEW",
+    "ACK_HELD": "OPERATOR_REVIEW",
     "IDENTITY_CONFLICT": "OPERATOR_REVIEW",
 }
 _RECOVERY_RANK = ("OPERATOR_REVIEW", "STORED_INBOUND_REPLAY", "LEDGER_ACK_RECOVERY")
@@ -1036,6 +1038,19 @@ _RECOVERY_RANK = ("OPERATOR_REVIEW", "STORED_INBOUND_REPLAY", "LEDGER_ACK_RECOVE
 def _inbound_correlation(wamid: str) -> str:
     import hashlib
     return "in:" + hashlib.sha256(wamid.encode()).hexdigest()[:32]
+
+
+def _lease_live(r: dict, now: datetime) -> bool:
+    """A row from the authority's view carries `ack_lease_live` (database clock); a row added
+    here for CE synchronization carries the raw expiry instead."""
+    if "ack_lease_live" in r:
+        return bool(r["ack_lease_live"])
+    exp = r.get("ack_lease_expires_at")
+    if exp is None:
+        return False
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    return exp >= now
 
 
 def booking_attention(db: Session, *, now: Optional[datetime] = None,
@@ -1047,13 +1062,23 @@ def booking_attention(db: Session, *, now: Optional[datetime] = None,
     the acknowledgement's WAMID, the identity outcome and the reasons. Never shown: raw
     tokens, full WAMIDs, names, phones, e-mails or message text.
 
+    Convergence Phase 3-R1 — every row also states, from durable fields only:
+    `booking` (COMMITTED: the booking stands and must not be recreated), `ack_state` /
+    `ack_delivery` (`booking_authority.AckDelivery`: the row's state and the last classified
+    outcome — e.g. HELD_OPERATOR / UNCERTAIN), `automatic_resend` (NONE_OWED, PERMITTED,
+    IN_FLIGHT or HELD), `ack_attempts`, and `ack_identity` — a 20-character prefix of the
+    command-bound delivery identity, whose per-attempt fingerprints are the outbound rows'
+    `content_fingerprint` (`/security/outbound-ledger?fingerprint=`).
+
     `CE_SYNC_INCOMPLETE` is detectable for Conversation-Engine rows only: their
     `correlation_id` names the causal inbound (`in:<sha256>`), so the inbound's `ai_event`
     tells whether CE finished the turn. A Data Exchange row's CE synchronization happens when
     its Flow reply reaches CE and is not linkable from the ledger.
     """
     from ..models import BookingCommandRecord as R
-    from ..services.booking_authority import ACK_PENDING_ATTENTION_SECONDS, BookingAuthority
+    from ..services.booking_authority import (ACK_PENDING_ATTENTION_SECONDS, BookingAuthority,
+                                              acknowledgement_delivery_identity,
+                                              acknowledgement_delivery_state)
 
     now = now or datetime.now(timezone.utc)
     age = (ACK_PENDING_ATTENTION_SECONDS if pending_older_than_seconds is None
@@ -1065,7 +1090,8 @@ def booking_attention(db: Session, *, now: Optional[datetime] = None,
         select(R.id, R.idempotency_key, R.source, R.operation, R.revision_id,
                R.thread_revision_id, R.thread_id, R.lead_id, R.occupying, R.committed_at,
                R.correlation_id, R.ack_status, R.ack_attempts, R.ack_duplicate_risk,
-               R.ack_last_error, R.ack_transport_id, R.identity_outcome)
+               R.ack_last_error, R.ack_transport_id, R.identity_outcome,
+               R.ack_lease_expires_at)
         .where(R.source == "CONVERSATION_ENGINE", R.correlation_id.like("in:%"),
                R.command_state == "COMMITTED",       # a DETACHED row has no turn to finish
                R.committed_at >= now - timedelta(days=BOOKING_SYNC_LOOKBACK_DAYS))
@@ -1095,6 +1121,11 @@ def booking_attention(db: Session, *, now: Optional[datetime] = None,
         recoveries = {_BOOKING_RECOVERY.get(x, "OPERATOR_REVIEW") for x in r["reasons"]}
         transport = r.get("ack_transport_id") or ""
         committed = r.get("committed_at")
+        state, delivery, resend = acknowledgement_delivery_state(
+            ack_status=r.get("ack_status"), ack_attempts=r.get("ack_attempts"),
+            ack_duplicate_risk=r.get("ack_duplicate_risk"),
+            ack_last_error=r.get("ack_last_error"), lease_live=_lease_live(r, now))
+        key = r.get("idempotency_key")
         out.append({
             "id": r["id"],
             "key_kind": kind or None,
@@ -1107,7 +1138,12 @@ def booking_attention(db: Session, *, now: Optional[datetime] = None,
             "lead_id": r.get("lead_id"),
             "occupying": r.get("occupying"),
             "committed_at": committed.isoformat() if committed else None,
+            "booking": "COMMITTED",
             "ack_status": r.get("ack_status"),
+            "ack_state": state.value,
+            "ack_delivery": delivery.value,
+            "automatic_resend": resend,
+            "ack_identity": (acknowledgement_delivery_identity(key)[:20] if key else None),
             "ack_attempts": r.get("ack_attempts"),
             "ack_duplicate_risk": bool(r.get("ack_duplicate_risk")),
             "ack_error_category": r.get("ack_last_error"),

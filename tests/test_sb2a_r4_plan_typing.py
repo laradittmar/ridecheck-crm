@@ -323,10 +323,15 @@ class R4_Attention(unittest.TestCase):
         BookingAuthority(db).execute(_cmd(lead, idempotency_key="att", tracks_acknowledgement=True))
         auth = BookingAuthority(db)
         t = datetime(2030, 1, 1, tzinfo=timezone.utc)
-        for _ in range(ba.ACK_MAX_ATTEMPTS):
-            with mock.patch.object(ba, "_app_now", return_value=t):
-                auth.claim_acknowledgement("att")
-            t += timedelta(seconds=ba.ACK_LEASE_SECONDS + 1)
+        # Convergence Phase 3-R1 adaptation: ONE claim whose sender dies (formerly one per
+        # allowed attempt, each reclaiming the last dead lease — a reclaim no longer exists;
+        # the next claim would hold the row itself and the read would see FAILED). The lost
+        # sender is flagged `pending_terminalization`, which now means "lease gone" at any
+        # attempt count. What this test owns is unchanged: the read writes nothing, and
+        # terminalization is the explicit, idempotent operation.
+        with mock.patch.object(ba, "_app_now", return_value=t):
+            auth.claim_acknowledgement("att")
+        t += timedelta(seconds=ba.ACK_LEASE_SECONDS + 1)
         flushes, commits = [], []
         with mock.patch.object(ba, "_app_now", return_value=t), \
                 mock.patch.object(db, "commit", side_effect=lambda: commits.append(1)), \
@@ -334,7 +339,7 @@ class R4_Attention(unittest.TestCase):
             rows = auth.acknowledgements_needing_attention()
         self.assertEqual((commits, flushes), ([], []))
         self.assertEqual([(r["ack_status"], r["pending_terminalization"]) for r in rows], [("SENDING", True)])
-        self.assertNotIn("_terminalize_exhausted", inspect.getsource(BookingAuthority.acknowledgements_needing_attention))
+        self.assertNotIn("_hold_lost_senders", inspect.getsource(BookingAuthority.acknowledgements_needing_attention))
         with mock.patch.object(ba, "_app_now", return_value=t):
             self.assertEqual(auth.terminalize_exhausted_acknowledgements(), 1)
             self.assertEqual(auth.terminalize_exhausted_acknowledgements(), 0)

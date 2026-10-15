@@ -365,12 +365,16 @@ class R4Postgres(unittest.TestCase):
     def test_r4pg_14_attention_read_writes_nothing_and_terminalization_is_single(self):
         key = f"att-{self.lead}"
         self.book(self.cmd(time(10), key=key, tracks_acknowledgement=True))
-        for _ in range(self.ba.ACK_MAX_ATTEMPTS):
-            with Session(self.engine) as s:
-                self.ba.BookingAuthority(s).claim_acknowledgement(key)
-            with self.engine.begin() as c:
-                c.execute(text("UPDATE booking_commands SET ack_lease_expires_at = clock_timestamp() - "
-                               "interval '1 second' WHERE idempotency_key=:k"), {"k": key})
+        # Convergence Phase 3-R1 adaptation: ONE claim whose sender dies (formerly one per
+        # allowed attempt, each reclaiming the last dead lease — no reclaim exists now; a
+        # second claim would hold the row itself, before the read this test is about). The
+        # invariants owned here are unchanged: the read writes nothing, and exactly one of four
+        # concurrent terminalizations holds the row.
+        with Session(self.engine) as s:
+            self.ba.BookingAuthority(s).claim_acknowledgement(key)
+        with self.engine.begin() as c:
+            c.execute(text("UPDATE booking_commands SET ack_lease_expires_at = clock_timestamp() - "
+                           "interval '1 second' WHERE idempotency_key=:k"), {"k": key})
         stat = text("SELECT coalesce(sum(n_tup_ins + n_tup_upd + n_tup_del), 0) FROM pg_stat_xact_user_tables")
         with Session(self.engine) as s:
             # pending counts of EARLIER transactions on this backend may be visible (PG 15+):
@@ -392,7 +396,7 @@ class R4Postgres(unittest.TestCase):
         [t.start() for t in ts]; [t.join(20) for t in ts]
         self.assertEqual(sum(counts), 1)
         self.assertEqual(tuple(self.q("SELECT ack_status, ack_last_error FROM booking_commands WHERE idempotency_key=:k",
-                                      k=key)[0]), ("FAILED", "ACK_EXHAUSTED_AFTER_CRASH"))
+                                      k=key)[0]), ("FAILED", self.ba.ACK_SENDER_LOST))
 
     def _thread(self):
         with self.engine.begin() as c:

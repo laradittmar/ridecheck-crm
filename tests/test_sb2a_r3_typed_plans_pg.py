@@ -282,6 +282,16 @@ class R3Postgres(unittest.TestCase):
             c.execute(text(f"UPDATE booking_commands SET ack_lease_expires_at = clock_timestamp() + "
                            f"interval '{seconds} seconds' WHERE idempotency_key=:k"), {"k": key})
 
+    def state(self, key):
+        return tuple(self.q("SELECT ack_status, ack_last_error FROM booking_commands "
+                            "WHERE idempotency_key=:k", k=key)[0])
+
+    # Convergence Phase 3-R1 adaptation of r3_05..r3_07. OLD: the DATABASE clock decided when
+    # an expired lease could be RECLAIMED (and resent). NEW: no lease is ever reclaimed; the
+    # database clock decides when a lost sender is HELD as uncertain (`_hold_lost_senders`)
+    # instead of left in flight. The invariant these tests own — an application host's clock,
+    # however skewed, never decides the lease — is asserted on the hold. PROOF: under the old
+    # claim the post-expiry claims return a claim.
     def test_pg_r3_05_application_clock_never_decides_the_lease(self):
         key = f"clk-{self.lead}"; self.tracked(key)
         ahead = datetime.now(timezone.utc) + timedelta(days=3)
@@ -292,10 +302,13 @@ class R3Postgres(unittest.TestCase):
         lease = self.q("SELECT ack_lease_expires_at - clock_timestamp() FROM booking_commands "
                        "WHERE idempotency_key=:k", k=key)[0][0]
         self.assertTrue(timedelta(seconds=100) < lease <= timedelta(seconds=120), lease)
+        self.assertEqual(self.state(key)[0], "SENDING")            # …nor holds a live lease
         self.age(key, -1)                                           # expired by DATABASE time
-        self.assertIsNotNone(self.claim(key, app_now=behind))       # host far behind: reclaims
+        self.assertIsNone(self.claim(key, app_now=behind))          # host far behind: no resend
+        self.assertEqual(self.state(key), ("FAILED", self.ba.ACK_SENDER_LOST))  # …but held
 
-    def test_pg_r3_06_two_workers_with_skewed_clocks_one_sender(self):
+    def test_pg_r3_06_two_workers_with_skewed_clocks_no_sender(self):
+        # Phase 3-R1 (renamed from `..._one_sender`): neither skewed worker sends; one holds.
         key = f"clk2-{self.lead}"; self.tracked(key)
         self.claim(key); self.age(key, -1)                          # a dead claimant
         barrier, won = threading.Barrier(2), []
@@ -308,29 +321,36 @@ class R3Postgres(unittest.TestCase):
         ts = [threading.Thread(target=worker, args=(s,)) for s in
               (timedelta(hours=5), -timedelta(hours=5))]
         [t.start() for t in ts]; [t.join(20) for t in ts]
-        self.assertEqual(len(won), 1)
-        self.assertTrue(won[0].duplicate_risk)
+        self.assertEqual(won, [])
+        self.assertEqual(self.state(key), ("FAILED", self.ba.ACK_SENDER_LOST))
 
     def test_pg_r3_07_expiry_boundary_is_database_time(self):
         key = f"bnd-{self.lead}"; self.tracked(key)
         self.claim(key)
         self.age(key, 2)
         self.assertIsNone(self.claim(key))                          # 2 s left by the DB clock
+        self.assertEqual(self.state(key)[0], "SENDING")             # …still in flight
         self.age(key, 0)                                            # expires now (strict <)
-        self.assertIsNotNone(self.claim(key))
+        self.assertIsNone(self.claim(key))
+        self.assertEqual(self.state(key), ("FAILED", self.ba.ACK_SENDER_LOST))
 
     # ══ 4. Exhaustion at attempts 1..5 ═══════════════════════════════════════
 
-    def test_pg_r3_08_crash_at_each_attempt_then_terminal(self):
+    def test_pg_r3_08_a_crash_is_terminal_at_once(self):
+        # Convergence Phase 3-R1 adaptation (renamed from `..._crash_at_each_attempt_then_
+        # terminal`). OLD: five crashes, each dead lease reclaimed, then terminal. NEW: the
+        # first crash is terminal — held as uncertain, never claimed again. WHY: owner policy.
+        # INVARIANT kept: terminal, booking untouched, listed for an operator. PROOF: the old
+        # claim returns attempt 2 after the first crash.
         key = f"exh-{self.lead}"; self.tracked(key)
-        for attempt in range(1, self.ba.ACK_MAX_ATTEMPTS + 1):
-            c = self.claim(key)
-            self.assertEqual((c.attempt, c.duplicate_risk), (attempt, attempt > 1))
-            self.age(key, -1)                                       # this claimant dies
+        c = self.claim(key)
+        self.assertEqual((c.attempt, c.duplicate_risk), (1, False))
+        self.age(key, -1)                                           # this claimant dies
+        self.assertIsNone(self.claim(key))
         self.assertIsNone(self.claim(key))
         row = self.q("SELECT ack_status, ack_attempts, ack_duplicate_risk, ack_last_error "
                      "FROM booking_commands WHERE idempotency_key=:k", k=key)[0]
-        self.assertEqual(tuple(row), ("FAILED", 5, True, "ACK_EXHAUSTED_AFTER_CRASH"))
+        self.assertEqual(tuple(row), ("FAILED", 1, True, self.ba.ACK_SENDER_LOST))
         self.assertEqual(self.counts()[0], 1)                       # booking untouched
         with Session(self.engine) as s:
             keys = [r["idempotency_key"] for r in
@@ -440,15 +460,19 @@ class R3LegacyLease(unittest.TestCase):
                 again = auth.claim_acknowledgement("legacy-1")         # its new lease is active
                 five = auth.claim_acknowledgement("legacy-5")
                 attention = {r["idempotency_key"]: r for r in auth.acknowledgements_needing_attention()}
-            self.assertIsNotNone(one)
-            self.assertTrue(one.duplicate_risk)
+            # Convergence Phase 3-R1 adaptation. OLD: a real SB2A-era SENDING row with no lease
+            # got one recovery send (attempt 2, duplicate risk); the exhausted one was terminal.
+            # NEW: both are held as uncertain — their senders' fate is unknown — and neither is
+            # ever claimed. INVARIANT kept: real upgraded rows are handled without error and are
+            # listed for an operator. PROOF: the old claim returns a claim for "legacy-1".
+            self.assertIsNone(one)
             self.assertIsNone(again)
             self.assertIsNone(five)
             rows = dict((k, tuple(v)) for k, *v in eng.connect().execute(text(
                 "SELECT idempotency_key, ack_status, ack_attempts, ack_duplicate_risk, ack_last_error "
                 "FROM booking_commands WHERE idempotency_key IN ('legacy-1','legacy-5')")).all())
-            self.assertEqual(rows["legacy-1"], ("SENDING", 2, True, "LEGACY_SENDING_NO_LEASE"))
-            self.assertEqual(rows["legacy-5"], ("FAILED", 5, True, "ACK_EXHAUSTED_AFTER_CRASH"))
+            self.assertEqual(rows["legacy-1"], ("FAILED", 1, True, ba.ACK_SENDER_LOST))
+            self.assertEqual(rows["legacy-5"], ("FAILED", 5, True, ba.ACK_SENDER_LOST))
             self.assertIn("legacy-5", attention)
             self.assertIn("legacy-1", attention)                         # duplicate risk is visible
         finally:

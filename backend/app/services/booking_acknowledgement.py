@@ -6,6 +6,21 @@ Track B's ledger-driven booking acknowledgement, verbatim from `870b4e3`
 * the Conversation Engine's Flow booking path and the Data Exchange confirmation, both
   through `acknowledge_committed_booking` (convergence Phase 3 — the only success copy);
 * `booking_recovery.recover_acknowledgement`, which is operator-invoked and has no route.
+
+Convergence Phase 3-R1 — what makes a booking command's acknowledgement at most once:
+
+* its delivery identity is the COMMAND's (`booking_authority.acknowledgement_delivery_identity`
+  of `booking_commands.idempotency_key`), one fingerprint per attempt, committed by the gate in
+  its dedup row and its `pending` outbound row BEFORE the transport is entered — the gate
+  never admits one attempt identity twice, at any age, whatever the inbound;
+* the ledger issues at most two attempts, and the second only after a DEFINITE non-delivery;
+  a sender that died after its claim is held as UNCERTAIN, never reclaimed (the lease is
+  concurrency exclusion only);
+* the irreversible boundary is the call into `_send_whatsapp_cloud_text`: before it, a failure
+  is definite; after it, only a documented Meta 4xx rejection is — everything else
+  (timeout, network, 5xx, 2xx without id, any other exception) is UNCERTAIN.
+A rare acknowledgement may therefore be missing and held for an operator; one booking command
+never produces two customer-visible acknowledgements through an automatic retry.
 """
 from __future__ import annotations
 
@@ -47,11 +62,20 @@ class ReceiptOutcome:
     def __bool__(self) -> bool:
         return self.sent
 
+    @property
+    def delivery(self):
+        """Phase 3-R1 typed outcome of this attempt (`booking_authority.AckDelivery`)."""
+        from .booking_authority import AckDelivery
+        if self.sent:
+            return AckDelivery.SENT_CONFIRMED
+        return AckDelivery.UNCERTAIN if self.ambiguous else AckDelivery.DEFINITELY_NOT_SENT
+
 
 def _send_ledger_acknowledgement(
     db: Session, ctx, *, name: str, selected_date: date, selected_time: time,
     correlation_id: Optional[str] = None,
     causal_inbound_wa_message_id: Optional[str] = None,
+    delivery_fingerprint: Optional[str] = None,
 ) -> "ReceiptOutcome":
     """Send the single canonical booking acknowledgement.
 
@@ -87,6 +111,10 @@ def _send_ledger_acknowledgement(
     from .outbound_safety_gate import GateOutcome, OutboundSafetyGate
 
     text = BOOKING_FLOW_RECEIPT_TEXT          # owner-approved copy (SB2A-R3)
+    # Phase 3-R1: where the attempt stands relative to the irreversible transport boundary.
+    # "before" — nothing can have left; "entered" — the sender was called and has not proven a
+    # rejection, so ANY failure from here on is UNCERTAIN; "settled" — classified below.
+    boundary = "before"
     # SB2A-R4 (R3A-05): failures KNOWN to precede any transport attempt are definitive —
     # no gate record, no network call, no duplicate risk, retryable once fixed.
     config_error = _receipt_pre_dispatch_error(ctx)
@@ -102,24 +130,35 @@ def _send_ledger_acknowledgement(
             deployment_id=get_deployment_id(),
             **{k: v for k, v in (
                 ("correlation_id", correlation_id),
-                ("causal_inbound_wa_message_id", causal_inbound_wa_message_id))
+                ("causal_inbound_wa_message_id", causal_inbound_wa_message_id),
+                ("delivery_identity", delivery_fingerprint))
                if v is not None},
         )
         if result.outcome != GateOutcome.ALLOWED:
             logger.warning(
                 "BOOKING_RECEIPT not sent thread_id=%s outcome=%s — booking stands",
                 ctx.thread.id, result.outcome.value)
+            if (delivery_fingerprint is not None
+                    and result.outcome == GateOutcome.BLOCKED_DUPLICATE):
+                # this attempt's identity crossed the gate before: the transport may have
+                # accepted that earlier crossing — uncertain, never definite
+                return ReceiptOutcome(False, None, "AMBIGUOUS_DELIVERY_IDENTITY_SEEN",
+                                      ambiguous=True)
             return ReceiptOutcome(False, None, f"GATE_{result.outcome.value}"[:64])
         try:
+            boundary = "entered"
             wa_message_id, _ = _send_whatsapp_cloud_text(
                 to_wa_id=ctx.contact.wa_id, text=text)
         except OutboundBlockedError:
             # raised by enforce_outbound_enabled, the transport's FIRST statement: nothing
             # left the process
+            boundary = "settled"
             gate.mark_failed(result.message_id)
             return ReceiptOutcome(False, None, "PRE_DISPATCH_OUTBOUND_BLOCKED")
         except MetaSendError as exc:
             status = exc.http_status
+            if status is not None and 400 <= status < 500:
+                boundary = "settled"           # Meta's documented rejection: not accepted
             gate.mark_failed(result.message_id, meta_http_status=status,
                              meta_error_payload=exc.to_payload())
             logger.error("BOOKING_RECEIPT Meta send failed thread_id=%s status=%s",
@@ -139,6 +178,7 @@ def _send_ledger_acknowledgement(
                          ctx.thread.id, type(exc).__name__)
             return ReceiptOutcome(False, None, "AMBIGUOUS_TRANSPORT_EXCEPTION",
                                   ambiguous=True)
+        boundary = "settled"
         wamid = (wa_message_id or "").strip()
         if not wamid:
             return ReceiptOutcome(False, None, "AMBIGUOUS_SUCCESS_WITHOUT_WAMID",
@@ -151,20 +191,31 @@ def _send_ledger_acknowledgement(
         return ReceiptOutcome(True, wamid, None)
     except Exception as exc:
         # The booking is already committed; nothing here may undo it.
+        if boundary == "entered":
+            # e.g. gate bookkeeping failed while classifying a transport failure: the sender
+            # WAS called and no rejection was proven — never "definitely not sent"
+            logger.error("BOOKING_RECEIPT failed after the transport boundary thread_id=%s: %s",
+                         ctx.thread.id, type(exc).__name__)
+            return ReceiptOutcome(False, None, "AMBIGUOUS_AFTER_TRANSPORT_BOUNDARY",
+                                  ambiguous=True)
         logger.error("BOOKING_RECEIPT failed before dispatch thread_id=%s: %s",
                      ctx.thread.id, exc)
     return ReceiptOutcome(False, None, "PRE_SEND_FAILURE")
 
 
 def send_booking_acknowledgement(
-    db: Session, *, wa_id, thread_id: int, correlation_id: Optional[str] = None,
+    db: Session, *, wa_id, thread_id: int, delivery_fingerprint: str,
+    correlation_id: Optional[str] = None,
     causal_inbound_wa_message_id: Optional[str] = None,
 ) -> "ReceiptOutcome":
     """SB2B (D1 B-5): the booking acknowledgement for callers that hold no BookingContext —
-    CE-W1 and the operator's ledger-driven recovery. It IS the Data Exchange path's
-    `_send_booking_receipt` (owner text, BOOKING_FLOW path, gate, outcome classification),
-    never a second copy of it. The caller must already hold the ledger's acknowledgement
-    claim: this function sends, it does not decide whether to."""
+    the shared `acknowledge_committed_booking` and the operator's ledger-driven recovery. The
+    caller must already hold the ledger's acknowledgement claim: this function sends, it does
+    not decide whether to. Phase 3-R1: `delivery_fingerprint` is REQUIRED — the claim's
+    command-bound attempt identity (`AckClaim.delivery_fingerprint`); a booking acknowledgement
+    is never deduplicated by its text."""
+    if type(delivery_fingerprint) is not str or len(delivery_fingerprint) != 64:
+        raise ValueError("a booking acknowledgement needs its claim's delivery fingerprint")
     from .booking_flow_service import BookingContext
     ctx = BookingContext(thread=SimpleNamespace(id=thread_id),
                          contact=SimpleNamespace(wa_id=wa_id), lead=None, state=None,
@@ -172,7 +223,8 @@ def send_booking_acknowledgement(
                          zone_group=None, zone_detail=None, booking_token="")
     return _send_ledger_acknowledgement(
         db, ctx, name="", selected_date=None, selected_time=None, correlation_id=correlation_id,
-        causal_inbound_wa_message_id=causal_inbound_wa_message_id)
+        causal_inbound_wa_message_id=causal_inbound_wa_message_id,
+        delivery_fingerprint=delivery_fingerprint)
 
 
 def acknowledge_committed_booking(
@@ -183,11 +235,13 @@ def acknowledge_committed_booking(
     """Convergence Phase 3 (B-5): THE one acknowledgement sequence for a committed or replayed
     Flow booking, shared by the Conversation Engine and the Data Exchange endpoint.
 
-    1. the ledger lease is claimed in its own short transaction (isolated session) — SENT,
-       NOT_APPLICABLE, an active lease or an exhausted row → nothing is owed, nothing is sent;
+    1. the ledger claim is taken in its own short transaction (isolated session) — SENT,
+       NOT_APPLICABLE, an attempt in flight, an UNCERTAIN or exhausted row → nothing is sent
+       (Phase 3-R1: at most two attempts per command, the second only after a definite
+       non-delivery; an expired lease is a lost sender, held, never reclaimed);
     2. the owner-approved text (`BOOKING_FLOW_RECEIPT_TEXT`, the only success copy) goes
-       through `OutboundSafetyGate` on the BOOKING_FLOW path, with the causal inbound where
-       one exists (CE; the Data Exchange request has none);
+       through `OutboundSafetyGate` on the BOOKING_FLOW path under the claim's command-bound
+       attempt identity, with the causal inbound where one exists (CE) recorded as evidence;
     3. SENT / FAILED / AMBIGUOUS is recorded in its own short transaction.
 
     It is called only after the booking transaction has committed, so no booking lock is held
@@ -202,7 +256,8 @@ def acknowledge_committed_booking(
         after = lookup_booking(db, key)
         return (after.ack_status if after else ack_status), None
     outcome = send_booking_acknowledgement(
-        db, wa_id=wa_id, thread_id=thread_id, correlation_id=correlation_id,
+        db, wa_id=wa_id, thread_id=thread_id, delivery_fingerprint=claim.delivery_fingerprint,
+        correlation_id=correlation_id,
         causal_inbound_wa_message_id=causal_inbound_wa_message_id)
     with isolated_session(db) as session:
         recorded = BookingAuthority(session).record_acknowledgement(
@@ -210,11 +265,9 @@ def acknowledge_committed_booking(
             error=getattr(outcome, "error", None) or (None if outcome else "NOT_SENT"),
             ambiguous=bool(getattr(outcome, "ambiguous", False)))
     if not recorded:
-        logger.warning("BOOKING_ACK outcome not recorded: lease reclaimed attempt=%s",
-                       claim.attempt)
-    if claim.duplicate_risk:
-        logger.warning("BOOKING_ACK attempt %s reclaimed an expired lease — the earlier "
-                       "attempt may have reached Meta; possible duplicate", claim.attempt)
+        logger.warning("BOOKING_ACK outcome not recorded: the claim no longer owns the row "
+                       "attempt=%s", claim.attempt)
+    logger.info("BOOKING_ACK attempt=%s delivery=%s", claim.attempt, outcome.delivery.value)
     after = lookup_booking(db, key)
     return (after.ack_status if after else None), outcome
 

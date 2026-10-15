@@ -310,19 +310,30 @@ class R03AckLease(unittest.TestCase):
         self.assertEqual((rec.ack_status, rec.ack_attempts, rec.ack_claim_token),
                          ("SENDING", 1, c.token))
 
-    def test_r2_25_expired_sending_is_reclaimed_and_flags_duplicate_risk(self):
+    def test_r2_25_expired_sending_is_held_never_reclaimed(self):
+        # Convergence Phase 3-R1 adaptation (renamed from `..._is_reclaimed_and_flags_
+        # duplicate_risk`). OLD: an expired SENDING lease was reclaimed as attempt 2 (duplicate
+        # risk) and SENT again. NEW: it is never reclaimed — the row is held as UNCERTAIN
+        # (FAILED, AMBIGUOUS_SENDER_LOST) and no claim exists; only the dead claimant's own
+        # late SENT may replace "uncertain" with the truth. WHY: the owner's delivery policy —
+        # a sender that died may already have been accepted by Meta, so a blind resend is the
+        # duplicate the independent review measured (P3R-01/02). INVARIANT kept and
+        # strengthened: one claimant owns the row; now also at most one send per command.
+        # PROOF: under the old claim the second `_claim` returns an attempt-2 claim.
         dead = self._claim(T0)        # process dies mid-send
         later = T0 + timedelta(seconds=ba.ACK_LEASE_SECONDS + 1)
-        c = self._claim(later)
-        self.assertIsNotNone(c)
-        self.assertTrue(c.duplicate_risk)
-        self.assertEqual(c.attempt, 2)
-        # the dead claimant, if it wakes up, no longer owns the row
-        self.assertFalse(self.auth.record_acknowledgement(dead, sent=True, transport_id="wamid.DEAD"))
-        self.assertTrue(self.auth.record_acknowledgement(c, sent=True, transport_id="wamid.OK"))
+        self.assertIsNone(self._claim(later), "an expired lease admitted a resend")
         rec = self.rec()
-        self.assertEqual((rec.ack_status, rec.ack_transport_id, rec.ack_duplicate_risk),
-                         ("SENT", "wamid.OK", True))
+        self.assertEqual((rec.ack_status, rec.ack_attempts, rec.ack_duplicate_risk,
+                          rec.ack_last_error), ("FAILED", 1, True, ba.ACK_SENDER_LOST))
+        self.assertIsNone(self._claim(later + timedelta(days=30)))
+        # a late failure from the dead claimant cannot turn the hold into a retry …
+        self.assertFalse(self.auth.record_acknowledgement(dead, sent=False, error="META_400"))
+        # … but its late confirmation is the truth, and it is recorded
+        self.assertTrue(self.auth.record_acknowledgement(dead, sent=True, transport_id="wamid.DEAD"))
+        rec = self.rec()
+        self.assertEqual((rec.ack_status, rec.ack_transport_id, rec.ack_attempts),
+                         ("SENT", "wamid.DEAD", 1))
 
     def test_r2_26_failed_is_retried_and_records_the_error_category(self):
         c = self._claim(T0)

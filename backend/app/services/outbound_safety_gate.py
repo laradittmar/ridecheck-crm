@@ -178,6 +178,13 @@ class OutboundSafetyGate:
         correlation_id: Optional[str] = None,
         # WILD-01 FINDING-03: causal inbound identity for dedup
         causal_inbound_wa_message_id: Optional[str] = None,
+        # Convergence Phase 3-R1: a typed delivery identity (64 lowercase hex) — today only the
+        # booking acknowledgement's per-attempt fingerprint, derived from the committed
+        # booking command. When given it REPLACES the text fingerprint on every row this
+        # attempt writes, and the dedup matches on it alone: no time window, no causal
+        # inbound — one delivery identity crosses the gate at most once, ever. Messages
+        # without one keep the text/causal/10-minute dedup unchanged.
+        delivery_identity: Optional[str] = None,
     ) -> GateResult:
         """Check all gates and persist a pre-send audit record.
 
@@ -203,7 +210,13 @@ class OutboundSafetyGate:
             from .outbound_path_registry import get_deployment_id as _gdid
             deployment_id = _gdid()
 
-        fp = _content_fingerprint(text)
+        if delivery_identity is not None:
+            if (type(delivery_identity) is not str or len(delivery_identity) != 64
+                    or any(c not in "0123456789abcdef" for c in delivery_identity)):
+                raise ValueError("delivery_identity must be 64 lowercase hex characters")
+            fp = delivery_identity
+        else:
+            fp = _content_fingerprint(text)
 
         # ── -1. Authorized path check — dedicated gate session ───────────────
         path_result = self._check_authorized_path(
@@ -244,6 +257,7 @@ class OutboundSafetyGate:
                 fp=fp, message_type=message_type, now=now, text_content=text,
                 causal_inbound_wa_message_id=causal_inbound_wa_message_id,
                 path_id=path_id, deployment_id=deployment_id,
+                identity_bound=delivery_identity is not None,
             )
             if dedup_result is not None:
                 return dedup_result  # gate_db already committed inside _check_dedup
@@ -596,12 +610,17 @@ class OutboundSafetyGate:
         causal_inbound_wa_message_id: Optional[str] = None,
         path_id: Optional[str] = None,
         deployment_id: Optional[str] = None,
+        identity_bound: bool = False,
     ) -> Optional[GateResult]:
         """Rolling-window dedup check.
 
         When causal_inbound_wa_message_id is provided, a prior dedup row only
         blocks if it was caused by the SAME inbound event — different inbound
         messages that happen to produce identical reply text are allowed through.
+
+        Convergence Phase 3-R1: when `identity_bound`, `fp` is a typed delivery identity, not
+        a text fingerprint, and any prior dedup row carrying it blocks — at any age and
+        whatever its causal inbound.
 
         Writes and commits within `db` (caller-provided gate session).
         """
@@ -610,9 +629,10 @@ class OutboundSafetyGate:
             WhatsAppOutboundDedup.wa_id == wa_id,
             WhatsAppOutboundDedup.message_kind == message_type,
             WhatsAppOutboundDedup.content_fingerprint == fp,
-            WhatsAppOutboundDedup.created_at > cutoff,
         )
-        if causal_inbound_wa_message_id is not None:
+        if not identity_bound:       # one delivery identity, once: no window, no causal filter
+            q = q.where(WhatsAppOutboundDedup.created_at > cutoff)
+        if causal_inbound_wa_message_id is not None and not identity_bound:
             # WILD-01 FINDING-03: only block if the SAME inbound was already replied to.
             q = q.where(
                 WhatsAppOutboundDedup.causal_inbound_wa_message_id == causal_inbound_wa_message_id

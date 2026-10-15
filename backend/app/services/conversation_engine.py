@@ -4064,11 +4064,13 @@ class ConversationEngine:
 
     # ── SB2B Option B — adapter first, authoritative commit first, CE second ─────────
     #
-    # D1 §8.2 (binding rules B-1..B-8). Everything here runs only when
-    # `SMART_BOOKING_CE_ENABLED` is exactly True; with it off CE-W1/CE-W2 are the legacy code
-    # above and below, untouched. The booking authority owns the booking, its ledger row and
-    # the acknowledgement; CE reads the ledger first, calls the adapter while it holds no
-    # write, and only then commits its own state from the committed rows.
+    # D1 §8.2 (binding rules B-1..B-8). The booking writers here run only when
+    # `SMART_BOOKING_CE_ENABLED` is exactly True. With it off there is NO booking writer at all
+    # (convergence Phase 3): the legacy CE-W1/CE-W2 writers were deleted and must stay deleted;
+    # a booking-shaped turn still reads the ledger first and otherwise hands off truthfully.
+    # The booking authority owns the booking, its ledger row and the acknowledgement; CE reads
+    # the ledger first, calls the adapter while it holds no write, and only then commits its
+    # own state from the committed rows.
 
     #: Booking actions recorded in `ai_events.action`. Every one is in HANDLED_ACTIONS:
     #: an unhandled action would hand the turn to n8n's legacy booking chain.
@@ -4410,11 +4412,13 @@ class ConversationEngine:
             return None
 
     def _sb_acknowledge(self, ctx, result) -> "tuple[str | None, object | None]":
-        """B-5: the acknowledgement is the ledger row's. `acknowledge_committed_booking` claims
-        the lease, sends the owner-approved text through the outbound gate on the BOOKING_FLOW
-        path with this turn's causal inbound, and records SENT / FAILED / AMBIGUOUS — each in
-        its own short transaction, after the booking commit. SENT, an active lease, or nothing
-        owed → silence. Returns (ack status after, send outcome or None)."""
+        """B-5: the acknowledgement is the ledger row's. `acknowledge_committed_booking` takes
+        the ledger claim, sends the owner-approved text through the outbound gate on the
+        BOOKING_FLOW path under the command-bound attempt identity (this turn's causal inbound
+        is recorded, not used to deduplicate), and records SENT / FAILED / AMBIGUOUS — each in
+        its own short transaction, after the booking commit. SENT, an attempt in flight, an
+        uncertain or exhausted acknowledgement, or nothing owed → silence (Phase 3-R1: a fresh
+        inbound WAMID never admits another attempt). Returns (ack status after, outcome)."""
         from .booking_acknowledgement import acknowledge_committed_booking
         after, outcome = acknowledge_committed_booking(
             self.db, key=result.idempotency_key, ack_status=result.ack_status,
@@ -4488,7 +4492,10 @@ class ConversationEngine:
     def _sb_finish_committed(self, ctx, result, *, replayed: bool) -> ConversationHandleOut:
         """COMMITTED or IDEMPOTENT_REPLAY (fresh, raced, or a ledger hit): acknowledgement
         recovery first — after the authority commit, before CE's commit, so a crash in between
-        leaves the event re-enterable and the lease prevents a second send — then B-4."""
+        leaves the event re-enterable — then B-4. A re-entry never sends twice: the ledger
+        holds an attempt whose sender died as UNCERTAIN instead of reclaiming it, and the gate
+        never admits one command-bound attempt identity twice (Phase 3-R1); the lease only
+        excludes CONCURRENT claimants."""
         self._sb_note(outcome=("IDEMPOTENT_REPLAY" if replayed else result.outcome.value),
                       reason=result.reason, replayed=replayed,
                       revision_id=result.revision_id,
