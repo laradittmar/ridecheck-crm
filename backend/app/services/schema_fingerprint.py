@@ -13,6 +13,13 @@ frozen together with those literals: changing what is read means re-certifying t
 literal tests compare them with a hand-written DDL oracle, so no production constant is its own
 oracle.
 
+A deparse is not unique for one stored constraint: PostgreSQL 16 deparses a CHECK that was
+restored from `pg_dump` differently from the same CHECK as created (STRICT-SCHEMA-ADOPTION
+independent review, SSRV-01), and the restored form is a fixpoint of further dump/restore
+rounds. A caller that must accept a restored database therefore passes the FINITE list of exact
+fingerprints it permits (`matching`); nothing here normalises, rewrites or compares text
+loosely.
+
 Every value is catalogue metadata. No row value is read, so a refusal message carries none.
 """
 from __future__ import annotations
@@ -147,14 +154,17 @@ def function_fingerprint(conn, name: str) -> list:
 
 
 def column_fingerprint(conn, table: str, column: str) -> dict | None:
-    """One column's fingerprint plus the table-level properties that can falsify it (user
-    triggers, rewrite rules, row security). `column` is None in it when the column is absent;
-    the whole result is None when the table is."""
+    """One column's fingerprint plus what can falsify it: the table's user triggers, rewrite
+    rules, row security and inheritance/partitioning, and every constraint and index that
+    references the column (by key, INCLUDE list, expression or predicate — the catalogue's own
+    column references and recorded dependencies, never text). Constraints and indexes that do
+    not reference the column are not read. `column` is None in it when the column is absent
+    (and then nothing can reference it); the whole result is None when the table is."""
     oid = _oid(conn, table)
     if oid is None:
         return None
     col = _rows(conn, """
-        SELECT format_type(a.atttypid, a.atttypmod), a.attnotnull, a.attidentity,
+        SELECT a.attnum, format_type(a.atttypid, a.atttypmod), a.attnotnull, a.attidentity,
                a.attgenerated, a.attcollation = t.typcollation,
                pg_get_expr(d.adbin, d.adrelid), col_description(a.attrelid, a.attnum),
                a.attoptions
@@ -164,15 +174,54 @@ def column_fingerprint(conn, table: str, column: str) -> dict | None:
         o=oid, c=column)
     keys = ("type", "not_null", "identity", "generated", "default_collation", "default",
             "comment", "options")
-    (rls,) = _rows(conn, "SELECT relrowsecurity FROM pg_class WHERE oid = :o", o=oid)[0]
+    attnum = col[0][0] if col else None
+    (rel,) = _rows(conn, """
+        SELECT c.relrowsecurity, c.relkind, c.relispartition,
+               (SELECT count(*) FROM pg_inherits WHERE inhrelid = c.oid),
+               (SELECT count(*) FROM pg_inherits WHERE inhparent = c.oid)
+        FROM pg_class c WHERE c.oid = :o""", o=oid)
+    depends = ("EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = '{cls}'::regclass "
+               "AND d.objid = {obj} AND d.refclassid = 'pg_class'::regclass "
+               "AND d.refobjid = :o AND d.refobjsubid = :n)")
     return {
-        "column": tuple(zip(keys, col[0])) if col else None,
+        "column": tuple(zip(keys, col[0][1:])) if col else None,
         "table_triggers": _rows(conn, "SELECT tgname FROM pg_trigger WHERE tgrelid = :o "
                                       "AND NOT tgisinternal ORDER BY 1", o=oid),
         "table_rules": _rows(conn, "SELECT rulename FROM pg_rewrite WHERE ev_class = :o "
                                    "ORDER BY 1", o=oid),
-        "table_row_security": rls,
+        "table_row_security": rel[0],
+        "table_inheritance": tuple(zip(("relkind", "partition", "inherits_from",
+                                        "inherited_by"), rel[1:])),
+        # (table, name, type) of every constraint on either side that references the column
+        "column_constraints": [] if attnum is None else _rows(conn, f"""
+            SELECT con.conrelid::regclass::text, con.conname, con.contype
+            FROM pg_constraint con
+            WHERE (con.conrelid = :o AND :n = ANY (con.conkey))
+               OR (con.confrelid = :o AND :n = ANY (con.confkey))
+               OR {depends.format(cls="pg_constraint", obj="con.oid")}
+            ORDER BY 1, 2""", o=oid, n=attnum),
+        # every index on the table whose keys, INCLUDE list, expressions or predicate use it
+        "column_indexes": [] if attnum is None else _rows(conn, f"""
+            SELECT ic.relname FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid
+            WHERE i.indrelid = :o
+              AND (:n = ANY (i.indkey::int2[])
+                   OR {depends.format(cls="pg_class", obj="i.indexrelid")})
+            ORDER BY 1""", o=oid, n=attnum),
     }
+
+
+def matching(permitted: list[dict], found: dict | None) -> dict | None:
+    """The permitted fingerprint `found` equals EXACTLY, or None. `permitted` is a caller's
+    finite, frozen list; equality is whole-fingerprint equality, nothing looser."""
+    if found is None:
+        return None
+    return next((p for p in permitted if p == found), None)
+
+
+def closest_differences(permitted: list[dict], found: dict | None) -> list[str]:
+    """`differences` against the permitted fingerprint `found` is nearest to (for a refusal
+    message: what to look at first)."""
+    return min((differences(p, found) for p in permitted), key=len)
 
 
 def differences(expected: dict, found: dict | None) -> list[str]:

@@ -81,7 +81,10 @@ is a separate, owner-authorised milestone.
    fingerprint, before any DDL and again after installing, and fails the whole migration
    (nothing recorded, nothing changed) on any difference.
 5. **Record the branch** each revision printed in the upgrade output, per environment, in the
-   deployment record below (6.3):
+   deployment record below (6.3) — **only from an upgrade process whose final exit status is
+   zero.** A revision prints its branch when its own checks pass; a later failure in the same
+   run (another revision, or Alembic's version update) still rolls everything back, so a
+   printed branch from a failed run records nothing:
    `20261015_booking_attempt_events: CREATED | ADOPTED_ORM_SHAPE | VERIFIED_CANONICAL` and
    `20261016_notification_sent_at: ADDED | ADOPTED_LEGACY_COLUMN | VERIFIED_CANONICAL`.
    `crm` and `crm_test` (no evidence table; the old start-up's column, measured exactly the
@@ -89,7 +92,16 @@ is a separate, owner-authorised milestone.
 6. Start the replacement application. Its start-up check refuses to start unless the database
    is at exactly the code's Alembic head and both objects are exactly canonical
    (`SCHEMA_PREFLIGHT_FAILED` in the log, `DeclaredSchemaMissing`); the fix is step 3, never a
-   hand-made column, trigger or stamp.
+   hand-made column, trigger or stamp. "Canonical" for the column includes its surroundings:
+   no constraint or index referencing `notification_sent_at` (a `CHECK (notification_sent_at
+   IS NULL)` would block the e-mail's SENT mark) and no inheritance or partitioning of
+   `thread_revisions`.
+
+**After a restore from a `pg_dump`** (§4 step 3, or a §6.1 step-2 snapshot, plain or custom
+format): PostgreSQL 16 re-reads the two `booking_attempt_events` CHECK constraints in a
+different textual form of the same constraint. Both forms are accepted, exactly — the start-up
+check passes, and a rerun of step 3 prints `VERIFIED_CANONICAL` without changing anything. Do
+not drop and re-add the constraints to "normalise" them; any other form still refuses.
 
 **If an image was started first by mistake**, its `create_all` created `booking_attempt_events`
 in the exact application shape without the append-only trigger, and the start-up check then
@@ -131,10 +143,12 @@ checkpoint**, after which step 3 is rerun and must succeed on its own checks.
 
    Store the files and the hash file with the step-2 snapshot (`/opt/ridecheck-backups/`).
 4. If **both counts are zero**, `alembic downgrade 20261014_ledger_detached_state` is exact: it
-   drops the table, its trigger and function only when they are exactly the canonical shape,
-   and the column only if `20261016_notification_sent_at` created it (a column that an older
-   application start-up created is left in place, as it was found). Any other shape refuses
-   the downgrade: an object the migration cannot recognise is never erased.
+   drops the table, its trigger and function only when they are exactly the canonical shape
+   (either measured CHECK form, so a restored database downgrades too), and the column only if
+   `20261016_notification_sent_at` created it and no constraint or index references it (a
+   column that an older application start-up created is left in place, as it was found). Any
+   other shape refuses the downgrade: an object the migration cannot recognise is never
+   erased.
 5. **STOP condition.** If `booking_attempt_events` holds any row, or any
    `notification_sent_at` is non-null, the downgrade refuses (`audit-data loss` /
    `notification-evidence loss`) and records nothing. **Stop here.** Do not truncate, delete

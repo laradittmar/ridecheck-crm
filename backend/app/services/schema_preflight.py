@@ -10,11 +10,15 @@ refuses to let the application start. On PostgreSQL it requires:
   (`EXPECTED_HEAD`) — proof that the migrations ran and certified the schema;
 * `booking_attempt_events` to be EXACTLY the canonical fingerprint of migration
   `20261015_booking_attempt_events` (columns with defaults, CHECKs by deparse, UNIQUE, indexes,
-  no foreign key, the append-only trigger and function and no other trigger, rule or policy);
+  no foreign key, the append-only trigger and function and no other trigger, rule or policy),
+  each of its two CHECKs in either measured PostgreSQL 16 form — as created, or as a
+  `pg_dump` restore re-reads it (SSRV-01) — and in no other;
 * `thread_revisions.notification_sent_at` to be EXACTLY the column of migration
   `20261016_notification_sent_at` — nullable `timestamp with time zone`, no default, not
-  identity, not generated, with or without its marker — on a table with no user trigger, rule
-  or row security. A default would make every new booking read as already e-mailed.
+  identity, not generated, with or without its marker — on a plain table (no inheritance or
+  partitioning) with no user trigger, rule or row security, and with no constraint or index
+  referencing the column (SSRV-02). A default would make every new booking read as already
+  e-mailed; a CHECK on it would make the explicit mark fail after a delivered e-mail.
 
 It reads the catalogue only. It never creates, alters, repairs or adopts anything: it is not
 a second migration engine, and it fingerprints nothing else (the rest of the schema is the
@@ -30,9 +34,9 @@ import logging
 
 from sqlalchemy import inspect, text
 
-from .schema_fingerprint import (SchemaShapeRefused, column_fingerprint, differences,
-                                 function_fingerprint, require_certified_server,
-                                 table_fingerprint)
+from .schema_fingerprint import (SchemaShapeRefused, closest_differences, column_fingerprint,
+                                 differences, function_fingerprint, matching,
+                                 require_certified_server, table_fingerprint)
 
 logger = logging.getLogger(__name__)
 
@@ -53,10 +57,22 @@ def _btree(name, column, opclass, collation="", unique=False, primary=False):
             (opclass,), (collation,), None, None, None)
 
 
-def _check(name, column, values):
-    arr = ", ".join(f"'{v}'::character varying" for v in values)
-    return (name, "c", (column,), False, False, True, False, True,
-            f"CHECK ((({column})::text = ANY ((ARRAY[{arr}])::text[])))")
+def _check(name, column, values, form="created"):
+    if form == "created":
+        arr = ", ".join(f"'{v}'::character varying" for v in values)
+        deparse = f"CHECK ((({column})::text = ANY ((ARRAY[{arr}])::text[])))"
+    else:                                    # "restored": after pg_dump → restore (fixpoint)
+        arr = ", ".join(f"('{v}'::character varying)::text" for v in values)
+        deparse = f"CHECK ((({column})::text = ANY (ARRAY[{arr}])))"
+    return (name, "c", (column,), False, False, True, False, True, deparse)
+
+
+def _checks(outcome_form="created", stage_form="created"):
+    return [_check("ck_booking_attempt_events_outcome", "outcome",
+                   ("REFUSED", "RETRYABLE", "CONTENDED", "INTERNAL", "FAILED", "HELD"),
+                   outcome_form),
+            _check("ck_booking_attempt_events_stage", "stage",
+                   ("PRE_EXECUTE", "AUTHORITY", "FINALISE", "NOTIFICATION"), stage_form)]
 
 
 _EVENTS_CANONICAL = {
@@ -86,10 +102,7 @@ _EVENTS_CANONICAL = {
          True, "UNIQUE (event_uid)"),
         ("booking_attempt_events_pkey", "p", ("id",), False, False, True, True, True,
          "PRIMARY KEY (id)"),
-        _check("ck_booking_attempt_events_outcome", "outcome",
-               ("REFUSED", "RETRYABLE", "CONTENDED", "INTERNAL", "FAILED", "HELD")),
-        _check("ck_booking_attempt_events_stage", "stage",
-               ("PRE_EXECUTE", "AUTHORITY", "FINALISE", "NOTIFICATION")),
+        *_checks(),
     ],
     "referenced_by": [],
     "indexes": [
@@ -107,6 +120,10 @@ _EVENTS_CANONICAL = {
     "rules": [],
     "policies": [],
 }
+#: The canonical shape with each CHECK in either measured form — exactly these four.
+_EVENTS_PERMITTED = [{**_EVENTS_CANONICAL,
+                      "constraints": _EVENTS_CANONICAL["constraints"][:2] + _checks(o, st)}
+                     for o in ("created", "restored") for st in ("created", "restored")]
 _EVENTS_FUNCTION = [("booking_attempt_events_append_only", "plpgsql", "trigger", 0, "f", False,
                      "v", False, False, None, True, "348ed4cacd362157761a7ef24ec208da")]
 _NOTIFICATION_COLUMN = (("type", "timestamp with time zone"), ("not_null", False),
@@ -118,6 +135,12 @@ _NOTIFICATION_PERMITTED = (
     tuple((k, "created-by:20261016_notification_sent_at" if k == "comment" else v)
           for k, v in _NOTIFICATION_COLUMN),
 )
+#: `thread_revisions` around the column: nothing that could write, hide or block it.
+_NOTIFICATION_TABLE_LEVEL = {
+    "table_triggers": [], "table_rules": [], "table_row_security": False,
+    "table_inheritance": (("relkind", "r"), ("partition", False), ("inherits_from", 0),
+                          ("inherited_by", 0)),
+    "column_constraints": [], "column_indexes": []}
 
 
 def _postgres_problems(conn) -> list[str]:
@@ -134,7 +157,9 @@ def _postgres_problems(conn) -> list[str]:
         if heads != [EXPECTED_HEAD]:
             problems.append(f"Alembic version is {heads!r}, expected exactly "
                             f"[{EXPECTED_HEAD!r}]")
-    events = differences(_EVENTS_CANONICAL, table_fingerprint(conn, "booking_attempt_events"))
+    found = table_fingerprint(conn, "booking_attempt_events")
+    events = [] if matching(_EVENTS_PERMITTED, found) is not None else closest_differences(
+        _EVENTS_PERMITTED, found)
     events += differences({"function": _EVENTS_FUNCTION},
                           {"function": function_fingerprint(
                               conn, "booking_attempt_events_append_only")})
@@ -148,10 +173,8 @@ def _postgres_problems(conn) -> list[str]:
     else:
         bad = [] if col["column"] in _NOTIFICATION_PERMITTED else differences(
             {"column": _NOTIFICATION_COLUMN}, {"column": col["column"]})
-        bad += differences({"table_triggers": [], "table_rules": [],
-                            "table_row_security": False},
-                           {k: col[k] for k in ("table_triggers", "table_rules",
-                                                "table_row_security")})
+        bad += differences(_NOTIFICATION_TABLE_LEVEL,
+                           {k: col[k] for k in _NOTIFICATION_TABLE_LEVEL})
         if bad:
             problems.append("thread_revisions.notification_sent_at is not the canonical shape "
                             "of migration 20261016_notification_sent_at: " + "; ".join(bad))

@@ -38,15 +38,26 @@ generated status and collation, every constraint by PostgreSQL's own deparse, ev
 structure, every user trigger, rule and policy, the owned sequence and the table's own
 properties. Anything else — a widened CHECK under the right name, a missing default, an extra
 trigger, a rule, a row — REFUSES the whole upgrade; nothing is altered, dropped or replaced, so
-the version and the original fingerprint stay as they were. After installation the canonical
-fingerprint is verified again, exactly. One line names the branch taken, for the deployment
-record. Migrations still run BEFORE the replacement application container starts
+the version and the original fingerprint stay as they were. After installation the fingerprint
+is verified again, exactly: what this revision created must read in the creation form; a table
+it adopted or verified must read exactly as classified, plus what was installed. One line names
+the branch taken, for the deployment record (record it only from a run that exited 0).
+
+Restore (STRICT-SCHEMA-ADOPTION-CORRECTION, SSRV-01): PostgreSQL 16 deparses each of the two
+CHECKs of a table restored by `pg_dump` (plain or custom format) in ONE other form — the same
+stored constraint, re-read — and that form is a fixpoint of further dump/restore rounds
+(measured on 16.13). For exactly those two constraints, and only in their deparse field, both
+measured forms are accepted (`CHECK_FORMS`); every other part of the fingerprint, and every
+other deparse — a widened, narrowed, reordered, renamed or disjunctive CHECK, `NOT VALID` —
+still refuses. Nothing is normalised and nothing is rewritten: a restored table keeps its
+restored form. Migrations still run BEFORE the replacement application container starts
 (`docs/operations/RECOVERY_MANIFEST.md` §6); the application refuses to start on a schema
 that is not at this shape.
 
 Reversibility: `downgrade()` drops the table, its trigger and function — ONLY while the table
-is EMPTY and EXACTLY the canonical shape (or the `create_all` shape, which a database built by
-`create_all` + `alembic stamp` carries). With evidence rows present it REFUSES: dropping them
+is EMPTY and EXACTLY the canonical shape, either CHECK form (or the `create_all` shape, which
+a database built by `create_all` + `alembic stamp` carries). With evidence rows present it
+REFUSES: dropping them
 is audit-data loss and cannot be undone. Export or deliberately discard the rows first — an
 explicit owner checkpoint, never automatic (`docs/operations/RECOVERY_MANIFEST.md` §6). Any
 other shape refuses too: an object this revision cannot recognise is never erased.
@@ -56,9 +67,9 @@ Revision ID: 20261015_booking_attempt_events
 from alembic import op
 import sqlalchemy as sa
 
-from app.services.schema_fingerprint import (SchemaShapeRefused, differences,
-                                             function_fingerprint, require_certified_server,
-                                             table_fingerprint)
+from app.services.schema_fingerprint import (SchemaShapeRefused, closest_differences,
+                                             differences, function_fingerprint, matching,
+                                             require_certified_server, table_fingerprint)
 
 revision: str = "20261015_booking_attempt_events"
 down_revision: str = "20261014_ledger_detached_state"
@@ -103,11 +114,29 @@ def _btree(name, column, opclass, collation="", unique=False, primary=False):
             (opclass,), (collation,), None, None, None)
 
 
-def _check(name, column, values):
-    arr = ", ".join(f"'{v}'::character varying" for v in values)
+def _check(name, column, values, form="created"):
     # (name, type, key columns, deferrable, deferred, validated, no-inherit, local, deparse)
-    return (name, "c", (column,), False, False, True, False, True,
-            f"CHECK ((({column})::text = ANY ((ARRAY[{arr}])::text[])))")
+    if form == "created":       # as this revision (or create_all) creates it
+        arr = ", ".join(f"'{v}'::character varying" for v in values)
+        deparse = f"CHECK ((({column})::text = ANY ((ARRAY[{arr}])::text[])))"
+    elif form == "restored":    # the same constraint after pg_dump → restore (a fixpoint)
+        arr = ", ".join(f"('{v}'::character varying)::text" for v in values)
+        deparse = f"CHECK ((({column})::text = ANY (ARRAY[{arr}])))"
+    else:
+        raise ValueError(form)
+    return (name, "c", (column,), False, False, True, False, True, deparse)
+
+
+#: The only two measured PostgreSQL 16 deparses of each CHECK (SSRV-01). Finite by
+#: measurement: a restored table re-dumped and restored again reads the restored form.
+CHECK_FORMS = ("created", "restored")
+_STAGES = ("PRE_EXECUTE", "AUTHORITY", "FINALISE", "NOTIFICATION")
+_OUTCOMES = ("REFUSED", "RETRYABLE", "CONTENDED", "INTERNAL", "FAILED", "HELD")
+
+
+def _checks(outcome_form="created", stage_form="created"):
+    return [_check("ck_booking_attempt_events_outcome", "outcome", _OUTCOMES, outcome_form),
+            _check("ck_booking_attempt_events_stage", "stage", _STAGES, stage_form)]
 
 
 #: What `Base.metadata.create_all` makes (the model declares the columns, CHECKs, UNIQUE and
@@ -138,10 +167,7 @@ F_ORM = {
         (_UNIQUE, "u", ("event_uid",), False, False, True, True, True, "UNIQUE (event_uid)"),
         ("booking_attempt_events_pkey", "p", ("id",), False, False, True, True, True,
          "PRIMARY KEY (id)"),
-        _check("ck_booking_attempt_events_outcome", "outcome",
-               ("REFUSED", "RETRYABLE", "CONTENDED", "INTERNAL", "FAILED", "HELD")),
-        _check("ck_booking_attempt_events_stage", "stage",
-               ("PRE_EXECUTE", "AUTHORITY", "FINALISE", "NOTIFICATION")),
+        *_checks(),
     ],
     "referenced_by": [],
     "indexes": [
@@ -166,6 +192,18 @@ F_FUNCTION = [(_FUNCTION, "plpgsql", "trigger", 0, "f", False, "v", False, False
                "348ed4cacd362157761a7ef24ec208da")]
 
 
+def _with_check_forms(shape):
+    """`shape` with each CHECK independently in either measured form — the constraints part's
+    deparse fields are the ONLY thing that varies (the UNIQUE and PRIMARY KEY stay first)."""
+    return [{**shape, "constraints": shape["constraints"][:2] + _checks(o, st)}
+            for o in CHECK_FORMS for st in CHECK_FORMS]
+
+
+#: Every exact fingerprint each state may have; the creation form first.
+F_ORM_PERMITTED = _with_check_forms(F_ORM)
+F_CANONICAL_PERMITTED = _with_check_forms(F_CANONICAL)
+
+
 def _lock_and_read(bind):
     """Bounded lock, then the fingerprint read under it (None when the table is absent)."""
     bind.execute(sa.text("SET LOCAL lock_timeout = '10s'"))
@@ -186,36 +224,38 @@ def _refuse(why, problems):
         "(docs/operations/RECOVERY_MANIFEST.md §6). Differences: " + "; ".join(problems))
 
 
-def _classify(bind, table, fn) -> str:
-    """The single permitted branch for what exists, or a typed refusal. Reads only."""
+def _classify(bind, table, fn) -> tuple[str, dict]:
+    """The single permitted branch for what exists, or a typed refusal, with the EXACT
+    fingerprint the table must have once the branch is done. Reads only."""
     if table is None:
         if fn:
             _refuse(f"{_TABLE} is absent but a function {_FUNCTION} already exists",
                     differences({"function": []}, {"function": fn}))
-        return "CREATED"
-    vs_orm, vs_canonical = differences(F_ORM, table), differences(F_CANONICAL, table)
-    if not vs_orm:
+        return "CREATED", F_CANONICAL                  # created here: the creation form
+    orm, canonical = matching(F_ORM_PERMITTED, table), matching(F_CANONICAL_PERMITTED, table)
+    if orm is not None:
         if fn:
             _refuse(f"{_TABLE} has the create_all shape but a function {_FUNCTION} already "
                     "exists", differences({"function": []}, {"function": fn}))
-        branch = "ADOPTED_ORM_SHAPE"
-    elif not vs_canonical:
+        branch, after = "ADOPTED_ORM_SHAPE", {**orm, "triggers": F_CANONICAL["triggers"]}
+    elif canonical is not None:
         if fn != F_FUNCTION:
             _refuse(f"{_TABLE} has the canonical trigger but {_FUNCTION} is not the canonical "
                     "function", differences({"function": F_FUNCTION}, {"function": fn}))
-        branch = "VERIFIED_CANONICAL"
+        branch, after = "VERIFIED_CANONICAL", canonical
     else:
         _refuse(f"{_TABLE} exists and is not exactly a shape this revision may adopt",
-                vs_orm if len(vs_orm) <= len(vs_canonical) else vs_canonical)
+                closest_differences(F_ORM_PERMITTED + F_CANONICAL_PERMITTED, table))
     if _has_rows(bind):
         _refuse(f"{_TABLE} exists and holds rows; a pre-existing table is adopted only when "
                 "EMPTY (rows written without append-only enforcement cannot be certified)",
                 ["rows present"])
-    return branch
+    return branch, after
 
 
-def _verify_canonical(bind) -> None:
-    problems = differences(F_CANONICAL, table_fingerprint(bind, _TABLE)) + differences(
+def _verify_canonical(bind, expected) -> None:
+    """Exactly `expected` (the classified shape plus what was installed) and the function."""
+    problems = differences(expected, table_fingerprint(bind, _TABLE)) + differences(
         {"function": F_FUNCTION}, {"function": function_fingerprint(bind, _FUNCTION)})
     if problems:
         _refuse(f"{_TABLE} is not exactly canonical after installation", problems)
@@ -232,7 +272,7 @@ def upgrade() -> None:
         raise RuntimeError("convergence Phase 4 is PostgreSQL-only")
     require_certified_server(bind, revision)
     table, fn = _lock_and_read(bind)
-    branch = _classify(bind, table, fn)
+    branch, after = _classify(bind, table, fn)
     if branch == "CREATED":
         _create_table()
     if branch in ("CREATED", "ADOPTED_ORM_SHAPE"):
@@ -241,7 +281,7 @@ def upgrade() -> None:
         CREATE TRIGGER {_TRIGGER}
           BEFORE UPDATE OR DELETE ON {_TABLE}
           FOR EACH ROW EXECUTE FUNCTION {_FUNCTION}()""")
-    _verify_canonical(bind)
+    _verify_canonical(bind, after)
     print(f"{revision}: {branch}", flush=True)
 
 
@@ -279,16 +319,18 @@ def downgrade() -> None:
             f"booking_attempt_events holds {rows} evidence row(s); dropping them is audit-data "
             "loss and cannot be undone. Downgrade refused — export and hash the evidence, "
             "then follow the owner checkpoint in docs/operations/RECOVERY_MANIFEST.md §6.")
-    if not differences(F_CANONICAL, table) and fn == F_FUNCTION:
+    if matching(F_CANONICAL_PERMITTED, table) is not None and fn == F_FUNCTION:
         op.execute(f"DROP TRIGGER {_TRIGGER} ON {_TABLE}")
         op.execute(f"DROP FUNCTION {_FUNCTION}()")
-    elif differences(F_ORM, table) or fn:
-        # Only the two shapes this revision owns are removed; anything else is left for the
-        # owner, never erased (a `create_all` + `stamp` database carries F_ORM, empty).
+    elif matching(F_ORM_PERMITTED, table) is None or fn:
+        # Only the two shapes this revision owns are removed (either measured CHECK form);
+        # anything else is left for the owner, never erased (a `create_all` + `stamp`
+        # database carries F_ORM, empty).
         raise SchemaShapeRefused(
             f"{revision}: downgrade refused — {_TABLE} is not exactly a shape this revision "
             "owns, so it is not dropped. Differences from the canonical shape: "
-            + "; ".join(differences(F_CANONICAL, table)
+            + "; ".join((closest_differences(F_CANONICAL_PERMITTED, table) if table else
+                         ["object absent"])
                         + differences({"function": F_FUNCTION}, {"function": fn})))
     for name in reversed(_INDEXES):
         op.execute(f"DROP INDEX {name}")
