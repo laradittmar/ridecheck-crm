@@ -754,9 +754,17 @@ class P4R1_SchemaOrder(_Schema):
                 "create_all is not expected to install the trigger")
         from app.services.schema_preflight import (DeclaredSchemaMissing,
                                                    require_declared_booking_schema)
-        for url, n in ((PARENT_URL, 2), (APPFIRST_URL, 2)):
+        # STRICT-SCHEMA-ADOPTION adaptation. OLD: exactly 2 problems (the column + the
+        # trigger, by name). NEW: the preflight also requires the exact Alembic head and the
+        # canonical fingerprint, so each schema reports its three problems — the version, the
+        # evidence table (absent / not canonical) and the absent column — asserted by content.
+        for url in (PARENT_URL, APPFIRST_URL):
             with self.subTest(db=url.rsplit("/", 1)[-1]):
-                self.assertEqual(len(self.startup_missing(url)), n, self.startup_missing(url))
+                missing = self.startup_missing(url)
+                self.assertEqual(len(missing), 3, missing)
+                self.assertIn(f"Alembic version is ['{P4_PARENT}']", missing[0])
+                self.assertIn("booking_attempt_events is not the canonical shape", missing[1])
+                self.assertIn("notification_sent_at", missing[2])
                 with self.assertRaises(DeclaredSchemaMissing):
                     require_declared_booking_schema(_eng(url))
 

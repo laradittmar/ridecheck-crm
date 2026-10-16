@@ -61,7 +61,7 @@ Contents are never recorded here or in git.
 | Commit `ddcd03b` (2026-05-10), an ancestor of `origin/main`, contains a literal Meta token and a Gmail app password already published to GitHub | **HIGH** | rotate both credentials; history rewrite is not planned |
 | n8n workflow JSON in `N8N workflows/` is a stale March export (96/112 nodes) versus the live workflow (164 nodes, updated 2026-08-14) | LOW | the n8n database is the operational source of truth; treat repo copies as historical |
 
-## 6. Booking-convergence schema: deploy order and rollback (Phase 4 / 4-R1)
+## 6. Booking-convergence schema: deploy order and rollback (Phase 4 / 4-R1 / strict adoption)
 
 Applies to any deployment that carries migrations `20261015_booking_attempt_events` and
 `20261016_notification_sent_at` (the booking-attempt evidence table and the declared
@@ -77,16 +77,37 @@ is a separate, owner-authorised milestone.
    image with the production `DATABASE_URL`; the running application is not replaced yet).
 4. Verify: `SELECT version_num FROM alembic_version` → `20261016_notification_sent_at`, and
    `SELECT count(*) FROM pg_trigger WHERE tgname = 'trg_booking_attempt_events_append_only'` → 1.
-   The upgrade itself verifies every enforcement object and fails the whole migration (nothing
-   recorded) if one is missing.
-5. Start the replacement application. Its start-up check refuses to start on a schema that
-   lacks the declared column or the append-only trigger (`SCHEMA_PREFLIGHT_FAILED` in the log,
-   `DeclaredSchemaMissing`); the fix is step 3, never a hand-made column.
+   The upgrade itself compares every object it owns with its exact frozen catalogue
+   fingerprint, before any DDL and again after installing, and fails the whole migration
+   (nothing recorded, nothing changed) on any difference.
+5. **Record the branch** each revision printed in the upgrade output, per environment, in the
+   deployment record below (6.3):
+   `20261015_booking_attempt_events: CREATED | ADOPTED_ORM_SHAPE | VERIFIED_CANONICAL` and
+   `20261016_notification_sent_at: ADDED | ADOPTED_LEGACY_COLUMN | VERIFIED_CANONICAL`.
+   `crm` and `crm_test` (no evidence table; the old start-up's column, measured exactly the
+   legacy shape on 2026-10-16) are expected to print `CREATED` and `ADOPTED_LEGACY_COLUMN`.
+6. Start the replacement application. Its start-up check refuses to start unless the database
+   is at exactly the code's Alembic head and both objects are exactly canonical
+   (`SCHEMA_PREFLIGHT_FAILED` in the log, `DeclaredSchemaMissing`); the fix is step 3, never a
+   hand-made column, trigger or stamp.
 
-If an image was started first by mistake, its `create_all` may have created
-`booking_attempt_events` without its trigger. `alembic upgrade head` reconciles that table (it
-compares every column, adds what is missing, installs the trigger and verifies) — do not drop
-or stamp it by hand.
+**If an image was started first by mistake**, its `create_all` created `booking_attempt_events`
+in the exact application shape without the append-only trigger, and the start-up check then
+refused to serve, so the table is empty. Rerun step 3: the upgrade adopts that exact empty table
+(`ADOPTED_ORM_SHAPE`) and the start then succeeds. Do not drop, alter or stamp it by hand.
+
+**If the upgrade refuses** (`SchemaShapeRefused`: an object exists in any other shape, or the
+evidence table already holds rows): **STOP.** The refusal changed nothing and names every
+differing property. Capture the full message and a schema-only dump with its hash for the
+owner:
+
+```sh
+pg_dump --schema-only -t booking_attempt_events -t thread_revisions "$URL" > refused_schema.sql
+sha256sum refused_schema.sql > refused_schema.sha256
+```
+
+There is no automatic or scripted repair. Any manual drop or edit is an explicit **owner
+checkpoint**, after which step 3 is rerun and must succeed on its own checks.
 
 ### 6.2 Rollback — evidence-bearing downgrade is refused by default
 
@@ -110,9 +131,10 @@ or stamp it by hand.
 
    Store the files and the hash file with the step-2 snapshot (`/opt/ridecheck-backups/`).
 4. If **both counts are zero**, `alembic downgrade 20261014_ledger_detached_state` is exact: it
-   drops the table, its trigger and function, and the column only if
-   `20261016_notification_sent_at` created it (a column that an older application start-up
-   created is left in place, as it was found).
+   drops the table, its trigger and function only when they are exactly the canonical shape,
+   and the column only if `20261016_notification_sent_at` created it (a column that an older
+   application start-up created is left in place, as it was found). Any other shape refuses
+   the downgrade: an object the migration cannot recognise is never erased.
 5. **STOP condition.** If `booking_attempt_events` holds any row, or any
    `notification_sent_at` is non-null, the downgrade refuses (`audit-data loss` /
    `notification-evidence loss`) and records nothing. **Stop here.** Do not truncate, delete
@@ -124,6 +146,13 @@ or stamp it by hand.
    `UPDATE thread_revisions SET notification_sent_at = NULL`, then repeat step 4. Nulling
    `notification_sent_at` removes the operator e-mail's only dedup: a redelivered booking turn
    may e-mail the team again.
+
+### 6.3 Deployment record — branch taken per environment
+
+| environment | date | `20261015` branch | `20261016` branch | recorded by |
+|---|---|---|---|---|
+| `crm_test` | not applied | — | — | — |
+| `crm` | not applied | — | — | — |
 
 The Phase 2 `DETACHED` ledger state has no data-bearing rollback at all (`P2R-01`); that
 posture is a separate owner decision and is not changed by this section.
