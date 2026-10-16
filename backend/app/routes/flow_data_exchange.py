@@ -24,6 +24,7 @@ from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
 from ..db import get_db
+from ..services.booking_attempt_events import dx_attempt_ref
 from ..services.booking_flow_service import (
     FLOW_VERSION,
     BookingFlowService,
@@ -114,7 +115,13 @@ async def booking_flow_data_exchange(
                 result = svc.handle_prepare_summary(booking_token, data)
 
             elif trigger == "confirm_booking":
-                result = svc.handle_confirm_booking(booking_token, data)
+                # Phase 4-R1 (P4RV-02): the delivery's replay identity, from the envelope as
+                # received — a digest only; the IV and ciphertext themselves go nowhere.
+                result = svc.handle_confirm_booking(
+                    booking_token, data,
+                    attempt_ref=dx_attempt_ref(
+                        body.get("initial_vector") if isinstance(body, dict) else None,
+                        body.get("encrypted_flow_data") if isinstance(body, dict) else None))
 
             else:
                 logger.warning("BOOKING_FLOW unknown trigger=%r", trigger)

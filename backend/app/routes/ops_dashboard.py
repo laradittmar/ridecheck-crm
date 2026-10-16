@@ -1078,8 +1078,8 @@ def booking_attention(db: Session, *, now: Optional[datetime] = None,
 
     Convergence Phase 4 (SB2B-RV-04) — the OPERATOR notification (the team's booking e-mail),
     kept distinct from the customer acknowledgement above. Every customer booking row also
-    states `notification_state`: SENT (`thread_revisions.notification_sent_at` — a column the
-    application adds at start-up, read here only where it exists), FAILED or
+    states `notification_state`: SENT (`thread_revisions.notification_sent_at` — declared schema
+    since Phase 4-R1, migration 20261016_notification_sent_at), FAILED or
     HELD (a `booking_attempt_events` NOTIFICATION row: send failed / not configured), or
     PENDING (no e-mail recorded — a Data Exchange booking, or one whose sender died); with
     `notification_attempts`, `notification_last_reason` and `notification_next_action`. A
@@ -1185,7 +1185,6 @@ def _notification_truth(db: Session, *, now: datetime, settled: datetime, rows: 
     """SB2B-RV-04: the operator e-mail state of every customer booking in the lookback, read
     from durable fields only (no write). Adds an OPERATOR_NOTIFICATION_* reason, and the row,
     to `rows` when a settled booking's e-mail is not SENT. Returns {ledger id: fields}."""
-    from sqlalchemy import bindparam, inspect as _inspect, text as _text
     from ..models import BookingAttemptEvent as E
     from ..models import BookingCommandRecord as R
     booked = db.execute(
@@ -1200,16 +1199,13 @@ def _notification_truth(db: Session, *, now: datetime, settled: datetime, rows: 
     ).all()
     if not booked:
         return {}
-    sent: set = set()
-    try:
-        cols = {c["name"] for c in _inspect(db.get_bind()).get_columns("thread_revisions")}
-    except Exception:
-        cols = set()
-    if "notification_sent_at" in cols:
-        sent = set(db.execute(
-            _text("SELECT id FROM thread_revisions WHERE notification_sent_at IS NOT NULL "
-                  "AND id IN :ids").bindparams(bindparam("ids", expanding=True)),
-            {"ids": [b.thread_revision_id for b in booked]}).scalars().all())
+    # Phase 4-R1 (P4RV-04): `notification_sent_at` is declared schema (model + migration
+    # 20261016_notification_sent_at), read like any other column. The old "absent column →
+    # nothing SENT" fallback made every booking read "no enviado" on a migrated database.
+    from ..models import ThreadRevision as TR
+    sent = set(db.execute(select(TR.id).where(
+        TR.notification_sent_at.is_not(None),
+        TR.id.in_([b.thread_revision_id for b in booked]))).scalars().all())
     evidence: dict[int, list] = {}
     for ev in db.execute(select(E.hist_thread_revision_id, E.outcome, E.reason, E.occurred_at)
                          .where(E.stage == "NOTIFICATION",

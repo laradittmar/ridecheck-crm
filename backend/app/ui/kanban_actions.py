@@ -480,73 +480,169 @@ def ui_undo_delete(
     })
 
 
+def _pending_restore(item: dict[str, Any]) -> None:
+    """Phase 4-R1 (P4RV-01): a REFUSED delete did not happen, so its pending token is put
+    back exactly as it was (same token, same already-passed deadline): a retry of the same
+    commit receives the same typed refusal, and an undo still finds it."""
+    with _PENDING_LOCK:
+        _PENDING_DELETES[item["token"]] = item
+
+
 def ui_commit_delete(
     token: str = Form(...),
     db: Session = Depends(get_db),
 ):
+    """Commit a pending Kanban delete — revision-level or lead-level.
+
+    Convergence Phase 4-R1 (P4RV-01, owner decision: deletion is not cancellation). A
+    delete NEVER cancels a booking. The complete target set is locked and checked BEFORE the
+    first write; if any target still OCCUPIES the agenda, or is still the accepted revision
+    of a customer offer, the WHOLE delete is refused with a typed 409 and nothing at all is
+    written — no cancel, no delete, no ledger or attempt row, no token consumed. The booking
+    must first be cancelled through the canonical booking action (the CRM revision form,
+    which goes through `BookingAuthority`); a later explicit delete of what is then a
+    non-occupying, unreferenced revision follows the unchanged deletion policy below. A
+    database refusal at commit (a protected relationship) rolls the whole transaction back
+    and is answered as the same typed 409, never a 500.
+    """
+    from sqlalchemy.exc import IntegrityError, OperationalError
+
     item, state = _pending_take_if_expired(token)
     if not item:
         # Idempotent/no-crash path: token may already be undone/committed/invalid.
         return JSONResponse({"ok": True, "committed": False, "state": state})
 
     kind = item.get("type")
-    if kind == "lead":
-        lead_id = int(item.get("lead_id"))
-        lead = db.get(Lead, lead_id)
-        if lead:
-            revs = db.execute(select(Revision).where(Revision.lead_id == lead_id)
-                              .order_by(Revision.id)).scalars().all()
-            refused = _cancel_occupying_before_delete(db, revs)
-            if refused is not None:
-                return refused
-            db.query(Revision).filter(Revision.lead_id == lead_id).delete(synchronize_session=False)
-            db.delete(db.get(Lead, lead_id))
-            db.commit()
-    elif kind == "revision":
-        rev_id = int(item.get("revision_id"))
-        rev = db.get(Revision, rev_id)
-        if rev:
-            refused = _cancel_occupying_before_delete(db, [rev])
-            if refused is not None:
-                return refused
-            db.delete(db.get(Revision, rev_id))
-            db.commit()
-    else:
+    if kind not in ("lead", "revision"):
         return JSONResponse({"ok": True, "committed": False, "state": "unsupported_type"})
+    try:
+        if kind == "lead":
+            lead_id = int(item.get("lead_id"))
+            revs = _lock_delete_targets(db, lead_id=lead_id)
+            lead = _lock_lead(db, lead_id)
+            if lead is not None:
+                # Re-read under the lead lock: a revision committed for this lead between the
+                # first read and the lock is part of the target set too.
+                ids = [r.id for r in revs]
+                again = [r.id for r in _lock_delete_targets(db, lead_id=lead_id)]
+                if again != ids:
+                    db.rollback()
+                    _pending_restore(item)
+                    return _delete_refusal("DELETE_TARGETS_CHANGED", lead_id=lead_id,
+                                           revision_ids=again, status=409)
+                refused = _refuse_protected_delete(db, revs, lead_id=lead_id)
+                if refused is not None:
+                    db.rollback()
+                    _pending_restore(item)
+                    return refused
+                db.query(Revision).filter(Revision.lead_id == lead_id).delete(
+                    synchronize_session=False)
+                db.delete(lead)
+                db.commit()
+            else:
+                db.rollback()
+        else:
+            rev_id = int(item.get("revision_id"))
+            revs = _lock_delete_targets(db, revision_id=rev_id)
+            if revs:
+                refused = _refuse_protected_delete(db, revs, lead_id=revs[0].lead_id)
+                if refused is not None:
+                    db.rollback()
+                    _pending_restore(item)
+                    return refused
+                db.delete(revs[0])
+                db.commit()
+            else:
+                db.rollback()
+    except IntegrityError:
+        # A relationship the preflight does not name refused the delete. The transaction
+        # held every write, so rolling it back leaves the target set exactly as it was.
+        db.rollback()
+        _pending_restore(item)
+        logger.warning("KANBAN_DELETE_REFUSED_BY_SCHEMA kind=%s lead_id=%s", kind,
+                       item.get("lead_id"))
+        return _delete_refusal("REVISION_DELETE_PROTECTED", lead_id=item.get("lead_id"),
+                               revision_ids=[item.get("revision_id")] if kind == "revision"
+                               else None, status=409)
+    except OperationalError as exc:
+        # Lock contention or a deadlock victim: nothing was written; the same commit can be
+        # retried once the other writer finishes. Any other operational error is not ours to
+        # type: it propagates.
+        if getattr(getattr(exc, "orig", None), "sqlstate", None) not in _CONTENTION_SQLSTATES:
+            db.rollback()
+            _pending_restore(item)
+            raise
+        db.rollback()
+        _pending_restore(item)
+        return _delete_refusal("DELETE_CONTENDED", lead_id=item.get("lead_id"),
+                               revision_ids=None, status=503)
 
     return JSONResponse({"ok": True, "committed": True})
 
 
-def _cancel_occupying_before_delete(db: Session, revisions) -> JSONResponse | None:
-    """Convergence Phase 4: deleting a revision that OCCUPIES the agenda is a cancellation,
-    and a cancellation belongs to the booking authority. Each occupying revision is first
-    CANCELLED through `BookingAuthority` (typed CANCEL command, durable form key derived from
-    the revision and the booking version it was deleted at — so a retried delete replays);
-    only then is the row removed, as before. A refusal deletes nothing and answers a typed
-    409 with the authority's code. Non-occupying rows are deleted as before."""
+#: lock_not_available, deadlock_detected, serialization_failure.
+_CONTENTION_SQLSTATES = frozenset({"55P03", "40P01", "40001"})
+
+
+def _lock_delete_targets(db: Session, *, lead_id: int | None = None,
+                         revision_id: int | None = None) -> list:
+    """The delete's target revisions, locked FOR UPDATE in id order (PostgreSQL; a no-op
+    clause elsewhere) — revision rows BEFORE the lead row, the booking authority's own order
+    (its K5/K6 revision locks precede K8, the lead), so a delete and a booking never wait on
+    each other in opposite orders."""
+    q = select(Revision).order_by(Revision.id).with_for_update()
+    q = q.where(Revision.lead_id == lead_id) if revision_id is None else \
+        q.where(Revision.id == revision_id)
+    return list(db.execute(q).scalars().all())
+
+
+def _lock_lead(db: Session, lead_id: int):
+    return db.execute(select(Lead).where(Lead.id == lead_id).with_for_update()
+                      ).scalars().first()
+
+
+def _refuse_protected_delete(db: Session, revisions, *, lead_id) -> JSONResponse | None:
+    """The preflight. Reads only. A revision that still OCCUPIES the agenda is a live
+    booking; a revision that is still the accepted revision of a customer offer is booking
+    history the offer must keep (its pointer is never cleared to make a delete possible).
+    Either one refuses the whole delete."""
+    from ..models import WhatsAppBookingOffer as O
     from ..services import booking_representation as br
-    from ..services.booking_attempt_events import outcome_for, record_attempt_event
-    for rev in revisions:
-        if not br.is_occupying(rev.turno_fecha, rev.turno_hora, rev.estado_revision):
-            continue
-        command = command_for_edit(
-            rev, source=BookingSource.CRM, new_date=rev.turno_fecha, new_time=rev.turno_hora,
-            new_status="CANCELADO", new_profesional_id=None,
-            expected_version=int(rev.booking_version), actor="crm-delete")
-        result = BookingAuthority(db).execute(command)
-        if not result.ok:
-            record_attempt_event(db, source="CRM", stage="AUTHORITY",
-                                 outcome=outcome_for(result.outcome),
-                                 reason=result.reason or result.outcome.value,
-                                 command_key=command.idempotency_key,
-                                 attempt_ref=command.idempotency_key, revision_id=rev.id)
-            return JSONResponse(status_code=_CRM_REFUSAL_STATUS.get(result.outcome.value, 409),
-                                content={"ok": False, "committed": False,
-                                         "state": "booking_refused",
-                                         "code": result.outcome.value,
-                                         "reason": result.reason,
-                                         "message": result.message})
+    occupying = [r.id for r in revisions
+                 if br.is_occupying(r.turno_fecha, r.turno_hora, r.estado_revision)]
+    if occupying:
+        return _delete_refusal("BOOKING_MUST_BE_CANCELLED_FIRST", lead_id=lead_id,
+                               revision_ids=occupying, status=409)
+    ids = [r.id for r in revisions]
+    referenced = sorted(set(db.execute(select(O.accepted_revision_id).where(
+        O.accepted_revision_id.in_(ids))).scalars().all())) if ids else []
+    if referenced:
+        return _delete_refusal("REVISION_DELETE_PROTECTED", lead_id=lead_id,
+                               revision_ids=referenced, status=409)
     return None
+
+
+_DELETE_REFUSAL_MESSAGES = {
+    "BOOKING_MUST_BE_CANCELLED_FIRST": (
+        "No se borró nada: hay un turno vigente. Borrar no cancela un turno — primero "
+        "cancelalo desde la ficha de la revisión (estado CANCELADO) y después podés borrarla."),
+    "REVISION_DELETE_PROTECTED": (
+        "No se borró nada: la revisión es el historial de una reserva hecha por el cliente "
+        "y debe conservarse."),
+    "DELETE_TARGETS_CHANGED": (
+        "No se borró nada: la ficha cambió mientras se borraba. Revisala y volvé a intentar."),
+    "DELETE_CONTENDED": (
+        "No se borró nada: la ficha se está modificando en este momento. Volvé a intentar."),
+}
+
+
+def _delete_refusal(reason: str, *, lead_id, revision_ids, status: int) -> JSONResponse:
+    return JSONResponse(status_code=status, content={
+        "ok": False, "committed": False, "state": "delete_refused",
+        "code": "DELETE_REFUSED", "reason": reason,
+        "message": _DELETE_REFUSAL_MESSAGES[reason],
+        "lead_id": lead_id, "revision_ids": revision_ids,
+    })
 
 
 def _render_booking_refusal(db: Session, lead_id: int, result, requested_day):

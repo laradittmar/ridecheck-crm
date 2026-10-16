@@ -15948,11 +15948,15 @@ Respondé SOLO con JSON válido:
                                         reason="NOTIFICATION_NOT_CONFIGURED")
             return
 
+        # Phase 4-R1 (P4RV-04): the column is declared schema now, and the application will
+        # not start without it. The read still runs under a SAVEPOINT, so a database error
+        # here can never abort the session the price read and the write-back below share.
         try:
-            row = self.db.execute(
-                sql_text("SELECT notification_sent_at FROM thread_revisions WHERE id = :id"),
-                {"id": thread_rev_id},
-            ).first()
+            with self.db.begin_nested():
+                row = self.db.execute(
+                    sql_text("SELECT notification_sent_at FROM thread_revisions WHERE id = :id"),
+                    {"id": thread_rev_id},
+                ).first()
             if row and row.notification_sent_at is not None:
                 logger.info("M18 booking notification already sent thread_rev=%s", thread_rev_id)
                 return
@@ -16005,10 +16009,11 @@ Respondé SOLO con JSON válido:
 
         if ok:
             try:
-                self.db.execute(
-                    sql_text("UPDATE thread_revisions SET notification_sent_at = NOW() WHERE id = :id"),
-                    {"id": thread_rev_id},
-                )
+                with self.db.begin_nested():      # 4-R1: a failure cannot poison the session
+                    self.db.execute(
+                        sql_text("UPDATE thread_revisions SET notification_sent_at = NOW() WHERE id = :id"),
+                        {"id": thread_rev_id},
+                    )
                 self.db.commit()
                 logger.info("M18 notification sent thread_rev=%s crm_rev=%s", thread_rev_id, crm_rev_id)
             except Exception as exc:

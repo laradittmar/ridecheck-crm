@@ -85,6 +85,24 @@ class P4_Events(unittest.TestCase):
             self.assertNotIn(secret, blob)
         self.assertEqual((len(ev.command_key_hash), len(ev.attempt_ref_hash)), (16, 16))
         self.assertEqual(ev.hist_thread_id, self.tid)
+        # Phase 4-R1 strengthening (R1-E, audit §15.3 m3). OLD: only "not contained" and
+        # "16 long" — both hold for `str(value)[:16]`, because every secret above is longer
+        # than 16 characters. NEW (added, nothing removed): the stored values EQUAL an
+        # independently computed SHA-256 prefix, and a short secret that would fit whole in
+        # the column is absent from the row.
+        import hashlib
+        self.assertEqual(ev.command_key_hash, hashlib.sha256(key.encode()).hexdigest()[:16])
+        self.assertEqual(ev.attempt_ref_hash, hashlib.sha256(ref.encode()).hexdigest()[:16])
+        short = "pw-7Qz"
+        self.assertTrue(bae.record_attempt_event(
+            self.db, source="CRM", stage="AUTHORITY", outcome="REFUSED", reason="R",
+            command_key=short, attempt_ref=short + "!", thread_id=self.tid))
+        ev2 = _events(self.db, source="CRM")[0]
+        blob2 = repr({c.name: getattr(ev2, c.name) for c in ev2.__table__.columns})
+        self.assertNotIn(short, blob2, "a short secret was stored raw")
+        self.assertEqual(ev2.command_key_hash, hashlib.sha256(short.encode()).hexdigest()[:16])
+        self.assertEqual(ev2.attempt_ref_hash,
+                         hashlib.sha256((short + "!").encode()).hexdigest()[:16])
 
     def test_p4u_03_one_logical_attempt_one_row_distinct_attempts_distinct_rows(self):
         e = dict(source="CRM", stage="AUTHORITY", outcome="REFUSED", reason="SLOT_CONFLICT",
@@ -237,36 +255,75 @@ class P4_OperatorPaths(unittest.TestCase):
         self.assertEqual([(e.stage, e.outcome) for e in _events(self.db, source="CRM")],
                          [("AUTHORITY", "REFUSED")])
 
-    def test_p4u_17_deleting_an_occupying_revision_cancels_it_through_the_authority(self):
-        from app.ui import kanban_actions as ka
-        item = ka._pending_store({"type": "revision", "revision_id": self.rev.id})
-        item["deadline"] = ka._utcnow() - timedelta(seconds=1)
-        calls = []
-        real = BookingAuthority.execute
+    # Convergence Phase 4-R1 adaptation (P4RV-01; owner decision "deletion is not
+    # cancellation"). OLD p4u_17 — `deleting_an_occupying_revision_cancels_it_through_the_
+    # authority`: a delete of an occupying revision answered 200 after a CANCEL command, and
+    # the row was gone. OLD p4u_18 — `a_refused_cancellation_deletes_nothing`: with the
+    # authority's CANCEL refused (503) the lead survived. NEW: a delete never cancels. Both
+    # shapes now refuse the WHOLE delete with a typed 409 before any write, the authority is
+    # never called, and the token survives for an identical retry; only after a canonical
+    # cancellation may an explicit delete proceed. Proven on a real customer booking (an
+    # accepted offer referencing the revision) on PostgreSQL in test_convergence_p4_r1_pg.py.
 
-        def spy(auth, cmd, **k):
-            calls.append(cmd.operation)
-            return real(auth, cmd, **k)
-        with mock.patch.object(BookingAuthority, "execute", spy):
-            resp = ka.ui_commit_delete(token=item["token"], db=self.db)
-        self.assertEqual(resp.status_code, 200)
-        self.assertEqual(calls, [BookingOperation.CANCEL])
+    def _pending(self, **payload):
+        from app.ui import kanban_actions as ka
+        item = ka._pending_store(payload)
+        item["deadline"] = ka._utcnow() - timedelta(seconds=1)
+        return item["token"]
+
+    def _offers_table(self):
+        from app.models import WhatsAppBookingOffer
+        WhatsAppBookingOffer.__table__.create(self.db.get_bind(), checkfirst=True)
+
+    def test_p4u_17_deleting_an_occupying_revision_is_refused_never_cancelled(self):
+        import json as _json
+        from app.ui import kanban_actions as ka
+        self._offers_table()
+        token = self._pending(type="revision", lead_id=self.lead.id, revision_id=self.rev.id)
+        before = self.snapshot()
+        with mock.patch.object(BookingAuthority, "execute",
+                               side_effect=AssertionError("a delete must not cancel")):
+            first = ka.ui_commit_delete(token=token, db=self.db)
+            again = ka.ui_commit_delete(token=token, db=self.db)
+        for resp in (first, again):
+            body = _json.loads(resp.body)
+            self.assertEqual((resp.status_code, body["code"], body["reason"], body["committed"]),
+                             (409, "DELETE_REFUSED", "BOOKING_MUST_BE_CANCELLED_FIRST", False))
+            self.assertEqual(body["revision_ids"], [self.rev.id])
+        self.assertEqual(self.snapshot(), before, "a refused delete changed the booking")
+        self.assertEqual(_events(self.db, source="CRM"), [], "a refused delete wrote evidence")
+        # the canonical cancellation first, then an explicit delete follows the old policy
+        from app.services.booking_authority import command_for_edit
+        rev = self.db.get(Revision, self.rev.id)
+        res = BookingAuthority(self.db).execute(command_for_edit(
+            rev, source=BookingSource.CRM, new_date=rev.turno_fecha, new_time=rev.turno_hora,
+            new_status="CANCELADO", new_profesional_id=None,
+            expected_version=int(rev.booking_version), actor="test-cancel"))
+        self.assertEqual(res.outcome, BookingOutcome.COMMITTED, res.reason)
+        done = ka.ui_commit_delete(token=token, db=self.db)
+        self.assertEqual(done.status_code, 200)
+        self.assertTrue(_json.loads(done.body)["committed"])
         self.db.expire_all()
         self.assertIsNone(self.db.get(Revision, self.rev.id))
-        self.assertIn("CANCEL", [r.operation for r in self.db.query(BookingCommandRecord)])
 
-    def test_p4u_18_a_refused_cancellation_deletes_nothing(self):
-        from app.services.booking_authority import refuse
+    def test_p4u_18_a_lead_delete_containing_a_booking_changes_nothing(self):
+        import json as _json
         from app.ui import kanban_actions as ka
-        item = ka._pending_store({"type": "lead", "lead_id": self.lead.id})
-        item["deadline"] = ka._utcnow() - timedelta(seconds=1)
-        with mock.patch.object(BookingAuthority, "execute", lambda *a, **k: refuse(
-                BookingOutcome.RETRYABLE_FAILURE, "THREAD_STATE_CONTENDED")):
-            resp = ka.ui_commit_delete(token=item["token"], db=self.db)
-        self.assertEqual(resp.status_code, 503)
-        self.db.expire_all()
-        self.assertIsNotNone(self.db.get(Lead, self.lead.id))
-        self.assertIsNotNone(self.db.get(Revision, self.rev.id))
+        self._offers_table()
+        loose = Revision(lead_id=self.lead.id)              # deletable on its own
+        self.db.add(loose); self.db.commit()
+        token = self._pending(type="lead", lead_id=self.lead.id)
+        before = (self.snapshot(), self.db.query(Revision).count(), self.db.query(Lead).count())
+        with mock.patch.object(BookingAuthority, "execute",
+                               side_effect=AssertionError("a delete must not cancel")):
+            resp = ka.ui_commit_delete(token=token, db=self.db)
+        body = _json.loads(resp.body)
+        self.assertEqual((resp.status_code, body["reason"]),
+                         (409, "BOOKING_MUST_BE_CANCELLED_FIRST"))
+        self.assertEqual(body["revision_ids"], [self.rev.id])
+        self.assertEqual((self.snapshot(), self.db.query(Revision).count(),
+                          self.db.query(Lead).count()), before, "partial lead delete")
+        self.assertIsNotNone(self.db.get(Revision, loose.id))
 
     def _form(self, **over):
         self.db.expire_all()

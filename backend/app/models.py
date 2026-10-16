@@ -679,6 +679,13 @@ class ThreadRevision(Base):
     appointment_approval_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, unique=True)
     appointment_approval_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     appointment_approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    #: M18: when the operator booking e-mail for this booking was delivered — its only dedup
+    #: and the SENT leg of the operator notification surface. Convergence Phase 4-R1
+    #: (P4RV-04): DECLARED schema, owned by this model and migration
+    #: `20261016_notification_sent_at`; it used to exist only because an application
+    #: start-up hook ran `ALTER TABLE … ADD COLUMN IF NOT EXISTS`.
+    notification_sent_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

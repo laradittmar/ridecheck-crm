@@ -744,15 +744,22 @@ class BookingFlowService:
             ),
         }
 
-    def handle_confirm_booking(self, booking_token: str, data: dict) -> dict:
+    def handle_confirm_booking(self, booking_token: str, data: dict, *,
+                               attempt_ref: Optional[str] = None) -> dict:
         """confirm_booking. See `_confirm_booking`; a refusal branch that finds the submission
-        booked on its ledger re-read answers that booking's SUCCESS instead."""
+        booked on its ledger re-read answers that booking's SUCCESS instead.
+
+        `attempt_ref` (Phase 4-R1, P4RV-02) is the delivery's replay identity, derived by the
+        route from the request envelope (`booking_attempt_events.dx_attempt_ref`): a transport
+        retry of one delivery is ONE logical attempt, so it leaves one event and moves the
+        refusal counters once. Without one, the request is its own attempt."""
         try:
-            return self._confirm_booking(booking_token, data)
+            return self._confirm_booking(booking_token, data, attempt_ref=attempt_ref)
         except _LedgerReplay as replay:
             return replay.response
 
-    def _confirm_booking(self, booking_token: str, data: dict) -> dict:
+    def _confirm_booking(self, booking_token: str, data: dict, *,
+                         attempt_ref: Optional[str] = None) -> dict:
         """confirm_booking — convergence Phase 3: THE BOOKING AUTHORITY BOOKS, nothing here.
 
         Track A's in-session writer that stood here (bounded entry → admission → one-argument
@@ -787,10 +794,12 @@ class BookingFlowService:
         if not token.strip():
             raise BookingTokenError("token missing")
         key = flow_idempotency_key(token)
-        # Convergence Phase 4: a Data Exchange request carries no replay identity of its own,
-        # so each request is a distinct attempt for the evidence it leaves (P2R-10).
+        # Convergence Phase 4 / 4-R1: the attempt is the DELIVERY — the envelope digest the
+        # route derived (a transport retry is the same attempt); a caller with no envelope
+        # gets a fresh reference, i.e. a distinct attempt (P2R-10, P4RV-02).
         from .booking_attempt_events import fresh_attempt_ref
-        attempt = fresh_attempt_ref()
+        attempt = (attempt_ref if isinstance(attempt_ref, str) and attempt_ref.strip()
+                   else fresh_attempt_ref())
 
         # ── 1. the ledger speaks first ───────────────────────────────────────────
         hit = self._ledger_hit(key)

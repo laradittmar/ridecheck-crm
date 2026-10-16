@@ -11,6 +11,11 @@
 #
 # Exits non-zero — and prints WHICH variable is missing, never its value — so the deploy
 # command after the && never runs.
+#
+# Booking-convergence schema (Phase 4 / 4-R1): `alembic upgrade head` runs AFTER this check
+# and BEFORE the replacement application container starts; the application refuses to start
+# without it. Deploy order, evidence export/hash and the refused-by-default rollback:
+# docs/operations/RECOVERY_MANIFEST.md §6.
 set -euo pipefail
 
 ENV_FILE="${1:-/opt/ridecheck-crm/.env}"

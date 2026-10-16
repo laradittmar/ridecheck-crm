@@ -17,11 +17,12 @@ Rules (each one is tested):
 * **Fail safe.** A failure is logged as `BOOKING_ATTEMPT_EVENT_NOT_RECORDED` and swallowed:
   the outcome was decided already and evidence must never change or retry it.
 * **Idempotency.** `event_uid` = SHA-256 of (source, stage, command key, attempt reference,
-  reason), UNIQUE, inserted with ON CONFLICT DO NOTHING. A HANDLER REPLAY of one logical
-  attempt — the same inbound WAMID redelivered to CE, the same operator idempotency key sent
-  again — derives the same uid and writes nothing more. DISTINCT attempts stay distinct: a
-  new inbound message, a new operator key, or a new Data Exchange request (which carries no
-  replay identity of its own, so each request gets a fresh reference) derive new uids.
+  reason), UNIQUE, inserted with ON CONFLICT DO NOTHING … RETURNING, so PostgreSQL itself
+  reports whether this call admitted the row. A REPLAY of one logical attempt — the same
+  inbound WAMID redelivered to CE, the same operator idempotency key sent again, the same
+  Data Exchange envelope re-sent by the transport (`dx_attempt_ref`) — derives the same uid
+  and writes nothing more. DISTINCT attempts stay distinct: a new inbound message, a new
+  operator key, a new customer submission (a fresh IV) derive new uids.
 * **Privacy.** Keys and attempt references are stored only as 16-hex SHA-256 prefixes; the
   reason is a typed code truncated to 64 characters; `hist_*` ids are historical scalars.
   Never a raw Flow token, raw command key, phone number, customer text, secret or payload.
@@ -48,6 +49,25 @@ def short_hash(value: Optional[str]) -> Optional[str]:
     if value is None or value == "":
         return None
     return hashlib.sha256(str(value).encode()).hexdigest()[:16]
+
+
+def dx_attempt_ref(initial_vector, encrypted_flow_data) -> Optional[str]:
+    """Phase 4-R1 (P4RV-02): the replay identity of one Data Exchange delivery, derived from
+    the request envelope BEFORE decryption: SHA-256 over the base64 `initial_vector` and
+    `encrypted_flow_data` exactly as received. A transport retry re-sends the same bytes and
+    derives the same reference; a new customer submission is encrypted under a fresh IV and
+    derives a new one. Only this digest leaves the route (and only its 16-hex prefix is ever
+    stored) — never the IV, the ciphertext or anything decrypted. None when either field is
+    missing or not a string, and the caller then falls back to a fresh reference."""
+    if not isinstance(initial_vector, str) or not isinstance(encrypted_flow_data, str) \
+            or not initial_vector or not encrypted_flow_data:
+        return None
+    digest = hashlib.sha256()
+    digest.update(b"dxe1\x00")
+    digest.update(initial_vector.encode("ascii", "replace"))
+    digest.update(b"\x00")
+    digest.update(encrypted_flow_data.encode("ascii", "replace"))
+    return "dx:" + digest.hexdigest()
 
 
 def fresh_attempt_ref() -> str:
@@ -110,8 +130,9 @@ def insert_attempt_event(session: Session, *, source: str, stage: str, outcome: 
                          attempt_ref: Optional[str] = None, thread_id=None, offer_id=None,
                          revision_id=None, thread_revision_id=None,
                          once_per_attempt: bool = False) -> bool:
-    """INSERT … ON CONFLICT (event_uid) DO NOTHING in `session`'s transaction. True when a row
-    was written, False when this logical attempt was already recorded. Raises on a database
+    """INSERT … ON CONFLICT (event_uid) DO NOTHING … RETURNING in `session`'s transaction.
+    True when THIS call admitted the row, False when this logical attempt was already
+    recorded (the admission result the finaliser's counters depend on). Raises on a database
     error: the caller owns this transaction (the refusal finaliser) and decides.
 
     `once_per_attempt`: the uid ignores the reason, so one attempt at this stage is recorded
@@ -130,9 +151,14 @@ def insert_attempt_event(session: Session, *, source: str, stage: str, outcome: 
         from sqlalchemy.dialects.postgresql import insert
     else:
         from sqlalchemy.dialects.sqlite import insert
+    # Phase 4-R1 (P4RV-03): the database decides admission. `rowcount` cannot — psycopg3
+    # reports -1 for INSERT … ON CONFLICT DO NOTHING, so `bool(rowcount)` was always True on
+    # PostgreSQL. RETURNING yields the new row's id exactly when THIS statement inserted it,
+    # and nothing when the uid already existed (a concurrent inserter of the same uid waits
+    # on the unique index and then returns nothing): first = admitted, replay = not.
     stmt = insert(E.__table__).values(**values).on_conflict_do_nothing(
-        index_elements=["event_uid"])
-    return bool(session.execute(stmt).rowcount)
+        index_elements=["event_uid"]).returning(E.__table__.c.id)
+    return session.execute(stmt).first() is not None
 
 
 def record_attempt_event(db: Session, **event) -> bool:

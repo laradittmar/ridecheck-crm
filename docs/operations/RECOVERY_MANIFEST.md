@@ -60,3 +60,70 @@ Contents are never recorded here or in git.
 | No off-host copy of `/opt/ridecheck-backups` — it shares the disk with the data it protects | **MEDIUM** | copy the snapshot set to object storage or another machine |
 | Commit `ddcd03b` (2026-05-10), an ancestor of `origin/main`, contains a literal Meta token and a Gmail app password already published to GitHub | **HIGH** | rotate both credentials; history rewrite is not planned |
 | n8n workflow JSON in `N8N workflows/` is a stale March export (96/112 nodes) versus the live workflow (164 nodes, updated 2026-08-14) | LOW | the n8n database is the operational source of truth; treat repo copies as historical |
+
+## 6. Booking-convergence schema: deploy order and rollback (Phase 4 / 4-R1)
+
+Applies to any deployment that carries migrations `20261015_booking_attempt_events` and
+`20261016_notification_sent_at` (the booking-attempt evidence table and the declared
+`thread_revisions.notification_sent_at`). Not yet applied to `crm` or `crm_test`; applying them
+is a separate, owner-authorised milestone.
+
+### 6.1 Deploy order — migrations run before the replacement application container starts
+
+1. `scripts/preflight_deploy.sh <env-file> <compose-file>` passes.
+2. Snapshot the target database (`pg_dump`) and record its sha256.
+3. With the **new** image's code, and **before the replacement application container starts**,
+   run `alembic upgrade head` against the target database (a one-off container of the new
+   image with the production `DATABASE_URL`; the running application is not replaced yet).
+4. Verify: `SELECT version_num FROM alembic_version` → `20261016_notification_sent_at`, and
+   `SELECT count(*) FROM pg_trigger WHERE tgname = 'trg_booking_attempt_events_append_only'` → 1.
+   The upgrade itself verifies every enforcement object and fails the whole migration (nothing
+   recorded) if one is missing.
+5. Start the replacement application. Its start-up check refuses to start on a schema that
+   lacks the declared column or the append-only trigger (`SCHEMA_PREFLIGHT_FAILED` in the log,
+   `DeclaredSchemaMissing`); the fix is step 3, never a hand-made column.
+
+If an image was started first by mistake, its `create_all` may have created
+`booking_attempt_events` without its trigger. `alembic upgrade head` reconciles that table (it
+compares every column, adds what is missing, installs the trigger and verifies) — do not drop
+or stamp it by hand.
+
+### 6.2 Rollback — evidence-bearing downgrade is refused by default
+
+1. Prefer an **application-only** rollback: the schema changes are additive, so the previous
+   image runs against them unchanged. Stop the new container, start the previous one, and leave
+   the schema at the head. This needs no data decision.
+2. A schema downgrade is a separate step. First count the evidence:
+
+   ```sql
+   SELECT count(*) FROM booking_attempt_events;
+   SELECT count(*) FROM thread_revisions WHERE notification_sent_at IS NOT NULL;
+   ```
+
+3. Export and hash it **before anything else**, whatever the counts:
+
+   ```sh
+   psql "$URL" -c "\copy (SELECT * FROM booking_attempt_events ORDER BY id) TO 'attempt_events.csv' CSV HEADER"
+   psql "$URL" -c "\copy (SELECT id, notification_sent_at FROM thread_revisions WHERE notification_sent_at IS NOT NULL ORDER BY id) TO 'notification_sent.csv' CSV HEADER"
+   sha256sum attempt_events.csv notification_sent.csv > evidence.sha256
+   ```
+
+   Store the files and the hash file with the step-2 snapshot (`/opt/ridecheck-backups/`).
+4. If **both counts are zero**, `alembic downgrade 20261014_ledger_detached_state` is exact: it
+   drops the table, its trigger and function, and the column only if
+   `20261016_notification_sent_at` created it (a column that an older application start-up
+   created is left in place, as it was found).
+5. **STOP condition.** If `booking_attempt_events` holds any row, or any
+   `notification_sent_at` is non-null, the downgrade refuses (`audit-data loss` /
+   `notification-evidence loss`) and records nothing. **Stop here.** Do not truncate, delete
+   or null anything to get past it.
+6. Destroying that evidence is an explicit **owner checkpoint**, never automatic and never part
+   of a scripted rollback. Only after the owner has seen the step-3 export and its hash, and
+   authorised it in writing, may an operator run `TRUNCATE booking_attempt_events` (row
+   `DELETE` is refused by the append-only trigger) and/or
+   `UPDATE thread_revisions SET notification_sent_at = NULL`, then repeat step 4. Nulling
+   `notification_sent_at` removes the operator e-mail's only dedup: a redelivered booking turn
+   may e-mail the team again.
+
+The Phase 2 `DETACHED` ledger state has no data-bearing rollback at all (`P2R-01`); that
+posture is a separate owner decision and is not changed by this section.

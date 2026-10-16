@@ -25,9 +25,13 @@ durability WITHOUT giving any authority back to the refusal path:
        ISSUED and may be retried or booked;
      * transient contention never reaches here as a refusal: it is evidence only.
 4. Before it commits it appends ONE `booking_attempt_events` row (stage FINALISE) whose uid is
-   once-per-attempt: a handler replay of the same attempt finds it and rolls back, so the
-   counters move once. If K1 or K2 is contended the offer is left untouched and only a
-   CONTENDED event is written.
+   once-per-attempt, and THAT INSERT IS THE ADMISSION: PostgreSQL reports (ON CONFLICT DO
+   NOTHING … RETURNING) whether this call inserted it. Only the first admission of a logical
+   attempt keeps its writes; a replay — a CE redelivery of the same inbound WAMID, a
+   transport retry of the same Data Exchange envelope — gets "not inserted" and rolls back
+   its whole transaction (or savepoint), so `refused_count`, `last_refusal` and any
+   terminalisation move with the event, once (Phase 4-R1, P4RV-02/03). If K1 or K2 is
+   contended the offer is left untouched and only a CONTENDED event is written.
 5. It never raises. Any failure is logged; the customer outcome was decided already.
 """
 from __future__ import annotations
@@ -166,8 +170,12 @@ def _finalise_in(s: Session, *, token: str, observed: str, event: dict,
         offers.record_refusal(offer.id, canonical, thread_id=thread_id)
     reason = canonical or observed
     offer_id = getattr(offer, "id", None)
+    # The admission: the counters / reason / terminalisation written above survive ONLY if
+    # this insert is the first for the attempt; on a replay the caller rolls all of it back.
     if not insert_attempt_event(s, stage="FINALISE", outcome="REFUSED", reason=reason,
                                 offer_id=offer_id, once_per_attempt=True, **event):
+        logger.info("BOOKING_REFUSAL_REPLAY source=%s thread_id=%s offer_id=%s — attempt "
+                    "already finalised; nothing kept", event["source"], thread_id, offer_id)
         return FinaliseResult(False, reason, offer_id, replay=True)   # already finalised
     status = None
     if offer is not None:

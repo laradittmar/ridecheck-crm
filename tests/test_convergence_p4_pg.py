@@ -45,12 +45,16 @@ class _P4(_Race):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        # The production schema: `main.py` adds this column at start-up (M18 operator e-mail);
-        # no migration declares it. Without it M18's raw SQL aborts the CE transaction and the
-        # notification path under test is not the production one.
-        with cls.engine.begin() as c:
-            c.execute(text("ALTER TABLE thread_revisions "
-                           "ADD COLUMN IF NOT EXISTS notification_sent_at TIMESTAMPTZ"))
+        # Phase 4-R1 adaptation (P4RV-04). OLD: this fixture ran the start-up's
+        # `ALTER TABLE thread_revisions ADD COLUMN IF NOT EXISTS notification_sent_at`
+        # itself — manufacturing a column no schema source declared. NEW: the column comes
+        # from migration 20261016_notification_sent_at like every other one, and the fixture
+        # only ASSERTS it is there (a database not at the head fails here, loudly).
+        with cls.engine.connect() as c:
+            assert c.execute(text(
+                "SELECT count(*) FROM information_schema.columns WHERE table_name = "
+                "'thread_revisions' AND column_name = 'notification_sent_at'")).scalar() == 1, \
+                "database not migrated to 20261016_notification_sent_at"
 
     def offer(self, w):
         with self.engine.connect() as c:
@@ -511,8 +515,15 @@ class P4R_Migration(unittest.TestCase):
         try:
             heads = self.alembic("heads")
             self.assertEqual(heads.returncode, 0, heads.stderr)
+            # Phase 4-R1 adaptation. OLD: the one head was 20261015_booking_attempt_events and
+            # `downgrade -1` from the head reached this revision's downgrade. NEW: 4-R1 adds
+            # 20261016_notification_sent_at on top, so the round trip first steps down to
+            # 20261015 explicitly (an empty, marker-owned column — exact) and the Phase 4
+            # assertions below run unchanged from there; it ends back at the head.
             self.assertEqual([h for h in heads.stdout.split("\n") if h.strip()],
-                             ["20261015_booking_attempt_events (head)"])
+                             ["20261016_notification_sent_at (head)"])
+            step = self.alembic("downgrade", "20261015_booking_attempt_events")
+            self.assertEqual(step.returncode, 0, step.stderr[-800:])
             def columns():
                 with eng.connect() as c:
                     return c.execute(text(
@@ -537,13 +548,17 @@ class P4R_Migration(unittest.TestCase):
                 self.assertEqual(c.execute(text("SELECT version_num FROM alembic_version"))
                                  .scalar(), "20261014_ledger_detached_state")
             self.assertEqual(columns(), at_head, "the downgrade changed another table")
+            up = self.alembic("upgrade", "20261015_booking_attempt_events")
+            self.assertEqual(up.returncode, 0, up.stderr[-800:])
+            self.assertEqual(columns(), at_head, "the round trip changed another table")
             up = self.alembic("upgrade", "head")
             self.assertEqual(up.returncode, 0, up.stderr[-800:])
             with eng.connect() as c:
                 self.assertEqual(c.execute(text(
                     "SELECT count(*) FROM pg_trigger WHERE tgname = "
                     "'trg_booking_attempt_events_append_only'")).scalar(), 1)
-            self.assertEqual(columns(), at_head, "the round trip changed another table")
+                self.assertEqual(c.execute(text("SELECT version_num FROM alembic_version"))
+                                 .scalar(), "20261016_notification_sent_at")
         finally:
             eng.dispose()
 

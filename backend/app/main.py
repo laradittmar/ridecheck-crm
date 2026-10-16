@@ -594,14 +594,14 @@ async def _start_followup_tasks() -> None:
 
 
 @app.on_event("startup")
-def _migrate_m15_8_notification_sent() -> None:
-    from sqlalchemy import text
-    with engine.connect() as conn:
-        conn.execute(text(
-            "ALTER TABLE thread_revisions "
-            "ADD COLUMN IF NOT EXISTS notification_sent_at TIMESTAMPTZ"
-        ))
-        conn.commit()
+def _require_declared_booking_schema() -> None:
+    """Convergence Phase 4-R1 (P4RV-04/05) — the application does not own schema; Alembic
+    does. This replaces the M15.8 start-up hook that added `thread_revisions.notification_sent_at`
+    with DDL of its own, which made a running application the only source of that column.
+    The application now REFUSES TO START on a schema the migrations have not brought to the
+    declared shape, instead of running with half of it (see `schema_preflight`)."""
+    from .services.schema_preflight import require_declared_booking_schema
+    require_declared_booking_schema(engine)
 
 
 @app.on_event("startup")
