@@ -7,7 +7,8 @@ silence. Each class below turns one of them into a test that fails loudly.
 BND-01..09  the burst boundary the semantic engine and the deterministic rules actually saw
 ASY-01..04  the two pre-gates that see a WIDER boundary — pinned as asymmetric, not as equal
 NEU-01..08  externally observable behaviour with tracing enabled, off, and broken three ways
-AUTH-01..13 the trace endpoints require the CRM session; the rest of /api/ops does not change
+AUTH-01..13 the trace endpoints require the CRM session; the rest of /api/ops keeps its
+            route dependencies (PW1-R1 puts the whole prefix behind session-or-machine auth)
 SCP-01..07  scope labels: a conversational decision is never confused with a Flow transaction
 FLW-01..03  the Flow Data Exchange path is untouched and is not represented as hybrid
 
@@ -639,6 +640,12 @@ class EndpointAuthorization(unittest.TestCase):
                           "/api/ops/path-registry", "/api/ops/paths",
                           "/api/ops/summary", "/api/ops/threads"],
                          "no unrelated /api/ops route may gain or lose the session gate")
+        # Pre-Wild PW1-R1 (PW1RV-01): the ungated routes are no longer anonymous. They sit
+        # behind the middleware's OPERATIONS class (session or machine credential), which
+        # is not a route dependency and so does not move them between the two lists above.
+        import app.main as main
+        for path in ungated:
+            self.assertTrue(main._is_operations_path(path), path)
 
     def test_auth_13_no_secret_or_customer_text_in_api_or_page(self):
         with self.authed() as client:

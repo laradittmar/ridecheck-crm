@@ -299,15 +299,18 @@ def _client_is_peer_container(request: Request) -> bool:
     return address != gateway
 
 
-def _machine_auth_ok(request: Request) -> bool:
-    """A machine caller proves itself by shared secret OR by being a peer container."""
+def _machine_auth_ok(request: Request, *, trust_peer: bool = True) -> bool:
+    """A machine caller proves itself by shared secret OR by being a peer container.
+
+    `trust_peer=False` admits the shared secret only (PW1-R1: a request that carries
+    forwarding headers never earns peer status on the operations surfaces)."""
     settings = get_settings()
     secret = (getattr(settings, "internal_api_secret", "") or "").strip()
     if secret:
         supplied = (request.headers.get(INTERNAL_AUTH_HEADER) or "").strip()
         if supplied and hmac.compare_digest(supplied.encode(), secret.encode()):
             return True
-    return _client_is_peer_container(request)
+    return trust_peer and _client_is_peer_container(request)
 
 
 def _internal_auth_enforced() -> bool:
@@ -319,10 +322,63 @@ def _internal_auth_enforced() -> bool:
                 or (getattr(settings, "internal_api_trusted_cidr", "") or "").strip())
 
 
+# ── PW1-R1 (PW1RV-01) — the operations surfaces ──────────────────────────────
+#
+# `/security/*` and `/api/ops/*` return security-event details, outbound-ledger WAMIDs and,
+# on `/api/ops/messages`, customers' phone numbers, names and message text. They sat in no
+# class above, so every route without its own dependency answered anonymous callers. They
+# are now one OPERATIONS class, matched by prefix so a route registered later inherits it:
+#
+#   * a valid CRM session (the operator in `/control`), or
+#   * the existing machine credential (`_machine_auth_ok`): the shared secret, or a peer
+#     container — but never a peer whose request carries forwarding headers, because a
+#     proxy-rewritten client address is not a direct peer.
+#
+# Unlike MACHINE, this is NOT flag-guarded: `INTERNAL_API_AUTH_ENABLED` false, missing or
+# malformed leaves it enforced. It only adds a gate; a route's own stricter dependency
+# (`require_crm_session` on `/booking-attention`, `/turns`, `/offers` …) still runs after
+# it, so a machine caller admitted here is still refused there. The refusal is the same
+# generic 401 for every path in the family, existing or not, before any route or database
+# is reached.
+_OPERATIONS_PREFIXES = ("/security", "/api/ops")
+_FORWARDING_HEADERS = ("forwarded", "x-forwarded-for", "x-forwarded-host",
+                       "x-forwarded-proto", "x-real-ip")
+
+
+def _is_operations_path(path: str) -> bool:
+    return (path or "").startswith(_OPERATIONS_PREFIXES)
+
+
+def _request_route_paths(request: Request) -> tuple[str, ...]:
+    """Every spelling of the path a router could match: the URL path, and the raw ASGI
+    path with and without `root_path`. The guard applies when ANY of them is in the family."""
+    scope = request.scope
+    raw = scope.get("path") or ""
+    root = scope.get("root_path") or ""
+    stripped = raw[len(root):] if root and raw.startswith(root) else raw
+    return (request.url.path or "", raw, stripped)
+
+
+def _carries_forwarding_headers(request: Request) -> bool:
+    return any(request.headers.get(h) is not None for h in _FORWARDING_HEADERS)
+
+
+def _operations_auth_ok(request: Request) -> bool:
+    human = verify_session(request.cookies.get(SESSION_COOKIE))
+    if human and human.get("email"):
+        return True
+    return _machine_auth_ok(request, trust_peer=not _carries_forwarding_headers(request))
+
+
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     path = request.url.path or "/"
-    if _is_public_path(path):
+    if any(_is_operations_path(p) for p in _request_route_paths(request)):
+        if not _operations_auth_ok(request):
+            logger.warning("OPERATIONS_SURFACE_UNAUTHENTICATED path=%s method=%s",
+                           path, request.method)
+            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    elif _is_public_path(path):
         return await call_next(request)
 
     if _internal_auth_enforced() and _is_machine_api_path(path):

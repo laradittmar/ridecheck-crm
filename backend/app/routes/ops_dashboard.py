@@ -4,6 +4,10 @@ All endpoints are SELECT-only. No INSERT/UPDATE/DELETE.
 
 Prefix: /api/ops
 Tag: ops
+
+Access: every route requires a CRM session or the machine credential, enforced for the
+whole prefix by `main.auth_middleware` (PW1-R1); some routes additionally require the
+session alone (`require_crm_session`).
 """
 from __future__ import annotations
 
@@ -36,9 +40,10 @@ router = APIRouter(prefix="/api/ops", tags=["ops"])
 def require_crm_session(request: Request) -> str:
     """The same signed CRM session `/control` requires. Returns the operator's email.
 
-    Applied ONLY to the two hybrid-decision-trace endpoints. The rest of `/api/ops` keeps
-    the access policy it already had: widening it here would change the contract for
-    operational consumers that were never part of this milestone.
+    Applied to the customer-specific forensic endpoints (traces, offers, booking attention).
+    Pre-Wild PW1-R1: the whole of `/api/ops` is also behind `main.auth_middleware`'s
+    OPERATIONS class (CRM session or machine credential). That gate runs first and adds
+    nothing here — a machine caller it admits is still refused by this dependency.
 
     The check runs before any database access, so a caller without a session gets the same
     401 for a turn that exists, a turn that does not, and a malformed id. Whether a trace

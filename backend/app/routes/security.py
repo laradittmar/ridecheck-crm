@@ -23,6 +23,9 @@ Read-only surface for unauthorized outbound path events and outbound ledger.
 
 Answers: "What outbound messages did the system attempt to send?"
          "Did anything try to send WhatsApp outside an approved path?"
+
+Access: a CRM session or the machine credential (shared secret / peer container),
+enforced for the whole `/security` prefix by `main.auth_middleware` (PW1-R1).
 """
 from __future__ import annotations
 
