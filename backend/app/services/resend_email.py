@@ -10,6 +10,45 @@ logger = logging.getLogger(__name__)
 _RESEND_API_URL = "https://api.resend.com/emails"
 
 
+def _int_or_none(value) -> int | None:
+    try:
+        return None if value is None or isinstance(value, bool) else int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _reported_io_guard_trip(exc: BaseException, sender: str, *, thread_id=None,
+                            revision_id=None) -> bool:
+    """True when `exc` is the booking I/O guard, after making it operator-visible.
+
+    Pre-Wild PW1-B (P4RV-09). `forbid_external_io` raises `ExternalIOInsideBookingTransaction`
+    when a sender is reached while a booking transaction is still open — a programming error
+    that the senders' `except Exception` used to fold into an ordinary "send failed". Nothing
+    left the process and the sender still returns False, so every caller behaves exactly as
+    before (the booking stands; a notification is never marked SENT). What changes is that a
+    CRITICAL log line and an `EXTERNAL_IO_INSIDE_BOOKING_TRANSACTION` operational condition
+    now name it. Any other exception returns False here and keeps its existing handling.
+    """
+    from .booking_authority import _TXN_SCOPE, ExternalIOInsideBookingTransaction
+    if not isinstance(exc, ExternalIOInsideBookingTransaction):
+        return False
+    try:                                     # reporting must never change the sender's answer
+        operation = getattr(_TXN_SCOPE.get(), "operation", None)
+        logger.critical("RESEND_EXTERNAL_IO_INSIDE_BOOKING_TRANSACTION sender=%s operation=%s "
+                        "— nothing sent", sender, operation or "-")
+        from .security_events import SecurityEventType, record_operational_condition
+        record_operational_condition(
+            None, SecurityEventType.EXTERNAL_IO_INSIDE_BOOKING_TRANSACTION,
+            source_component=f"resend_email.{sender}", thread_id=_int_or_none(thread_id),
+            details={"channel": "resend_email", "sender": sender,
+                     "operation": (str(operation)[:64] if isinstance(operation, str) else None),
+                     "hist_revision_id": _int_or_none(revision_id)})
+    except Exception as report_exc:  # noqa: BLE001
+        logger.error("RESEND_IO_GUARD_REPORT_FAILED sender=%s: %s", sender,
+                     type(report_exc).__name__)
+    return True
+
+
 def _fmt(value: object, fallback: str = "Sin dato") -> str:
     s = str(value).strip() if value is not None else ""
     return s if s else fallback
@@ -213,6 +252,8 @@ def send_booking_notification(
         logger.error("[M15.8] Resend URL error for revision_id=%s: %s", revision_id, exc.reason)
         return False
     except Exception as exc:  # noqa: BLE001
+        if _reported_io_guard_trip(exc, "send_booking_notification", revision_id=revision_id):
+            return False
         logger.error("[M15.8] Resend unexpected error for revision_id=%s: %s", revision_id, exc)
         return False
 
@@ -371,6 +412,9 @@ def send_scheduling_handoff_notification(
         logger.error("[M15.8] Handoff email URL error lead_id=%s: %s", lead_id, exc.reason)
         return False
     except Exception as exc:  # noqa: BLE001
+        if _reported_io_guard_trip(exc, "send_scheduling_handoff_notification",
+                                   thread_id=thread_id, revision_id=revision_id):
+            return False
         logger.error("[M15.8] Handoff email unexpected error lead_id=%s: %s", lead_id, exc)
         return False
 
@@ -450,6 +494,8 @@ def send_unanswered_alert(
         logger.error("[alert] unanswered alert URL error thread_id=%s: %s", thread_id, exc.reason)
         return False
     except Exception as exc:  # noqa: BLE001
+        if _reported_io_guard_trip(exc, "send_unanswered_alert", thread_id=thread_id):
+            return False
         logger.error("[alert] unanswered alert unexpected error thread_id=%s: %s", thread_id, exc)
         return False
 
@@ -554,5 +600,7 @@ def send_human_review_notification(
         logger.error("[M15.8] Human review email URL error lead_id=%s: %s", lead_id, exc.reason)
         return False
     except Exception as exc:  # noqa: BLE001
+        if _reported_io_guard_trip(exc, "send_human_review_notification", thread_id=thread_id):
+            return False
         logger.error("[M15.8] Human review email unexpected error lead_id=%s: %s", lead_id, exc)
         return False

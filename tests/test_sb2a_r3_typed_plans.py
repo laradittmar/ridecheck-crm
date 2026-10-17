@@ -608,7 +608,11 @@ class R3_Receipt(unittest.TestCase):
             (dict(effect=MetaSendError(200, "{}", "no id")), (False, True, "AMBIGUOUS_2XX_WITHOUT_MESSAGE_ID")),
             (dict(effect=MetaSendError(503, "{}")), (False, True, "AMBIGUOUS_META_503")),
             (dict(effect=ValueError("malformed json")), (False, True, "AMBIGUOUS_TRANSPORT_EXCEPTION")),
-            (dict(effect=MetaSendError(400, "{}")), (False, False, "META_REJECTED_400")),
+            # Pre-Wild PW1-D (RV1-01): definite only when Graph's error envelope proves it; a
+            # bare 4xx body is UNCERTAIN (held, never resent)
+            (dict(effect=MetaSendError(400, '{"error": {"code": 100, "message": "bad"}}')),
+             (False, False, "META_REJECTED_400")),
+            (dict(effect=MetaSendError(400, "{}")), (False, True, "AMBIGUOUS_META_400_UNPROVEN")),
             (dict(ret=""), (False, True, "AMBIGUOUS_SUCCESS_WITHOUT_WAMID")),
             (dict(gate_ok=False, ret="w"), (False, False, "GATE_blocked_kill_switch")),
         ]

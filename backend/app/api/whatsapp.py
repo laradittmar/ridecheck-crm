@@ -456,6 +456,40 @@ def list_thread_candidates(thread_id: int, db: Session = Depends(get_db)):
     ).scalars().all()
 
 
+#: Pre-Wild PW1-C (CD-09): the status the Conversation Engine resolves focus by when no
+#: explicit pointer is set. Setting or removing it by hand moves focus outside the candidate
+#: authority, which withdraws the live offer when focus really moves.
+_FOCUS_STATUS = "current_focus"
+
+
+def _candidate_refusal(code: str, fields: list[str], message: str) -> HTTPException:
+    return HTTPException(status_code=409, detail={"code": code, "fields": fields,
+                                                  "message": message})
+
+
+def _refuse_offer_bound_candidate(db: Session, thread_id: int, candidate_id: int,
+                                  fields: list[str]) -> None:
+    """PW1-C: a candidate a live ISSUED offer is bound to is the vehicle that offer was
+    priced for; editing it by hand would invalidate the offer or redirect the booking. The
+    check runs under the thread's state row, bounded, in the canonical offer order."""
+    from ..models import WhatsAppBookingOffer
+    from ..services.offer_lifecycle import OfferLifecycle, OfferStatus
+    if OfferLifecycle(db).begin_offer_transaction(int(thread_id)) is not None:
+        raise _candidate_refusal("THREAD_STATE_CONTENDED", fields,
+                                 "La conversación está en uso por una reserva; reintentá.")
+    bound = db.execute(
+        select(WhatsAppBookingOffer.id)
+        .where(WhatsAppBookingOffer.thread_id == thread_id)
+        .where(WhatsAppBookingOffer.candidate_id == candidate_id)
+        .where(WhatsAppBookingOffer.status == OfferStatus.ISSUED).limit(1)).first()
+    if bound is not None:
+        db.rollback()
+        raise _candidate_refusal(
+            "CANDIDATE_BOUND_TO_LIVE_OFFER", fields,
+            "Este vehículo tiene una oferta de turno vigente; los cambios se hacen desde la "
+            "conversación, no desde esta edición.")
+
+
 @router.post("/thread/{thread_id}/candidates", response_model=WhatsAppThreadCandidateRead)
 def create_thread_candidate(
     thread_id: int,
@@ -463,6 +497,9 @@ def create_thread_candidate(
     db: Session = Depends(get_db),
 ):
     _require_thread(db, thread_id)
+    if payload.status == _FOCUS_STATUS:
+        raise _candidate_refusal("CANDIDATE_FOCUS_AUTHORITY_OWNED", ["status"],
+                                 "El foco de la conversación lo decide el motor, no esta edición.")
     candidate = WhatsAppThreadCandidate(thread_id=thread_id, **payload.model_dump(exclude_unset=True))
     db.add(candidate)
     try:
@@ -491,7 +528,16 @@ def patch_thread_candidate(
     if candidate is None:
         raise HTTPException(status_code=404, detail="Candidate not found")
 
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    changes = payload.model_dump(exclude_unset=True)
+    if "status" in changes and \
+            (changes["status"] == _FOCUS_STATUS) != (candidate.status == _FOCUS_STATUS):
+        raise _candidate_refusal("CANDIDATE_FOCUS_AUTHORITY_OWNED", ["status"],
+                                 "El foco de la conversación lo decide el motor, no esta edición.")
+    edited = sorted(f for f, v in changes.items() if v != getattr(candidate, f, None))
+    if edited:
+        _refuse_offer_bound_candidate(db, thread_id, candidate_id, edited)
+
+    for field, value in changes.items():
         setattr(candidate, field, value)
 
     try:

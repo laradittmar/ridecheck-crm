@@ -15,7 +15,9 @@ Rules (each one is tested):
 * **Bounded.** `lock_timeout` 500 ms and `statement_timeout` 1000 ms on PostgreSQL. The
   table has no foreign key, so an insert takes no lock on any business row.
 * **Fail safe.** A failure is logged as `BOOKING_ATTEMPT_EVENT_NOT_RECORDED` and swallowed:
-  the outcome was decided already and evidence must never change or retry it.
+  the outcome was decided already and evidence must never change or retry it. Pre-Wild
+  PW1-B (P4RV-09): it is also recorded, once and bounded, as an operator-visible
+  `SecurityEvent` of the same name (`security_events.record_operational_condition`).
 * **Idempotency.** `event_uid` = SHA-256 of (source, stage, command key, attempt reference,
   reason), UNIQUE, inserted with ON CONFLICT DO NOTHING … RETURNING, so PostgreSQL itself
   reports whether this call admitted the row. A REPLAY of one logical attempt — the same
@@ -175,4 +177,29 @@ def record_attempt_event(db: Session, **event) -> bool:
         logger.error("BOOKING_ATTEMPT_EVENT_NOT_RECORDED source=%s stage=%s reason=%s: %s",
                      event.get("source"), event.get("stage"), event.get("reason"),
                      type(exc).__name__)
+        try:
+            _report_lost_evidence(db, event, exc)
+        except Exception as report_exc:  # noqa: BLE001 — this function never raises
+            logger.error("BOOKING_ATTEMPT_EVENT_LOSS_NOT_REPORTED: %s", type(report_exc).__name__)
         return False
+
+
+def _report_lost_evidence(db: Session, event: dict, exc: BaseException) -> None:
+    """Pre-Wild PW1-B (P4RV-09): the lost row becomes an operator-visible condition instead of
+    a log line alone. Typed codes and historical ids only (the module's privacy rule); the
+    outcome stands either way, and `record_operational_condition` never raises or recurses."""
+    from .security_events import SecurityEventType, record_operational_condition
+    record_operational_condition(
+        db, SecurityEventType.BOOKING_ATTEMPT_EVIDENCE_NOT_RECORDED,
+        source_component="booking_attempt_events.record_attempt_event",
+        thread_id=_int(event.get("thread_id")),
+        details={
+            "source": str(event.get("source") or "")[:32] or None,
+            "stage": event.get("stage") if event.get("stage") in STAGES else None,
+            "outcome": event.get("outcome") if event.get("outcome") in OUTCOMES else None,
+            "reason": (str(event.get("reason")) if event.get("reason") else "UNSPECIFIED")[:64],
+            "error_class": type(exc).__name__[:64],
+            "hist_offer_id": _int(event.get("offer_id")),
+            "hist_revision_id": _int(event.get("revision_id")),
+            "hist_thread_revision_id": _int(event.get("thread_revision_id")),
+        })

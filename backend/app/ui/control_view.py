@@ -968,6 +968,8 @@ def render_control_page(user_email: str) -> str:
             </tbody>
           </table>
         </div>
+        <!-- PW1-B: failures of observability (lost evidence, I/O-guard trips on e-mail) -->
+        <div class="subtle" id="booking-conditions"></div>
       </div>
 
       <!-- Critical events panel -->
@@ -1572,6 +1574,22 @@ def render_control_page(user_email: str) -> str:
     function fetchBookings() {{
       apiFetch('/api/ops/booking-attention', function(data) {{
         var rows = (data && data.rows) || [];
+        // PW1-B (P4RV-09): conditions are listed beside the ledger rows, never merged in.
+        var conds = (data && data.operational_conditions) || [];
+        var condBox = document.getElementById('booking-conditions');
+        if (condBox) {{
+          condBox.innerHTML = conds.length
+            ? ('<strong>Fallas de evidencia u observabilidad (' + conds.length + ')</strong>'
+               + conds.map(function(c) {{
+                   return '<div>' + fmtDateTime(c.detected_at) + ' · ' + esc(c.condition)
+                     + (c.thread_url ? ' · <a href="' + esc(c.thread_url)
+                        + '" target="_blank" rel="noopener">' + esc(c.thread_id) + '</a>' : '')
+                     + (c.details && c.details.reason ? ' · ' + esc(c.details.reason) : '')
+                     + (c.details && c.details.sender ? ' · ' + esc(c.details.sender) : '')
+                     + '</div>';
+                 }}).join(''))
+            : '';
+        }}
         var tbody = document.getElementById('bookings-tbody');
         if (!tbody) return;
         if (!rows.length) {{

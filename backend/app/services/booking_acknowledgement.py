@@ -19,11 +19,14 @@ Convergence Phase 3-R1 — what makes a booking command's acknowledgement at mos
 * the irreversible boundary is the call into `_send_whatsapp_cloud_text`: before it, a failure
   is definite; after it, only a documented Meta 4xx rejection is — everything else
   (timeout, network, 5xx, 2xx without id, any other exception) is UNCERTAIN.
+  Pre-Wild PW1-D (RV1-01): "documented" means PROVEN by the response, not inferred from the
+  status range — `meta_rejection_is_definite`.
 A rare acknowledgement may therefore be missing and held for an operator; one booking command
 never produces two customer-visible acknowledgements through an automatic retry.
 """
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from datetime import date, time
@@ -71,6 +74,37 @@ class ReceiptOutcome:
         return AckDelivery.UNCERTAIN if self.ambiguous else AckDelivery.DEFINITELY_NOT_SENT
 
 
+def meta_rejection_is_definite(exc) -> bool:
+    """Does this `MetaSendError` PROVE that Meta did not accept the message? Fail-closed.
+
+    Pre-Wild PW1-D (RV1-01). The Phase 3-R1 review measured the old rule — any HTTP 4xx is a
+    definite rejection — recording a bare `408` with an HTML body as `META_REJECTED_408` and
+    admitting the retry. A status code alone cannot carry that proof: 408 says the exchange
+    did not complete, and a 4xx without Graph's error body may not come from Graph at all.
+    Definite therefore needs ALL of:
+
+    * a 4xx status other than 408, which is never definite whatever its body says;
+    * Graph's error envelope, parsed by `MetaSendError` from the body: a JSON object whose
+      `error` is an object carrying an integer `code` and a non-empty string `message`.
+
+    Everything else after the transport boundary stays UNCERTAIN, so it is held for an
+    operator and never sent again automatically. This classifies the shape of the response;
+    it does not interpret Meta's individual error codes.
+    """
+    status = getattr(exc, "http_status", None)
+    if type(status) is not int or not 400 <= status < 500 or status == 408:
+        return False
+    try:
+        body = json.loads(getattr(exc, "raw_body", "") or "")
+    except (TypeError, ValueError):
+        return False
+    err = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(err, dict):
+        return False
+    code, message = err.get("code"), err.get("message")
+    return (type(code) is int and isinstance(message, str) and bool(message.strip()))
+
+
 def _send_ledger_acknowledgement(
     db: Session, ctx, *, name: str, selected_date: date, selected_time: time,
     correlation_id: Optional[str] = None,
@@ -87,7 +121,8 @@ def _send_ledger_acknowledgement(
 
     Returns a ReceiptOutcome (SB2A-R3 classification):
       * definitive pre-send refusal (gate) or failure before dispatch → not sent
-      * definitive Meta rejection (4xx)                              → not sent
+      * definitive Meta rejection (a 4xx PROVEN by Graph's envelope) → not sent
+        (PW1-D: 408, or a 4xx without the envelope, is AMBIGUOUS)
       * success with a non-empty WAMID                               → sent
       * ambiguous: network/timeout after dispatch, 2xx without a usable id, malformed
         success, Meta 5xx                                            → AMBIGUOUS
@@ -157,14 +192,19 @@ def _send_ledger_acknowledgement(
             return ReceiptOutcome(False, None, "PRE_DISPATCH_OUTBOUND_BLOCKED")
         except MetaSendError as exc:
             status = exc.http_status
-            if status is not None and 400 <= status < 500:
+            definite = meta_rejection_is_definite(exc)          # PW1-D (RV1-01)
+            if definite:
                 boundary = "settled"           # Meta's documented rejection: not accepted
             gate.mark_failed(result.message_id, meta_http_status=status,
                              meta_error_payload=exc.to_payload())
-            logger.error("BOOKING_RECEIPT Meta send failed thread_id=%s status=%s",
-                         ctx.thread.id, status)
-            if status is not None and 400 <= status < 500:
+            logger.error("BOOKING_RECEIPT Meta send failed thread_id=%s status=%s definite=%s",
+                         ctx.thread.id, status, definite)
+            if definite:
                 return ReceiptOutcome(False, None, f"META_REJECTED_{status}")
+            if status is not None and 400 <= status < 500:
+                # a 4xx that does not prove non-acceptance (408, or no Graph envelope)
+                return ReceiptOutcome(False, None, f"AMBIGUOUS_META_{status}_UNPROVEN",
+                                      ambiguous=True)
             if status is None:
                 return ReceiptOutcome(False, None, "AMBIGUOUS_NETWORK_OR_TIMEOUT",
                                       ambiguous=True)

@@ -228,6 +228,25 @@ def _text_payload(wa_id: str, msg_id: str, body: str, name: str = "Test") -> dic
     }
 
 
+def _seed_authority_pointer(db, tid, **fields):
+    """Pre-Wild PW1-C (CD-09): the booking pointers (`current_revision_id`,
+    `current_focus_candidate_id`, `flow_booking_token`) are written by their authorities, and
+    the generic state PATCH now refuses them (typed 409, nothing applied). Tests that need a
+    pointer in place seed it the way the authority would, then exercise the PATCH."""
+    thread = db.get(WhatsAppThread, tid)
+    if getattr(thread, "state", None) is None:
+        thread.state = WhatsAppThreadState(thread_id=tid)
+    for name, value in fields.items():
+        setattr(thread.state, name, value)
+
+
+def _assert_pointer_patch_refused(case, response, *fields):
+    case.assertEqual(response.status_code, 409, response.text)
+    detail = response.json()["detail"]
+    case.assertEqual(detail["code"], "THREAD_STATE_FIELD_AUTHORITY_OWNED")
+    case.assertEqual(detail["fields"], sorted(fields))
+
+
 # ===========================================================================
 # TEST CASE A — Name already given: backend must store and return it
 # ===========================================================================
@@ -460,9 +479,12 @@ class TestCaseC_FormNotResent(unittest.TestCase):
         )
         self.db.add(revision)
 
+        # PW1-C (CD-09): the link is the booking authority's to write, not this PATCH's
         r = self.client.patch(f"/api/whatsapp/thread/{self.tid}/state",
                               json={"current_revision_id": revision.id})
-        self.assertEqual(r.status_code, 200)
+        _assert_pointer_patch_refused(self, r, "current_revision_id")
+        _seed_authority_pointer(self.db, self.tid, current_revision_id=revision.id)
+        r = self.client.get(f"/api/whatsapp/thread/{self.tid}/state")
         self.assertEqual(r.json()["current_revision_id"], revision.id)
 
     def test_revision_status_booked_marks_form_complete(self):
@@ -644,9 +666,12 @@ class TestCaseE_VehicleAndLocationMemory(unittest.TestCase):
         )
         self.db.add(candidate)
 
+        # PW1-C (CD-09): focus is the candidate authority's; the generic PATCH refuses it
         r = self.client.patch(f"/api/whatsapp/thread/{self.tid}/state",
                               json={"current_focus_candidate_id": candidate.id})
-        self.assertEqual(r.status_code, 200)
+        _assert_pointer_patch_refused(self, r, "current_focus_candidate_id")
+        _seed_authority_pointer(self.db, self.tid, current_focus_candidate_id=candidate.id)
+        r = self.client.get(f"/api/whatsapp/thread/{self.tid}/state")
         self.assertEqual(r.json()["current_focus_candidate_id"], candidate.id,
                          "current_focus_candidate_id not persisted — "
                          "Build Effective Quote Input will always see null")
@@ -997,8 +1022,8 @@ class TestCaseM4_BookingRepetitionPrevention(unittest.TestCase):
 
         r = self.client.patch(f"/api/whatsapp/thread/{self.tid}/state",
                               json={"current_revision_id": revision.id})
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.json()["current_revision_id"], revision.id)
+        _assert_pointer_patch_refused(self, r, "current_revision_id")   # PW1-C (CD-09)
+        _seed_authority_pointer(self.db, self.tid, current_revision_id=revision.id)
 
         r2 = self.client.get(f"/api/whatsapp/thread/{self.tid}/state")
         self.assertEqual(r2.json()["current_revision_id"], revision.id,
@@ -1090,17 +1115,21 @@ class TestCaseM4_BookingRepetitionPrevention(unittest.TestCase):
             status="collecting_data",
         )
         self.db.add(revision)
-        self.client.patch(f"/api/whatsapp/thread/{self.tid}/state",
-                          json={"current_revision_id": revision.id,
-                                "last_stage": "SCHEDULING"})
+        _seed_authority_pointer(self.db, self.tid, current_revision_id=revision.id,
+                                last_stage="SCHEDULING")
 
-        # AI patches with null revision id — must not clobber
+        # AI patches with null revision id — must not clobber. PW1-C (CD-09): naming the
+        # pointer at all is now refused whole, so nothing in that PATCH is applied.
+        r = self.client.patch(f"/api/whatsapp/thread/{self.tid}/state",
+                              json={"current_revision_id": None, "customer_name": "Benito"})
+        _assert_pointer_patch_refused(self, r, "current_revision_id")
         self.client.patch(f"/api/whatsapp/thread/{self.tid}/state",
-                          json={"current_revision_id": None, "customer_name": "Benito"})
+                          json={"customer_name": "Benito"})
 
         r = self.client.get(f"/api/whatsapp/thread/{self.tid}/state")
         self.assertEqual(r.json()["current_revision_id"], revision.id,
                          "current_revision_id erased by null patch")
+        self.assertEqual(r.json()["customer_name"], "Benito")
 
 
 # ===========================================================================
@@ -1182,9 +1211,9 @@ class TestCaseM41_AvailabilityFirstFlow(unittest.TestCase):
             status="collecting_data",
         )
         self.db.add(revision)
+        _seed_authority_pointer(self.db, self.tid, current_revision_id=revision.id)  # PW1-C
         self.client.patch(f"/api/whatsapp/thread/{self.tid}/state",
-                          json={"current_revision_id": revision.id,
-                                "last_stage": "SCHEDULING"})
+                          json={"last_stage": "SCHEDULING"})
 
         r = self.client.get(f"/api/whatsapp/thread/{self.tid}/state")
         self.assertEqual(r.json()["current_revision_id"], revision.id,
@@ -1314,13 +1343,15 @@ class TestCaseM5_BookingCompletion(unittest.TestCase):
         })
         rev_id = r.json()["revision_id"]
 
+        # PW1-C (CD-09): the n8n "Patch Thread State Revision Id" node (legacy branch) is now
+        # refused — the pointer is the booking authority's — and the refusal changes nothing.
         patch_r = self.client.patch(f"/api/whatsapp/thread/{self.tid}/state",
                                     json={"current_revision_id": rev_id})
-        self.assertEqual(patch_r.status_code, 200)
+        _assert_pointer_patch_refused(self, patch_r, "current_revision_id")
 
         state_r = self.client.get(f"/api/whatsapp/thread/{self.tid}/state")
-        self.assertEqual(state_r.json()["current_revision_id"], rev_id,
-                         "current_revision_id not persisted — Patch Thread State Revision Id node missing or broken")
+        self.assertIsNone(state_r.json()["current_revision_id"],
+                          "a refused PATCH must not write the pointer")
 
     def test_revision_patch_persists_buyer_email(self):
         """
@@ -1467,8 +1498,9 @@ class TestCaseM5_BookingCompletion(unittest.TestCase):
         })
         rev_id = r.json()["revision_id"]
 
+        _seed_authority_pointer(self.db, self.tid, current_revision_id=rev_id)  # PW1-C
         self.client.patch(f"/api/whatsapp/thread/{self.tid}/state",
-                          json={"current_revision_id": rev_id, "last_stage": "SCHEDULING"})
+                          json={"last_stage": "SCHEDULING"})
 
         # Simulate subsequent patch without current_revision_id
         self.client.patch(f"/api/whatsapp/thread/{self.tid}/state",

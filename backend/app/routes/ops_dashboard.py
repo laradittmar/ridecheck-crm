@@ -1246,6 +1246,55 @@ def get_booking_attention(
     """Booking ledger rows needing a person: stale or failed acknowledgements, ambiguous
     transport, duplicate risk, identity conflicts, CE synchronizations that never finished,
     and (convergence Phase 4) committed customer bookings whose operator e-mail was not sent.
-    Read-only, behind the same signed CRM session as `/control`."""
+    Pre-Wild PW1-B: `operational_conditions` lists lost booking evidence and booking I/O-guard
+    trips on the e-mail path. Read-only, behind the same signed CRM session as `/control`."""
     rows = booking_attention(db)
-    return {"count": len(rows), "rows": rows}
+    return {"count": len(rows), "rows": rows,
+            "operational_conditions": operational_conditions(db)}
+
+
+#: What an operational condition may show of its `details` (PW1-B): typed codes and
+#: historical ids, the only keys its writers put there. Anything else is dropped.
+_CONDITION_DETAIL_KEYS = ("source", "stage", "outcome", "reason", "error_class", "channel",
+                          "sender", "operation", "hist_offer_id", "hist_revision_id",
+                          "hist_thread_revision_id")
+
+
+def operational_conditions(db: Session, *, now: Optional[datetime] = None) -> list[dict]:
+    """Pre-Wild PW1-B (P4RV-09): failures of OBSERVABILITY an operator must see — booking
+    evidence that could not be written, and an e-mail sender that tripped the booking I/O
+    guard (`security_events.OPERATIONAL_CONDITION_TYPES`), newest first, in the booking
+    lookback. Read-only and outside every booking decision; listed beside, never merged into,
+    the ledger rows above. The read runs under a SAVEPOINT, so a database without the table
+    yields an empty list and a usable session."""
+    from ..services.security_events import OPERATIONAL_CONDITION_TYPES
+    now = now or datetime.now(timezone.utc)
+    try:
+        with db.begin_nested():
+            found = db.execute(
+                select(SecurityEvent.id, SecurityEvent.detected_at, SecurityEvent.event_type,
+                       SecurityEvent.severity, SecurityEvent.thread_id,
+                       SecurityEvent.source_component, SecurityEvent.details)
+                .where(SecurityEvent.event_type.in_(OPERATIONAL_CONDITION_TYPES),
+                       SecurityEvent.detected_at >= now - timedelta(days=BOOKING_SYNC_LOOKBACK_DAYS))
+                .order_by(SecurityEvent.detected_at.desc(), SecurityEvent.id.desc())
+                .limit(200)).all()
+    except Exception as exc:                       # noqa: BLE001 — a read, never a decision
+        logger.warning("OPERATIONAL_CONDITIONS_UNREADABLE: %s", type(exc).__name__)
+        return []
+    out = []
+    for r in found:
+        details = r.details if isinstance(r.details, dict) else {}
+        out.append({
+            "id": r.id,
+            "detected_at": r.detected_at.isoformat() if r.detected_at else None,
+            "condition": r.event_type,
+            "severity": r.severity,
+            "thread_id": r.thread_id,
+            "component": r.source_component,
+            "details": {k: details.get(k) for k in _CONDITION_DETAIL_KEYS if k in details},
+            "next_action": "OPERATOR_REVIEW",
+            "thread_url": (f"/whatsapp/thread/{r.thread_id}" if r.thread_id is not None
+                           else None),
+        })
+    return out

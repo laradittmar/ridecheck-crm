@@ -271,6 +271,23 @@ _MOTORCYCLE_ADVISOR_REPLY = (
 _MOTO_HANDOFF_TOKEN_PREFIX = "moto-handoff-"
 
 
+def _flow_routing_token(submitted_token, mirror_token) -> str:
+    """The token a Flow response is ROUTED by: the one the customer's submission carries.
+
+    PRE-WILD PW1-A (R3RV-01). Meta echoes the `flow_token` this engine sent with the Flow, so
+    the submission names its own family — a `moto-handoff-` contact form or a booking offer.
+    The thread-state mirror is only a copy, and a copy the cycle reset clears
+    (`_execute_cycle_reset` → `OfferLifecycle.withdraw` → `_clear_mirror`) between the
+    booking-shaped predicate and `_process_flow_response`: routing on it sent a motorcycle
+    contact submission to booking admission and lost the human handoff. The mirror is read
+    only when the delivery carries no token at all, and then as it stood BEFORE the reset
+    (`_handle` takes it at turn entry). A stale mirror can therefore never turn a submitted
+    booking token into a motorcycle handoff, nor the reverse.
+    """
+    submitted = (submitted_token or "").strip()
+    return submitted if submitted else (mirror_token or "")
+
+
 # Candidate type-safety: tipo_vehiculo values that represent motorcycles.
 # A MOTO candidate must never be repurposed as an automotive candidate and vice versa.
 _MOTO_TIPO_VALUES = frozenset({"MOTO", "MOTOCICLETA"})
@@ -3608,6 +3625,10 @@ class ConversationEngine:
         #     so a transient result rolls back a session that has nothing to lose.
         _booking_shaped = self._is_booking_shaped_submission(event, state)
         self._turn_booking_shaped = _booking_shaped
+        # PW1-A (R3RV-01): taken HERE, before the cycle reset can clear the mirror, so the
+        # predicate above and the router below read one value.
+        _flow_route = _flow_routing_token(event.flow_token,
+                                          getattr(state, "flow_booking_token", None))
         # WILD-01 FINDING-03: store inbound ID on ctx for causal dedup in gate calls
         ctx.inbound_wa_message_id = event.wa_message_id
         if _booking_shaped:
@@ -3693,7 +3714,8 @@ class ConversationEngine:
 
         # Route by message type
         if event.message_type == "flow_response" and event.flow_response:
-            return self._process_flow_response(ctx, event.flow_response, event.flow_token)
+            return self._process_flow_response(ctx, event.flow_response, event.flow_token,
+                                               routing_token=_flow_route)
 
         # Text path: uses n8n-provided content (audio already transcribed by n8n)
         return self._process_text(ctx, event)
@@ -3712,9 +3734,11 @@ class ConversationEngine:
 
           1. the transport delivered a Flow response, with a payload — `message_type` and
              `flow_response`, both set by the n8n webhook from Meta's envelope;
-          2. the thread's mirror token is NOT a motorcycle-handoff token, which
+          2. the routing token is NOT a motorcycle-handoff token, which
              `_process_flow_response` checks first because both paths share one Flow id and
-             the prefix is the only discriminator;
+             the prefix is the only discriminator. PW1-A (R3RV-01): that is the SUBMITTED
+             token (`_flow_routing_token`), the same value the router reads — not the mirror,
+             which a cycle reset clears between this read and the router's;
           3. the payload carries neither `tipo_vehiculo` nor `zona_general`, the
              distinctive keys of the two qualification fallback forms.
 
@@ -3726,8 +3750,8 @@ class ConversationEngine:
         """
         if event.message_type != "flow_response" or not event.flow_response:
             return False
-        if (getattr(state, "flow_booking_token", None) or "").startswith(
-                _MOTO_HANDOFF_TOKEN_PREFIX):
+        if _flow_routing_token(event.flow_token, getattr(state, "flow_booking_token", None)
+                               ).startswith(_MOTO_HANDOFF_TOKEN_PREFIX):
             return False
         payload = event.flow_response
         if "tipo_vehiculo" in payload or "zona_general" in payload:
@@ -3786,6 +3810,8 @@ class ConversationEngine:
         ctx: _Context,
         flow_data: dict,
         flow_token: str | None,
+        *,
+        routing_token: str | None = None,
     ) -> ConversationHandleOut:
         lead = ctx.lead
         assert lead is not None
@@ -3796,7 +3822,11 @@ class ConversationEngine:
         # Both paths use the same WHATSAPP_FLOW_ID (CLIENT DATA FLOW); the token prefix
         # is the only discriminator. Checked first so a motorcycle response is never
         # mis-routed to the booking handler (which creates a revision and sets AGENDADO).
-        if (state.flow_booking_token or "").startswith(_MOTO_HANDOFF_TOKEN_PREFIX):
+        # PW1-A (R3RV-01): the prefix is read from the SUBMITTED token (`_handle` passes the
+        # value it took before any cycle reset; a direct caller gets the same rule now).
+        if routing_token is None:
+            routing_token = _flow_routing_token(flow_token, state.flow_booking_token)
+        if routing_token.startswith(_MOTO_HANDOFF_TOKEN_PREFIX):
             return self._process_motorcycle_contact_response(ctx, state, flow_data)
 
         # Route to qualification fallback handlers BEFORE booking flow processing.
@@ -10181,8 +10211,11 @@ class ConversationEngine:
         lead = ctx.lead
         assert lead is not None
 
-        # Consume the pending motorcycle handoff token
-        state.flow_booking_token = None
+        # Consume the pending motorcycle handoff token. PW1-A: only a motorcycle-family
+        # mirror is ours to consume — a live booking offer's mirror is the offer authority's
+        # (G3-7P-R2: the mirror never lies), and a reset may already have cleared it.
+        if (state.flow_booking_token or "").startswith(_MOTO_HANDOFF_TOKEN_PREFIX):
+            state.flow_booking_token = None
 
         # Parse contact fields using same mapping as existing CLIENT DATA FLOW (MAIN screen).
         # telefono is intentionally skipped — WA phone is the authoritative contact identifier.
