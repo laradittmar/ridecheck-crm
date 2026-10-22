@@ -351,7 +351,10 @@ class N_Notice(unittest.TestCase):
         params = dict(zip(ON.TEMPLATE_PARAMETERS, sent["params"]))
         self.assertEqual(len(sent["params"]), 10)
         self.assertEqual(params["evento"], "Nueva reserva confirmada")
-        self.assertEqual(params["whatsapp_cliente"], f"+{w.wa_id}")
+        # OLD (c6e5ce9): f"+{w.wa_id}" — the approved template renders https://wa.me/{{3}}.
+        # NEW (W1F-OPERATOR-WA-ME-LINK-CONTRACT-CORRECTION): digits only.
+        self.assertEqual(params["whatsapp_cliente"], w.wa_id)
+        self.assertRegex(params["whatsapp_cliente"], r"^[1-9][0-9]{7,14}$")
         self.assertIn("Peugeot 208", params["vehiculo"])
         self.assertIn("Calle Falsa 123", params["lugar"])
         self.assertIn(w.day.strftime("%d/%m/%Y"), params["fecha_hora"])
@@ -612,6 +615,153 @@ class N_Notice(unittest.TestCase):
                 ON.attempt_fingerprint(a, bad)
         with self.assertRaises(ValueError):
             ON.notification_identity("")
+
+
+# ══ W1F-OPERATOR-WA-ME-LINK-CONTRACT-CORRECTION: {{3}} feeds https://wa.me/{{3}} ══════════
+
+WA_ME = re.compile(r"^https://wa\.me/[1-9][0-9]{7,14}$")
+CRM_LINK = re.compile(r"^https://crm\.ridecheck\.ar/whatsapp/thread/[0-9]+$")
+#: Each must fail closed — never repaired into some (possibly another customer's) number.
+MALFORMED_WA_IDS = (
+    "", " ", "+", "++5491100990055", "+ 5491100990055", "549+1100990055",
+    " 5491100990055", "5491100990055 ", "5491100990055\n", "549 11 0099 0055",
+    "549-11-0099-0055", "(549) 1100990055", "549.11.0099.0055", "54911abc0055",
+    "https://wa.me/5491100990055", "wa.me/5491100990055", "0491100990055",
+    "5491100", "54911009900551234", "٥٤٩١١٠٠٩٩٠٠٥٥", "５４９１１００９９００５５",
+    "5٤٩١١٠٠٩٩٠٠٥٥", "5491100990０55",           # ASCII lead, non-ASCII digits after
+)
+
+
+def set_customer_wa_id(engine, w, wa_id):
+    """Store `wa_id` as the booked customer's identity (as an upstream defect might)."""
+    with Session(engine) as db:
+        db.execute(update(WhatsAppContact).where(WhatsAppContact.id == w.contact_id)
+                   .values(wa_id=wa_id))
+        db.commit()
+
+
+def stored_customer_wa_id(engine, w):
+    with Session(engine) as db:
+        return db.get(WhatsAppContact, w.contact_id).wa_id
+
+
+class W_WaMeLinkContract(unittest.TestCase):
+
+    def test_w01_canonical_numbers_render_as_digits_only(self):
+        for stored, rendered in (
+                ("5491100990055", "5491100990055"),       # Argentine mobile
+                ("541100990055", "541100990055"),         # Argentine landline shape
+                ("447700900123", "447700900123"),         # non-Argentine (UK)
+                ("14155550123", "14155550123"),           # non-Argentine (NANP)
+                ("+5491100990055", "5491100990055"),      # one canonical `+`, removed
+                ("+447700900123", "447700900123")):
+            with self.subTest(stored=stored):
+                got = ON.customer_wa_me_parameter(stored)
+                self.assertEqual(got, rendered)
+                self.assertFalse(got.startswith("+"))
+                self.assertRegex(got, r"^[1-9][0-9]{7,14}$")
+                self.assertRegex(f"https://wa.me/{got}", WA_ME)
+
+    def test_w02_malformed_identities_fail_closed_without_repair(self):
+        for bad in MALFORMED_WA_IDS + (None, 5491100990055, b"5491100990055"):
+            with self.subTest(bad=bad):
+                self.assertIsNone(ON.customer_wa_me_parameter(bad))
+
+    def test_w03_the_sent_contract_ten_parameters_order_and_both_links(self):
+        self.assertEqual(ON.TEMPLATE_PARAMETERS, (
+            "evento", "cliente", "whatsapp_cliente", "vehiculo", "lugar", "fecha_hora",
+            "profesional", "estado", "identificadores", "crm"))
+        engine = H.sqlite_engine()
+        set_floor(engine)
+        w = book(engine)
+        with notifier() as tpl:
+            run(engine)
+        (sent,) = tpl.sent
+        self.assertEqual(len(sent["params"]), 10)
+        p = sent["params"]
+        self.assertEqual(p[0], "Nueva reserva confirmada")
+        self.assertEqual(p[2], w.wa_id)
+        self.assertRegex(f"https://wa.me/{p[2]}", WA_ME)
+        self.assertEqual(p[9], f"/whatsapp/thread/{w.thread_id}")
+        self.assertRegex(f"https://crm.ridecheck.ar{p[9]}", CRM_LINK)
+        self.assertEqual(sent["to"], DEST)
+        self.assertNotEqual(sent["to"], p[2])
+        (out,) = operator_outbound(engine)
+        self.assertIn(f"whatsapp_cliente: {w.wa_id}\n", out.text)
+        self.assertNotIn(f"+{w.wa_id}", out.text)
+
+    def test_w04_a_stored_plus_is_removed_only_at_the_rendering_boundary(self):
+        engine = H.sqlite_engine()
+        set_floor(engine)
+        w = book(engine)
+        set_customer_wa_id(engine, w, f"+{w.wa_id}")
+        with notifier() as tpl:
+            run(engine)
+        (sent,) = tpl.sent
+        self.assertEqual(sent["params"][2], w.wa_id)
+        self.assertEqual(stored_customer_wa_id(engine, w), f"+{w.wa_id}")   # storage unchanged
+        self.assertEqual(notices(engine)[0].status, "SENT")
+
+    def test_w05_a_non_argentine_customer_renders_its_own_digits(self):
+        engine = H.sqlite_engine()
+        set_floor(engine)
+        w = book(engine)
+        set_customer_wa_id(engine, w, "447700900123")
+        with notifier() as tpl:
+            run(engine)
+        self.assertEqual(tpl.sent[0]["params"][2], "447700900123")
+        self.assertRegex(f"https://wa.me/{tpl.sent[0]['params'][2]}", WA_ME)
+
+    def test_w06_malformed_customer_identity_is_held_with_zero_provider_calls(self):
+        for bad in MALFORMED_WA_IDS:
+            with self.subTest(bad=bad):
+                engine = H.sqlite_engine()
+                set_floor(engine)
+                w = book(engine)
+                set_customer_wa_id(engine, w, bad)
+                t0 = datetime.now(timezone.utc)
+                with notifier() as tpl:
+                    for k in range(4):                    # retries would be due by now
+                        run(engine, now=t0 + timedelta(minutes=2 * k))
+                self.assertEqual(tpl.sent, [])
+                self.assertEqual(operator_outbound(engine), [], "the gate was reached")
+                (n,) = notices(engine)
+                self.assertEqual((n.status, n.attempts, n.last_error),
+                                 ("HELD", 1, ON.CUSTOMER_WA_ID_MALFORMED))
+                row = attention(engine)[ledger(engine, w).id]
+                self.assertEqual(row["reasons"], ["OPERATOR_NOTIFICATION_REQUIRED"])
+                self.assertEqual(stored_customer_wa_id(engine, w), bad)
+
+    def test_w07_operator_and_customer_cannot_be_exchanged(self):
+        # the operator destination equals the customer once the customer's `+` is removed
+        engine = H.sqlite_engine()
+        set_floor(engine)
+        w = book(engine)
+        set_customer_wa_id(engine, w, f"+{DEST}")
+        with notifier() as tpl:
+            run(engine)
+        self.assertEqual(tpl.sent, [])
+        (n,) = notices(engine)
+        self.assertEqual((n.status, n.last_error), ("HELD", "DESTINATION_IS_CUSTOMER"))
+        # and the recipient is always the configured operator, never parameter {{3}}
+        engine = H.sqlite_engine()
+        set_floor(engine)
+        w = book(engine)
+        with notifier(template=Template("4xx", "ok")) as tpl:
+            t0 = datetime.now(timezone.utc)
+            run(engine, now=t0)
+            run(engine, now=t0 + timedelta(seconds=61))
+        self.assertEqual([s["to"] for s in tpl.sent], [DEST, DEST])
+        self.assertEqual([s["params"][2] for s in tpl.sent], [w.wa_id, w.wa_id])
+        (n,) = notices(engine)
+        self.assertEqual((n.status, n.attempts), ("SENT", 2))     # retry unchanged
+
+    def test_w08_the_formatter_is_the_operator_template_boundary_only(self):
+        app = ROOT / "backend" / "app"
+        users = sorted(str(p.relative_to(app)) for p in app.rglob("*.py")
+                       if "customer_wa_me_parameter" in p.read_text())
+        self.assertEqual(users, ["services/operator_notification.py"])
+        self.assertNotIn('f"+{wa_id}"', SOURCE)
 
 
 # ══ W1-F1: the alert predicate ═══════════════════════════════════════════════════════════

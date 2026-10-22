@@ -81,6 +81,10 @@ TEMPLATE_PARAMETERS = (
 EVENT_LABEL = "Nueva reserva confirmada"
 
 _DESTINATION = re.compile(r"[1-9][0-9]{7,14}")
+#: {{3}} is the customer's number as the approved template's `https://wa.me/{{3}}` needs it:
+#: international digits only, never `+` (W1F-OPERATOR-WA-ME-LINK-CONTRACT-CORRECTION).
+_WA_ME_DIGITS = re.compile(r"[1-9][0-9]{7,14}")
+CUSTOMER_WA_ID_MALFORMED = "CUSTOMER_WA_ID_MALFORMED"
 _TEMPLATE_NAME = re.compile(r"[a-z0-9_]{1,128}")
 _LANGUAGE = re.compile(r"[a-z]{2,3}(_[A-Z]{2})?")
 _PARAM_MAX = 120
@@ -164,6 +168,8 @@ class BookingSummary:
     """What the operator needs to continue — and nothing else (no transcript)."""
     parameters: tuple
     customer_wa_id: Optional[str]
+    #: A typed reason this summary must not be sent (the notice is HELD), or None.
+    problem: Optional[str] = None
 
     @property
     def preview(self) -> str:
@@ -176,6 +182,19 @@ def _param(value) -> str:
     empty parameter."""
     text = " ".join(str(value if value is not None else "").split())
     return (text or "Sin dato")[:_PARAM_MAX]
+
+
+def customer_wa_me_parameter(wa_id) -> Optional[str]:
+    """Parameter {{3}}: the stored customer WhatsApp id as ASCII digits only, so that the
+    template's `https://wa.me/{{3}}` opens exactly this customer — or None (fail closed).
+
+    Rendering only: canonical storage is never changed. One leading `+` is removed; nothing
+    else is repaired (no trimming, punctuation removal, padding, truncation or country code),
+    because a guessed number could open another customer's conversation."""
+    if type(wa_id) is not str:
+        return None
+    digits = wa_id[1:] if wa_id.startswith("+") else wa_id
+    return digits if _WA_ME_DIGITS.fullmatch(digits) else None
 
 
 def build_summary(db: Session, ledger) -> Optional[BookingSummary]:
@@ -209,9 +228,11 @@ def build_summary(db: Session, ledger) -> Optional[BookingSummary]:
     status = f"Reservado por el cliente · confirmación al cliente: {ledger.ack_status}"
     ids = f"Reserva {ledger.id} · Lead {ledger.lead_id} · Conversación {ledger.thread_id}"
     crm = f"/whatsapp/thread/{ledger.thread_id}" if ledger.thread_id is not None else None
-    values = (EVENT_LABEL, name, f"+{wa_id}" if wa_id else None, vehicle, place, when,
+    wa_me = customer_wa_me_parameter(wa_id)
+    values = (EVENT_LABEL, name, wa_me, vehicle, place, when,
               professional, status, ids, crm)
-    return BookingSummary(parameters=tuple(_param(v) for v in values), customer_wa_id=wa_id)
+    return BookingSummary(parameters=tuple(_param(v) for v in values), customer_wa_id=wa_id,
+                          problem=None if wa_me is not None else CUSTOMER_WA_ID_MALFORMED)
 
 
 # ── enqueue: committed ledger rows → one notice row each ─────────────────────
@@ -406,7 +427,10 @@ def send_claimed(db: Session, claim: Claim, config: Optional[OperatorConfig]) ->
         db.rollback()
         if summary is None:
             return Outcome(False, False, "SUMMARY_UNAVAILABLE")
-        if summary.customer_wa_id == config.destination:
+        if summary.problem is not None:
+            # a malformed customer number must never reach the operator as a wa.me link
+            return Outcome(False, False, summary.problem)
+        if config.destination in (summary.customer_wa_id, summary.parameters[2]):
             return Outcome(False, False, "DESTINATION_IS_CUSTOMER")
         thread_id, refused = _operator_thread(db, config.destination)
         if refused is not None:
