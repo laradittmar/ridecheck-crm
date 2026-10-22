@@ -48,6 +48,10 @@ EMPTY_URL = os.environ.get("CONV_P4R1_EMPTY_URL", "")
 P4_PARENT = "20261014_ledger_detached_state"
 P4_REV = "20261015_booking_attempt_events"
 R1_HEAD = "20261016_notification_sent_at"
+#: W1-F2 adaptation: the Alembic head is now the additive 20261022_operator_notifications, a
+#: child of R1_HEAD. Assertions that a database sits AT THE HEAD (after `upgrade head`, or
+#: unchanged after a refused downgrade) name it; R1_HEAD stays the 4-R1 revision under test.
+ALEMBIC_HEAD = "20261022_operator_notifications"
 
 
 def _rows(engine, sql, **p):
@@ -770,7 +774,7 @@ class P4R1_SchemaOrder(_Schema):
 
     def test_p4r1_50_parent_bootstrap_then_upgrade_to_the_new_head(self):
         self.upgrade(PARENT_URL)
-        self.assertEqual(_version(PARENT_URL), [R1_HEAD])
+        self.assertEqual(_version(PARENT_URL), [ALEMBIC_HEAD])
         self.assert_enforced(PARENT_URL)
         self.assertEqual(self.startup_missing(PARENT_URL), [])
         type(self).fp["upgraded"] = _fingerprint(PARENT_URL)
@@ -780,7 +784,7 @@ class P4R1_SchemaOrder(_Schema):
             self.assertIsNotNone(c.execute(text(
                 "SELECT to_regclass('booking_attempt_events')")).scalar())
         self.upgrade(APPFIRST_URL)
-        self.assertEqual(_version(APPFIRST_URL), [R1_HEAD])
+        self.assertEqual(_version(APPFIRST_URL), [ALEMBIC_HEAD])
         self.assert_enforced(APPFIRST_URL)
         self.assertEqual(self.startup_missing(APPFIRST_URL), [])
         type(self).fp["appfirst"] = _fingerprint(APPFIRST_URL)
@@ -801,7 +805,7 @@ class P4R1_SchemaOrder(_Schema):
             r = _alembic(PARENT_URL, "downgrade", P4_PARENT)
             self.assertNotEqual(r.returncode, 0, "an evidence-bearing downgrade ran")
             self.assertIn("audit-data loss", r.stderr + r.stdout)
-            self.assertEqual(_version(PARENT_URL), [R1_HEAD], "a partial downgrade was recorded")
+            self.assertEqual(_version(PARENT_URL), [ALEMBIC_HEAD], "a partial downgrade was recorded")
             self.assertEqual(_fingerprint(PARENT_URL), self.fp.get("upgraded"),
                              "partial downgrade")
             self.assertEqual(_rows(_eng(PARENT_URL),
@@ -829,7 +833,7 @@ class P4R1_SchemaOrder(_Schema):
         r = _alembic(PARENT_URL, "downgrade", P4_REV)
         self.assertNotEqual(r.returncode, 0, "a timestamp-bearing downgrade ran")
         self.assertIn("notification-evidence loss", r.stderr + r.stdout)
-        self.assertEqual(_version(PARENT_URL), [R1_HEAD])
+        self.assertEqual(_version(PARENT_URL), [ALEMBIC_HEAD])
         self.assertEqual(_rows(_eng(PARENT_URL), "SELECT count(*) FROM thread_revisions WHERE "
                                                  "notification_sent_at IS NOT NULL"), [1])
         with _eng(PARENT_URL).begin() as c:
@@ -863,7 +867,7 @@ class P4R1_LegacyStartupColumn(_Schema):
                            "VALUES (:t, 'booked', '2026-10-01T12:00:00Z')"), {"t": th})
         before = _rows(e, "SELECT notification_sent_at::text FROM thread_revisions")
         self.upgrade(LEGACY_URL)
-        self.assertEqual(_version(LEGACY_URL), [R1_HEAD])
+        self.assertEqual(_version(LEGACY_URL), [ALEMBIC_HEAD])
         self.assertEqual(_rows(e, "SELECT notification_sent_at::text FROM thread_revisions"),
                          before, "the upgrade rewrote existing evidence")
         self.assertEqual(_rows(e, "SELECT coalesce(col_description('thread_revisions'::regclass,"

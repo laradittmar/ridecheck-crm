@@ -29,7 +29,10 @@ Every `gate.attempt()` call MUST pass `path_id=OutboundPathId.<X>.value`.
 Calls with `path_id=None` are blocked at step -1 (before kill switch) and emit a
 `OUTBOUND_ATTEMPT_WITH_UNKNOWN_SOURCE` BLOCKER SecurityEvent.
 Authorized paths: CE_TEXT, CE_FLOW, CE_INTERACTIVE, CE_LIST, MANUAL_CRM,
-BOOKING_FLOW, SYSTEM_NOTIFICATION. Legacy: LEGACY_N8N_AI_PIPELINE (blocked).
+BOOKING_FLOW, SYSTEM_NOTIFICATION, OPERATOR_NOTIFICATION. Legacy: LEGACY_N8N_AI_PIPELINE (blocked).
+OPERATOR_NOTIFICATION (W1-F2) is not a send-to-any-phone path: the gate refuses it for any
+recipient other than the configured, well-formed operator destination
+(`operator_notification.operator_config`), and for every recipient while that is unconfigured.
 
 ### STATUS WEBHOOK CORRELATION
 Incoming Meta status webhooks (sent/delivered/read/failed) are matched to

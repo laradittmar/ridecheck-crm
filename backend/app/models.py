@@ -389,6 +389,65 @@ class BookingCommandRecord(Base):
     detached_history: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
 
+class OperatorNotification(Base):
+    """W1-F2: the operator's WhatsApp notice of one committed customer booking.
+
+    One row per booking command, never more: `UNIQUE (booking_command_id)` and
+    `UNIQUE (identity)` are the duplicate authority, so a Flow resubmission, an idempotent
+    replay or a provider callback can never create a second notice. The committed ledger row is
+    the durable trigger (the booking's own transaction wrote it); this row is written only
+    after that commit, by `services.operator_notification`.
+
+    `status`: PENDING (owed; `next_attempt_at` says when) → SENDING (one claimed attempt) →
+    SENT, or terminal FAILED (two definite failures) / HELD (never sent: not configured, no
+    summary, or an attempt whose outcome is unknown and is therefore never repeated). FAILED
+    and HELD are OPERATOR_NOTIFICATION_REQUIRED on `/api/ops/booking-attention`.
+    The `hist_*` ids are history, not foreign keys: a tester reset may delete what they name.
+    """
+    __tablename__ = "operator_notifications"
+    __table_args__ = (
+        UniqueConstraint("booking_command_id", name="uq_operator_notifications_command"),
+        UniqueConstraint("identity", name="uq_operator_notifications_identity"),
+        CheckConstraint("kind IN ('BOOKING_CREATED')", name="ck_operator_notifications_kind"),
+        CheckConstraint("status IN ('PENDING', 'SENDING', 'SENT', 'FAILED', 'HELD')",
+                        name="ck_operator_notifications_status"),
+        CheckConstraint("attempts >= 0 AND attempts <= 2",
+                        name="ck_operator_notifications_attempts"),
+        Index("ix_operator_notifications_status", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True)
+    booking_command_id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"), ForeignKey("booking_commands.id"),
+        nullable=False)
+    identity: Mapped[str] = mapped_column(String(64), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0,
+                                          server_default=text("0"))
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    destination_hash: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    template_name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    template_language: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    provider_message_id: Mapped[Optional[str]] = mapped_column(String(191), nullable=True)
+    outbound_message_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    last_error: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    claim_token: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True),
+                                                                 nullable=True)
+    next_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True),
+                                                                nullable=True)
+    sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False,
+                                                 server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False,
+                                                 server_default=func.now())
+    hist_thread_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    hist_lead_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    hist_revision_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    hist_thread_revision_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+
 class ViaticosZone(Base):
     __tablename__ = "viaticos_zones"
     __table_args__ = (

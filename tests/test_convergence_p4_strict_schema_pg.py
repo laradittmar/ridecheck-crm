@@ -41,6 +41,10 @@ PARENT_URL = os.environ.get("CONV_SSA_PARENT_URL", "")
 P4_PARENT = "20261014_ledger_detached_state"
 P4_REV = "20261015_booking_attempt_events"
 HEAD = "20261016_notification_sent_at"
+#: W1-F2 adaptation: `upgrade head` now ends one additive revision above HEAD
+#: (20261022_operator_notifications). Version assertions after `upgrade head` name it; HEAD
+#: stays the 4-R1 revision whose branches and literals these tests certify.
+ALEMBIC_HEAD = "20261022_operator_notifications"
 _SEQ = itertools.count(1)
 
 # ── the whole-database fingerprint (this file's own oracle) ──────────────────────────────────
@@ -253,7 +257,7 @@ class _Strict(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr[-2000:])
         for b in branches:
             self.assertIn(b, r.stdout)
-        self.assertEqual(_scalars(url, "SELECT version_num FROM alembic_version"), [HEAD])
+        self.assertEqual(_scalars(url, "SELECT version_num FROM alembic_version"), [ALEMBIC_HEAD])
         return r
 
     def refused(self, url, *expect, typed=True):
@@ -377,7 +381,7 @@ class SSA_ValidPaths(_Strict):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("notification-evidence loss", r.stderr + r.stdout)
         self.assertEqual(_scalars(url, probe), before)
-        self.assertEqual(_scalars(url, "SELECT version_num FROM alembic_version"), [HEAD])
+        self.assertEqual(_scalars(url, "SELECT version_num FROM alembic_version"), [ALEMBIC_HEAD])
 
     def test_ssa_05_already_canonical_objects_are_verified_not_rebuilt(self):
         url = self.db("head")

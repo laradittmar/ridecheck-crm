@@ -69,6 +69,7 @@ AUTHORIZED_PATHS: list[str] = [
     "MANUAL_CRM",
     "BOOKING_FLOW",
     "SYSTEM_NOTIFICATION",
+    "OPERATOR_NOTIFICATION",
 ]
 
 LEGACY_PATHS: list[str] = ["LEGACY_N8N_AI_PIPELINE"]
@@ -406,6 +407,13 @@ _PATH_DOC: dict[str, dict] = {
         "label": "Notificación del sistema",
         "initiator": "Tarea programada",
         "purpose": "Aviso automático determinista (seguimiento, recordatorio).",
+        "kind": "AUTOMATED",
+    },
+    "OPERATOR_NOTIFICATION": {
+        "label": "Aviso al operador",
+        "initiator": "Servicio de avisos de reservas",
+        "purpose": ("Aviso por WhatsApp (plantilla aprobada) al número del operador "
+                    "configurado, uno por reserva confirmada. Nunca a un cliente."),
         "kind": "AUTOMATED",
     },
     "LEGACY_N8N_AI_PIPELINE": {
@@ -1039,6 +1047,9 @@ _BOOKING_RECOVERY = {
     # Convergence Phase 4 (SB2B-RV-04): the booking stands; the team was not told by e-mail.
     "OPERATOR_NOTIFICATION_PENDING": "NOTIFY_TEAM_MANUALLY",
     "OPERATOR_NOTIFICATION_FAILED": "NOTIFY_TEAM_MANUALLY",
+    # W1-F2: the operator's WhatsApp notice FAILED twice or is HELD (not configured, refused,
+    # or uncertain — never repeated automatically). The booking stands.
+    "OPERATOR_NOTIFICATION_REQUIRED": "NOTIFY_TEAM_MANUALLY",
 }
 _RECOVERY_RANK = ("OPERATOR_REVIEW", "STORED_INBOUND_REPLAY", "LEDGER_ACK_RECOVERY",
                   "NOTIFY_TEAM_MANUALLY")
@@ -1091,6 +1102,13 @@ def booking_attention(db: Session, *, now: Optional[datetime] = None,
     committed customer booking whose e-mail is not SENT once `pending_older_than_seconds` has
     passed is listed with `OPERATOR_NOTIFICATION_PENDING` / `_FAILED`. The next action is to
     tell the team by hand: the booking itself stands and is never recreated from here.
+
+    W1-F2 — a booking that has an `operator_notifications` row (every customer booking
+    committed after migration 20261022) reports THAT notice instead, with
+    `notification_channel: WHATSAPP` and its own status (PENDING, SENDING, SENT, FAILED, HELD,
+    or DELIVERY_FAILED: sent, then reported `failed` by Meta's status callback — never resent).
+    FAILED, HELD or DELIVERY_FAILED is listed at once with `OPERATOR_NOTIFICATION_REQUIRED`;
+    PENDING or SENDING after the settle window with `OPERATOR_NOTIFICATION_PENDING`.
 
     `CE_SYNC_INCOMPLETE` is detectable for Conversation-Engine rows only: their
     `correlation_id` names the causal inbound (`in:<sha256>`), so the inbound's `ai_event`
@@ -1218,8 +1236,41 @@ def _notification_truth(db: Session, *, now: datetime, settled: datetime, rows: 
                                     [b.thread_revision_id for b in booked]))
                          .order_by(E.occurred_at, E.id)).all():
         evidence.setdefault(ev.hist_thread_revision_id, []).append(ev)
+    # W1-F2: where the operator's WhatsApp notice exists it is the notification truth (owner
+    # decision: the professional is told on WhatsApp; an e-mail never stands in for it).
+    # Bookings without one — committed before migration 20261022 — keep the e-mail truth.
+    from ..models import OperatorNotification as ON
+    whatsapp = {n.booking_command_id: n for n in db.execute(
+        select(ON.booking_command_id, ON.status, ON.attempts, ON.last_error,
+               WhatsAppMessage.status.label("delivery"))
+        .outerjoin(WhatsAppMessage, WhatsAppMessage.id == ON.outbound_message_id)
+        .where(ON.booking_command_id.in_([b.id for b in booked]))).all()}
     out = {}
     for b in booked:
+        notice = whatsapp.get(b.id)
+        if notice is not None:
+            # Meta's own later `failed` status for a notice it had accepted: shown, never
+            # resent — a provider callback never creates a second notice.
+            state = ("DELIVERY_FAILED" if notice.status == "SENT" and notice.delivery == "failed"
+                     else notice.status)
+            required = state in ("FAILED", "HELD", "DELIVERY_FAILED")
+            out[b.id] = {
+                "notification_state": state,
+                "notification_channel": "WHATSAPP",
+                "notification_attempts": int(notice.attempts),
+                "notification_last_reason": notice.last_error,
+                "notification_next_action": (None if state == "SENT"
+                                             else "NOTIFY_TEAM_MANUALLY"),
+            }
+            committed = b.committed_at
+            if committed is not None and committed.tzinfo is None:
+                committed = committed.replace(tzinfo=timezone.utc)
+            if required or (state != "SENT"
+                            and (committed is None or committed <= settled)):
+                row = rows.setdefault(b.id, {**dict(b._mapping), "reasons": []})
+                row["reasons"].append("OPERATOR_NOTIFICATION_REQUIRED" if required
+                                      else "OPERATOR_NOTIFICATION_PENDING")
+            continue
         evs = evidence.get(b.thread_revision_id, [])
         if b.thread_revision_id in sent:
             state = "SENT"

@@ -54,6 +54,9 @@ P4_HEAD = "20261015_booking_attempt_events"
 #: `thread_revisions.notification_sent_at`, P4RV-04), a child of P4_HEAD. Where these tests
 #: mean "the head" they now name it, and the chain HEAD ← P4_HEAD ← R1_HEAD is asserted.
 R1_HEAD = "20261016_notification_sent_at"
+#: W1-F2 adaptation: one more additive migration on top (`operator_notifications`), a child of
+#: R1_HEAD. Where these tests mean "the head" they now name it; the chain is still asserted.
+W1F_HEAD = "20261022_operator_notifications"
 DAY = date(2027, 3, 2)                       # a Tuesday; ScheduleService is not consulted here
 DAY2 = date(2027, 3, 3)
 WA_A, WA_B = "549110000901", "549110000902"
@@ -236,7 +239,7 @@ class P2_00_Schema(_Base):
         # Convergence Phase 4 / 4-R1 adaptation: the migrated head is now 4-R1's, whose
         # parent is Phase 4's, whose parent is HEAD (asserted in mg_01).
         self.assertEqual([r[0] for r in self.q("SELECT version_num FROM alembic_version")],
-                         [R1_HEAD])
+                         [W1F_HEAD])
         self.assertEqual(self.one("SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal AND "
                                   "tgname = 'trg_booking_commands_detached_terminal'"), 1)
         names = {r[0] for r in self.q("SELECT conname FROM pg_constraint WHERE conrelid = "
@@ -1171,7 +1174,8 @@ class P2_50_Migration(unittest.TestCase):
             # Convergence Phase 4 adaptation: still ONE head — the Phase 4 migration — whose
             # parent is the Phase 2 revision, whose parent is the Phase 1 merge.
             # Phase 4-R1 adaptation: the one head is now 4-R1's, whose parent is Phase 4's.
-            self.assertEqual(script.get_heads(), [R1_HEAD])
+            self.assertEqual(script.get_heads(), [W1F_HEAD])
+            self.assertEqual(script.get_revision(W1F_HEAD).down_revision, R1_HEAD)
             self.assertEqual(script.get_revision(R1_HEAD).down_revision, P4_HEAD)
             self.assertEqual(script.get_revision(P4_HEAD).down_revision, HEAD)
             self.assertEqual(script.get_revision(HEAD).down_revision, PARENT)
@@ -1184,7 +1188,9 @@ class P2_50_Migration(unittest.TestCase):
         # through the (empty) booking_attempt_events downgrade on its way to PARENT.
         # Phase 4-R1 adaptation: it now starts at the 4-R1 head (and passes through its
         # null-only, marker-owned column downgrade as well).
-        self.assertEqual(top[4], [R1_HEAD]); self.assertEqual(top[3], 1)
+        # W1-F2 adaptation: it now starts at W1F_HEAD and passes through its empty-table
+        # downgrade first.
+        self.assertEqual(top[4], [W1F_HEAD]); self.assertEqual(top[3], 1)
         self.alembic("downgrade", PARENT)
         mid = self.catalog()
         self.assertEqual(mid[4], [PARENT])

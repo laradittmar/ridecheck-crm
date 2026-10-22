@@ -112,7 +112,11 @@ class P4R1_DeclaredSchema(unittest.TestCase):
         for d in revs.values():
             downs.update(d if isinstance(d, (tuple, list)) else [d])
         heads = sorted(r for r in revs if r not in downs)
-        self.assertEqual(heads, ["20261016_notification_sent_at"])
+        # W1-F2 adaptation. OLD: the single head was 20261016_notification_sent_at. NEW: one
+        # additive revision, 20261022_operator_notifications, sits on it; the chain below it
+        # is asserted unchanged.
+        self.assertEqual(heads, ["20261022_operator_notifications"])
+        self.assertEqual(revs["20261022_operator_notifications"], "20261016_notification_sent_at")
         self.assertEqual(revs["20261016_notification_sent_at"], "20261015_booking_attempt_events")
         self.assertEqual(revs["20261015_booking_attempt_events"], "20261014_ledger_detached_state")
 

@@ -714,6 +714,10 @@ class T23_DeploymentWithUnregisteredSendPath(unittest.TestCase):
             "_send_whatsapp_cloud_flow": OutboundPathId.CE_FLOW,
             "_send_whatsapp_cloud_interactive": OutboundPathId.CE_INTERACTIVE,
             "_send_whatsapp_cloud_list": OutboundPathId.CE_LIST,
+            # W1-F2 adaptation: the operator's booking notice is the one template sender, and
+            # its only path is OPERATOR_NOTIFICATION (the gate pins it to the configured
+            # operator destination).
+            "_send_whatsapp_cloud_template": OutboundPathId.OPERATOR_NOTIFICATION,
         }
         for fn_name in send_fns:
             expected_path = fn_to_path.get(fn_name)

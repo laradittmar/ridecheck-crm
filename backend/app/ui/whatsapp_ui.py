@@ -189,6 +189,78 @@ def _send_whatsapp_cloud_text(to_wa_id: str, text: str) -> tuple[str, int]:
     raise MetaSendError(status_code, body, error_message="Unexpected response: no messages[0].id")
 
 
+def _send_whatsapp_cloud_template(
+    to_wa_id: str,
+    template_name: str,
+    language_code: str,
+    body_parameters: list[str],
+) -> tuple[str, int]:
+    """W1-F2: send one approved WhatsApp message TEMPLATE (body parameters only).
+
+    A business-initiated message to a number outside its 24-hour customer-service window can
+    only be a template; the operator's own number is not a customer conversation, so the
+    operator notice is always one. Unlike the text sender there is no dummy mode: without a
+    real token this raises before the network, so a notice can never be recorded as sent
+    when nothing was. The recipient is logged by its last four digits only."""
+    enforce_outbound_enabled("whatsapp_ui._send_whatsapp_cloud_template", "template", to_wa_id,
+                             text=template_name)
+    settings = get_settings()
+    token = (settings.whatsapp_token or "").strip()
+    phone_number_id = (settings.whatsapp_phone_number_id or "").strip()
+    if not token or token.lower() == "dummy":
+        raise RuntimeError("WHATSAPP_TOKEN missing — a template is never simulated")
+    if not phone_number_id:
+        raise RuntimeError("WHATSAPP_PHONE_NUMBER_ID missing")
+    logger.info("WHATSAPP_OUTBOUND_TEMPLATE_ATTEMPT to=...%s template=%s",
+                to_wa_id[-4:], template_name)
+
+    endpoint = f"https://graph.facebook.com/v19.0/{phone_number_id}/messages"
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_wa_id,
+        "type": "template",
+        "template": {
+            "name": template_name,
+            "language": {"code": language_code},
+            "components": [{
+                "type": "body",
+                "parameters": [{"type": "text", "text": p} for p in body_parameters],
+            }],
+        },
+    }
+    req = urlrequest.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        from ..services.booking_authority import forbid_external_io
+        forbid_external_io("meta_graph")
+        with urlrequest.urlopen(req, timeout=15) as resp:
+            status_code = int(getattr(resp, "status", 200))
+            body = resp.read().decode("utf-8", errors="replace")
+    except error.HTTPError as exc:
+        err_body = exc.read().decode("utf-8", errors="replace")
+        logger.error("WHATSAPP_OUTBOUND_TEMPLATE_RESPONSE status=%s", exc.code)
+        raise MetaSendError(exc.code, err_body) from exc
+    except OSError as exc:
+        logger.error("WHATSAPP_OUTBOUND_TEMPLATE_TIMEOUT/NETWORK: %s", type(exc).__name__)
+        raise MetaSendError(None, str(exc)) from exc
+
+    logger.info("WHATSAPP_OUTBOUND_TEMPLATE_RESPONSE status=%s", status_code)
+    response_data = json.loads(body) if body.strip() else {}
+    messages = response_data.get("messages") if isinstance(response_data, dict) else None
+    if isinstance(messages, list) and messages and isinstance(messages[0], dict):
+        wa_message_id = str(messages[0].get("id") or "").strip()
+        if wa_message_id:
+            return wa_message_id, status_code
+    raise MetaSendError(status_code, body, error_message="Unexpected response: no messages[0].id")
+
+
 def _send_whatsapp_cloud_interactive(
     to_wa_id: str,
     body_text: str,

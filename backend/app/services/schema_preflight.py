@@ -41,7 +41,7 @@ from .schema_fingerprint import (SchemaShapeRefused, closest_differences, column
 logger = logging.getLogger(__name__)
 
 #: The single Alembic head this code requires (a test pins it to the script directory).
-EXPECTED_HEAD = "20261016_notification_sent_at"
+EXPECTED_HEAD = "20261022_operator_notifications"
 
 
 class DeclaredSchemaMissing(RuntimeError):

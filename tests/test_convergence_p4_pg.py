@@ -521,7 +521,10 @@ class P4R_Migration(unittest.TestCase):
             # 20261015 explicitly (an empty, marker-owned column — exact) and the Phase 4
             # assertions below run unchanged from there; it ends back at the head.
             self.assertEqual([h for h in heads.stdout.split("\n") if h.strip()],
-                             ["20261016_notification_sent_at (head)"])
+                             ["20261022_operator_notifications (head)"])
+            # W1-F2 adaptation. OLD: 20261016 was the head. NEW: the additive revision
+            # 20261022_operator_notifications is the head; the step down below passes through
+            # its downgrade (an empty table) and the Phase 4 assertions are unchanged.
             step = self.alembic("downgrade", "20261015_booking_attempt_events")
             self.assertEqual(step.returncode, 0, step.stderr[-800:])
             def columns():
@@ -558,7 +561,7 @@ class P4R_Migration(unittest.TestCase):
                     "SELECT count(*) FROM pg_trigger WHERE tgname = "
                     "'trg_booking_attempt_events_append_only'")).scalar(), 1)
                 self.assertEqual(c.execute(text("SELECT version_num FROM alembic_version"))
-                                 .scalar(), "20261016_notification_sent_at")
+                                 .scalar(), "20261022_operator_notifications")  # W1-F2 head
         finally:
             eng.dispose()
 

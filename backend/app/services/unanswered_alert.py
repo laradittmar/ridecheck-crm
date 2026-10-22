@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Optional
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -128,6 +129,69 @@ _RESET_ALERT_SQL = text("""
         updated_at = NOW()
     WHERE thread_id = :thread_id
 """)
+
+
+# W1-F1 — a committed, acknowledged Flow booking is not an unanswered customer.
+#
+# On a Flow booking, Meta delivers the Flow's completion as an inbound `flow_response` message,
+# and it can be stored AFTER the booking acknowledgement (first Wild, 2026-10-21: ack 21:27:23,
+# completion 21:27:27). The booking sets `needs_human=true` by design, so the thread-level
+# human-handoff query saw "latest message inbound" and e-mailed the operator a false
+# "sin respuesta" at 21:30:00. That inbound IS answered: it is the same submission the booking
+# authority committed and acknowledged.
+#
+# The decision is structural — never prose, never timing:
+#   1. the thread's latest message (the one the query found inbound) is a stored Flow
+#      response;
+#   2. its booking-command key is the key the booking writers execute under
+#      (`booking_ce_adapter.flow_booking_key` over the stored Flow token — the Data Exchange
+#      endpoint's `flow:` key — or the inbound's own id), parsed from the stored payload with
+#      the webhook's own rules (`booking_recovery.stored_inbound_event`);
+#   3. that ledger row is a COMMITTED CREATE on THIS thread with its booking projection;
+#   4. its acknowledgement is SENT, and the acknowledgement's WAMID is an outbound message on
+#      THIS thread that Meta accepted (sent / delivered / read).
+# Anything short of all four — another thread's booking, a refused or failed submission, an
+# acknowledgement never delivered, a fallback or handoff Flow that books nothing, a customer
+# writing again after the booking — leaves the alert exactly as it was.
+
+_ACCEPTED_STATUSES = ("sent", "delivered", "read")
+
+
+def latest_inbound_is_acknowledged_booking_completion(db: Session, thread_id: int) -> Optional[int]:
+    """The booking command whose committed, acknowledged booking the thread's latest message
+    completes, or None. Read-only."""
+    from sqlalchemy import select
+
+    from ..models import BookingCommandRecord as R
+    from ..models import WhatsAppMessage as M
+    from .booking_ce_adapter import flow_booking_key
+    from .booking_recovery import stored_inbound_event
+
+    latest = db.execute(
+        select(M.direction, M.message_type, M.wa_message_id)
+        .where(M.thread_id == thread_id, M.status.notin_(("blocked", "failed")))
+        .order_by(M.timestamp.desc(), M.id.desc()).limit(1)).first()
+    if (latest is None or latest.direction != "in" or latest.message_type != "flow_response"
+            or not latest.wa_message_id):
+        return None
+    event = stored_inbound_event(db, latest.wa_message_id)
+    if event is None or event.thread_id != thread_id:
+        return None
+    key = flow_booking_key(int(thread_id), event.flow_token, latest.wa_message_id)
+    if key is None:
+        return None
+    ledger = db.execute(select(R.id, R.thread_id, R.command_state, R.operation,
+                               R.thread_revision_id, R.ack_status, R.ack_transport_id)
+                        .where(R.idempotency_key == key)).first()
+    if (ledger is None or ledger.command_state != "COMMITTED" or ledger.operation != "CREATE"
+            or ledger.thread_id != thread_id or ledger.thread_revision_id is None
+            or ledger.ack_status != "SENT" or not ledger.ack_transport_id):
+        return None
+    acknowledged = db.execute(
+        select(M.id).where(M.wa_message_id == ledger.ack_transport_id, M.direction == "out",
+                           M.thread_id == thread_id, M.status.in_(_ACCEPTED_STATUSES))
+    ).first()
+    return int(ledger.id) if acknowledged is not None else None
 
 
 def _send_alert_email(thread_id: int, customer_name: str, reason: str = "CE") -> None:
@@ -339,6 +403,13 @@ def _run_check() -> None:
             thread_id = row.thread_id
             customer_name = row.customer_name or "desconocido"
             try:
+                booked = latest_inbound_is_acknowledged_booking_completion(db, thread_id)
+                db.rollback()
+                if booked is not None:
+                    logger.info(
+                        "unanswered_alert: Thread #%s latest inbound completes acknowledged "
+                        "booking command #%s — answered, no handoff alert", thread_id, booked)
+                    continue
                 logger.warning(
                     "unanswered_alert: Thread #%s de %s (human handoff) sin respuesta >%ds",
                     thread_id, customer_name, _ALERT_THRESHOLD_SECONDS,

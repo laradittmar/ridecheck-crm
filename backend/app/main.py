@@ -48,6 +48,7 @@ from .services.buscando_followup import buscando_followup_loop
 from .services.outbound_path_registry import AUTHORIZED_PATHS, get_deployment_id
 from .services.quote_followup import quote_followup_loop
 from .services.unanswered_alert import unanswered_alert_loop
+from .services.operator_notification import operator_notification_loop
 from .settings import get_settings
 from .ui.kanban import router as ui_router
 from .ui.whatsapp_ui import router as whatsapp_ui_router
@@ -647,6 +648,12 @@ async def _start_unanswered_alert_task() -> None:
 async def _start_followup_tasks() -> None:
     _keep(asyncio.create_task(quote_followup_loop(), name="quote_followup"))
     _keep(asyncio.create_task(buscando_followup_loop(), name="buscando_followup"))
+
+
+@app.on_event("startup")
+async def _start_operator_notification_task() -> None:
+    # W1-F2: inert until configured — committed bookings are then recorded HELD and listed.
+    _keep(asyncio.create_task(operator_notification_loop(), name="operator_notification"))
 
 
 @app.on_event("startup")

@@ -51,6 +51,9 @@ class SecurityEventType:
     DEPLOYMENT_WITH_UNREGISTERED_META_SEND_PATH = "DEPLOYMENT_WITH_UNREGISTERED_META_SEND_PATH"
     BOOKING_ATTEMPT_EVIDENCE_NOT_RECORDED = "BOOKING_ATTEMPT_EVIDENCE_NOT_RECORDED"
     EXTERNAL_IO_INSIDE_BOOKING_TRANSACTION = "EXTERNAL_IO_INSIDE_BOOKING_TRANSACTION"
+    # W1-F2: the operator-notification path was asked to send to anyone but the configured
+    # operator destination (or while no valid destination is configured).
+    OPERATOR_NOTIFICATION_UNCONFIGURED_DESTINATION = "OPERATOR_NOTIFICATION_UNCONFIGURED_DESTINATION"
 
 
 #: The operational conditions `/api/ops/booking-attention` lists (PW1-B).

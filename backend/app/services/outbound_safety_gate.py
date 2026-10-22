@@ -104,6 +104,14 @@ def _content_fingerprint(text: str) -> str:
     return hashlib.sha256(collapsed.encode()).hexdigest()
 
 
+def _is_configured_operator(wa_id: str) -> bool:
+    """W1-F2: is `wa_id` exactly the configured operator destination? False whenever the
+    operator notice is not fully and validly configured (`operator_config`), fail closed."""
+    from .operator_notification import operator_config
+    config = operator_config()
+    return config is not None and type(wa_id) is str and wa_id == config.destination
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 class GateOutcome(str, Enum):
@@ -420,6 +428,16 @@ class OutboundSafetyGate:
                 evt_type = SecurityEventType.UNREGISTERED_OUTBOUND_SOURCE
                 severity = SecuritySeverity.BLOCKER
                 reason = f"UNAUTHORIZED_PATH: '{path_id}' is not in the authorized path registry"
+            elif (pid_enum is OutboundPathId.OPERATOR_NOTIFICATION
+                  and not _is_configured_operator(wa_id)):
+                # W1-F2: the operator path is not a send-to-any-phone path. Its only recipient
+                # is the configured, well-formed operator destination; anything else — or any
+                # recipient at all while it is unconfigured — is refused here, before the kill
+                # switch, whoever the caller is.
+                evt_type = SecurityEventType.OPERATOR_NOTIFICATION_UNCONFIGURED_DESTINATION
+                severity = SecuritySeverity.BLOCKER
+                reason = ("UNAUTHORIZED_PATH: OPERATOR_NOTIFICATION to a recipient other than "
+                          "the configured operator destination")
             else:
                 return None  # valid path — continue to kill switch
 

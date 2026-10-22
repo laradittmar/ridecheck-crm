@@ -13,6 +13,9 @@ Canonical path IDs discovered by M21.3-TRACE-BLOCKER-META audit:
   MANUAL_CRM       — Operator-initiated manual reply from CRM UI
   BOOKING_FLOW     — Booking confirmation flow triggered after scheduling
   SYSTEM_NOTIFICATION — System-level operational notification (non-conversation)
+  OPERATOR_NOTIFICATION — W1-F2: the operator's WhatsApp notice of a committed booking,
+                          to the ONE configured operator destination only (the gate refuses
+                          any other recipient on this path)
 
 Legacy paths (defined for detection only — NOT in AUTHORIZED_PATHS):
   LEGACY_N8N_AI_PIPELINE — n8n AI fallback branch (dead code since M18/CE).
@@ -34,6 +37,7 @@ class OutboundPathId(str, Enum):
     MANUAL_CRM = "MANUAL_CRM"
     BOOKING_FLOW = "BOOKING_FLOW"
     SYSTEM_NOTIFICATION = "SYSTEM_NOTIFICATION"
+    OPERATOR_NOTIFICATION = "OPERATOR_NOTIFICATION"
     # Legacy — detection only; not in AUTHORIZED_PATHS
     LEGACY_N8N_AI_PIPELINE = "LEGACY_N8N_AI_PIPELINE"
 
@@ -88,6 +92,12 @@ AUTHORIZED_PATHS: dict[OutboundPathId, AuthorizedPath] = {
         source_component="services.system_notification",
         allowed_message_types=frozenset({"text"}),
         description="System-level operational notification (non-conversation)",
+    ),
+    OutboundPathId.OPERATOR_NOTIFICATION: AuthorizedPath(
+        path_id=OutboundPathId.OPERATOR_NOTIFICATION,
+        source_component="services.operator_notification",
+        allowed_message_types=frozenset({"template"}),
+        description="Operator booking notice — approved template to the configured operator only",
     ),
 }
 

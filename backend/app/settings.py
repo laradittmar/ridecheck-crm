@@ -94,6 +94,14 @@ class Settings:
     # everywhere: with it off CE-W1/CE-W2 keep their legacy behaviour exactly, and nothing
     # writes a booking ledger row from CE. Read with `is True`, never truthiness.
     smart_booking_ce_enabled: bool = False
+    # W1-F2 — the operator's WhatsApp notice of a committed customer booking. OFF unless
+    # OPERATOR_WHATSAPP_NOTIFY_ENABLED is exactly "true" AND the destination and the approved
+    # Meta template are configured and well formed (`operator_notification.operator_config`);
+    # anything else fails closed. Runtime configuration only — never a literal in source.
+    operator_whatsapp_notify_enabled: bool = False
+    operator_whatsapp_to: str = ""
+    operator_booking_template_name: str = ""
+    operator_booking_template_language: str = ""
     conversation_engine_direct_webhook_enabled: bool = False
     openai_chat_model: str = "gpt-4o-mini"
     quarantined_test_wa_ids: tuple[str, ...] = ()
@@ -199,6 +207,11 @@ def get_settings() -> Settings:
         hybrid_trace_enabled=(_getenv("HYBRID_TRACE_ENABLED", "false").lower() == "true"),
         smart_booking_ce_enabled=(
             _getenv("SMART_BOOKING_CE_ENABLED", "false").lower() == "true"),
+        operator_whatsapp_notify_enabled=(
+            _getenv("OPERATOR_WHATSAPP_NOTIFY_ENABLED", "false").lower() == "true"),
+        operator_whatsapp_to=_getenv("OPERATOR_WHATSAPP_TO"),
+        operator_booking_template_name=_getenv("OPERATOR_BOOKING_TEMPLATE_NAME"),
+        operator_booking_template_language=_getenv("OPERATOR_BOOKING_TEMPLATE_LANGUAGE"),
         conversation_engine_direct_webhook_enabled=_getenv("CONVERSATION_ENGINE_DIRECT_WEBHOOK_ENABLED", "false").lower() in ("1", "true", "yes"),
         openai_chat_model=_getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
         quarantined_test_wa_ids=_parse_quarantined_wa_ids(),
