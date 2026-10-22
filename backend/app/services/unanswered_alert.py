@@ -28,6 +28,12 @@ _CHECK_INTERVAL_SECONDS = 60    # poll every 60 seconds
 #   unanswered_alert_sent_at IS NULL (no alert sent yet)
 #   event older than _ALERT_THRESHOLD_SECONDS
 # Updates performance_status=ALERT and unanswered_alert_sent_at to prevent repeat alerts.
+#
+# W1F-O1: this is the ONE per-turn query, and `_run_check` executes it. Until 2026-10-22 the
+# job ran its own inline copy without the R2 successor clause below, so the clause was tested
+# but never ran, and answered turns were e-mailed as "sin respuesta". The threshold is a real
+# bind parameter multiplied by a one-second interval — a quoted ':threshold' inside an
+# INTERVAL literal is not a bind at all.
 
 _FIND_UNANSWERED_EVENTS_SQL = text("""
     SELECT
@@ -45,7 +51,7 @@ _FIND_UNANSWERED_EVENTS_SQL = text("""
         AND ae.alert_eligible = true
         AND (ae.reply_produced IS NULL OR ae.reply_produced = false)
         AND ae.unanswered_alert_sent_at IS NULL
-        AND ae.created_at < NOW() - INTERVAL ':threshold seconds'
+        AND ae.created_at < NOW() - (:threshold_seconds * INTERVAL '1 second')
         AND wc.wa_id NOT IN (SELECT phone FROM excluded_phones)
         AND (wts.needs_human IS NULL OR wts.needs_human = false)
         -- L4.7W5-R2 successor suppression. A conversation that was answered is not
@@ -77,7 +83,7 @@ _FIND_UNANSWERED_EVENTS_SQL = text("""
               AND ob.wa_message_id IS NOT NULL
               AND ob.timestamp > ae.created_at
         )
-""")
+""").bindparams(threshold_seconds=_ALERT_THRESHOLD_SECONDS)
 
 _MARK_EVENT_ALERTED_SQL = text("""
     UPDATE ai_events
@@ -321,30 +327,7 @@ def _run_check() -> None:
     db = SessionLocal()
     try:
         # ── Per-turn SLA check (WILD-04R) ──────────────────────────────────
-        event_rows = db.execute(
-            text(
-                f"""
-                SELECT
-                    ae.id            AS event_id,
-                    ae.thread_id,
-                    ae.wa_message_id,
-                    wts.customer_name,
-                    wc.wa_id
-                FROM ai_events ae
-                JOIN whatsapp_threads wt ON wt.id = ae.thread_id
-                JOIN whatsapp_contacts wc ON wc.id = wt.contact_id
-                LEFT JOIN whatsapp_thread_states wts ON wts.thread_id = ae.thread_id
-                WHERE
-                    ae.reply_required = true
-                    AND ae.alert_eligible = true
-                    AND (ae.reply_produced IS NULL OR ae.reply_produced = false)
-                    AND ae.unanswered_alert_sent_at IS NULL
-                    AND ae.created_at < NOW() - INTERVAL '{_ALERT_THRESHOLD_SECONDS} seconds'
-                    AND wc.wa_id NOT IN (SELECT phone FROM excluded_phones)
-                    AND (wts.needs_human IS NULL OR wts.needs_human = false)
-                """
-            )
-        ).fetchall()
+        event_rows = db.execute(_FIND_UNANSWERED_EVENTS_SQL).fetchall()
 
         event_ids = [r.event_id for r in event_rows]
         logger.info(

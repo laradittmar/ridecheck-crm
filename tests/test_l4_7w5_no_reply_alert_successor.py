@@ -329,7 +329,12 @@ class PreservedBehaviour(_Fixture):
 
     def test_pre_08_the_120_second_threshold_is_unchanged(self):
         self.assertIn("_ALERT_THRESHOLD_SECONDS = 120", ALERT_SOURCE)
-        self.assertIn("ae.created_at < NOW() - INTERVAL ':threshold seconds'", ALERT_SOURCE)
+        # OLD (W1F-O1): asserted the text "INTERVAL ':threshold seconds'" — a quoted
+        # placeholder that is not a bind, in a constant the job never executed.
+        # NEW: the executed constant binds the threshold, and binds it to 120.
+        self.assertIn("ae.created_at < NOW() - (:threshold_seconds * INTERVAL '1 second')",
+                      ALERT_SOURCE)
+        self.assertIn(".bindparams(threshold_seconds=_ALERT_THRESHOLD_SECONDS)", ALERT_SOURCE)
 
     def test_pre_09_the_operational_meaning_is_documented(self):
         self.assertIn("operational flag", ALERT_SOURCE)
