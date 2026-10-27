@@ -55,6 +55,16 @@ class Settings:
     # later reply-phase move consumes. Rendering a secondary FAQ answer ALONGSIDE a
     # clarification Flow still needs that move; see the G3-7H closeout.
     layer_d_register_and_continue_enabled: bool = False
+    # W1F-W-01 R3 — locality resolution safety. Default OFF: flag-off behaviour is the
+    # deployed 6a14cdb behaviour, byte for byte. On, three things change and nothing else:
+    # the declared coverage boundary and the two new locality validators are consulted
+    # BEFORE any candidate or thread zone is written, and plural vehicle-location clauses
+    # ("los autos están en Flores") are read. A refused locality is never persisted and
+    # never reaches PricingService, ScheduleService or BookingAuthority; it falls through
+    # to the existing coverage/handoff or location-clarification outcome.
+    # ENABLING THIS IS A SEPARATE OWNER CHECKPOINT: with it off, W1FRV-02 and W1FRV-03
+    # remain open in the runtime. See the R3 closeout.
+    locality_resolution_safety_enabled: bool = False
     # G3-7F — the Grounded-Target Invariant. The reconciler establishes a correction's
     # target from a ground it verifies itself (literal identity, a validated singleton focus,
     # or a typed in-burst reference) instead of trusting the interpreter's confidence. G3-7C
@@ -189,6 +199,8 @@ def get_settings() -> Settings:
             _getenv("REPLY_RENDERER_DEMOTION_ENABLED", "true").lower() == "true"),
         layer_d_register_and_continue_enabled=(
             _getenv("LAYER_D_REGISTER_AND_CONTINUE_ENABLED", "false").lower() == "true"),
+        locality_resolution_safety_enabled=(
+            _getenv("LOCALITY_RESOLUTION_SAFETY_ENABLED", "false").lower() == "true"),
         correction_target_grounding_enabled=(
             _getenv("CORRECTION_TARGET_GROUNDING_ENABLED", "false").lower() == "true"),
         provisional_correction_enabled=(

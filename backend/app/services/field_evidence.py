@@ -10,6 +10,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from app.services import locality_text as _loc
 from app.services.vehicle_catalog import lookup_vehicle, fuzzy_lookup_vehicle
 
 # ── Source labels (ER-2) ───────────────────────────────────────────────────────
@@ -38,36 +39,20 @@ _INTENT_PREPURCHASE = "PREPURCHASE_INSPECTION"
 _YEAR_RE = re.compile(r"\b(19[89]\d|20[0-2]\d)\b")
 
 # ── Detection patterns ────────────────────────────────────────────────────────
-# These are replicated from conversation_engine.py to avoid a circular import.
-# The CE imports from this module; this module must not import from CE.
+# W1F-W-01 R3: these were REPLICATED from conversation_engine.py "to avoid a circular
+# import", and the review measured the hazard that creates (finding W1FRV-07). They now
+# come from `locality_text`, a leaf module that imports nothing from this package, so both
+# consumers hold the SAME objects. The rule this module still obeys is unchanged: the CE
+# imports from here; this module must not import from CE.
 
-_CUSTOMER_ORIGIN_CAPTURE_RE = re.compile(
-    r"\b(?:soy\s+de|vivo\s+en|estoy\s+en|vengo\s+de|me\s+encuentro\s+en)"
-    r"\s+((?:\w+\s*){1,3})",
-    re.IGNORECASE,
-)
+_CUSTOMER_ORIGIN_CAPTURE_RE = _loc.CUSTOMER_ORIGIN_CAPTURE_RE
 
 # Explicit vehicle-location clauses — each captures a locality (1-4 words).
-# Pattern index 6 (alt-location "o puede ser X") is the contradiction signal.
-_VEHICLE_LOCATION_CLAUSE_PATTERNS: list[re.Pattern[str]] = [
-    re.compile(
-        r"\bel\s+(?:auto|veh[ií]culo|coche|m[oó]vil)\s+(?:ahora\s+)?"
-        r"est[aá](?:\s+ubicad[ao])?\s+en\s+((?:\w+\s*){1,4})",
-        re.IGNORECASE,
-    ),
-    re.compile(r"\best[aá]\s+para\s+revisar\s+en\s+((?:\w+\s*){1,4})", re.IGNORECASE),
-    re.compile(r"\bla\s+revisi[oó]n\s+ser[ií]a\s+en\s+((?:\w+\s*){1,4})", re.IGNORECASE),
-    re.compile(r"\bhay\s+que\s+verlo\s+en\s+((?:\w+\s*){1,4})", re.IGNORECASE),
-    re.compile(r"\blo\s+tienen\s+en\s+((?:\w+\s*){1,4})", re.IGNORECASE),
-    re.compile(r"\best[aá]\s+ubicad[ao]\s+en\s+((?:\w+\s*){1,4})", re.IGNORECASE),
-    re.compile(r"\bo\s+puede\s+(?:ser|estar)\s+(?:en\s+)?((?:\w+\s*){1,3})", re.IGNORECASE),
-]
+# The LAST pattern (alt-location "o puede ser X") is the contradiction signal, whatever
+# the list's length: `clause_patterns()` always returns it last, plural clauses included.
+_VEHICLE_LOCATION_CLAUSE_PATTERNS: list[re.Pattern[str]] = _loc.VEHICLE_LOCATION_CLAUSE_PATTERNS
 
-_LOCATION_UNCERTAINTY_RE = re.compile(
-    r"\b(?:o\s+puede\s+(?:ser|estar)|no\s+s[eé]|no\s+estoy\s+segur[ao]|"
-    r"tal\s+vez|quiz[aá]s)\b",
-    re.IGNORECASE,
-)
+_LOCATION_UNCERTAINTY_RE = _loc.LOCATION_UNCERTAINTY_RE
 
 _INSP_DISASSEMBLED: list[re.Pattern[str]] = [
     re.compile(r"\bdesarmad[oa]\b", re.IGNORECASE),
@@ -339,24 +324,61 @@ def _resolve_vehicle_year(ctx: Any, state: Any, turn: str) -> FieldEvidence:
     return _NONE_EVIDENCE
 
 
-def _extract_vehicle_location_from_turn(turn: str) -> tuple[list[str], bool]:
-    """Return (localities, has_contradiction) from explicit vehicle-location clauses."""
+def _extract_vehicle_location_from_turn(
+    turn: str,
+    *,
+    locality_safety: bool = False,
+) -> tuple[list[str], bool]:
+    """Return (localities, has_contradiction) from explicit vehicle-location clauses.
+
+    `locality_safety` is W1F-W-01 R3, off by default so the inherited behaviour is the
+    default. On, two things change and nothing else:
+
+      * plural clauses are read too ("los autos están en Flores" — finding W1FRV-05);
+      * a captured locality that the TEXT already disqualifies is dropped rather than
+        reported as confirmed evidence: a declared out-of-coverage city, a name that is
+        only part of a longer connector-joined proper name ("mar del plata",
+        "san miguel del monte"), or a name shared with a locality outside the coverage
+        area ("san nicolás"). This module never reads the viáticos catalogue, so it can
+        only REFUSE a locality here — whether a surviving one exists is still the
+        catalogue's decision, made by the CE.
+    """
+    patterns = _loc.clause_patterns(plural=locality_safety)
     localities: list[str] = []
-    for pat in _VEHICLE_LOCATION_CLAUSE_PATTERNS[:-1]:
+    for pat in patterns[:-1]:
         m = pat.search(turn)
         if m:
             loc = m.group(1).strip()
             if loc and loc not in localities:
                 localities.append(loc)
-    alt_m = _VEHICLE_LOCATION_CLAUSE_PATTERNS[-1].search(turn)
+    if locality_safety:
+        localities = [loc for loc in localities if not _locality_text_disqualified(loc, turn)]
+    alt_m = patterns[-1].search(turn)
     contradiction = bool(alt_m and _LOCATION_UNCERTAINTY_RE.search(turn))
     return localities, contradiction
 
 
-def _resolve_inspection_location(ctx: Any, state: Any, turn: str) -> FieldEvidence:
+def _locality_text_disqualified(locality: str, turn: str) -> bool:
+    """True when the text alone already shows this locality must not be treated as known.
+
+    Text-level only, by design: no catalogue, no database, no network — this module is
+    read-only and pure (ER-10/ER-13).
+    """
+    if _loc.is_outside_coverage(locality) or _loc.is_outside_coverage(turn):
+        return True
+    if _loc.composite_name_conflict(locality, locality):
+        return True
+    if _loc.is_cross_coverage_ambiguous(locality) and not _loc.disambiguated_by_text(turn):
+        return True
+    return False
+
+
+def _resolve_inspection_location(ctx: Any, state: Any, turn: str,
+                                 *, locality_safety: bool = False) -> FieldEvidence:
     """ER-8: explicit vehicle clause > candidate zone > thread zone fallback."""
     if turn:
-        localities, contradiction = _extract_vehicle_location_from_turn(turn)
+        localities, contradiction = _extract_vehicle_location_from_turn(
+            turn, locality_safety=locality_safety)
         if contradiction or len(localities) >= 2:
             # SC17 / LR-8: same-turn contradiction — unresolved
             return FieldEvidence(
@@ -498,6 +520,8 @@ def resolve_field_evidence(
     ctx: Any,
     state: Any,
     current_turn_text: str = "",
+    *,
+    locality_safety: bool = False,
 ) -> FieldEvidenceSnapshot:
     """Assemble a read-only evidence snapshot from all available sources.
 
@@ -509,6 +533,11 @@ def resolve_field_evidence(
         state: WhatsAppThreadState or compatible SimpleNamespace.
         current_turn_text: Raw current-turn text for real-time detection.
             Omit (or pass "") when calling from CE after candidates are set.
+        locality_safety: W1F-W-01 R3. Off by default (the inherited behaviour). On, the
+            inspection-location reading also understands plural vehicle clauses and
+            refuses a locality the text itself disqualifies, so this snapshot cannot
+            report an out-of-coverage or cross-coverage-ambiguous locality as a confirmed
+            inspection location. The CE passes its own flag value.
     """
     turn = current_turn_text or ""
     return FieldEvidenceSnapshot(
@@ -516,7 +545,8 @@ def resolve_field_evidence(
         vehicle=_resolve_vehicle(ctx, state, turn),
         vehicle_year=_resolve_vehicle_year(ctx, state, turn),
         vehicle_category=_resolve_vehicle_category(ctx, state, turn),
-        inspection_location=_resolve_inspection_location(ctx, state, turn),
+        inspection_location=_resolve_inspection_location(
+            ctx, state, turn, locality_safety=locality_safety),
         customer_origin=_resolve_customer_origin(turn),
         inspectability=_resolve_inspectability(state, turn),
         scheduling=_resolve_scheduling(state),

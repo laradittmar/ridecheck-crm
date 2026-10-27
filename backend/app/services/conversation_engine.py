@@ -58,6 +58,10 @@ from ..schemas.conversation import (
     ConversationHandleOut,
 )
 from ..schemas.hybrid_trace import DecisionSite
+# W1F-W-01 R3: locality text — the clause patterns, the locative-context rule, the coverage
+# list and the three locality validators. A LEAF module (it imports nothing from this
+# package), so `field_evidence` binds the SAME objects instead of replicating them.
+from . import locality_text as _loc
 from .response_composition import (LiveResponsePlan, Proposition, PropositionId,
                                    SuppressionReason, flow_completion_ack_authorized)
 from ..schemas.hybrid_trace import (CoexistencePolicy, FLOW_COMPLETION_ACK_CONDITIONS,
@@ -625,71 +629,35 @@ def _coerce_candidate_year(value) -> "int | None":
     return year if 1900 <= year <= date.today().year + 1 else None
 
 
-_VEHICLE_LOCATION_CLAUSE_PATTERNS: list[re.Pattern[str]] = [
-    re.compile(
-        r'\bel\s+(?:auto|veh[ií]culo|coche|m[oó]vil)\s+(?:ahora\s+)?'
-        r'est[aá](?:\s+ubicad[ao])?\s+en\s+((?:\w+\s*){1,4})',
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r'\best[aá]\s+para\s+revisar\s+en\s+((?:\w+\s*){1,4})',
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r'\bla\s+revisi[oó]n\s+ser[ií]a\s+en\s+((?:\w+\s*){1,4})',
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r'\bhay\s+que\s+verlo\s+en\s+((?:\w+\s*){1,4})',
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r'\blo\s+tienen\s+en\s+((?:\w+\s*){1,4})',
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r'\best[aá]\s+ubicad[ao]\s+en\s+((?:\w+\s*){1,4})',
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r'\bo\s+puede\s+(?:ser|estar)\s+(?:en\s+)?((?:\w+\s*){1,3})',
-        re.IGNORECASE,
-    ),
-]
+# ── W1F-W-01 R3: these names are now BINDINGS, not definitions ───────────────
+# The patterns, the origin language, the uncertainty markers and the clause splitter live
+# in `locality_text`, which `field_evidence` imports too. The module-level names are kept
+# because the existing suites reference them; they are the SAME objects the other consumer
+# holds, so the two copies cannot diverge any more (finding W1FRV-07).
+#
+# Each pattern captures a locality (1–4 words); the LAST is the alt-location contradiction
+# signal. `_VEHICLE_LOCATION_CLAUSE_PATTERNS` stays the inherited SINGULAR set: the plural
+# clauses (R3 item 4) are selected per call through `_loc.clause_patterns(plural=...)`, so
+# they appear only when `LOCALITY_RESOLUTION_SAFETY_ENABLED` is on.
+_VEHICLE_LOCATION_CLAUSE_PATTERNS: list[re.Pattern[str]] = _loc.VEHICLE_LOCATION_CLAUSE_PATTERNS
 
 # Customer-origin language. These phrases describe where the CUSTOMER is,
 # not where the vehicle is for inspection (LR-2).
-_CUSTOMER_ORIGIN_RE = re.compile(
-    r'\b(?:soy\s+de|vivo\s+en|estoy\s+en|vengo\s+de|me\s+encuentro\s+en)\b',
-    re.IGNORECASE,
-)
+_CUSTOMER_ORIGIN_RE = _loc.CUSTOMER_ORIGIN_RE
 
 # Uncertainty markers that, combined with two distinct vehicle-location zones,
 # signal a same-turn contradiction (SC17 / LR-8).
-_LOCATION_UNCERTAINTY_RE = re.compile(
-    r'\b(?:o\s+puede\s+(?:ser|estar)|no\s+s[eé]|no\s+estoy\s+segur[ao]|'
-    r'tal\s+vez|quiz[aá]s)\b',
-    re.IGNORECASE,
-)
+_LOCATION_UNCERTAINTY_RE = _loc.LOCATION_UNCERTAINTY_RE
 
-
-def _has_customer_origin_clause(text: str) -> bool:
-    """True when text contains explicit customer-origin language (LR-2)."""
-    return bool(_CUSTOMER_ORIGIN_RE.search(text))
-
+_has_customer_origin_clause = _loc.has_customer_origin_clause
 
 # ── L4.6 Phase C: isolate customer-origin clauses ────────────────────────────
 # "Está en Berazategui, pero yo soy de Tigre." carries BOTH an inspection location
 # and a customer origin.  The origin clause must suppress only itself — never the
 # inspection location evidence sitting in another clause (L4-WILD-B finding LOC-A).
-_ORIGIN_CLAUSE_SPLIT_RE = re.compile(r'(?:[,.;]|\bpero\b|\baunque\b)', re.IGNORECASE)
+_ORIGIN_CLAUSE_SPLIT_RE = _loc.ORIGIN_CLAUSE_SPLIT_RE
 
-
-def _strip_customer_origin_clauses(text: str) -> str:
-    """Return *text* without the clauses that state where the CUSTOMER is."""
-    parts = _ORIGIN_CLAUSE_SPLIT_RE.split(text or "")
-    kept = [p.strip() for p in parts if p.strip() and not _CUSTOMER_ORIGIN_RE.search(p)]
-    return ". ".join(kept)
+_strip_customer_origin_clauses = _loc.strip_customer_origin_clauses
 
 
 
@@ -792,13 +760,10 @@ _AWAITING_QUALIFICATION = "AWAITING_QUALIFICATION"
 
 # Clearly out-of-coverage cities/provinces. Accent-stripped lowercase forms;
 # matched against _norm_lower(message). GBA localities are NOT listed here.
-_OUTSIDE_COVERAGE_CITIES: frozenset[str] = frozenset({
-    "cordoba", "rosario", "mendoza", "tucuman", "santa fe",
-    "mar del plata", "salta", "jujuy", "san juan", "san luis",
-    "neuquen", "bariloche", "bahia blanca", "resistencia",
-    "corrientes", "posadas", "formosa", "rio cuarto",
-    "comodoro rivadavia", "rio gallegos", "santa rosa", "rawson", "ushuaia",
-})
+# W1F-W-01 R3: the set now lives in `locality_text` and is bound here. Unchanged content;
+# what changed is WHEN it is consulted — before a zone is written, not only afterwards in
+# the routing gate (finding W1FRV-03).
+_OUTSIDE_COVERAGE_CITIES: frozenset[str] = _loc.OUTSIDE_COVERAGE_CITIES
 
 # Words indicating the customer has a concern about the vehicle condition.
 _VEHICLE_CONCERN_WORDS: frozenset[str] = frozenset({
@@ -2124,9 +2089,7 @@ def _norm_lower(s: str) -> str:
     return " ".join(_strip_accents(s).lower().split())
 
 
-def _is_outside_coverage(text: str) -> bool:
-    n = _norm_lower(text)
-    return any(city in n for city in _OUTSIDE_COVERAGE_CITIES)
+_is_outside_coverage = _loc.is_outside_coverage
 
 
 def _has_vehicle_concern(text: str) -> bool:
@@ -2582,10 +2545,9 @@ def _time_hour(time_str: str) -> int:
         return 0
 
 
-def _strip_accents(text: str) -> str:
-    """Decompose text and drop combining diacritical marks → ASCII-safe lowercase."""
-    nfkd = unicodedata.normalize("NFKD", text)
-    return "".join(c for c in nfkd if not unicodedata.combining(c)).lower()
+# W1F-W-01 R3: one implementation, in `locality_text`, shared with `field_evidence`, so
+# "Benavídez" can never normalise differently in one consumer than in the other.
+_strip_accents = _loc.strip_accents
 
 
 def _detect_time_period(texts: list[str]) -> str | None:
@@ -3154,27 +3116,14 @@ class _Context:
 
 
 # ── L4.7W5-F5: article-prefixed locality matching ────────────────────────────
-_ARTICLE_PREFIX_RE = re.compile(r"^(?:la|el|los|las)\s+")
+# W1F-W-01 R3: bound from `locality_text`; `field_evidence` holds the same objects.
+_ARTICLE_PREFIX_RE = _loc.ARTICLE_PREFIX_RE
 
 # A locality whose name is also a common noun is only a locality when the sentence places
 # something there. "en la boca" is a place; "me mordí la boca" is not.
-_LOCATIVE_MARKERS = r"(?:en|de|del|desde|hacia|para|por|zona|barrio|localidad|partido|ciudad|esta|estoy|queda|vivo)"
+_LOCATIVE_MARKERS = _loc.LOCATIVE_MARKERS
 
-
-def _locality_in_context(normalized_text: str, form: str) -> bool:
-    """True when `form` appears as a locality, not as incidental vocabulary.
-
-    Accepted when the form is preceded by a locative marker (optionally with its article),
-    or when it is effectively the whole message — a bare "paternal" answering "¿en qué zona
-    está el auto?" is a location, and demanding a preposition there would be pedantic.
-
-    Word boundaries throughout: an alias must never fire from inside a longer word.
-    """
-    escaped = re.escape(form)
-    if re.fullmatch(rf"(?:la|el|los|las)?\s*{escaped}\s*[.!?]*", normalized_text.strip()):
-        return True
-    pattern = rf"\b{_LOCATIVE_MARKERS}\b\s+(?:la|el|los|las)?\s*\b{escaped}\b"
-    return re.search(pattern, normalized_text) is not None
+_locality_in_context = _loc.locality_in_context
 
 
 
@@ -3383,6 +3332,11 @@ class ConversationEngine:
         self._turn_offer_admission = None        # G3-7R/S2: what admission decided
         self._turn_offer_withdrawal = None
         self._turn_service_question = False
+        # OWNER-REVIEW-R1 R1RV-02: this turn's locality ambiguity, as a reason string. Read
+        # by `_turn_clarification_decision`, so it is per-turn memory and must be cleared
+        # here for the reason the G3-7G audit established — a reused engine instance must
+        # never report a previous turn's verdict as this turn's.
+        self._turn_locality_ambiguity = None
         self._turn_correction_echo = ()          # G3-7F: Tier 1 must echo what it changed
         self._turn_correction_moto = False       # G3-7F-R2: corrected category is a MOTO
         self._turn_correction_category = None    # G3-7F-R2: the category the correction set
@@ -5896,7 +5850,8 @@ class ConversationEngine:
         # Solano" is the measured case — and treating that as a known location silenced the
         # very question the workflow still needs answered.
         zone_grp, _zone_det = self._get_active_inspection_location(ctx, state)
-        if zone_grp or resolve_field_evidence(ctx, state).location_known():
+        if zone_grp or resolve_field_evidence(
+                ctx, state, locality_safety=self._locality_safety_on()).location_known():
             return False
         if getattr(self, "_turn_service_question", False):
             return False
@@ -6031,9 +5986,17 @@ class ConversationEngine:
             or _raw_vehicle_named
             or ce_vehicle is not None
             or _r_marca or _r_modelo or _r_tipo)
+        # ── OWNER-REVIEW-R1 R1RV-02: an ambiguous locality is location evidence ──────
+        # `_apply_zone_from_text` refused to write a locality this turn because the name
+        # belongs to more than one real place, one of them outside the coverage area. That
+        # refusal is the strongest possible evidence that the turn IS about location — the
+        # same reasoning G3-7L applied to a CONTESTED vehicle burst above. Admission governs
+        # WRITING and relevance governs ASKING; this touches only the second.
+        _locality_ambiguous = bool(getattr(self, "_turn_locality_ambiguity", None))
         location_relevant = bool(
             location_mention is not None
             or ce_location
+            or _locality_ambiguous
             or _r_zone_grp or _r_zone_det)
 
         # ── resolution: reconciled proposal first, then committed canonical state ──
@@ -6055,9 +6018,15 @@ class ConversationEngine:
             or (getattr(ce_vehicle, "tipo_vehiculo", None) or "").strip()
             or (getattr(focus, "tipo_vehiculo", None) or "").strip())
         _zone_grp, _zone_det = self._get_active_inspection_location(ctx, state)
-        _snap = resolve_field_evidence(ctx, state, current_turn_text)
+        _snap = resolve_field_evidence(ctx, state, current_turn_text,
+                                      locality_safety=self._locality_safety_on())
+        # An ambiguous locality named THIS TURN contradicts whatever is stored, so the
+        # location is not resolved for the purpose of this decision. Nothing stored is
+        # deleted or overwritten by saying so — the question is asked and the old zone
+        # stands until the customer's answer replaces it (R1RV-02).
         location_resolved = bool(
-            _r_zone_grp or _zone_grp or _snap.location_known())
+            not _locality_ambiguous
+            and (_r_zone_grp or _zone_grp or _snap.location_known()))
 
         # ── immutable attempt history, read ONLY when it can change the answer ──
         # Attempt history matters exactly when a family is in play AND unresolved, because
@@ -6142,7 +6111,7 @@ class ConversationEngine:
         self._turn_clar_semantic = bool(vehicle_mention is not None
                                         or location_mention is not None)
         self._turn_clar_deterministic = bool(
-            ce_vehicle is not None or ce_location
+            ce_vehicle is not None or ce_location or _locality_ambiguous
             or _r_marca or _r_modelo or _r_tipo or _r_zone_grp or _r_zone_det)
         self._turn_clar_identity = bool(identity_resolved and category_resolved)
         self._turn_clar_location = bool(location_resolved)
@@ -8145,6 +8114,39 @@ class ConversationEngine:
             )
             return _out("replied", wa_message_id=sent_id)
 
+        # ── W1F-W-01 R3: a form answer is evidence, not an authority ─────────────
+        # The Flow form is the strongest evidence class there is (the customer typed it),
+        # and that is exactly why an unsupported or ambiguous locality must not become a
+        # zone here: `canonical_group` comes from the dropdown and would pair a real group
+        # with a locality we cannot serve or cannot identify. Both outcomes already exist
+        # in this function's vocabulary — the coverage response and the warm handoff — and
+        # neither writes `home_zone_*`.
+        # OWNER-REVIEW-R1 R1RV-01: the dropdown is part of the answer. `zona_general` is an
+        # explicit coverage-area selection made in the same submission, so it is passed as
+        # the disambiguator — a customer who answers "CABA" + "San Nicolás" has settled the
+        # ambiguity and must be served, not handed to a person. A selection that disagrees
+        # with the locality's own area settles nothing and still reaches the handoff below.
+        # The comparison is between two area strings; no place name is read here.
+        if self._locality_safety_on() and localidad:
+            _fv, _, _fwhy = self._locality_verdict(localidad, area_hint=canonical_group)
+            if _fv == _loc.LocalityVerdict.UNSUPPORTED:
+                self._decision_log(ctx, "location_form_refused", verdict=_fv,
+                                   reason=_fwhy, target="none")
+                self.db.commit()
+                return self._send_coverage_response(ctx, state)
+            if _fv == _loc.LocalityVerdict.AMBIGUOUS:
+                self._decision_log(ctx, "location_form_ambiguous", verdict=_fv,
+                                   reason=_fwhy, target="none")
+                # The same exit the unresolvable-`zona_general` branch above already uses:
+                # warm handoff, a person owns the thread, no new transport site. (The G3-5F
+                # inventory tests count the blocked-outbound exits in this file, and R3 is
+                # not entitled to add an eighth.)
+                state.needs_human = True
+                lead.necesita_humano = True
+                self.db.commit()
+                sent_id = self._send_text_to_wa(ctx, _FALLBACK_WARM_HANDOFF)
+                return _out("replied", wa_message_id=sent_id)
+
         # Try to resolve localidad to a DB-validated zone_detail.
         _zone_before = (state.home_zone_group, state.home_zone_detail)
         db_zone = self._extract_zone_from_text(localidad) if localidad else None
@@ -8254,7 +8256,8 @@ class ConversationEngine:
         if _is_outside_coverage(combined):
             return self._send_coverage_response(ctx, state), False
 
-        _snap = resolve_field_evidence(ctx, state, combined)
+        _snap = resolve_field_evidence(ctx, state, combined,
+                                      locality_safety=self._locality_safety_on())
         vehicle_known = _snap.vehicle_known() or bool(
             pre_detected_vehicle is not None
             and getattr(pre_detected_vehicle, "tipo_vehiculo", None)
@@ -9310,7 +9313,8 @@ class ConversationEngine:
         self._answer_source = None
 
         # M21.1.6: determine whether narrative AI adds value for this turn (NU-14)
-        _snap_pre = resolve_field_evidence(ctx, state)
+        _snap_pre = resolve_field_evidence(ctx, state,
+                                          locality_safety=self._locality_safety_on())
         _use_narrative = narrative_needs_ai(_snap_pre, current_turn_text)
         _narr: NarrativeInterpretation | None = None
 
@@ -10338,7 +10342,11 @@ class ConversationEngine:
         """
         seen: set[str | None] = set()
         results = []
-        for pattern in _VEHICLE_LOCATION_CLAUSE_PATTERNS:
+        # W1F-W-01 R3 item 4: with locality safety on, plural subjects are read too —
+        # "los autos están en Flores" is the same claim about the same inspection location
+        # and matched nothing before (finding W1FRV-05). Each captured locality still has
+        # to survive the catalogue and the validators in `_extract_zone_from_text`.
+        for pattern in _loc.clause_patterns(plural=self._locality_safety_on()):
             for m in pattern.finditer(text):
                 locality = m.group(1).strip()
                 if not locality:
@@ -10514,7 +10522,8 @@ class ConversationEngine:
             # `resolve_field_evidence` is read-only (M21.1.5) and already runs three times
             # per turn in the live path; a failure here degrades to semantic-only claims.
             try:
-                field_snapshot = resolve_field_evidence(ctx, ctx.state)
+                field_snapshot = resolve_field_evidence(
+                    ctx, ctx.state, locality_safety=self._locality_safety_on())
             except Exception:
                 field_snapshot = None
             cycle_id = str(getattr(ctx.state, "current_cycle_start_message_db_id", None)
@@ -12003,6 +12012,35 @@ class ConversationEngine:
             (early_return, vehicle_location_written).
             If early_return is not None the caller must return it immediately.
         """
+        # ── W1F-W-01 R3: nothing is written until coverage and ambiguity are decided ──
+        # This is the whole of R3 scope item 2. The inherited order evaluated coverage in
+        # `_routing_gate`, AFTER this helper had already written the zone; an unsupported
+        # locality therefore persisted and survived the human handoff.
+        if self._locality_safety_on():
+            _v, _, _why = self._locality_verdict(text)
+            if _v == _loc.LocalityVerdict.UNSUPPORTED:
+                self._decision_log(ctx, "location_refused", verdict=_v, reason=_why,
+                                   target="none")
+                if allow_contradiction_return:
+                    return self._send_coverage_response(ctx, state), False
+                return None, False
+            if _v == _loc.LocalityVerdict.AMBIGUOUS:
+                # A real name with more than one real place: ask, never assume. No zone is
+                # written — and the ambiguity is RECORDED, so the one clarification decision
+                # later in the turn asks for the location because the locality was
+                # ambiguous, not merely because nothing happened to be stored.
+                #
+                # OWNER-REVIEW-R1 R1RV-02. Relying on absence was measured and was not
+                # enough: on a turn that already had a zone ("perdón, el auto está en San
+                # Nicolás" at QUOTED) `location_resolved` was True, the route was
+                # DOMAIN_NOT_RELEVANT, and the customer was re-quoted the OLD locality as
+                # if they had said nothing. This is evidence contributing to a decision —
+                # it grants permission to ASK and writes nothing.
+                self._turn_locality_ambiguity = _why
+                self._decision_log(ctx, "location_ambiguous", verdict=_v, reason=_why,
+                                   target="none")
+                return None, False
+
         _vehicle_location_written = False
         _vlzones = self._extract_vehicle_location_zones(text)
         if len(_vlzones) >= 2 and _LOCATION_UNCERTAINTY_RE.search(text):
@@ -14911,7 +14949,99 @@ Respondé SOLO con JSON válido:
             ctx.thread.id, candidate.id, match.tipo_vehiculo, anio,
         )
 
+    # ── W1F-W-01 R3 ─────────────────────────────────────────────────────────────
+    def _locality_safety_on(self) -> bool:
+        """Is locality-resolution safety armed on this deployment?
+
+        Default OFF when the attribute is absent, which is the deployed `6a14cdb` shape.
+        """
+        return getattr(getattr(self, "settings", None),
+                       "locality_resolution_safety_enabled", False) is True
+
+    def _matched_forms_in_text(self, normalized_text: str, zone) -> list[str]:
+        """Which of this zone's names actually occur, as whole tokens, in the text.
+
+        The matcher below can fire from the canonical name, from the article-stripped
+        alias, or from the zone group; the compact and ASR-fuzzy passes fire from no
+        literal occurrence at all. Returning the forms that are really present keeps the
+        composite-name validator honest: it can only refuse a form the customer wrote.
+        """
+        import re as _re
+        forms: list[str] = []
+        for raw in (getattr(zone, "zone_detail", None), getattr(zone, "zone_group", None)):
+            if not raw:
+                continue
+            norm = _loc.norm_locality_text(raw)
+            candidates = [norm]
+            stripped = _loc.ARTICLE_PREFIX_RE.sub("", norm)
+            if stripped and stripped != norm:
+                candidates.append(stripped)
+            for cand in candidates:
+                if cand and cand not in forms and _re.search(
+                        rf"\b{_re.escape(cand)}\b", normalized_text):
+                    forms.append(cand)
+        return forms
+
+    def _locality_verdict(self, text: str, zone=None, *, matched: bool = False,
+                          area_hint: str | None = None):
+        """(verdict, zone, reason) for a locality reading. Writes nothing, asks nothing.
+
+        `area_hint` is an explicit coverage-area selection the customer made in the same
+        submission — the Location Flow's `zona_general` dropdown. It can only ever settle an
+        ambiguity, never create one, and it settles it only when it agrees with the matched
+        locality's own area (see `locality_text.disambiguated_by_text`).
+
+        The order is the point. Coverage is decided FIRST, before a zone can be produced at
+        all, because the W1F-W-01 review measured the opposite order in the deployed code:
+        `_apply_zone_from_text` wrote `('Sur','La Plata')` for "en mar del plata" and the
+        out-of-coverage response was only produced afterwards, by the routing gate, leaving
+        a false zone on the thread (finding W1FRV-03).
+        """
+        V = _loc.LocalityVerdict
+        if _loc.is_outside_coverage(text):
+            return V.UNSUPPORTED, None, "declared outside the coverage area"
+        if not matched:
+            zone = self._match_zone_in_text(text)
+        if zone is None:
+            return V.UNRESOLVED, None, "no catalogue locality in this text"
+
+        normalized = _loc.norm_locality_text(text)
+        catalog = tuple(
+            z.zone_detail for z in (getattr(self, "_zone_catalog_snapshot", None) or ())
+            if getattr(z, "zone_detail", None))
+        forms = self._matched_forms_in_text(normalized, zone)
+        if forms and all(_loc.composite_name_conflict(normalized, f, catalog) for f in forms):
+            return (V.UNRESOLVED, None,
+                    f"only part of a longer name: {'/'.join(forms)}")
+
+        detail = getattr(zone, "zone_detail", None)
+        if (detail and _loc.is_cross_coverage_ambiguous(detail)
+                and not _loc.disambiguated_by_text(
+                    normalized, getattr(zone, "zone_group", None), area_hint=area_hint)):
+            return V.AMBIGUOUS, None, _loc.ambiguity_reason(detail) or "ambiguous locality"
+        return V.RESOLVED, zone, "catalogue locality"
+
     def _extract_zone_from_text(self, text: str) -> "ViaticosZone | None":
+        """Resolve a locality from text, or None.
+
+        With locality safety OFF this is the inherited matcher, unchanged. With it ON the
+        matcher's answer has to survive the three validators in `_locality_verdict` before
+        it can be returned, so an unsupported, ambiguous or merely partial name resolves to
+        None — and a caller that writes only what it is given therefore writes nothing.
+        """
+        zone = self._match_zone_in_text(text)
+        if not self._locality_safety_on():
+            return zone
+        verdict, safe_zone, reason = self._locality_verdict(text, zone, matched=True)
+        if verdict != _loc.LocalityVerdict.RESOLVED:
+            logger.info("W1F-R3 locality refused verdict=%s reason=%s", verdict, reason)
+            return None
+        return safe_zone
+
+    def _match_zone_in_text(self, text: str) -> "ViaticosZone | None":
+        """The inherited matcher: Dock Sud, CABA synonyms, article context, containment,
+        compact/ASR-fuzzy, then bare group. Unchanged by R3 except for the catalogue
+        snapshot it leaves behind, which the validators read instead of querying again."""
         from sqlalchemy import select as _select
 
         # Normalize: strip Unicode diacritics, lowercase, collapse whitespace.
@@ -14922,6 +15052,7 @@ Respondé SOLO con JSON válido:
 
         normalized_text = _n(text)
         zones = list(self.db.execute(_select(ViaticosZone)).scalars().all())
+        self._zone_catalog_snapshot = zones      # W1F-W-01 R3: read-only, same query
 
         # Dock Sud fast-path: "doc sud", "dock sud" and typo variants → Sur/Dock Sud.
         # Must be checked BEFORE the CABA synonyms and zone_detail loop to prevent

@@ -1,0 +1,211 @@
+180	Sur	Coronel Brandsen	200000
+181	Sur	La Plata	180000
+182	Sur	Berisso	190000
+183	Sur	Ensenada	190000
+184	Oeste	Cañuelas	170000
+185	Oeste	General Las Heras	190000
+186	Oeste	Luján	200000
+187	Oeste	Exaltación de la Cruz	200000
+188	Norte	Zárate	250000
+189	Norte	Campana	190000
+190	Oeste	General Rodriguez	160000
+191	Oeste	Marcos Paz	160000
+192	Oeste	Merlo	100000
+193	Sur	La Matanza Este	90000
+194	Sur	Ezeiza	100000
+195	Sur	Esteban Echeverría	90000
+196	Sur	Presidente Perón	110000
+197	Sur	Florencio Varela	100000
+198	Sur	Berazategui	90000
+199	Norte	Escobar	100000
+200	Norte	Pilar	90000
+201	Oeste	Moreno	90000
+202	Sur	Lomas de Zamora	80000
+203	Sur	Almirante Brown	80000
+204	Sur	Quilmes	50000
+205	Norte	Malvinas Argentinas	30000
+208	Oeste	Hurlingham	40000
+209	Oeste	Ituzaingó	50000
+210	Oeste	Morón	50000
+211	Oeste	La Matanza Oeste	50000
+212	Sur	Lanús	30000
+213	Sur	Avellaneda	30000
+214	Norte	Tigre	0
+215	Oeste	San Martin	30000
+216	Oeste	3 de Febrero	40000
+217	Norte	San Fernando	0
+218	Norte	San Isidro	0
+219	Norte	Beccar	0
+220	Norte	Vicente Lopez	0
+221	CABA	Agronomía	0
+222	CABA	Almagro	0
+223	CABA	Balvanera	0
+224	CABA	Barracas	0
+225	CABA	Belgrano	0
+226	CABA	Boedo	0
+227	CABA	Caballito	0
+228	CABA	Chacarita	0
+229	CABA	Coghlan	0
+230	CABA	Colegiales	0
+231	CABA	Constitución	0
+232	CABA	Flores	0
+233	CABA	Floresta	0
+234	CABA	La Boca	0
+235	CABA	La Paternal	0
+236	CABA	Liniers	0
+237	CABA	Mataderos	0
+238	CABA	Monte Castro	0
+239	CABA	Monserrat	0
+240	CABA	Nueva Pompeya	0
+241	CABA	Núñez	0
+242	CABA	Palermo	0
+243	CABA	Parque Avellaneda	0
+244	CABA	Parque Chacabuco	0
+245	CABA	Parque Chas	0
+246	CABA	Parque Patricios	0
+247	CABA	Puerto Madero	0
+248	CABA	Recoleta	0
+249	CABA	Retiro	0
+250	CABA	Saavedra	0
+251	CABA	San Cristóbal	0
+252	CABA	San Nicolás	0
+253	CABA	San Telmo	0
+254	CABA	Vélez Sarsfield	0
+255	CABA	Versalles	0
+256	CABA	Villa Crespo	0
+257	CABA	Villa del Parque	0
+258	CABA	Villa Devoto	0
+259	CABA	Villa General Mitre	0
+260	CABA	Villa Lugano	0
+261	CABA	Villa Luro	0
+262	CABA	Villa Ortúzar	0
+263	CABA	Villa Pueyrredón	0
+264	CABA	Villa Real	0
+265	CABA	Villa Riachuelo	0
+266	CABA	Villa Santa Rita	0
+267	CABA	Villa Soldati	0
+268	CABA	Villa Urquiza	0
+269	Oeste	Lomas del Mirador	50000
+270	Oeste	San Justo	40000
+271	Oeste	Ramos Mejía	50000
+272	Oeste	Villa Luzuriaga	50000
+273	Oeste	Ciudad Evita	30000
+274	Oeste	Tapiales	30000
+275	Oeste	La Tablada	50000
+276	Oeste	Isidro Casanova	90000
+277	Oeste	Rafael Castillo	90000
+278	Oeste	González Catán	90000
+279	CABA	CABA	0
+280	Sur	Dock Sud	30000
+281	Norte	Benavídez	20000
+282	CABA		0
+283	Norte		0
+284	Oeste		30000
+285	Sur		30000
+286	CABA	Capital Federal	0
+287	CABA	Capital	0
+288	Norte	Acassuso	0
+289	Norte	Belén de Escobar	100000
+290	Norte	Boulogne	0
+291	Norte	Boulogne Sur Mer	0
+292	Norte	Carapachay	0
+293	Norte	Del Viso	90000
+294	Norte	Don Torcuato	0
+295	Norte	El Talar	0
+296	Norte	Florida	0
+297	Norte	Garín	100000
+298	Norte	General Pacheco	0
+299	Norte	Ingeniero Maschwitz	100000
+300	Norte	La Lucila	0
+301	Norte	Manuel Alberti	90000
+302	Norte	Maquinista Savio	100000
+303	Norte	Martínez	0
+304	Norte	Munro	0
+305	Norte	Nordelta	0
+306	Norte	Olivos	0
+307	Norte	Pacheco	0
+308	Norte	Presidente Derqui	90000
+309	Norte	Ricardo Rojas	0
+310	Norte	Rincón de Milberg	0
+311	Norte	Santa Catalina	20000
+312	Norte	Tortuguitas	80000
+313	Norte	Victoria	0
+314	Norte	Villa Adelina	0
+315	Norte	Villa Martelli	0
+316	Norte	Villa Rosa	90000
+317	Norte	Virreyes	0
+318	Oeste	Bella Vista	50000
+319	Oeste	Caseros	40000
+320	Oeste	Castelar	50000
+321	Oeste	Ciudad Jardín	40000
+322	Oeste	Ciudadela	40000
+323	Oeste	Cuartel V	90000
+324	Oeste	El Palomar	50000
+325	Oeste	Francisco Álvarez	90000
+326	Oeste	Grand Bourg	90000
+327	Oeste	Gregorio de Laferrère	90000
+328	Oeste	Haedo	50000
+329	Oeste	José C. Paz	90000
+330	Oeste	José León Suárez	30000
+331	Oeste	La Reja	90000
+332	Oeste	Libertad	100000
+333	Oeste	Los Polvorines	90000
+334	Oeste	Mariano Acosta	100000
+335	Oeste	Martín Coronado	40000
+336	Oeste	Muñiz	50000
+337	Oeste	Pablo Nogués	90000
+338	Oeste	Padua	90000
+339	Oeste	Paso del Rey	90000
+340	Oeste	Pontevedra	100000
+341	Oeste	Sáenz Peña	40000
+342	Oeste	San Andrés	30000
+343	Oeste	San Antonio de Padua	90000
+344	Oeste	San Miguel	50000
+345	Oeste	Santos Lugares	40000
+346	Oeste	Trujui	90000
+347	Oeste	Villa Ballester	30000
+348	Oeste	Villa Bosch	40000
+349	Oeste	Villa Lynch	30000
+350	Oeste	Villa Sarmiento	50000
+351	Oeste	Villa Tesei	40000
+352	Oeste	Villa Udaondo	50000
+353	Oeste	William Morris	40000
+354	Sur	Adrogué	80000
+355	Sur	Banfield	80000
+356	Sur	Bernal	80000
+357	Sur	Bosques	100000
+358	Sur	Burzaco	80000
+359	Sur	Canning	100000
+360	Sur	City Bell	180000
+361	Sur	Claypole	80000
+362	Sur	Don Bosco	50000
+363	Sur	El Jagüel	90000
+364	Sur	Ezpeleta	50000
+365	Sur	Gerli	30000
+366	Sur	Glew	80000
+367	Sur	Gonnet	170000
+368	Sur	Guernica	110000
+369	Sur	Hudson	90000
+370	Sur	José Mármol	80000
+371	Sur	Llavallol	80000
+372	Sur	Longchamps	80000
+373	Sur	Los Hornos	180000
+374	Sur	Luis Guillón	90000
+375	Sur	Monte Chingolo	30000
+376	Sur	Monte Grande	90000
+377	Sur	Piñeyro	30000
+378	Sur	Plátanos	90000
+379	Sur	Rafael Calzada	80000
+380	Sur	Ranelagh	90000
+381	Sur	Remedios de Escalada	30000
+382	Sur	Ringuelet	180000
+383	Sur	San Francisco Solano	50000
+384	Sur	Sarandí	30000
+385	Sur	Temperley	80000
+386	Sur	Tolosa	180000
+387	Sur	Tristán Suárez	100000
+388	Sur	Turdera	80000
+389	Sur	Valentín Alsina	30000
+390	Sur	Villa Dominico	30000
+391	Sur	Villa Elisa	180000
+392	Sur	Wilde	30000
