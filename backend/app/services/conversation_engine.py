@@ -3127,6 +3127,39 @@ _locality_in_context = _loc.locality_in_context
 
 
 
+class _ZoneBuffer:
+    """The pre-candidate thread buffer, shaped like a candidate for the one zone writer.
+
+    `whatsapp_thread_states.home_zone_*` is the buffer the review calls role-ambiguous
+    (RC-5) and it is not renamed here — R1 changes an order, not a schema. What this
+    adapter does change is who may write it: a value reaching the buffer from the admission
+    boundary goes through `_apply_inspection_zone` and is therefore decided by the
+    certified reconciler, instead of being assigned directly the way the location form
+    still assigns it (W1FRV-04).
+    """
+
+    __slots__ = ("_state",)
+
+    def __init__(self, state):
+        self._state = state
+
+    @property
+    def zone_group(self):
+        return getattr(self._state, "home_zone_group", None)
+
+    @zone_group.setter
+    def zone_group(self, value):
+        self._state.home_zone_group = value
+
+    @property
+    def zone_detail(self):
+        return getattr(self._state, "home_zone_detail", None)
+
+    @zone_detail.setter
+    def zone_detail(self, value):
+        self._state.home_zone_detail = value
+
+
 class ConversationEngine:
     def __init__(self, db: Session, settings: Settings) -> None:
         self.db = db
@@ -3144,6 +3177,7 @@ class ConversationEngine:
         self._availability_authority_phases = {}  # G3-5B: one decision per phase
         self._turn_semantic_burst = None           # G3-5B: which burst was interpreted
         self._turn_semantic_dispatched = False      # G3-5C: arms the fail-closed check
+        self._turn_admission = None                 # W1F-W-01 R1: this turn's admission
         self._turn_semantic_calls = 0              # model invocations
         self._semantic_accessor_reads = 0          # reads of that one interpretation
         # ── G3-5E: the reply-generation role, counted and attributed separately ──
@@ -3332,6 +3366,8 @@ class ConversationEngine:
         self._turn_offer_admission = None        # G3-7R/S2: what admission decided
         self._turn_offer_withdrawal = None
         self._turn_service_question = False
+        # W1F-W-01 R1: this turn's admission decisions, for the trace and the tests.
+        self._turn_admission = None
         # OWNER-REVIEW-R1 R1RV-02: this turn's locality ambiguity, as a reason string. Read
         # by `_turn_clarification_decision`, so it is per-turn memory and must be cleared
         # here for the reason the G3-7G audit established — a reused engine instance must
@@ -7095,6 +7131,27 @@ class ConversationEngine:
             proposals["needs_human"] = True
         return proposals
 
+    def _semantic_binding_refused(self) -> bool:
+        """Is this turn's interpretation NOT bound to this turn's canonical burst?
+
+        The G3-5B/G3-5C rule, read from one place because W1F-W-01 R1 adds a second reader:
+        the admission boundary applies the same fail-closed test before it will treat a
+        semantic claim as being about this turn. Logs the refusal exactly as before, and
+        never calls the provider, so a rejection can never cost a second model call.
+        """
+        burst = getattr(self, "_canonical_turn_burst", None)
+        bound = getattr(self, "_turn_semantic_burst", None)
+        dispatched = bool(getattr(self, "_turn_semantic_dispatched", False))
+        if dispatched and burst is not None and bound != burst.fingerprint:
+            try:
+                logger.warning(
+                    "G3-5C SEMANTIC BINDING REFUSED canonical=%s semantic=%s",
+                    burst.fingerprint[:12], (str(bound)[:12] if bound else "absent"))
+            except Exception:
+                pass
+            return True
+        return False
+
     def _semantic_reading(self):
         """Everything this decision needs, from ONE read of the burst's interpretation.
 
@@ -7117,21 +7174,12 @@ class ConversationEngine:
         # over the reconciler. When the bindings disagree the reading is treated as
         # UNAVAILABLE — the deterministic floor's own bounded behaviour — rather than
         # silently outranking evidence it never saw.
-        burst = getattr(self, "_canonical_turn_burst", None)
-        bound = getattr(self, "_turn_semantic_burst", None)
-        dispatched = bool(getattr(self, "_turn_semantic_dispatched", False))
         # G3-5C (audit G5B-05): fail CLOSED. Once an interpretation has been dispatched for
         # this turn its evidence is admissible only when it is POSITIVELY bound to the
         # canonical burst. A foreign binding and a missing binding are the same answer —
         # UNAVAILABLE, the deterministic floor's own bounded behaviour. Nothing here calls
         # the provider, so a rejection can never cost a second model call.
-        if dispatched and burst is not None and bound != burst.fingerprint:
-            try:
-                logger.warning(
-                    "G3-5C SEMANTIC BINDING REFUSED canonical=%s semantic=%s",
-                    burst.fingerprint[:12], (str(bound)[:12] if bound else "absent"))
-            except Exception:
-                pass
+        if self._semantic_binding_refused():
             return SimpleNamespace(status="UNAVAILABLE", availability=None,
                                    ambiguous=None, faq_topics=frozenset())
         try:
@@ -8549,6 +8597,32 @@ class ConversationEngine:
         _svc_out = self._handle_explicit_service_gate(ctx, current_turn_text)
         if _svc_out is not None:
             return _svc_out
+
+        # ── W1F-W-01 R1: ADMIT BEFORE ROUTE ───────────────────────────────
+        # The review's one structural change. Authority in the inherited engine is
+        # POSITIONAL: whatever gate answers first ends the turn, and everything the turn
+        # understood dies with it — measured twice in one Wild, at Layer D and at Layer F
+        # step 9, with the correct locality available both times. This decides the turn's
+        # locality evidence here, before the first gate that can discard it returns, and
+        # writes it through the same chokepoint the zone block uses. Nothing is sent from
+        # inside it.
+        #
+        # PLACEMENT (owner correction OC-R1, 2026-10-27): below Layers A/B/C, above
+        # Layer D. The three pre-gates above are terminal: motorcycle and phone-call hand
+        # the customer to a person, and the unsupported-service gate states a boundary.
+        # None of them continues the automated conversation, so none of them needs the
+        # locality persisted — and admission calls `_semantic_turn_evidence()`, whose
+        # bounded wait (SEMANTIC_SAME_TURN_TIMEOUT_SECONDS, 6.0 s) would otherwise be
+        # coupled to three safety/handoff replies that answer in milliseconds today.
+        # Layer D is the first gate that ends the turn while the conversation CONTINUES,
+        # and it is one of the two gates the Wild measured dropping the locality
+        # (the other is Layer F step 9, further down), so the measured requirement —
+        # "en flores" survives the FAQ and Layer-F exits — is preserved here.
+        #
+        # Default OFF: with the flag off this is one attribute read and the turn below is
+        # byte-for-byte the committed behaviour.
+        if self._admission_on():
+            self._admit_turn_evidence(ctx, state, list(self._canonical_turn_burst.texts))
 
         # ── M21.1.1 Layer D: FAQ bypass (all stages) ──────────────────────
         # Informational unless the same message also contains a pre-purchase signal,
@@ -11462,8 +11536,16 @@ class ConversationEngine:
 
     def _apply_inspection_zone(self, ctx, target, *, zone_group=None, zone_detail=None,
                                source: str = "ce", role: str = "INSPECTION_LOCATION",
-                               state=None) -> bool:
-        """Write an inspection locality onto a candidate or onto the pre-candidate buffer."""
+                               state=None, claims=None) -> bool:
+        """Write an inspection locality onto a candidate or onto the pre-candidate buffer.
+
+        `claims` lets a caller hand in the claims it already holds instead of having this
+        method compose one from `(zone_group, zone_detail)`. W1F-W-01 R1's admission
+        boundary is the one caller that uses it: it has a turn's claims from BOTH producers
+        and the whole point is that `reconcile_inspection_location` — not the boundary, and
+        not a second copy of its ladder — decides which producer wins. Every existing caller
+        passes nothing and gets exactly the single claim it got before.
+        """
         if not self._location_authority_on():
             wrote = False
             if zone_group is not None:
@@ -11485,11 +11567,14 @@ class ConversationEngine:
         }.get(source, EvidenceClass.DETERMINISTIC_EXTRACTED)
         cycle_id = self._reconciler_cycle_id(state if state is not None else ctx.state)
         locality = zone_detail or zone_group
-        claims = ([ClaimEvidence(claim_type=claim_type, value=locality,
-                                 evidence_class=evidence_class, producer=f"ce:{source}",
-                                 explicitness=Explicitness.STATED,
-                                 cycle_id=cycle_id).with_id()]
-                  if locality else [])
+        if claims is None:
+            claims = ([ClaimEvidence(claim_type=claim_type, value=locality,
+                                     evidence_class=evidence_class, producer=f"ce:{source}",
+                                     explicitness=Explicitness.STATED,
+                                     cycle_id=cycle_id).with_id()]
+                      if locality else [])
+        else:
+            claims = list(claims)
 
         def _validate(value: str):
             zone = self._extract_zone_from_text(value)
@@ -11985,6 +12070,23 @@ class ConversationEngine:
     # ── L4.6 Phase B/D — canonical response/state consistency ────────────────
 
 
+    def _is_current_focus(self, state, candidate) -> bool:
+        """Is this candidate the thread's ESTABLISHED current subject?
+
+        Candidate-location isolation (M21.2.14): a "mentioned" candidate from a prior turn
+        — a MOTO from a completed handoff, say — is not the current subject and must not
+        inherit location evidence from a different vehicle's conversation. The predicate
+        existed three times inside `_apply_zone_from_text` and is now read from one place,
+        because W1F-W-01 R1 adds a fourth reader (the admission boundary) and W1FRV-07 is
+        the finding about one rule living in two copies.
+        """
+        if candidate is None:
+            return False
+        if getattr(candidate, "status", None) == "current_focus":
+            return True
+        focus_id = getattr(state, "current_focus_candidate_id", None)
+        return focus_id is not None and focus_id == getattr(candidate, "id", None)
+
     def _apply_zone_from_text(
         self,
         ctx: "_Context",
@@ -12056,16 +12158,7 @@ class ConversationEngine:
             # that is the established current focus.  A "mentioned" candidate from a prior
             # turn (e.g. a MOTO from a completed handoff) is NOT the current subject and
             # must not inherit location evidence from a different vehicle's conversation.
-            _fc_is_current = (
-                _fc is not None
-                and (
-                    _fc.status == "current_focus"
-                    or (
-                        getattr(state, "current_focus_candidate_id", None) is not None
-                        and state.current_focus_candidate_id == _fc.id
-                    )
-                )
-            )
+            _fc_is_current = self._is_current_focus(state, _fc)
             if _fc_is_current:
                 self._apply_inspection_zone(ctx, _fc, zone_group=_vzone.zone_group,
                                             zone_detail=_vzone.zone_detail,
@@ -12097,16 +12190,7 @@ class ConversationEngine:
                     if _vlzones_stripped:
                         _vz2 = _vlzones_stripped[0]
                         _fc3 = self._focus_candidate(ctx)
-                        _fc3_is_current = (
-                            _fc3 is not None
-                            and (
-                                _fc3.status == "current_focus"
-                                or (
-                                    getattr(state, "current_focus_candidate_id", None) is not None
-                                    and state.current_focus_candidate_id == _fc3.id
-                                )
-                            )
-                        )
+                        _fc3_is_current = self._is_current_focus(state, _fc3)
                         if _fc3_is_current:
                             self._apply_inspection_zone(ctx, _fc3,
                                                         zone_group=_vz2.zone_group,
@@ -12134,16 +12218,7 @@ class ConversationEngine:
                         state.home_zone_group = _zh.zone_group
                     _fc2 = self._focus_candidate(ctx)
                     # Same isolation: only write to an established current-focus candidate.
-                    _fc2_is_current = (
-                        _fc2 is not None
-                        and (
-                            _fc2.status == "current_focus"
-                            or (
-                                getattr(state, "current_focus_candidate_id", None) is not None
-                                and state.current_focus_candidate_id == _fc2.id
-                            )
-                        )
-                    )
+                    _fc2_is_current = self._is_current_focus(state, _fc2)
                     if _fc2_is_current and not _fc2.zone_group:
                         self._apply_inspection_zone(ctx, _fc2, zone_group=_zh.zone_group,
                                                     zone_detail=_zh.zone_detail,
@@ -14950,6 +15025,176 @@ Respondé SOLO con JSON válido:
         )
 
     # ── W1F-W-01 R3 ─────────────────────────────────────────────────────────────
+    # ── W1F-W-01 R1 — EVIDENCE ADMISSION ─────────────────────────────────────
+    #
+    # The review's one structural change, and it is an ORDER: a turn's understanding is
+    # decided before any gate can answer the customer and return. Everything called from
+    # here already exists — the role-aware deterministic reader, the R3 locality validators,
+    # the C2 chokepoint, the certified reconciler, the claim projection. What did not exist
+    # is a place where a semantic INSPECTION_LOCATION claim could arrive at all, which is
+    # why the flags being ON changed nothing for it and why its refusal left no record.
+    #
+    # Scope, stated as a boundary rather than as an intention:
+    #   * admits ONE family (the inspection locality) and records a typed refusal for every
+    #     other family the interpreter produced;
+    #   * writes only through `_apply_inspection_zone`, so the C2 chokepoints remain the
+    #     only writers of a candidate field;
+    #   * sends nothing, calls no model, quotes nothing, books nothing;
+    #   * never overwrites an established value, and never outranks the customer's own words;
+    #   * persists NO outstanding question. The system still does not know what it asked, so
+    #     Layer F step 9 can still answer an answer. That is R2, and R1 does not pretend
+    #     otherwise.
+
+    def _admission_on(self) -> bool:
+        """Is the evidence-admission boundary armed? Default OFF = committed behaviour."""
+        return getattr(getattr(self, "settings", None),
+                       "evidence_admission_enabled", False) is True
+
+    def _admission_locality_validator(self, value: str):
+        """The R3 resolver, as the admission boundary's injected validator.
+
+        Returns `(status, (zone_group, zone_detail) | None, detail)`. The four statuses are
+        the four `LocalityVerdict` values, so admission reads the certified verdict and
+        forms no opinion of its own about what a locality is: an unsupported name, a name
+        that is only part of a longer one, and San Nicolás are refused HERE for the same
+        reasons and by the same code that refuses them at the zone block.
+        """
+        from .evidence_admission import (VALIDATOR_AMBIGUOUS, VALIDATOR_OK,
+                                         VALIDATOR_UNRESOLVED, VALIDATOR_UNSUPPORTED)
+        text = str(value or "")
+        if not text.strip():
+            return VALIDATOR_UNRESOLVED, None, "empty value"
+        if self._locality_safety_on():
+            verdict, zone, reason = self._locality_verdict(text)
+            V = _loc.LocalityVerdict
+            if verdict == V.UNSUPPORTED:
+                return VALIDATOR_UNSUPPORTED, None, reason
+            if verdict == V.AMBIGUOUS:
+                return VALIDATOR_AMBIGUOUS, None, reason
+            if verdict != V.RESOLVED or zone is None:
+                return VALIDATOR_UNRESOLVED, None, reason
+            return (VALIDATOR_OK,
+                    (getattr(zone, "zone_group", None), getattr(zone, "zone_detail", None)),
+                    reason)
+        # Locality safety OFF: the inherited matcher is the only validator there is. The
+        # coverage and ambiguity verdicts simply do not exist on that deployment, and
+        # admission must not invent them — R3 is the milestone that adds them.
+        zone = self._extract_zone_from_text(text)
+        if zone is None:
+            return VALIDATOR_UNRESOLVED, None, "no catalogue locality in this value"
+        return (VALIDATOR_OK,
+                (getattr(zone, "zone_group", None), getattr(zone, "zone_detail", None)),
+                "catalogue locality")
+
+    def _admit_turn_evidence(self, ctx: "_Context", state, texts) -> "object | None":
+        """Decide this turn's locality evidence BEFORE the gate chain can answer.
+
+        Two readings, one decision, in this order:
+
+        A. the deterministic role-aware reader, run in its **write-only** mode
+           (`allow_contradiction_return=False`), so it keeps LR-2 origin separation, LR-3
+           explicit vehicle-location authority, the R3 coverage/ambiguity pre-gate and
+           candidate isolation — and cannot send. The coverage response and the SC17
+           contradiction reply are still produced by the zone block later in the turn, by
+           the same code as today, because this run never consumes them.
+
+        B. the semantic claims, at the typed admission boundary. They are written only when
+           A established nothing: the customer's own words outrank a reading of them, which
+           is the reconciler's ladder expressed as an order of operations.
+
+        Returns the `AdmissionResult` (for the trace and the tests) or None when the
+        boundary could not run. Never raises: a failure here degrades to the inherited
+        behaviour, which is the whole turn exactly as it runs today.
+        """
+        from .evidence_admission import admit
+        from .claim_projection import claims_from_turn_evidence
+
+        burst_texts = [t for t in (texts or ()) if isinstance(t, str) and t]
+        text = " ".join(burst_texts)
+        cycle_id = self._reconciler_cycle_id(state)
+
+        # ── A. the deterministic reading, written through the existing chokepoint ──
+        before = self._get_active_inspection_location(ctx, state)
+        if text:
+            try:
+                self._apply_zone_from_text(ctx, state, text,
+                                           allow_contradiction_return=False)
+            except Exception as exc:
+                logger.warning("W1F-R1 admission zone read failed thread_id=%s: %s",
+                               getattr(ctx.thread, "id", None), type(exc).__name__)
+        established = self._get_active_inspection_location(ctx, state)
+        wrote_this_turn = any(established) and established != before
+        # LR-2 is the authority on ROLE. When the turn carries a customer-origin clause and
+        # the role-aware reader still produced no inspection locality, it has DECIDED: the
+        # place named belongs to the customer. A semantic role label may not overrule that.
+        role_decided_by_text = bool(
+            text and not wrote_this_turn and _has_customer_origin_clause(text))
+
+        # ── B. the semantic reading, at the boundary ──────────────────────────────
+        binding_ok = not self._semantic_binding_refused()
+        evidence = None
+        if binding_ok:
+            try:
+                evidence = self._semantic_turn_evidence()
+            except Exception as exc:
+                logger.warning("W1F-R1 admission semantic read unavailable: %s",
+                               type(exc).__name__)
+                evidence = None
+        revision_id = getattr(state, "current_revision_id", None)
+        claims = (claims_from_turn_evidence(
+            evidence, texts=burst_texts, cycle_id=cycle_id,
+            revision_id=(revision_id if isinstance(revision_id, int) else None))
+            if evidence is not None else [])
+
+        burst = getattr(self, "_canonical_turn_burst", None)
+        result = admit(
+            claims,
+            cycle_id=cycle_id,
+            turn_id=getattr(self, "_correlation_id", None),
+            burst_fingerprint=getattr(burst, "fingerprint", None),
+            turn_message_ids=(tuple(str(m) for m in burst.ordered_message_ids)
+                              if burst is not None else ()),
+            locality_validator=self._admission_locality_validator,
+            canonical_locality=(established if any(established) else None),
+            canonical_from_this_turn=wrote_this_turn,
+            role_decided_by_text=role_decided_by_text,
+            semantic_binding_ok=binding_ok)
+
+        # ── the admitted claims reach the ONE writer; refusals are recorded ────────
+        for record in result.admitted:
+            target = self._focus_candidate(ctx)
+            if not self._is_current_focus(state, target):
+                # No candidate yet, or only an unrelated mentioned one. The pre-candidate
+                # buffer is written through the same chokepoint via an adapter, so the
+                # reconciler decides here too (the location form's bypass of it is
+                # W1FRV-04 and is not repeated).
+                target = _ZoneBuffer(state)
+            wrote = self._apply_inspection_zone(
+                ctx, target, zone_group=record.zone_group, zone_detail=record.zone_detail,
+                source="admission", state=state,
+                claims=list(result.admitted_claims))
+            self._decision_log(
+                ctx, "evidence_admitted", claim=record.claim_type,
+                outcome=record.outcome, reason=record.reason,
+                zone_group=record.zone_group, zone_detail=record.zone_detail,
+                producer=record.provenance.producer,
+                evidence_class=record.provenance.evidence_class,
+                turn=record.provenance.turn_id,
+                messages=",".join(record.provenance.source_message_ids),
+                target=("candidate" if not isinstance(target, _ZoneBuffer)
+                        else "state_buffer"),
+                written=bool(wrote))
+            break           # one locality per turn; a second one is a question, not a write
+        for record in result.refused:
+            self._decision_log(
+                ctx, "evidence_refused", claim=record.claim_type,
+                outcome=record.outcome, reason=record.reason, detail=record.detail,
+                producer=record.provenance.producer,
+                evidence_class=record.provenance.evidence_class,
+                turn=record.provenance.turn_id)
+        self._turn_admission = result
+        return result
+
     def _locality_safety_on(self) -> bool:
         """Is locality-resolution safety armed on this deployment?
 

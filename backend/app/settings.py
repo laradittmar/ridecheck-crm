@@ -65,6 +65,16 @@ class Settings:
     # ENABLING THIS IS A SEPARATE OWNER CHECKPOINT: with it off, W1FRV-02 and W1FRV-03
     # remain open in the runtime. See the R3 closeout.
     locality_resolution_safety_enabled: bool = False
+    # W1F-W-01 R1 — evidence admission. Default OFF: flag-off behaviour is the committed
+    # 83f45b2 behaviour, byte for byte. On, ONE thing changes: this turn's projected
+    # INSPECTION_LOCATION claims are decided at a typed admission boundary BEFORE the
+    # ordered gate chain can answer the customer and return, so a turn that exits early no
+    # longer destroys what it understood. Admission validates through the certified R3
+    # resolver and writes through the certified C2 chokepoint; it admits no other claim
+    # family, sends nothing, calls no model, creates no booking and overwrites no
+    # established value. It does NOT persist an outstanding question — the system still does
+    # not know what it asked, and Layer F step 9 can still answer an answer. That is R2.
+    evidence_admission_enabled: bool = False
     # G3-7F — the Grounded-Target Invariant. The reconciler establishes a correction's
     # target from a ground it verifies itself (literal identity, a validated singleton focus,
     # or a typed in-burst reference) instead of trusting the interpreter's confidence. G3-7C
@@ -201,6 +211,8 @@ def get_settings() -> Settings:
             _getenv("LAYER_D_REGISTER_AND_CONTINUE_ENABLED", "false").lower() == "true"),
         locality_resolution_safety_enabled=(
             _getenv("LOCALITY_RESOLUTION_SAFETY_ENABLED", "false").lower() == "true"),
+        evidence_admission_enabled=(
+            _getenv("EVIDENCE_ADMISSION_ENABLED", "false").lower() == "true"),
         correction_target_grounding_enabled=(
             _getenv("CORRECTION_TARGET_GROUNDING_ENABLED", "false").lower() == "true"),
         provisional_correction_enabled=(

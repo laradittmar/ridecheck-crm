@@ -903,10 +903,16 @@ class DomainVerdictGuard(unittest.TestCase):
         # already produced and makes no provider call, which is what the assertions
         # above this one actually guard. The per-turn provider count is pinned
         # separately by the semantic-call-count tests.
-        self.assertEqual(calls, 8,
+        # W1F-W-01 R1 added ONE more authorised reader — `_admit_turn_evidence`, the
+        # evidence-admission boundary. Same shape as the two additions above: it reads the
+        # interpretation this turn already produced, through the same accessor, and makes
+        # no provider call. Measured on the complete turn: `_turn_semantic_calls` is 0 on an
+        # admitting turn, so admission before the gate chain costs nothing the turn was not
+        # already paying. An unauthorised tenth reader still fails here.
+        self.assertEqual(calls, 9,
                          "five pre-existing consumers, the R2 reader, the G3-7 deriver, "
-                         "and the G3-7F clarification decision — none of which calls the "
-                         "provider")
+                         "the G3-7F clarification decision and the W1F-R1 admission "
+                         "boundary — none of which calls the provider")
         readers = {n.name for n in ast.walk(tree)
                    if isinstance(n, ast.FunctionDef)
                    and "_semantic_turn_evidence()" in ast.unparse(n)}
