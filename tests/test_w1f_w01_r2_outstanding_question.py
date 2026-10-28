@@ -2973,14 +2973,168 @@ class TestR2K_Migration(unittest.TestCase):
         self.assertIn(f'down_revision: str = "{self.PARENT}"', source)
 
     def test_k02_the_downgrade_refuses_rather_than_deletes(self):
-        """The contract, read off the source and proven by the rehearsal: with any row in
-        either table the downgrade raises and changes nothing. A CODE rollback does not
-        need it — both tables are unread with the flags off."""
+        """The contract, read off the source: with any row in either table the downgrade
+        raises and deletes nothing. `k02b` executes it; this one guards the shape of the
+        source so a future edit cannot quietly turn a refusal into a DELETE."""
         source = (BACKEND_DIR / "migrations" / "versions"
                   / f"{self.HEAD}.py").read_text(encoding="utf-8")
         self.assertIn("downgrade REFUSED", source)
         self.assertNotIn("DELETE FROM whatsapp_outstanding_questions", source)
         self.assertNotIn("DELETE FROM whatsapp_thread_evidence", source)
+
+    def test_k02b_the_refusal_runs_for_real_and_tells_the_operator_what_to_do(self):
+        """OC-R2-MIGRATION-ROLLBACK-MESSAGE — execute the refusal, do not read it.
+
+        `k02` reads the source; this runs `alembic downgrade -1` against a real server with
+        a real row in **each** table and asserts on the exception the operator would
+        actually see. That matters because the message is read in a recovery window, by
+        someone deciding what to start next, and the previous wording — "A CODE rollback
+        does not need this downgrade" — invited exactly the wrong conclusion: that the
+        parent-head image could be started against this schema. It cannot; its
+        `schema_preflight.EXPECTED_HEAD` is the parent revision and it exits rather than
+        start (measured in the build-preparation milestone).
+
+        Five things are proved here, and the fifth is the correction: the downgrade refuses,
+        both rows survive, the head does not move, the message names the schema-compatible
+        fallback boundary, and the obsolete phrase is gone.
+        """
+        import os
+        from alembic import command
+        from alembic.config import Config
+        if self._tables_present() != 2:
+            self.skipTest("the rehearsal database is not at this revision")
+        # The refusal message quotes the TABLE's row count, so the assertion below is only
+        # exact if the fixture's rows are the only ones. Requiring that up front is also the
+        # safe direction: this test must never be the thing that deletes somebody's
+        # evidence to make its own arithmetic work.
+        for table in self.TABLES:
+            held = self._sql(f"SELECT count(*) FROM {table}")[0][0]
+            if held:
+                self.skipTest(f"{table} already holds {held} row(s); this test neither "
+                              "deletes evidence nor guesses at the count")
+        thread_id = self._pg_thread("549000000992")
+        self._sql(
+            "INSERT INTO whatsapp_thread_evidence (thread_id, cycle_key, claim_type, "
+            f"outcome, claim_id, created_at) VALUES ({thread_id}, 0, "
+            "'INSPECTION_LOCATION', 'ACCEPT', 'k02b-evidence', now())")
+        self._sql(
+            "INSERT INTO whatsapp_outstanding_questions (thread_id, cycle_key, "
+            "question_kind, asked_by, identity, status, asked_at, expires_after_turns, "
+            f"turns_observed, created_at, updated_at) VALUES ({thread_id}, 0, "
+            "'INSPECTION_LOCATION', 'REPLY_MODEL', 'k02b-question', 'PENDING_DELIVERY', "
+            "now(), 3, 0, now(), now())")
+        rows_before = (self._sql("SELECT count(*) FROM whatsapp_thread_evidence")[0][0],
+                       self._sql("SELECT count(*) FROM whatsapp_outstanding_questions")[0][0])
+        self.assertEqual((1, 1), rows_before, "the fixture did not seed one row per table")
+        head_before = self._sql("SELECT version_num FROM alembic_version")[0][0]
+        self.assertEqual(self.HEAD, head_before)
+
+        cfg = Config()
+        cfg.set_main_option("script_location",
+                            str(BACKEND_DIR / "migrations"))
+        # `migrations/env.py` takes the URL from the environment and permits no fallback,
+        # so it is set for the duration of this call and nowhere else.
+        with patch.dict(os.environ, {"DATABASE_URL": _R2_PG_URL}):
+            with self.assertRaises(RuntimeError) as caught:
+                command.downgrade(cfg, "-1")
+        message = str(caught.exception)
+
+        # 1 — it refused
+        self.assertIn("downgrade REFUSED", message)
+        self.assertIn("whatsapp_thread_evidence holds 1 row(s)", message)
+        self.assertIn("whatsapp_outstanding_questions holds 1 row(s)", message)
+        # 2 — both rows are still there
+        self.assertEqual(
+            rows_before,
+            (self._sql("SELECT count(*) FROM whatsapp_thread_evidence")[0][0],
+             self._sql("SELECT count(*) FROM whatsapp_outstanding_questions")[0][0]),
+            "the refusal deleted evidence")
+        # 3 — the head did not move
+        self.assertEqual(self.HEAD, self._sql("SELECT version_num FROM alembic_version")[0][0])
+        self.assertEqual(2, self._tables_present(), "a refused downgrade dropped a table")
+        # 4 — the message carries the schema-compatible fallback boundary
+        for needle in ("NO EVIDENCE ROW WAS DELETED",
+                       f"LEAVE THE DATABASE AT {self.HEAD}",
+                       "behavioural rollback keeps this schema",
+                       "requires an image whose schema preflight accepts this head",
+                       "EVIDENCE_ADMISSION_ENABLED",
+                       "certified compatibility image",
+                       f"parent-head image ({self.PARENT}) is NOT valid",
+                       "will refuse to start",
+                       f"Returning to {self.PARENT} is a separate, separately authorised",
+                       "archive and remove the evidence rows first"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, message)
+        # 5 — the obsolete claim is gone, from the message AND from the file
+        self.assertNotIn("code rollback", message.lower(),
+                         "the refusal still uses the ambiguous phrase")
+        self.assertNotIn("does not need this downgrade", message)
+        source = (BACKEND_DIR / "migrations" / "versions"
+                  / f"{self.HEAD}.py").read_text(encoding="utf-8")
+        self.assertNotIn("code rollback", source.lower(),
+                         "the migration source still claims a code rollback needs no "
+                         "schema rollback")
+
+    def test_k02c_an_empty_pair_still_downgrades_and_re_upgrades_identically(self):
+        """The other side of the same contract, executed: with the tables EMPTY the
+        downgrade succeeds and a re-upgrade restores a schema with the same fingerprint.
+
+        Both schemas are produced by the migration itself — the comparison would be
+        worthless if one side were built by `create_all`, which renders `JSONB` as `json`
+        under this harness's type patch and would fail the test for a fixture reason.
+
+        It therefore operates on the rehearsal database and puts it back: an `addCleanup`
+        re-upgrades to head unconditionally, so a failure here cannot leave the database
+        downgraded for the tests that follow.
+        """
+        import os
+        from alembic import command
+        from alembic.config import Config
+        if self._tables_present() != 2:
+            self.skipTest("the rehearsal database is not at this revision")
+        for table in self.TABLES:
+            if self._sql(f"SELECT count(*) FROM {table}")[0][0]:
+                self.skipTest(f"{table} is not empty; this test must not delete evidence")
+
+        cfg = Config()
+        cfg.set_main_option("script_location", str(BACKEND_DIR / "migrations"))
+
+        def _restore():
+            with patch.dict(os.environ, {"DATABASE_URL": _R2_PG_URL}):
+                command.upgrade(cfg, "head")
+        self.addCleanup(_restore)
+
+        before = self._fingerprint()
+        self.assertIsNotNone(before)
+        with patch.dict(os.environ, {"DATABASE_URL": _R2_PG_URL}):
+            command.downgrade(cfg, "-1")
+        self.assertEqual(0, self._tables_present(), "the empty downgrade dropped nothing")
+        self.assertEqual(self.PARENT,
+                         self._sql("SELECT version_num FROM alembic_version")[0][0])
+        self.assertEqual(
+            0, self._sql("SELECT count(*) FROM information_schema.columns WHERE "
+                         "table_name='whatsapp_thread_candidates' AND column_name IN "
+                         "('zone_evidence_id','vehicle_evidence_id')")[0][0],
+            "the two candidate columns survived the downgrade")
+        # business data is untouched by either direction
+        msgs = self._sql("SELECT count(*) FROM whatsapp_messages")[0][0]
+
+        with patch.dict(os.environ, {"DATABASE_URL": _R2_PG_URL}):
+            command.upgrade(cfg, "head")
+        self.assertEqual(2, self._tables_present())
+        self.assertEqual(self.HEAD,
+                         self._sql("SELECT version_num FROM alembic_version")[0][0])
+        self.assertEqual(before, self._fingerprint(),
+                         "re-upgrading produced a different schema")
+        self.assertEqual(msgs, self._sql("SELECT count(*) FROM whatsapp_messages")[0][0],
+                         "a schema round trip changed business data")
+
+    def _fingerprint(self):
+        """The column shape of the two new tables, as the catalogue reports it."""
+        return self._sql(
+            "SELECT md5(string_agg(x, '|')) FROM (SELECT table_name||'.'||column_name||"
+            "':'||data_type||':'||is_nullable AS x FROM information_schema.columns WHERE "
+            f"table_name = ANY(ARRAY{list(self.TABLES)!r}) ORDER BY 1) y")[0][0]
 
     def test_k03_one_live_question_per_field_is_enforced_by_postgresql(self):
         """The partial unique index, against a real server. The service's supersede step is
@@ -3147,9 +3301,19 @@ class TestR2K_Migration(unittest.TestCase):
         return self._sql("SELECT id FROM whatsapp_threads ORDER BY id DESC LIMIT 1")[0][0]
 
     def _pg_drop(self, wa_id):
-        self._sql("DELETE FROM whatsapp_outstanding_questions WHERE thread_id IN "
-                  "(SELECT t.id FROM whatsapp_threads t JOIN whatsapp_contacts c ON "
-                  f"c.id = t.contact_id WHERE c.wa_id = '{wa_id}')")
+        """Remove a fixture thread and everything that references it, in FK order.
+
+        `whatsapp_thread_evidence.thread_id` and `whatsapp_outstanding_questions.thread_id`
+        are `NO ACTION` keys — deliberately, per the migration's own docstring: the thread
+        references are the only ones the certified tester reset must delete explicitly. So
+        both tables are cleared BEFORE the thread, and omitting either one makes the thread
+        delete fail with `23503` (measured, when `k02b` seeded an evidence row and this
+        helper only knew about questions).
+        """
+        where = ("thread_id IN (SELECT t.id FROM whatsapp_threads t JOIN whatsapp_contacts "
+                 f"c ON c.id = t.contact_id WHERE c.wa_id = '{wa_id}')")
+        self._sql(f"DELETE FROM whatsapp_outstanding_questions WHERE {where}")
+        self._sql(f"DELETE FROM whatsapp_thread_evidence WHERE {where}")
         self._sql("DELETE FROM whatsapp_threads WHERE contact_id IN (SELECT id FROM "
                   f"whatsapp_contacts WHERE wa_id = '{wa_id}')")
         self._sql(f"DELETE FROM whatsapp_contacts WHERE wa_id = '{wa_id}'")

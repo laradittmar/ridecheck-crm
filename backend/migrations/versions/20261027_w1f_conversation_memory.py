@@ -48,10 +48,19 @@ Downgrade — **data-safe, and it refuses rather than deletes.** With any row in
 it REFUSES: those rows are the record of what the customer was told and what the system
 decided about what they said, and `superseded_by_id` means the history is not reconstructible
 from canonical state. An EMPTY pair is dropped, and the two candidate columns are dropped
-only when every value in them is NULL. The flags make this safe to need rarely: both tables
-are unread when `EVIDENCE_ADMISSION_ENABLED` / `OUTSTANDING_QUESTION_ENABLED` are OFF, so a
-CODE rollback needs no schema rollback at all (review §15: "the two new tables are additive
-and unread when the flags are OFF").
+only when every value in them is NULL.
+
+**What a rollback actually requires once these tables hold rows** — stated here because the
+refusal message is read by an operator in a recovery window, and the earlier wording was
+ambiguous enough to mislead one. Both tables are unread when `EVIDENCE_ADMISSION_ENABLED` /
+`OUTSTANDING_QUESTION_ENABLED` are OFF (review §15: "the two new tables are additive and
+unread when the flags are OFF"), so turning the flags off restores the committed behaviour
+**on an image that accepts this head** — the integrated image with the flags off, or the
+certified compatibility image built for this head. It does **not** make the parent-head
+image startable: that image's `schema_preflight.EXPECTED_HEAD` is `down_revision`, and it
+refuses a database at this revision. So a behavioural rollback keeps this schema; returning
+to the parent schema means archiving and removing the evidence rows under separate
+authorisation, and only then running this downgrade.
 
 Revision ID: 20261027_w1f_conversation_memory
 """
@@ -284,10 +293,19 @@ def downgrade() -> None:
             + ", ".join(f"{t} holds {n} row(s)" for t, n in held.items())
             + ". Those rows are the record of what the customer was told and what the "
               "system decided about what they said, and `superseded_by_id` means the "
-              "history is not reconstructible from canonical state. Nothing was dropped. "
-              "A CODE rollback does not need this downgrade: both tables are unread with "
-              "EVIDENCE_ADMISSION_ENABLED and OUTSTANDING_QUESTION_ENABLED off. To drop "
-              "them deliberately, archive the rows first and run this again.")
+              "history is not reconstructible from canonical state. "
+              "NO EVIDENCE ROW WAS DELETED and nothing was dropped. "
+              f"LEAVE THE DATABASE AT {revision}. "
+              "A behavioural rollback keeps this schema and changes the APPLICATION: it "
+              "requires an image whose schema preflight accepts this head. Two are valid "
+              "fallbacks — the integrated image with EVIDENCE_ADMISSION_ENABLED, "
+              "OUTSTANDING_QUESTION_ENABLED and LOCALITY_RESOLUTION_SAFETY_ENABLED off, "
+              "and the certified compatibility image built for this head. The "
+              f"parent-head image ({down_revision}) is NOT valid against this schema and "
+              "will refuse to start. "
+              f"Returning to {down_revision} is a separate, separately authorised "
+              "operation: archive and remove the evidence rows first, then run this "
+              "downgrade again.")
 
     present = _candidate_columns(bind)
     for column in CANDIDATE_COLUMNS:
