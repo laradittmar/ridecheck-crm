@@ -3178,6 +3178,13 @@ class ConversationEngine:
         self._turn_semantic_burst = None           # G3-5B: which burst was interpreted
         self._turn_semantic_dispatched = False      # G3-5C: arms the fail-closed check
         self._turn_admission = None                 # W1F-W-01 R1: this turn's admission
+        #: W1F-W-01 R2 — per-turn, never sticky. The answered-question set is the typed
+        #: routing fact; the evidence rows are this turn's persisted decisions; the skip
+        #: flag records that the semantic wait was not paid.
+        self._turn_answered_questions = ()
+        self._turn_evidence_rows = ()
+        self._turn_semantic_wait_skipped = False
+        self._turn_question_recorded = ()
         self._turn_semantic_calls = 0              # model invocations
         self._semantic_accessor_reads = 0          # reads of that one interpretation
         # ── G3-5E: the reply-generation role, counted and attributed separately ──
@@ -3368,6 +3375,13 @@ class ConversationEngine:
         self._turn_service_question = False
         # W1F-W-01 R1: this turn's admission decisions, for the trace and the tests.
         self._turn_admission = None
+        #: W1F-W-01 R2 — per-turn, never sticky. The answered-question set is the typed
+        #: routing fact; the evidence rows are this turn's persisted decisions; the skip
+        #: flag records that the semantic wait was not paid.
+        self._turn_answered_questions = ()
+        self._turn_evidence_rows = ()
+        self._turn_semantic_wait_skipped = False
+        self._turn_question_recorded = ()
         # OWNER-REVIEW-R1 R1RV-02: this turn's locality ambiguity, as a reason string. Read
         # by `_turn_clarification_decision`, so it is per-turn memory and must be cleared
         # here for the reason the G3-7G audit established — a reused engine instance must
@@ -8198,10 +8212,47 @@ class ConversationEngine:
         # Try to resolve localidad to a DB-validated zone_detail.
         _zone_before = (state.home_zone_group, state.home_zone_detail)
         db_zone = self._extract_zone_from_text(localidad) if localidad else None
-        state.home_zone_group = db_zone.zone_group if db_zone else canonical_group
-        state.home_zone_detail = db_zone.zone_detail if db_zone else (localidad or None)
-        if referencia and not state.home_zone_detail:
-            state.home_zone_detail = referencia
+        _form_group = db_zone.zone_group if db_zone else canonical_group
+        _form_detail = db_zone.zone_detail if db_zone else (localidad or None)
+        if referencia and not _form_detail:
+            _form_detail = referencia
+
+        # ── W1F-W-01 R2 — W1FRV-04 CLOSED: the form goes through the same path as text ──
+        #
+        # The finding, in the review's words: the Location Flow "writes `state.home_zone_*`
+        # only; candidate 144 `zone=NULL`; reconciler not consulted". Measured on the Wild.
+        # The strongest evidence class in the system — the customer typed it into a form we
+        # sent — was the one write that bypassed the authority every weaker producer goes
+        # through, so a form answer could not be reconciled against a confirmed value, left
+        # no provenance, and never reached the candidate being quoted.
+        #
+        # It now takes the identical route as a locality read from text, and the route is
+        # R1's, unchanged: the R3 validator has already run above (the UNSUPPORTED and
+        # AMBIGUOUS branches are the fail-closed exits and they still come first), the write
+        # goes through `_apply_inspection_zone` — the C2 chokepoint — and the claim is
+        # `HUMAN_CONFIRMED`, which is the top of the reconciler's ladder, so it outranks
+        # every other producer BY THE CERTIFIED RULE rather than by assignment order.
+        #
+        # The target is chosen by the same `_is_current_focus` predicate admission uses: a
+        # candidate in focus receives it, and with no candidate yet the pre-candidate buffer
+        # receives it through `_ZoneBuffer`, so the buffer write is reconciled too instead of
+        # being assigned. With R2 OFF the two direct assignments below are the committed
+        # behaviour, byte for byte.
+        if self._r2_on():
+            self._apply_form_location(ctx, state, zone_group=_form_group,
+                                      zone_detail=_form_detail)
+        else:
+            # The flag-OFF branch keeps the committed expressions VERBATIM, and that is
+            # deliberate rather than stylistic: C2's `test_vl_10_pre_candidate_buffer_preserved`
+            # pins the literal `state.home_zone_group = db_zone.zone_group` as its evidence
+            # that `state.home_zone_*` was not repurposed. Factoring it into a temporary
+            # broke that assertion while its subject still held — the buffer IS still the
+            # buffer — so the literal stays and no certified test has to be edited for a
+            # refactor it was never about.
+            state.home_zone_group = db_zone.zone_group if db_zone else canonical_group
+            state.home_zone_detail = db_zone.zone_detail if db_zone else (localidad or None)
+            if referencia and not state.home_zone_detail:
+                state.home_zone_detail = referencia
 
         # ── G3-7P (review B-01): an accepted LOCATION change invalidates the offer ───
         # The zone pair is a pricing input — `PricingService.quote(db, tipo_vehiculo,
@@ -12047,16 +12098,51 @@ class ConversationEngine:
         """
         if not ctx.candidates:
             return
-        buffered_group = getattr(state, "home_zone_group", None)
-        buffered_detail = getattr(state, "home_zone_detail", None)
-        if not buffered_group and not buffered_detail:
-            return
         candidate = ctx.candidates[0]
         if candidate.zone_group or candidate.zone_detail:
             return  # explicit per-candidate evidence always wins
-        self._apply_inspection_zone(ctx, candidate, zone_group=buffered_group,
-                                    zone_detail=buffered_detail, source="buffer",
+
+        # ── W1F-W-01 R2: a TYPED evidence row, when there is one ─────────────────────
+        # Review §8.2's whole purpose. The buffer below works and R1 proved it works — the
+        # measured turn-2 quote is correct — but it is an untyped value: it cannot say which
+        # cycle, which turn or which ROLE it came from, which is precisely why `RISK-03`
+        # refuses to inherit it at candidate creation and why this helper has to lean on
+        # `_execute_cycle_reset` clearing the buffer to be cycle-safe at all.
+        #
+        # An evidence row answers all three questions as columns, so the binding is checked
+        # rather than assumed: same thread, same cycle, role INSPECTION_LOCATION, outcome
+        # ACCEPT, not superseded, not already bound (`thread_evidence.bindable_locality`).
+        # The VALUE still goes through `_apply_inspection_zone` — the C2 chokepoint and the
+        # reconciler — so this is a better-provenanced source for the same certified write,
+        # never a second writer. `zone_evidence_id` then records WHICH row set the location,
+        # which is the §8.3 column.
+        evidence_row = None
+        if self._r2_on():
+            try:
+                from .thread_evidence import bind as _bind, bindable_locality
+                evidence_row = bindable_locality(
+                    self.db, thread_id=ctx.thread.id,
+                    cycle_key=self._r2_cycle_key(state))
+            except Exception as exc:
+                logger.warning("W1F-R2 evidence lookup failed thread_id=%s: %s",
+                               ctx.thread.id, type(exc).__name__)
+                evidence_row = None
+
+        if evidence_row is not None:
+            group, detail = evidence_row.zone_pair()
+            source = "evidence"
+        else:
+            group = getattr(state, "home_zone_group", None)
+            detail = getattr(state, "home_zone_detail", None)
+            source = "buffer"
+        if not group and not detail:
+            return
+        self._apply_inspection_zone(ctx, candidate, zone_group=group,
+                                    zone_detail=detail, source=source,
                                     state=getattr(ctx, "state", None))
+        if evidence_row is not None:
+            if _bind(self.db, evidence_row, candidate.id):
+                candidate.zone_evidence_id = evidence_row.id
         try:
             self.db.flush()
         except Exception:
@@ -12064,7 +12150,8 @@ class ConversationEngine:
         self._decision_log(
             ctx, "location_buffer_attached",
             candidate_id=getattr(candidate, "id", None),
-            zone_group=buffered_group, zone_detail=buffered_detail,
+            zone_group=group, zone_detail=detail, source=source,
+            evidence_id=getattr(evidence_row, "id", None),
         )
 
     # ── L4.6 Phase B/D — canonical response/state consistency ────────────────
@@ -12522,6 +12609,34 @@ class ConversationEngine:
         # carry an active vehicle or explicit inspection request; this step only fires
         # when none of those signals are present (pure soft-close / not-ready messages).
         if any(p.search(current_turn_text) for p in _DEFERRED_INTEREST_PATTERNS):
+            return None
+
+        # 8.9. W1F-W-01 R2 — THE CUSTOMER ANSWERED OUR OWN QUESTION.
+        #
+        # This is the Wild's turn 2 and the precondition the review's R2 plan specifies:
+        # "Layer F step 9 gains one precondition: it may not send `_UNCERTAIN_SERVICE_REPLY`
+        # while an outstanding question exists that this turn answered."
+        #
+        # The bot asked where the vehicle was; the customer replied `en flores`; step 9 read
+        # the words, found no service keyword, and sent the generic qualification greeting —
+        # three times in one conversation. The words were never the problem. The missing fact
+        # was that we had asked something, and R2 supplies it.
+        #
+        # SCOPE, EXACTLY. This suppresses ONE reply: the contradictory greeting, on a turn
+        # that answered a question we actually delivered. It is reached only after steps 1-8
+        # have all declined, so it can take no decision away from them, and Layers A/B/C/D
+        # and every coverage, consent, pricing, scheduling, handoff and booking authority sit
+        # outside this function entirely and are untouched. It returns None — "continue" —
+        # and deliberately does NOT set `last_intent`: an answer about WHERE the car is is
+        # not a statement of commercial intent, and inventing one here is exactly the
+        # silent-invention the milestone forbids. What the turn says next is still decided
+        # downstream from canonical state, and it may ask for the vehicle it genuinely does
+        # not know.
+        if self._answered_question_kinds():
+            logger.info("W1F-R2 step 9 suppressed thread_id=%s answered=%s", ctx.thread.id,
+                        sorted(self._answered_question_kinds()))
+            self._decision_log(ctx, "uncertain_greeting_suppressed",
+                               answered=",".join(sorted(self._answered_question_kinds())))
             return None
 
         # 9. No inspection service signal found → UNCERTAIN clarification
@@ -14831,6 +14946,25 @@ Respondé SOLO con JSON válido:
             # Zone is filled by LR-3 (explicit vehicle-location in current turn) or by
             # the post-AI gap-fill block when LR-3 wrote to state this same turn.
             # Historical state zones from prior sessions must not contaminate new candidates.
+            #
+            # ── W1F-W-01 R2: a TYPED evidence row MAY be inherited, and only a typed one ──
+            # The guard above stays exactly as it is, and it stays for the reason it was
+            # written: `state.home_zone_*` cannot say which cycle, turn or ROLE it came
+            # from, so inheriting it here could contaminate a new candidate with a locality
+            # from a previous session. Review §8.2's answer is not to relax the guard but to
+            # supply a value that CAN answer those questions — `whatsapp_thread_evidence`
+            # carries `cycle_key`, `turn_id` and `role` as columns, so
+            # `thread_evidence.bindable_locality` checks what RISK-03 could only assume.
+            # This is `W1F-C-05` and `W1F-C-07`: a locality given before the vehicle existed
+            # now reaches the candidate created afterwards. The write still goes through
+            # `_apply_inspection_zone`, so the C2 chokepoint and the reconciler remain the
+            # only authority, and the row is bound once so "which evidence set this
+            # candidate's location" keeps one answer.
+            # Neither the isolation rule NOR the interlock is repeated here:
+            # `_bind_evidence_to_candidate` enforces both itself. Mutations M07 and M34 each
+            # survived by deleting a call-site copy of a rule that also lived in the method,
+            # so the copies are gone and the method is the single home for both.
+            self._bind_evidence_to_candidate(ctx, state, candidate)
             if status == "current_focus" and state:
                 for c in ctx.candidates:
                     if c.status == "current_focus":
@@ -15014,6 +15148,13 @@ Respondé SOLO con JSON válido:
         )
         self.db.add(candidate)
         self.db.flush()
+        # ── W1F-W-01 R2: the SECOND creation site, and it is the one the Wild takes ──
+        # Measured, not assumed: on the Wild's turn 3 ("es un toyota corolla 2024") the
+        # candidate is created HERE, by the proactive catalogue path, and not by
+        # `_apply_candidate` — so a binding placed only there would never have run on the
+        # very sequence this milestone exists to close. Both creation sites bind, by one
+        # call into one method, which is also why that method is where the rules live.
+        self._bind_evidence_to_candidate(ctx, state, candidate)
         if state:
             state.current_focus_candidate_id = candidate.id
             # S3: a proactively created focus is still a focus move.
@@ -15045,10 +15186,88 @@ Respondé SOLO con JSON válido:
     #     Layer F step 9 can still answer an answer. That is R2, and R1 does not pretend
     #     otherwise.
 
+    def _integrated_features_armed(self) -> bool:
+        """THE ONE INTERLOCK. Are R1, R2 and R3 all armed? Default OFF.
+
+        OC-R2 CORRECTION 2, and the owner's reasoning is measured rather than theoretical.
+        The R2 closeout itself proved an unsafe PARTIAL posture: with R1 ON and R2 OFF, an
+        interpreter reading `INSPECTION_LOCATION = "la boca"` out of `me mordí la boca` was
+        admitted and `('CABA','La Boca')` was written — the `W1F-C-18` protection defeated
+        through the semantic path. Guarding only "R2 without R1" was therefore not enough:
+        **R1's own safety depends on R2's predicate**, because the predicate is what refuses
+        to consult the interpreter on a burst whose words resolve to no locality, and R3 is
+        what makes a resolved locality safe to price.
+
+        So the three flags are one switch for R1 and R2 behaviour. Every partial combination
+        is INERT: no semantic locality admitted, no evidence persisted or bound, no question
+        recorded or activated or answered, no greeting suppressed, no R3 validator bypassed.
+
+        R3 keeps its own independence, as the owner specified — `_locality_safety_on()` is
+        untouched, so `LOCALITY_RESOLUTION_SAFETY_ENABLED` alone still delivers exactly the
+        certified R3 behaviour it was committed with.
+
+        ONE implementation, not several duplicated checks: `_admission_on` and `_r2_on`
+        both delegate here and add nothing, and a structural test asserts no other site
+        reads the three flags together.
+        """
+        settings = getattr(self, "settings", None)
+        return (getattr(settings, "evidence_admission_enabled", False) is True
+                and getattr(settings, "outstanding_question_enabled", False) is True
+                and getattr(settings, "locality_resolution_safety_enabled", False) is True)
+
     def _admission_on(self) -> bool:
-        """Is the evidence-admission boundary armed? Default OFF = committed behaviour."""
-        return getattr(getattr(self, "settings", None),
-                       "evidence_admission_enabled", False) is True
+        """Is the evidence-admission boundary armed? The interlock decides; see it."""
+        return self._integrated_features_armed()
+
+    def _r2_on(self) -> bool:
+        """Is the R2 outstanding-question contract armed? The interlock decides; see it.
+
+        Kept as its own name because it reads at the call sites as the thing being asked
+        ("is the question contract live?"), but it adds NO condition of its own — a second
+        opinion about the posture is how interlocks drift apart.
+        """
+        return self._integrated_features_armed()
+
+    def _r2_cycle_key(self, state) -> int:
+        """The canonical cycle identity, from the ONE function that defines it.
+
+        `clarification_attempt.cycle_key` reads the integer column directly and documents
+        why a timestamp must never substitute for it. R2 imports that function rather than
+        repeating the COALESCE, so the questions, the evidence rows and the Flow attempts
+        cannot end up keyed three ways.
+        """
+        from .clarification_attempt import cycle_key as _ck
+        return _ck(state)
+
+    def _locality_possible_in_burst(self, texts) -> bool:
+        """R1-PL-01: is there anything in this burst for the boundary to DECIDE?
+
+        One call into the ONE shared predicate. The resolver handed in is the inherited
+        matcher — the same six passes the admission validator resolves a value through — so
+        there is a single catalogue rule in play and this is not a second copy of it.
+
+        The resolver passed in is widened by exactly one certified function, and the reason
+        is G-11 rather than admission. `is_outside_coverage` is R3's own DB-free coverage
+        list (`locality_text`), already consulted by `_locality_verdict`. Without it, a burst
+        naming Córdoba or Rosario — real localities the system must REFUSE — resolves to
+        nothing in the catalogue, so the predicate would skip the read and the refusal would
+        leave no record at all. The customer still gets the coverage response either way, but
+        "we were told Córdoba and refused it, for this reason, on this turn" is precisely the
+        evidence finding G-11 exists to preserve. So a coverage-listed city counts as
+        something to decide, and the boundary records its refusal.
+
+        This is not a second copy of the catalogue rule: it is a different certified rule
+        (coverage, not resolution), called from the one place the predicate is composed.
+        """
+        from .claim_projection import locality_mention_possible
+
+        def _resolve(text):
+            zone = self._match_zone_in_text(text)
+            if zone is not None:
+                return zone
+            return True if _loc.is_outside_coverage(text) else None
+
+        return locality_mention_possible(texts, resolve=_resolve)
 
     def _admission_locality_validator(self, value: str):
         """The R3 resolver, as the admission boundary's injected validator.
@@ -15064,6 +15283,23 @@ Respondé SOLO con JSON válido:
         text = str(value or "")
         if not text.strip():
             return VALIDATOR_UNRESOLVED, None, "empty value"
+        # ── W1F-W-01 R2: a context check used to live HERE, and it was dead code ──────
+        # Worth recording, because the reasoning that put it here was wrong in a way that
+        # is easy to repeat. R1 validates a claim value in ISOLATION, and the L4.7W5-F5
+        # article rule is about CONTEXT — `resolve("la boca")` succeeds where
+        # `resolve("me mordí la boca")` correctly refuses — so an interpreter reading
+        # INSPECTION_LOCATION = "la boca" out of that sentence IS admitted by R1 alone
+        # (measured: it writes `('CABA','La Boca')`). R2 first re-validated the value
+        # against the burst here to close that.
+        #
+        # Mutation M21 disabled this branch and SURVIVED, which was the right answer: the
+        # branch can never fire. With R2 on, the R1-PL-01 predicate gates the semantic read
+        # on `resolve(burst) is not None`, so by the time a claim exists at all the burst
+        # has already resolved — and the only case the context check would refuse is
+        # exactly the case where no claim was ever produced. **The predicate is
+        # self-protecting**, the check was a second mechanism for a case the first one
+        # already owned, and an unreachable guard misleads the next reader. It is gone;
+        # `test_g06` now pins the mechanism that does the work.
         if self._locality_safety_on():
             verdict, zone, reason = self._locality_verdict(text)
             V = _loc.LocalityVerdict
@@ -15132,14 +15368,30 @@ Respondé SOLO con JSON válido:
 
         # ── B. the semantic reading, at the boundary ──────────────────────────────
         binding_ok = not self._semantic_binding_refused()
+        # ── W1F-W-01 R1-PL-01 (owner decision OC-R1-R1, option c) ────────────────
+        # The ONE shared predicate decides whether this turn has anything to wait FOR.
+        # `_semantic_turn_evidence()` is a bounded wait of SEMANTIC_SAME_TURN_TIMEOUT_SECONDS
+        # (6.0 s on the candidate deployment), and a burst whose own words contain no
+        # catalogue locality cannot produce an admissible one — `INFERRED_NOT_EXPLICIT`
+        # refuses every claim such a burst could yield, by name. So the turn does not wait.
+        # It is a WAIT that is skipped, never a dispatch: the interpretation was started
+        # above Layer A exactly as at the starting HEAD and still records in shadow.
+        locality_possible = self._locality_possible_in_burst(burst_texts)
+        semantic_wait_skipped = False
         evidence = None
-        if binding_ok:
+        if binding_ok and (locality_possible or not self._r2_on()):
             try:
                 evidence = self._semantic_turn_evidence()
             except Exception as exc:
                 logger.warning("W1F-R1 admission semantic read unavailable: %s",
                                type(exc).__name__)
                 evidence = None
+        elif binding_ok:
+            semantic_wait_skipped = True
+            logger.info("W1F-R2 semantic wait skipped thread_id=%s — no catalogue locality "
+                        "in the customer's own words this turn",
+                        getattr(getattr(ctx, "thread", None), "id", None))
+        self._turn_semantic_wait_skipped = semantic_wait_skipped
         revision_id = getattr(state, "current_revision_id", None)
         claims = (claims_from_turn_evidence(
             evidence, texts=burst_texts, cycle_id=cycle_id,
@@ -15192,8 +15444,281 @@ Respondé SOLO con JSON válido:
                 producer=record.provenance.producer,
                 evidence_class=record.provenance.evidence_class,
                 turn=record.provenance.turn_id)
+        # ── W1F-W-01 R2: the turn's decisions become DURABLE, then close what we asked ──
+        # Order matters and is the review's §7.2 order: persist (step 3) before reconciling
+        # the outstanding question (step 4), so the row that closes a question is already
+        # on disk and `answered_by_evidence_id` can point at it.
+        if self._r2_on():
+            try:
+                self._persist_turn_evidence(ctx, state, result)
+            except Exception as exc:
+                logger.warning("W1F-R2 evidence persistence failed thread_id=%s: %s",
+                               getattr(getattr(ctx, "thread", None), "id", None),
+                               type(exc).__name__)
+            try:
+                self._reconcile_outstanding_questions(ctx, state, result)
+            except Exception as exc:
+                logger.warning("W1F-R2 question reconciliation failed thread_id=%s: %s",
+                               getattr(getattr(ctx, "thread", None), "id", None),
+                               type(exc).__name__)
         self._turn_admission = result
         return result
+
+    # ── W1F-W-01 R2 — durability and the outstanding-question contract ───────────
+
+    def _persist_turn_evidence(self, ctx: "_Context", state, result) -> list:
+        """Persist every admission decision for this turn, acceptance and refusal alike.
+
+        Thin by design: `thread_evidence.persist_admission` owns the rows and the
+        idempotency, this method owns only the identity of the thread and the cycle. The
+        rows are additive history — they are never read as canonical truth, which is why a
+        rollback to the flag-OFF behaviour needs no schema rollback.
+        """
+        from .thread_evidence import persist_admission
+        rows = persist_admission(
+            self.db, thread_id=ctx.thread.id,
+            cycle_key=self._r2_cycle_key(state), result=result)
+        self._turn_evidence_rows = rows
+        for row in rows:
+            self._decision_log(
+                ctx, "evidence_persisted", claim=row.claim_type, role=row.role,
+                outcome=row.outcome, reason=row.reason, evidence_id=row.id,
+                normalized=row.normalized_value)
+        return rows
+
+    def _reconcile_outstanding_questions(self, ctx: "_Context", state, result) -> list:
+        """Close the questions this turn's ADMITTED evidence answers. Returns the closed.
+
+        Review §7.2 step 4. Three things happen here and they are deliberately separate:
+
+        1. every live question is charged one customer turn, and one that has run out is
+           ABANDONED explicitly — expiry is a written state, never an inference from a
+           missing row;
+        2. each remaining live question is matched against this turn's admitted records by
+           `outstanding_question.match`, a pure rule over typed decisions. Nothing in that
+           function can see model prose;
+        3. a match closes the question by CONDITIONAL UPDATE, so a replay or a second
+           worker produces one close and one refusal, and the typed routing fact below is
+           set only for the question that was actually closed by THIS call.
+
+        The routing fact is the narrow one the milestone specifies: a list of the questions
+        this turn answered. It suppresses the Layer F step 9 greeting and nothing else.
+        """
+        from . import outstanding_question as OQ
+        cycle = self._r2_cycle_key(state)
+        thread_id = ctx.thread.id
+        focus = self._focus_candidate(ctx)
+        focus_id = getattr(focus, "id", None) if self._is_current_focus(state, focus) else None
+
+        expired = OQ.observe_turn(self.db, thread_id=thread_id, cycle_key=cycle)
+        for row in expired:
+            self._decision_log(ctx, "outstanding_question_expired",
+                               kind=row.question_kind, question_id=row.id,
+                               turns=row.turns_observed)
+
+        rows_by_claim = {r.claim_id: r for r in getattr(self, "_turn_evidence_rows", ()) or ()}
+        closed: list = []
+        for question in OQ.live(self.db, thread_id=thread_id, cycle_key=cycle):
+            record, why = OQ.match(question, result.records, cycle_key=cycle,
+                                   candidate_id=focus_id)
+            if record is None:
+                self._decision_log(ctx, "outstanding_question_unmatched",
+                                   kind=question.question_kind, question_id=question.id,
+                                   reason=why)
+                continue
+            claim_id = getattr(record.provenance, "claim_id", None)
+            evidence_row = rows_by_claim.get(claim_id)
+            if OQ.close_answered(self.db, question, claim_id=claim_id,
+                                 evidence_id=getattr(evidence_row, "id", None)):
+                closed.append(question)
+                self._decision_log(
+                    ctx, "outstanding_question_answered", kind=question.question_kind,
+                    question_id=question.id, claim=str(record.claim_type),
+                    claim_id=claim_id, asked_by=question.asked_by)
+            else:
+                # Lost the race, or this inbound message is a replay. Either way the
+                # question is settled and this turn does not get to claim the closure.
+                self._decision_log(ctx, "outstanding_question_already_closed",
+                                   kind=question.question_kind, question_id=question.id)
+        self._turn_answered_questions = tuple(closed)
+        return closed
+
+    def _record_delivered_questions(self, ctx: "_Context", *, text: str,
+                                    outbound_message_id=None,
+                                    wa_message_id=None) -> tuple:
+        """Record the question(s) the DELIVERED message actually asked. Returns the rows.
+
+        Two provenances, because the system asks in two voices and the review's §8.1
+        `asked_by` column exists to tell them apart:
+
+        `DETERMINISTIC_TEMPLATE` — the clarification producer's typed proposition reached
+            the composed message. `plan.included()` answers that STRUCTURALLY, from the same
+            `_ordered_included()` set `compose()` rendered; the G3-7F owner resolution
+            forbids proving inclusion by searching customer prose and this does not.
+
+        `REPLY_MODEL` — the reply model's own sentence asked it. On the Wild's turn 1 there
+            was no proposition at all to include: the clarification producer requires a
+            focus candidate with a `tipo_vehiculo` and turn 1 had no candidate, so the
+            location question came purely from the model's prose. `_reply_already_asks_location`
+            is the EXISTING certified probe the same producer already uses to avoid asking
+            twice — reused, not copied, so the two cannot disagree about what counts as
+            asking. Reading our OWN delivered sentence is not treating model prose as
+            authority over the customer: it is observing what we sent. No claim about the
+            customer is derived from it, and closing the question still requires R1's
+            admitted evidence.
+
+        Nothing here can ask a question or change canonical state; it writes one row.
+        """
+        if not self._r2_on() or not wa_message_id:
+            return ()
+        from . import outstanding_question as OQ
+        state = getattr(ctx, "state", None)
+        if state is None:
+            return ()
+        plan = getattr(self, "_live_plan", None)
+        asked_by = None
+        if plan is not None and plan.included(
+                PropositionId.clarification("inspection_location")):
+            asked_by = OQ.OQ_ASKED_BY_DETERMINISTIC_TEMPLATE
+        elif _reply_already_asks_location(text or ""):
+            asked_by = OQ.OQ_ASKED_BY_REPLY_MODEL
+        if asked_by is None:
+            return ()
+        focus = self._focus_candidate(ctx)
+        focus_id = (getattr(focus, "id", None)
+                    if self._is_current_focus(state, focus) else None)
+        row, created = OQ.record_asked(
+            self.db, thread_id=ctx.thread.id, cycle_key=self._r2_cycle_key(state),
+            kind=OQ.OQ_KIND_INSPECTION_LOCATION, asked_by=asked_by,
+            wa_message_id=wa_message_id, outbound_message_id=outbound_message_id,
+            asked_turn_id=getattr(self, "_correlation_id", None), candidate_id=focus_id)
+        if row is not None:
+            # The race the owner named: a status callback can land between `mark_sent`'s
+            # commit and this row existing. The ledger is the rendezvous — see
+            # `reconcile_delivery` — so a callback that arrived early is applied here and
+            # nothing is lost.
+            try:
+                OQ.reconcile_delivery(self.db, row)
+            except Exception as exc:
+                logger.warning("W1F-R2 delivery reconciliation failed wamid=%s: %s",
+                               wa_message_id, type(exc).__name__)
+            self._turn_question_recorded = (row,)
+            self._decision_log(
+                ctx, "outstanding_question_asked", kind=row.question_kind,
+                question_id=row.id, asked_by=row.asked_by, created=bool(created),
+                candidate_id=focus_id, status=row.status,
+                delivery_status=row.delivery_status)
+        return (row,) if row is not None else ()
+
+    def _bind_evidence_to_candidate(self, ctx: "_Context", state, candidate) -> bool:
+        """Bind this cycle's unbound locality evidence to a newly created candidate.
+
+        Returns whether a row was bound. Every refusal is a column comparison inside
+        `thread_evidence.bindable_locality` — wrong thread, wrong cycle, wrong role, not
+        accepted, superseded, already bound — so none of RISK-03's three unknowables is
+        assumed here.
+
+        CANDIDATE ISOLATION IS ENFORCED HERE, NOT BY THE CALLER. It was the caller's job in
+        the first draft, and mutation M07 — which deleted the caller's `current_focus`
+        condition — SURVIVED: a `mentioned` MOTO from an earlier handoff would have
+        inherited the car's locality, which is exactly the M21.2.14 defect. A rule that
+        holds only while every call site remembers it is the W1FRV-07 shape, so it lives at
+        the one place that performs the write, and `_is_current_focus` is the same predicate
+        admission and the location form use.
+        """
+        if candidate is None or candidate.zone_group or candidate.zone_detail:
+            return False
+        if not self._r2_on():
+            # THE INTERLOCK LIVES HERE TOO, for the same reason the isolation rule does.
+            # Mutation M34 removed it from a CALL SITE and survived, because the site it
+            # removed it from is not the one the Wild's turn 3 uses — there are two creation
+            # sites, and a guard at each is one rule with two homes (W1FRV-07). It matters
+            # operationally rather than theoretically: after a behavioural rollback (flags
+            # OFF, same image, stale evidence rows still in the table) a binding that ran
+            # anyway would consume a leftover row and write a zone — exactly what §14 of the
+            # closeout promises cannot happen. `test_e04d` is that scenario.
+            return False
+        if not self._is_current_focus(state, candidate):
+            self._decision_log(ctx, "evidence_binding_refused",
+                               candidate_id=getattr(candidate, "id", None),
+                               reason="NOT_CURRENT_FOCUS")
+            return False
+        try:
+            from .thread_evidence import bind as _bind, bindable_locality
+            row = bindable_locality(self.db, thread_id=ctx.thread.id,
+                                    cycle_key=self._r2_cycle_key(state))
+        except Exception as exc:
+            logger.warning("W1F-R2 candidate evidence lookup failed thread_id=%s: %s",
+                           ctx.thread.id, type(exc).__name__)
+            return False
+        if row is None:
+            return False
+        group, detail = row.zone_pair()
+        if not group and not detail:
+            return False
+        wrote = self._apply_inspection_zone(
+            ctx, candidate, zone_group=group, zone_detail=detail,
+            source="evidence_binding", state=state)
+        bound = _bind(self.db, row, candidate.id)
+        if bound:
+            candidate.zone_evidence_id = row.id
+            self.db.flush()
+        self._decision_log(
+            ctx, "evidence_bound_to_candidate", candidate_id=candidate.id,
+            evidence_id=row.id, zone_group=group, zone_detail=detail,
+            cycle=row.cycle_key, turn=row.turn_id, written=bool(wrote), bound=bool(bound))
+        return bool(bound)
+
+    def _apply_form_location(self, ctx: "_Context", state, *, zone_group,
+                             zone_detail) -> bool:
+        """Write a Location-Flow answer through the reconciler, as HUMAN_CONFIRMED.
+
+        W1FRV-04. One call into the C2 chokepoint, with a typed claim whose evidence class
+        says what it is: the customer filled in a form we sent, which is stronger than
+        anything a producer can infer and is ranked as such by
+        `reconcile_inspection_location`'s ladder — not by being written last.
+
+        Returns whether the chokepoint wrote. It assigns no field itself; a structural test
+        asserts that.
+        """
+        from .evidence_admission import ADMITTED_CLAIM_TYPES  # noqa: F401  (contract anchor)
+        from ..schemas.claims import (ClaimEvidence, ClaimType, EvidenceClass,
+                                      Explicitness, Polarity)
+        from ..schemas.turn_evidence import EvidenceStatus
+        burst = getattr(self, "_canonical_turn_burst", None)
+        claim = ClaimEvidence(
+            claim_type=ClaimType.INSPECTION_LOCATION,
+            value=(zone_detail or zone_group),
+            evidence_class=EvidenceClass.HUMAN_CONFIRMED,
+            status=EvidenceStatus.CONFIRMED,
+            polarity=Polarity.ASSERTED,
+            producer="flow:location_fallback",
+            producer_version="1.0",
+            explicitness=Explicitness.STATED,
+            cycle_id=self._reconciler_cycle_id(state),
+            source_message_ids=(tuple(str(m) for m in burst.ordered_message_ids)
+                                if burst is not None else ())).with_id()
+        focus = self._focus_candidate(ctx)
+        target = focus if self._is_current_focus(state, focus) else _ZoneBuffer(state)
+        wrote = self._apply_inspection_zone(
+            ctx, target, zone_group=zone_group, zone_detail=zone_detail,
+            source="location_form", state=state, claims=[claim])
+        self._decision_log(
+            ctx, "location_form_reconciled", zone_group=zone_group,
+            zone_detail=zone_detail, evidence_class=EvidenceClass.HUMAN_CONFIRMED.value,
+            target=("candidate" if not isinstance(target, _ZoneBuffer) else "state_buffer"),
+            written=bool(wrote))
+        return bool(wrote)
+
+    def _answered_question_kinds(self) -> frozenset:
+        """The typed routing fact: which question kinds THIS turn answered.
+
+        Read by exactly one gate (Layer F step 9) and by the trace. It is a set of kinds,
+        not a boolean, so "the customer answered the location question" can never be read
+        as "the customer answered whatever we are about to ask".
+        """
+        return frozenset(q.question_kind
+                         for q in getattr(self, "_turn_answered_questions", ()) or ())
 
     def _locality_safety_on(self) -> bool:
         """Is locality-resolution safety armed on this deployment?
@@ -16186,6 +16711,18 @@ Respondé SOLO con JSON válido:
         try:
             wa_message_id, _ = _send_whatsapp_cloud_text(to_wa_id=wa_id, text=text)
             gate.mark_sent(result.message_id, wa_message_id)
+            # ── W1F-W-01 R2: the question is RECORDED here, and ACTIVATED elsewhere ──
+            # After `mark_sent`, which is the point at which Meta has ACCEPTED the message
+            # and handed back a correlation handle. OC-R2 CORRECTION 1: that is not
+            # delivery, and this no longer pretends it is — the row is created
+            # `PENDING_DELIVERY` and owns nothing until a status webhook reports the
+            # customer has it. Every way a turn can fail even to be accepted — the gate
+            # blocked it, Meta raised, composition suppressed every proposition, the text
+            # was empty — leaves this line unreached, so none of them leaves a row at all.
+            self._record_delivered_questions(
+                ctx, text=text,
+                outbound_message_id=getattr(result, "message_id", None),
+                wa_message_id=wa_message_id)
         except MetaSendError as exc:
             self._turn_dispatch_result = DispatchResult.FAILED
             logger.error("M18 send_text MetaSendError thread_id=%s: %s", ctx.thread.id, exc)

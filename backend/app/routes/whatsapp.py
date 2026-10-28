@@ -620,6 +620,38 @@ async def inbound_webhook(request: Request, db: Session = Depends(get_db)):
 
                         existing_msg.status = incoming_status
                         db.commit()
+                        # ── W1F-W-01 R2 (OC-R2 CORRECTION 1) ────────────────────────────
+                        # THIS is where an outstanding question becomes active, and it is
+                        # deliberately here rather than at send time: a WAMID proves Meta
+                        # accepted the message, and only `delivered` or `read` proves the
+                        # customer has it. The call is made for EVERY status because it is
+                        # idempotent and decisive for only three of them — `delivered` and
+                        # `read` activate, `failed` ends, everything else changes nothing.
+                        #
+                        # No new route and no new authenticity boundary: this handler is
+                        # already behind the `X-Hub-Signature-256` HMAC check against
+                        # `WHATSAPP_APP_SECRET` at the top of `inbound_webhook`, which fails
+                        # closed when the secret is unset. A status can therefore only
+                        # activate a question if Meta signed it.
+                        #
+                        # OC-R2-R1: the returned count also covers a status that
+                        # TERMINALIZED a question instead of activating it — a late delivery
+                        # for an ask a newer one has replaced. That is a real write and must
+                        # be committed here, which is why the service counts it.
+                        try:
+                            from ..services.outstanding_question import activate_on_status
+                            _activated = activate_on_status(
+                                db, wa_message_id=wa_message_id, status=incoming_status)
+                            if _activated:
+                                db.commit()
+                                logger.info(
+                                    "W1F_R2_QUESTION_DELIVERY status=%s wa_message_id=%s "
+                                    "rows=%s", incoming_status, wa_message_id, _activated)
+                        except Exception:
+                            db.rollback()
+                            logger.warning(
+                                "W1F-R2 question delivery update failed wa_message_id=%s "
+                                "status=%s", wa_message_id, incoming_status, exc_info=True)
                         if incoming_status == "failed" and getattr(existing_msg, "direction", None) == "out":
                             logger.error(
                                 "WHATSAPP_OUTBOUND_DELIVERY_FAILED wa_message_id=%s status=failed — "

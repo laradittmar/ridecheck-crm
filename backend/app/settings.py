@@ -75,6 +75,35 @@ class Settings:
     # established value. It does NOT persist an outstanding question — the system still does
     # not know what it asked, and Layer F step 9 can still answer an answer. That is R2.
     evidence_admission_enabled: bool = False
+    # W1F-W-01 R2 — the outstanding-question contract and cross-turn evidence retention.
+    # Default OFF: flag-off behaviour is the committed a6aabece behaviour, byte for byte.
+    #
+    # ON, four things change and nothing else:
+    #   1. a question the system ACTUALLY DELIVERED is recorded (after transport confirmed
+    #      it, never from the plan's intention), so the system knows what it asked;
+    #   2. an admitted claim for that question's own field, cycle and candidate CLOSES it,
+    #      idempotently and by conditional update — model prose closes nothing;
+    #   3. the closure becomes a typed routing fact that suppresses ONLY the contradictory
+    #      Layer F step 9 greeting for the question it answered. It bypasses no motorcycle,
+    #      phone-call, unsupported-service, coverage, consent, pricing, scheduling, handoff
+    #      or booking authority, and it is never read as commercial acceptance;
+    #   4. admitted and refused evidence is PERSISTED with provenance, so a locality given
+    #      before the vehicle existed can bind to the candidate created afterwards through
+    #      the certified rules (review §8.2; W1F-C-05 / W1F-C-07).
+    #
+    # It also closes R1-PL-01: with it ON, a turn whose words contain no catalogue locality
+    # does not wait for the semantic interpretation it could not use.
+    #
+    # INTERACTION, AND IT IS FAIL-CLOSED. R2 needs R1: without
+    # `EVIDENCE_ADMISSION_ENABLED` there are no admitted claims, so nothing could close a
+    # question and a recorded question would only ever expire. `_r2_on()` therefore
+    # requires BOTH, and R2 alone is inert rather than half-active. R3 stays independent:
+    # with `LOCALITY_RESOLUTION_SAFETY_ENABLED` off, R2 keeps and closes exactly what the
+    # inherited matcher resolves, and the coverage/ambiguity verdicts it cannot see are
+    # R3's to add.
+    #
+    # ENABLING THIS IS A SEPARATE OWNER CHECKPOINT after R1+R2+R3 become one candidate.
+    outstanding_question_enabled: bool = False
     # G3-7F — the Grounded-Target Invariant. The reconciler establishes a correction's
     # target from a ground it verifies itself (literal identity, a validated singleton focus,
     # or a typed in-burst reference) instead of trusting the interpreter's confidence. G3-7C
@@ -213,6 +242,8 @@ def get_settings() -> Settings:
             _getenv("LOCALITY_RESOLUTION_SAFETY_ENABLED", "false").lower() == "true"),
         evidence_admission_enabled=(
             _getenv("EVIDENCE_ADMISSION_ENABLED", "false").lower() == "true"),
+        outstanding_question_enabled=(
+            _getenv("OUTSTANDING_QUESTION_ENABLED", "false").lower() == "true"),
         correction_target_grounding_enabled=(
             _getenv("CORRECTION_TARGET_GROUNDING_ENABLED", "false").lower() == "true"),
         provisional_correction_enabled=(

@@ -41,7 +41,11 @@ from .schema_fingerprint import (SchemaShapeRefused, closest_differences, column
 logger = logging.getLogger(__name__)
 
 #: The single Alembic head this code requires (a test pins it to the script directory).
-EXPECTED_HEAD = "20261022_operator_notifications"
+#: W1F-W-01 R1+R2 added `20261027_w1f_conversation_memory`. Bumping this is what makes the
+#: migration DEPLOYMENT-ORDERED: an image carrying this code refuses to start until the
+#: migration has run, which is the ordering `docs/operations/RECOVERY_MANIFEST.md` §6
+#: already requires and the reason R1 shipped without a table.
+EXPECTED_HEAD = "20261027_w1f_conversation_memory"
 
 
 class DeclaredSchemaMissing(RuntimeError):

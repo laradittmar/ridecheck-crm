@@ -87,8 +87,10 @@ from ..models import (
     WhatsAppClarificationAttempt,
     WhatsAppContact,
     WhatsAppMessage,
+    WhatsAppOutstandingQuestion,
     WhatsAppThread,
     WhatsAppThreadCandidate,
+    WhatsAppThreadEvidence,
     WhatsAppThreadState,
 )
 
@@ -157,6 +159,23 @@ def _offer_table_present(db: Session) -> bool:
             WhatsAppBookingOffer.__tablename__)
     except Exception:                           # pragma: no cover - defensive
         logger.debug("reset: could not inspect for the offer table", exc_info=True)
+        return False
+
+
+def _r2_table_present(db: Session, model) -> bool:
+    """Is one of W1F-W-01 R2's two tables in this database?
+
+    Same reasoning and the same session-own connection as `_offer_table_present`: the R2
+    migration is not applied to `crm` or `crm_test` when this is written, and the reset has
+    to keep working against a schema that predates it. Asked through the inspector rather
+    than by catching an exception, because a failed statement would abort the reset's own
+    transaction.
+    """
+    try:
+        return sa_inspect(db.connection()).has_table(model.__tablename__)
+    except Exception:                           # pragma: no cover - defensive
+        logger.debug("reset: could not inspect for %s", model.__tablename__,
+                     exc_info=True)
         return False
 
 
@@ -331,6 +350,23 @@ def reset_tester_to_zero_state(db: Session, wa_id: str) -> ResetResult:
         _delete(WhatsAppClarificationAttempt,
                 WhatsAppClarificationAttempt.thread_id.in_(thread_ids),
                 "clarification_attempts")
+        # W1F-W-01 R2, THIRD AND FOURTH BLOCKING REFERENTS — and they are here because
+        # G37R-RV-03 taught the rule the hard way: `ask pg_constraint, not the code`.
+        # `whatsapp_outstanding_questions` references the thread, and
+        # `whatsapp_thread_evidence` references the thread and (SET NULL) the candidates, so
+        # both must go before the thread; the questions must also go before this helper's
+        # own `whatsapp_messages` deletion is irrelevant for them (`outbound_message_id` is
+        # a HISTORICAL scalar with no foreign key, deliberately — see the model), but the
+        # ORDER is kept here anyway so a future FK cannot reintroduce the 23503 the review
+        # measured. The evidence rows go before the candidates whose ids they carry.
+        if _r2_table_present(db, WhatsAppOutstandingQuestion):
+            _delete(WhatsAppOutstandingQuestion,
+                    WhatsAppOutstandingQuestion.thread_id.in_(thread_ids),
+                    "outstanding_questions")
+        if _r2_table_present(db, WhatsAppThreadEvidence):
+            _delete(WhatsAppThreadEvidence,
+                    WhatsAppThreadEvidence.thread_id.in_(thread_ids),
+                    "thread_evidence")
         _delete(WhatsAppMessage, WhatsAppMessage.thread_id.in_(thread_ids), "messages")
         _delete(WhatsAppThreadCandidate,
                 WhatsAppThreadCandidate.thread_id.in_(thread_ids), "candidates")

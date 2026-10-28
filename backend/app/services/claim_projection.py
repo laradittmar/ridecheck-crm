@@ -229,6 +229,60 @@ def _class_for(explicitness: Explicitness, default: EvidenceClass) -> EvidenceCl
             else default)
 
 
+# ── W1F-W-01 R1-PL-01 — the ONE predicate for "could a locality be admitted here?" ──────
+
+def locality_mention_possible(texts: Iterable[str], *, resolve) -> bool:
+    """Could this burst produce an ADMISSIBLE inspection-locality claim at all?
+
+    Owner decision OC-R1-R1 chose option (c): carry R1's residual semantic wait into R2 and
+    close it with **one shared predicate**, because a second copy of the verbatim/catalogue
+    rule is finding W1FRV-07 and was declared unacceptable. This is that predicate.
+
+    It composes two rules that already exist and introduces no third:
+
+    1. `_explicitness` (below) decides that a value is `STATED` — and so promoted to
+       `EXPLICIT_CUSTOMER` by `_class_for` — only when `_fold(value)` appears in `_fold` of
+       what the customer actually wrote; R1 admits nothing weaker, by name
+       (`INFERRED_NOT_EXPLICIT`). An admissible locality is therefore IN this burst.
+    2. `resolve` is the caller's certified catalogue resolver, handed in rather than
+       imported, so this module stays DB-free and exactly one resolver is in play. It is
+       applied to **the burst**, which is the whole point: the deployed resolver is not a
+       bag of names but six ordered passes including L4.7W5-F5's article rule, and that rule
+       is *about context* — `me mordí la boca` must not read La Boca.
+
+    SO THE PREDICATE IS: does the certified resolver find a locality in the customer's own
+    words? Nothing more. No name list, no window scan, no second normalisation.
+
+    **This is exact, not merely conservative, and R2 is what makes it exact.** The honest
+    history matters here. The first version of this predicate asked the resolver about the
+    burst and claimed the resolver was monotone — that a name found in a substring is found
+    in the whole text. A probe over all 211 catalogue localities disproved it: twelve
+    article-prefixed names (`La Plata`, `La Boca`, `El Talar`, …) resolve when they stand
+    alone and are correctly refused inside `me mordí la boca`, so `resolve(burst)` can be
+    None while `resolve("la boca")` is not. Window scanning the burst instead would restore
+    safety and cost up to 770 ms per turn — measured — which is worse than the wait it
+    exists to avoid.
+
+    R2 closes the gap at the other end instead, where it was always a latent defect: the
+    admission validator now resolves a claim value **in its burst context** rather than in
+    isolation, so the article rule applies to the semantic producer's reading exactly as it
+    applies to the deterministic one. With that, "admissible" implies "the resolver found it
+    in the burst", which is this predicate — one rule, consulted twice, agreeing by
+    construction rather than by coincidence. Both halves are behind the R2 flag, so the
+    committed behaviour is untouched when it is OFF.
+
+    A resolver fault returns True: that is the safe direction (wait, as R1 does today),
+    because a predicate that said "nothing here" on an exception would discard evidence.
+    """
+    joined = " ".join(t for t in (texts or ()) if isinstance(t, str) and t).strip()
+    if not joined:
+        return False
+    try:
+        return resolve(joined) is not None
+    except Exception:
+        return True
+
+
 # ── TurnEvidence → claims ─────────────────────────────────────────────────────
 
 def claims_from_turn_evidence(

@@ -660,6 +660,16 @@ class WhatsAppThreadCandidate(Base):
     zone_detail: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
     direccion_texto: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     source_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    #: W1F-W-01 R2, review §8.3 — which typed evidence row set this candidate's location
+    #: and identity. Per-field provenance is not needed once `whatsapp_thread_evidence`
+    #: exists (the rows bound to a candidate ARE its provenance); these two exist so a
+    #: reader does not have to join to answer "is this trustworthy".
+    #: `SET NULL`, never `NO ACTION`: the certified tester reset deletes candidates before
+    #: threads, and G37R-RV-03 measured what a blocking reference here costs.
+    zone_evidence_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("whatsapp_thread_evidence.id", ondelete="SET NULL"), nullable=True)
+    vehicle_evidence_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("whatsapp_thread_evidence.id", ondelete="SET NULL"), nullable=True)
     status: Mapped[str] = mapped_column(String(30), nullable=False, default="mentioned", server_default="mentioned")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
@@ -1236,6 +1246,314 @@ Index("ix_booking_attempt_events_thread", BookingAttemptEvent.hist_thread_id)
 Index("ix_booking_attempt_events_thread_revision", BookingAttemptEvent.hist_thread_revision_id)
 
 Index("ix_dedup_wa_kind_fp_created", WhatsAppOutboundDedup.wa_id, WhatsAppOutboundDedup.message_kind, WhatsAppOutboundDedup.content_fingerprint, WhatsAppOutboundDedup.created_at)
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════
+# W1F-W-01 R2 — conversation memory: what we asked, and what the customer told us
+# ══════════════════════════════════════════════════════════════════════════════════════
+
+#: The SIX states of an outstanding question. Every one of them is WRITTEN; none is inferred
+#: from the absence of a row, because absence is how this programme spells "we never asked"
+#: and it must stay distinguishable from "we asked and it is settled".
+#:
+#: OC-R2 CORRECTION 1. The first implementation had four states and created the question
+#: ACTIVE as soon as the Meta call returned a WAMID. **That was wrong, and the owner is
+#: right about why: a WAMID proves Meta ACCEPTED the message, not that the recipient
+#: received it.** Meta reports `sent`, `delivered`, `read` and `failed` through later status
+#: webhooks, and this repository already records them
+#: (`routes/whatsapp.py:STATUS_PRECEDENCE`, pending < sent < delivered < read < failed).
+#: So acceptance now produces a NON-ACTIVE row and only an observed `delivered` or `read`
+#: activates it.
+OQ_PENDING_DELIVERY = "PENDING_DELIVERY"   # accepted by Meta; the customer may not have it
+OQ_OUTSTANDING = "OUTSTANDING"             # delivered or read: the customer HAS it
+OQ_ANSWERED = "ANSWERED"
+OQ_SUPERSEDED = "SUPERSEDED"
+OQ_ABANDONED = "ABANDONED"
+OQ_UNDELIVERED = "UNDELIVERED"             # Meta reported `failed`: terminal, never active
+OQ_STATUSES = (OQ_PENDING_DELIVERY, OQ_OUTSTANDING, OQ_ANSWERED, OQ_SUPERSEDED,
+               OQ_ABANDONED, OQ_UNDELIVERED)
+#: The ONE definition of "this question is active". Only a row in this set may own the
+#: per-field constraint, match evidence, close, suppress a greeting or influence routing.
+OQ_ACTIVE_STATUSES = (OQ_OUTSTANDING,)
+#: The Meta statuses that establish the customer actually has the message. `sent` is NOT one
+#: of them — it means Meta accepted it for delivery, which is what the WAMID already said.
+#: `read` without a prior `delivered` still establishes delivery: you cannot read what was
+#: not delivered, and Meta does not guarantee the intermediate callback arrives.
+OQ_DELIVERING_STATUSES = ("delivered", "read")
+#: The Meta status that makes it terminal.
+OQ_FAILED_STATUS = "failed"
+
+#: The question kinds R2 can both ASK and RECOGNISE AN ANSWER TO. Deliberately short: a kind
+#: is only listed when a producer actually asks it and an admitted claim family can close it.
+#: `expected_slots` carries the claim types, so a new kind is data, not a schema change.
+OQ_KIND_INSPECTION_LOCATION = "INSPECTION_LOCATION"
+OQ_KIND_VEHICLE_IDENTITY = "VEHICLE_IDENTITY"
+OQ_KINDS = (OQ_KIND_INSPECTION_LOCATION, OQ_KIND_VEHICLE_IDENTITY)
+
+#: Who worded the question that was actually delivered.
+OQ_ASKED_BY_REPLY_MODEL = "REPLY_MODEL"
+OQ_ASKED_BY_DETERMINISTIC_TEMPLATE = "DETERMINISTIC_TEMPLATE"
+OQ_ASKED_BY_FLOW = "FLOW"
+OQ_ASKED_BY_OPERATOR = "OPERATOR"
+OQ_ASKED_BY = (OQ_ASKED_BY_REPLY_MODEL, OQ_ASKED_BY_DETERMINISTIC_TEMPLATE,
+               OQ_ASKED_BY_FLOW, OQ_ASKED_BY_OPERATOR)
+
+
+class WhatsAppOutstandingQuestion(Base):
+    """One row per question the system asked, and whether Meta confirmed it was delivered.
+
+    W1F-W-01 R2, architectural review §8.1. The Wild's defect was not that the interpreter
+    misread `en flores` — it read it correctly, twice — but that nothing in the system knew
+    a question had been asked, so the answer arrived as an unprompted fragment and Layer F
+    step 9 greeted it. This table is the missing fact.
+
+    **A row exists because Meta accepted the message; a row is ACTIVE because Meta confirmed
+    DELIVERED or READ.** Those are two different facts and this table keeps them apart.
+    `delivered` means the recipient's device has it — not that a human looked at it; only
+    `read` would support that, and this contract never needs the stronger fact.
+    A blocked, failed, suppressed or empty dispatch leaves no row at all. An accepted send
+    leaves a `PENDING_DELIVERY` row, which owns nothing: it cannot suppress a greeting, match
+    evidence, close, hold the per-field constraint or influence routing. Only an observed
+    `delivered` or `read` status promotes it to `OUTSTANDING`.
+
+    OC-R2 CORRECTION 1, and the correction matters: the first implementation treated the
+    WAMID returned by the Meta call as proof of delivery. It is not — it is proof of
+    acceptance and a correlation handle. The distinction is load-bearing here because the
+    whole point of the contract is to suppress a reply on the strength of "we asked them
+    something", and a message sitting in Meta's queue, or rejected outside the 24-hour
+    session window, was never asked of anybody. This repository already receives and ranks
+    the real statuses, so the fix needs no new transport and no new route.
+
+    Why a table and not a column (review §8.1): more than one question can be outstanding —
+    the Wild had the location question open while the vehicle was still unknown — and the
+    history must be auditable. Why not widen `whatsapp_clarification_attempts`: that table is
+    Flow-shaped and its two families are load-bearing for the one-attempt rule; its own
+    docstring warns "TWO FACTS, NOT ONE", and "we have spent our one Flow attempt" must not
+    become entangled with "we are waiting for an answer".
+
+    Three database-enforced invariants:
+
+        UNIQUE (identity)                                  one asked question -> one row,
+                                                           so a retry or a duplicate
+                                                           delivery callback cannot open a
+                                                           second
+        UNIQUE (thread_id, cycle_key, question_kind)        at most ONE live question may own
+               WHERE status = 'OUTSTANDING'                 a field at a time (review: "at
+                                                           most the contractually permitted
+                                                           active question may own a field")
+        CHECKs on status / question_kind / asked_by         the vocabulary cannot drift
+
+    The second is what makes supersession a fact rather than a convention: a second ask for
+    the same field in the same cycle must SUPERSEDE the first explicitly, and two concurrent
+    asks cannot both leave a live row behind.
+
+    **Which of two asks wins is decided by `id`, and by nothing else** (OC-R2-R1). The
+    primary key is this table's only immutable, monotonic, locally assigned ordering, and
+    `delivered` callbacks do not arrive in acceptance order: a late delivery for a replaced
+    question must not displace the question the customer actually has. Neither
+    `asked_at` (a clock) nor `wa_message_id` (Meta's opaque handle) orders anything, and
+    webhook arrival time is explicitly not an ordering. `outstanding_question` holds the one
+    implementation.
+
+    `cycle_key` is `COALESCE(state.current_cycle_start_message_db_id, 0)`, exactly as
+    `whatsapp_clarification_attempts` defines it — an integer message id, never a timestamp,
+    so the identity is stable across bursts, duplicates and restarts.
+
+    `outbound_message_id` is a HISTORICAL scalar id and deliberately **not** a foreign key.
+    The newest migration in this repository (`20261022_operator_notifications`) established
+    that doctrine after G37R-RV-03 measured a tester reset failing `23503` on exactly such a
+    reference: the certified reset deletes `whatsapp_messages` before the thread, so a
+    foreign key here would block it. The gate's ledger row is still findable by id; nothing
+    joins to it in a hot path.
+    """
+
+    __tablename__ = "whatsapp_outstanding_questions"
+    __table_args__ = (
+        UniqueConstraint("identity", name="uq_outstanding_question_identity"),
+        CheckConstraint(
+            "question_kind IN ('INSPECTION_LOCATION', 'VEHICLE_IDENTITY')",
+            name="ck_outstanding_question_kind"),
+        CheckConstraint(
+            "status IN ('PENDING_DELIVERY', 'OUTSTANDING', 'ANSWERED', 'SUPERSEDED', "
+            "'ABANDONED', 'UNDELIVERED')",
+            name="ck_outstanding_question_status"),
+        CheckConstraint(
+            "asked_by IN ('REPLY_MODEL', 'DETERMINISTIC_TEMPLATE', 'FLOW', 'OPERATOR')",
+            name="ck_outstanding_question_asked_by"),
+        CheckConstraint("expires_after_turns >= 1", name="ck_outstanding_question_expiry"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    thread_id: Mapped[int] = mapped_column(
+        ForeignKey("whatsapp_threads.id"), nullable=False)
+    #: `COALESCE(state.current_cycle_start_message_db_id, 0)` — see the class docstring.
+    cycle_key: Mapped[int] = mapped_column(Integer, nullable=False)
+    question_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    #: jsonb: the `ClaimType` values whose admitted evidence would answer this question.
+    #: A list, because a kind may be answerable by more than one family.
+    expected_slots: Mapped[Optional[dict]] = mapped_column(
+        JSONB, nullable=True)
+    asked_by: Mapped[str] = mapped_column(String(32), nullable=False)
+    #: Deterministic UUIDv5 over (namespace, thread, cycle, kind, originating wa_message_id).
+    #: The UNIQUE above is the authority; a replayed delivery callback recomputes the same
+    #: value and is refused by the database rather than by a lookup that can race.
+    identity: Mapped[str] = mapped_column(String(36), nullable=False)
+    #: HISTORICAL scalar — not a foreign key. See the class docstring.
+    outbound_message_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    #: The WAMID Meta returned for the message that carried the question: the ACCEPTANCE
+    #: evidence this row exists on, and the correlation handle the later status callbacks
+    #: arrive under. Not delivery evidence — `delivery_status` is.
+    wa_message_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    #: The inbound burst/turn that caused us to ask, for provenance.
+    asked_turn_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    #: The candidate the question is about, when it is about one at all. SET NULL, because
+    #: the certified reset deletes candidates before threads and a NO ACTION reference here
+    #: would block it.
+    candidate_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("whatsapp_thread_candidates.id", ondelete="SET NULL"), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    asked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    #: How many of the customer's own turns this question survives. 1 would make it useless
+    #: on the Wild (the answer came on the next turn); the review's `W1F-C-11` requires it to
+    #: survive one off-topic turn, so the default is 3 and expiry is COUNTED, never a clock.
+    expires_after_turns: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=3, server_default=text("3"))
+    #: Customer turns observed since `asked_at`. Compared with `expires_after_turns`.
+    turns_observed: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0"))
+    #: The `ClaimEvidence.claim_id` content hash of the admitted claim that closed it.
+    answered_by_claim_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    #: The evidence row that closed it, when one was persisted. SET NULL for the same
+    #: reset reason as `candidate_id`.
+    answered_by_evidence_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("whatsapp_thread_evidence.id", ondelete="SET NULL"), nullable=True)
+    #: The row that replaced this one, when `status = 'SUPERSEDED'`.
+    superseded_by_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("whatsapp_outstanding_questions.id", ondelete="SET NULL"), nullable=True)
+    #: The last Meta status observed for `wa_message_id` — the delivery provenance this
+    #: row's activation rests on. `delivered` or `read` activated it; `failed` ended it.
+    delivery_status: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    #: When the row became ACTIVE, which is a different moment from `asked_at`: `asked_at`
+    #: is when Meta accepted the message, this is when the customer was shown to have it.
+    activated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    #: Why it left its active state — a typed code, never prose.
+    closed_reason: Mapped[Optional[str]] = mapped_column(String(48), nullable=True)
+    closed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(),
+        nullable=False)
+
+
+class WhatsAppThreadEvidence(Base):
+    """One row per typed claim this thread produced, accepted or refused, with provenance.
+
+    W1F-W-01 R2, architectural review §8.2. This is **the persistence of an existing
+    in-memory type, not a new model**: `schemas/claims.ClaimEvidence` already carries every
+    attribute below, including `cycle_id`, `supersedes` and the content-hash `claim_id`.
+
+    It is what makes `RISK-03` obsolete. `_apply_candidate` refuses to inherit
+    `state.home_zone_*` at candidate creation — correctly, because an untyped buffer value
+    cannot say which cycle, turn or ROLE it came from, so a locality from a previous session
+    could contaminate a new candidate. A row here can say all three, so staleness and
+    contamination become queryable rather than unknowable, and a locality given BEFORE the
+    vehicle can be bound to the candidate created after it (`W1F-C-05`, `W1F-C-07`).
+
+    **Refusals are rows too.** `outcome` and `reason` carry R1's admission vocabulary
+    unchanged, so "we were told Mar del Plata and refused it, for this reason, on this turn"
+    is as durable as an acceptance. That is finding G-11: a refusal nobody can read is
+    invisible.
+
+    Binding rules live in `services/thread_evidence.py`, not here. A row is bindable to a
+    candidate only when it is in the SAME cycle, carries the INSPECTION_LOCATION role, was
+    ACCEPTED, is not superseded and is not already bound elsewhere — and the write still goes
+    through the reconciler, never directly onto the candidate.
+    """
+
+    __tablename__ = "whatsapp_thread_evidence"
+    __table_args__ = (
+        UniqueConstraint("thread_id", "claim_id", name="uq_thread_evidence_claim"),
+        CheckConstraint("outcome IN ('ACCEPT', 'CLARIFY', 'HOLD', 'NEEDS_HUMAN')",
+                        name="ck_thread_evidence_outcome"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    thread_id: Mapped[int] = mapped_column(
+        ForeignKey("whatsapp_threads.id"), nullable=False)
+    #: `COALESCE(state.current_cycle_start_message_db_id, 0)`, as everywhere else.
+    cycle_key: Mapped[int] = mapped_column(Integer, nullable=False)
+    #: The engine's correlation id for the burst this claim came from.
+    turn_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    claim_type: Mapped[str] = mapped_column(String(48), nullable=False)
+    #: INSPECTION_LOCATION | CUSTOMER_ORIGIN | SELLER_LOCATION | NULL — the role the
+    #: producer assigned, which is what LR-2 exists to keep separate.
+    role: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    value: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    #: The validator's normalized output, e.g. "CABA|Flores". Human-readable, one field,
+    #: so a reader never has to re-run a validator to see what was accepted.
+    normalized_value: Mapped[Optional[str]] = mapped_column(String(160), nullable=True)
+    evidence_class: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    producer: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    producer_version: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    status: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    polarity: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    explicitness: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    #: The admission boundary's decision and its typed reason code, unchanged from R1's
+    #: `ReconciliationOutcome` / `AdmissionReason` vocabulary.
+    outcome: Mapped[str] = mapped_column(String(16), nullable=False)
+    reason: Mapped[Optional[str]] = mapped_column(String(48), nullable=True)
+    #: jsonb list of the WAMIDs this claim was read from.
+    source_message_ids: Mapped[Optional[dict]] = mapped_column(
+        JSONB, nullable=True)
+    #: jsonb: the validator's own output, e.g. {"zone_group": ..., "zone_detail": ...}.
+    validated_as: Mapped[Optional[dict]] = mapped_column(
+        JSONB, nullable=True)
+    #: `ClaimEvidence.claim_id` — the content hash. With `thread_id` it is UNIQUE, so one
+    #: claim produces one row however many times the turn is replayed.
+    claim_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    bound_to_candidate_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("whatsapp_thread_candidates.id", ondelete="SET NULL"), nullable=True)
+    bound_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    superseded_by_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("whatsapp_thread_evidence.id", ondelete="SET NULL"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    def zone_pair(self) -> tuple:
+        """The validator's `(zone_group, zone_detail)`, or `(None, None)`.
+
+        Read from `validated_as`, which is what the certified resolver returned — never
+        re-derived from `value`, because re-deriving it is how two copies of a rule start.
+        """
+        raw = self.validated_as if isinstance(self.validated_as, dict) else None
+        if not raw:
+            return (None, None)
+        return (raw.get("zone_group"), raw.get("zone_detail"))
+
+
+Index("ix_outstanding_question_live", WhatsAppOutstandingQuestion.thread_id,
+      WhatsAppOutstandingQuestion.cycle_key, WhatsAppOutstandingQuestion.status)
+#: OC-R2 CORRECTION 1: the status webhook knows only the WAMID, so activation looks the
+#: question up by it. Without this index every status callback scans the table.
+Index("ix_outstanding_question_wamid", WhatsAppOutstandingQuestion.wa_message_id)
+#: Review §8.1 / R2 scope: "at most the contractually permitted active question may own a
+#: field at a time". One LIVE question per (thread, cycle, kind), enforced by the database
+#: and not by a read-then-write that two workers can both pass.
+Index("uq_outstanding_question_one_live_per_field",
+      WhatsAppOutstandingQuestion.thread_id, WhatsAppOutstandingQuestion.cycle_key,
+      WhatsAppOutstandingQuestion.question_kind,
+      unique=True,
+      postgresql_where=text("status = 'OUTSTANDING'"),
+      sqlite_where=text("status = 'OUTSTANDING'"))
+
+Index("ix_thread_evidence_lookup", WhatsAppThreadEvidence.thread_id,
+      WhatsAppThreadEvidence.cycle_key, WhatsAppThreadEvidence.claim_type)
+Index("ix_thread_evidence_unbound", WhatsAppThreadEvidence.thread_id,
+      WhatsAppThreadEvidence.cycle_key, WhatsAppThreadEvidence.bound_to_candidate_id)
 
 
 # Convergence Phase 4 (CD-07): rule K-E — a thread state is taken before a lead, for every

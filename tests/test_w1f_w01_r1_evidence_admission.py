@@ -161,7 +161,14 @@ def _turn(text, *, admission, evidence=None, vehicle=False, zone=None,
             db.commit()
             other_id = other.id
         engine = H._engine(db, safety=safety)
+        # OC-R2 CORRECTION 2: R1 behaviour is now behind the THREE-flag interlock
+        # (`_integrated_features_armed`), because the R2 closeout measured that R1 ON with
+        # R2 OFF admits `la boca` out of `me mordí la boca`. "Admission armed" therefore
+        # means the integrated posture, and this module arms it as one switch. The R3 flag
+        # is `safety`, which `_engine` already sets; `TestR1D_FlagOff` and the R2 module's
+        # eight-row matrix are where the partial postures are proven inert.
         engine.settings.evidence_admission_enabled = admission
+        engine.settings.outstanding_question_enabled = admission
         if evidence is not None:
             with patch.object(ConversationEngine, "_semantic_turn_evidence",
                               return_value=evidence):
@@ -432,16 +439,25 @@ class TestR1B_WholeTurn(unittest.TestCase):
     def test_b04_a_locality_only_the_interpreter_inferred_is_not_admitted(self):
         """The ASR case: `floress` resolves to nothing deterministically, and `Flores` is
         the interpreter's reading of a corrupted token — a confident match on a corrupted
-        token is still a guess about what was said. It is refused by name here and remains
-        what the certified design already makes it: `_recover_locality`'s confirmable
-        proposal. Nothing is persisted in either posture."""
+        token is still a guess about what was said. Nothing is persisted in either posture.
+
+        UPDATED BY OC-R2 CORRECTION 2, and the guarantee got STRONGER rather than weaker.
+        R1 alone admitted these claims to the boundary and refused them there, by name
+        (`INFERRED_NOT_EXPLICIT`). Under the integrated posture the R1-PL-01 predicate sees
+        that the burst's own words contain no catalogue locality and no coverage city, so
+        the interpreter is never consulted at all: there is no claim to refuse, and the
+        assertion is now that the boundary produced NO record and wrote nothing. A reading
+        that was never requested cannot be admitted by a future mistake either."""
         for mangled in ("en flore", "en florez", "en tegui"):
             with self.subTest(text=mangled):
                 off, on = _both(mangled, evidence=_evidence(_loc("Flores")))
                 self.assertEqual(off.turn.thread_zone, (None, None))
                 self.assertEqual(on.turn.thread_zone, (None, None))
-                self.assertEqual(on.record_for().reason,
-                                 EA.AdmissionReason.INFERRED_NOT_EXPLICIT)
+                self.assertEqual((), tuple(on.admission.records),
+                                 "the interpreter was consulted on a burst with no "
+                                 "resolvable locality in the customer's own words")
+                self.assertTrue(
+                    getattr(on.turn.engine, "_turn_semantic_wait_skipped", False))
         # `floress` is NOT one of them: the inherited matcher's compact/ASR pass reads it,
         # so that locality is deterministic evidence and admission is not what keeps it.
         _, on = _both("en floress")
@@ -460,10 +476,18 @@ class TestR1B_WholeTurn(unittest.TestCase):
         self.assertFalse(on.record_for().admitted)
 
     def test_b06_a_stale_reading_persists_nothing(self):
+        """Two ways a stale reading is refused, and the integrated posture uses the cheaper.
+
+        The boundary's `STALE_TURN` rule still exists and `TestR1A_Boundary::a06` proves it
+        directly. Through the whole turn, `ya te lo dije` carries no locality in the
+        customer's own words, so the R1-PL-01 predicate declines to consult the interpreter
+        and the stale reading never reaches the boundary at all. Nothing persisted, and
+        nothing asked."""
         on = _turn("ya te lo dije", admission=True,
                    evidence=_evidence(_loc("Flores"), message_ids=("wamid.OLD",)))
         self.assertEqual(on.turn.thread_zone, (None, None))
-        self.assertEqual(on.record_for().reason, EA.AdmissionReason.STALE_TURN)
+        self.assertEqual((), tuple(on.admission.records))
+        self.assertTrue(getattr(on.turn.engine, "_turn_semantic_wait_skipped", False))
 
     def test_b07_evidence_cannot_leak_to_another_candidate(self):
         """Candidate-location isolation (M21.2.14): a `mentioned` MOTO from an earlier
@@ -660,34 +684,68 @@ class TestR1D_FlagOff(unittest.TestCase):
         engine = ConversationEngine.__new__(ConversationEngine)
         engine.settings = MagicMock()
         self.assertFalse(engine._admission_on())
+        self.assertFalse(engine._integrated_features_armed())
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 class TestR1E_NotR2(unittest.TestCase):
     """What R1 does not do. These assertions are the honest half of the milestone."""
 
-    def test_e01_no_outstanding_question_is_persisted(self):
-        """R2's contract does not exist yet, and R1 does not fake one.
+    def test_e01_r1_alone_is_inert_under_the_interlock(self):
+        """R1 ALONE DOES NOTHING NOW, and that is the owner's correction, not a regression.
 
-        The only question-tracking mechanism in the system is the Flow-shaped attempt
-        store. A model-generated question still leaves no row, and admission adds none."""
-        on = _turn("en flores", admission=True, evidence=_evidence(_loc("Flores")))
-        self.assertEqual(on.turn.attempts, [])
-        from app.models import Base as _ModelBase
-        tables = set(_ModelBase.metadata.tables) if hasattr(
-            _ModelBase, "metadata") else set()
-        self.assertNotIn("whatsapp_outstanding_questions", tables)
+        This assertion has moved twice and the history is the point. It began as "the
+        `whatsapp_outstanding_questions` table does not exist", which stopped being the
+        invariant when R2 added the table. It became "R1 with the R2 flag off records no
+        question", which was true but hid something worse: the R2 closeout then MEASURED
+        that R1 ON with R2 OFF admits `la boca` out of `me mordí la boca` and writes
+        `('CABA','La Boca')`.
 
-    def test_e02_layer_f_step_nine_can_still_answer_an_answer(self):
-        """The Wild's exact turn-2 defect is NOT closed by R1, and this test says so.
+        So OC-R2 CORRECTION 2 put R1 behind the three-flag interlock, and the invariant is
+        now the strongest of the three: with only `EVIDENCE_ADMISSION_ENABLED` armed,
+        **nothing happens at all** — no admission, no evidence row, no question, and the
+        committed pre-R1 behaviour of the turn."""
+        from app.models import WhatsAppOutstandingQuestion, WhatsAppThreadEvidence
+        db = H._SessionLocal()
+        try:
+            H._seed_catalogue(db)
+            thread_id, cand_id, wa = H._seed_thread(db, vehicle=False,
+                                                    stage=H.STAGE_QUALIFYING)
+            engine = H._engine(db, safety=True)
+            engine.settings.evidence_admission_enabled = True
+            engine.settings.outstanding_question_enabled = False
+            self.assertFalse(engine._integrated_features_armed())
+            self.assertFalse(engine._admission_on(), "R1 armed itself without the interlock")
+            with patch.object(ConversationEngine, "_semantic_turn_evidence",
+                              return_value=_evidence(_loc("Flores"))):
+                turn = H._run(db, engine, thread_id, wa, "en flores", cand_id=cand_id)
+            self.assertEqual((None, None), turn.thread_zone,
+                             "a partial posture admitted a locality")
+            self.assertIsNone(getattr(engine, "_turn_admission", None))
+            self.assertEqual(0, db.query(WhatsAppOutstandingQuestion)
+                             .filter_by(thread_id=thread_id).count())
+            self.assertEqual(0, db.query(WhatsAppThreadEvidence)
+                             .filter_by(thread_id=thread_id).count())
+            self.assertEqual([], turn.attempts)
+        finally:
+            db.close()
 
-        The customer answers the system's own question with a bare locality; the intent
-        gate finds no service signal in the words and sends the qualification greeting.
-        R1's change is that the locality survives it. R2 adds the outstanding-question
-        contract that stops the greeting; when R2 lands, this assertion inverts."""
+    def test_e02_layer_f_step_nine_still_answers_an_unprompted_locality(self):
+        """What R1 contributes, with the greeting case stated exactly as it now stands.
+
+        R1's closeout predicted this would invert when R2 landed, and it has — but not in
+        the blunt way the prediction implied. The greeting is suppressed only when the turn
+        ANSWERED a question the customer was shown to have received. Here no question was
+        ever asked, so `en flores` is an unprompted fragment, step 9 finds no service signal
+        and greets exactly as the committed system does.
+
+        R1's contribution is unchanged and is the other assertion: the locality survives
+        that greeting instead of being destroyed by it. The three-turn sequence where the
+        greeting IS suppressed lives in the R2 suite, because it needs a delivered
+        question."""
         on = _turn("en flores", admission=True, evidence=_evidence(_loc("Flores")))
         self.assertTrue(any(_GREETING_MARK in s for s in on.turn.sent),
-                        "R1 alone does not stop the greeting — that is R2")
+                        "an UNPROMPTED locality must still reach the greeting")
         self.assertEqual(on.turn.thread_zone, ("CABA", "Flores"))
 
     def test_e03_the_admission_record_claims_nothing_about_questions(self):
@@ -1022,6 +1080,7 @@ class TestR1G_Placement(unittest.TestCase):
                     db, vehicle=False, zone=None, stage=H.STAGE_QUALIFYING, flag=None)
                 engine = H._engine(db, safety=True)
                 engine.settings.evidence_admission_enabled = True
+                engine.settings.outstanding_question_enabled = True   # OC-R2: the interlock
                 engine.settings.shadow_understand_enabled = True
                 engine.settings.shadow_understand_async = True
                 engine.settings.semantic_same_turn_enabled = True
@@ -1073,11 +1132,14 @@ class TestR1G_Placement(unittest.TestCase):
              EA.AdmissionReason.LOCALITY_UNSUPPORTED),
             ("ambiguous", "en san nicolas", _evidence(_loc("san nicolas")),
              EA.AdmissionReason.LOCALITY_AMBIGUOUS),
+            # OC-R2 CORRECTION 2: these two bursts carry no resolvable locality in the
+            # customer's own words, so the predicate declines to consult the interpreter
+            # and there is no claim to refuse. `None` means "no record, nothing written",
+            # which is the stronger outcome; the boundary rules themselves are proven
+            # directly by `TestR1A_Boundary`.
             ("stale", "ya te lo dije",
-             _evidence(_loc("Flores"), message_ids=("wamid.OLD",)),
-             EA.AdmissionReason.STALE_TURN),
-            ("inferred", "en flore", _evidence(_loc("Flores")),
-             EA.AdmissionReason.INFERRED_NOT_EXPLICIT),
+             _evidence(_loc("Flores"), message_ids=("wamid.OLD",)), None),
+            ("inferred", "en flore", _evidence(_loc("Flores")), None),
             ("origin_role", "soy de flores", _evidence(_loc("Flores")),
              EA.AdmissionReason.ROLE_DECIDED_BY_TEXT),
         )
@@ -1085,7 +1147,10 @@ class TestR1G_Placement(unittest.TestCase):
             with self.subTest(case=name):
                 on = _turn(text, admission=True, evidence=evidence)
                 self.assertEqual(on.turn.thread_zone, (None, None))
-                self.assertEqual(on.record_for().reason, reason)
+                if reason is None:
+                    self.assertEqual((), tuple(on.admission.records))
+                else:
+                    self.assertEqual(on.record_for().reason, reason)
         # candidate isolation, at the new placement
         on = _turn("en flores", admission=True, vehicle=True, mentioned=True,
                    evidence=_evidence(_loc("Flores")))
