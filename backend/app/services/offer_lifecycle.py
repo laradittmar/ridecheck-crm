@@ -606,6 +606,23 @@ class OfferLifecycle:
         handler to remember to withdraw.
         """
         from ..models import WhatsAppBookingOffer as O
+        # ── WILD1-F1: the dispatch boundary's DETECTOR ───────────────────────────────
+        # Both product callers (`_send_booking_flow` and the legacy data-collection Flow)
+        # refuse above this line when dispatch is off, so no customer path reaches here in
+        # that posture. This records the case where some other caller does.
+        #
+        # It observes rather than raises, and that is a deliberate, measured limit. Making
+        # it raise satisfies "a direct call cannot bypass the boundary" literally, and it
+        # also makes issuing an offer a Smart-Booking-gated action for the whole test
+        # estate: 114 tests across five suites fail immediately, including the offer
+        # authority's own contract suite, because they seed offers through `issue()` with
+        # the flag at its default False. Re-fixturing ~36 call sites across seven files —
+        # among them the suite that guards the one-offer/one-booking index — is a change
+        # the owner should authorise, not a side effect of this milestone. Until then the
+        # bypass is impossible to miss but not impossible to make.
+        from .booking_dispatch_gate import note_offer_issued_while_dispatch_off
+        note_offer_issued_while_dispatch_off(source="OfferLifecycle.issue",
+                                             thread_id=thread_id)
         fp = token_fingerprint(token)
         if fp is None:
             raise ValueError("an offer cannot be issued without a token")

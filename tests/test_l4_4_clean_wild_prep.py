@@ -67,6 +67,12 @@ def _engine():
     db.bind = sqlite
     settings = MagicMock()
     settings.whatsapp_flow_id = "1644218879979041"
+    # WILD1-F1: dispatching the booking Flow is gated on SMART_BOOKING_CE_ENABLED.
+    # A bare MagicMock answers the gate's `is True` test with a MagicMock, which reads
+    # as OFF, so a suite asserting that a valid slot DOES dispatch must say it wants
+    # dispatch. Individual tests already override this both ways (see the
+    # smart_booking_ce_enabled assignments further down this file).
+    settings.smart_booking_ce_enabled = True
     settings.whatsapp_website_flow_id = ""
     settings.booking_flow_id = "28104222025943520"
     eng = ConversationEngine(db=db, settings=settings)

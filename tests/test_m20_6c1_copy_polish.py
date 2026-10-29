@@ -239,6 +239,10 @@ def _make_settings():
     s.whatsapp_vehicle_fallback_flow_id = ""
     s.whatsapp_location_fallback_flow_id = ""
     s.whatsapp_website_flow_id = ""
+    # WILD1-F1: the booking/data-collection Flow dispatch is gated on
+    # SMART_BOOKING_CE_ENABLED; a bare MagicMock reads as OFF. This suite asserts the
+    # Flow intro copy, so the Flow has to be permitted to open.
+    s.smart_booking_ce_enabled = True
     return s
 
 

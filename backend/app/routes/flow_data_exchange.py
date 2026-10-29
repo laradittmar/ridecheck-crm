@@ -38,6 +38,8 @@ from ..services.booking_flow_service import (
 
 logger = logging.getLogger(__name__)
 
+from ..services.flow_contract import appointment_payload  # WILD1-F3
+
 router = APIRouter(tags=["flows"])
 
 _TEXT_PLAIN = "text/plain"
@@ -124,11 +126,16 @@ async def booking_flow_data_exchange(
                         body.get("encrypted_flow_data") if isinstance(body, dict) else None))
 
             else:
-                logger.warning("BOOKING_FLOW unknown trigger=%r", trigger)
+                # WILD1-F4: an empty trigger is what the real handset sent four times.
+                # Logged as a validation refusal, never as an internal error, and the
+                # payload itself is never logged.
+                logger.warning("BOOKING_FLOW_VALIDATION_REFUSED kind=unknown_trigger "
+                               "trigger=%r token_present=%s", trigger, bool(booking_token))
                 raise HTTPException(status_code=422, detail=f"Unknown trigger: {trigger!r}")
 
         else:
-            logger.warning("BOOKING_FLOW unknown action=%r", action)
+            logger.warning("BOOKING_FLOW_VALIDATION_REFUSED kind=unknown_action "
+                           "action=%r token_present=%s", action, bool(booking_token))
             raise HTTPException(status_code=422, detail=f"Unknown action: {action!r}")
 
     except BookingAlreadyCompletedError as exc:
@@ -162,29 +169,30 @@ async def booking_flow_data_exchange(
     except BookingTokenError as exc:
         logger.warning("BOOKING_FLOW_TOKEN_ERROR: %s", exc)
         # Flow session expired or tampered — return an error screen
+        # WILD1-F3: built by the one contract builder, which supplies every declared key
+        # and refuses an undeclared one. `has_error` is what makes the message visible on
+        # the target Flow; the hand-rolled dict that stood here carried `error_message`
+        # with no flag and, on the PUBLISHED v7.3, five keys it does not declare at all.
         error_response = {
             "version": FLOW_VERSION,
             "screen": "APPOINTMENT",
-            "data": {
-                "error_message": "Tu sesión de reserva expiró. Por favor, volvé a iniciar el proceso.",
-                "booking_token": "",
-                "date": [],
-                "is_date_enabled": False,
-                "time": [],
-                "is_time_enabled": False,
-                "vehicle_summary": "",
-                "location_summary": "",
-                # L4.7W5-GATE-A: the candidate Flow declares these on APPOINTMENT, so an
-                # error screen must carry them too — empty, because an expired session has
-                # no selection and no identity to assert.
-                "selected_date": "",
-                "selected_time": "",
-                "customer_name": "",
-                "contact_phone": "",
-                "contact_phone_display": "",
-            },
+            "data": appointment_payload(
+                error_message="Tu sesión de reserva expiró. Por favor, volvé a iniciar el proceso.",
+                has_error=True,
+            ),
         }
         return _encrypt_and_return(error_response, aes_key, iv)
+
+    except HTTPException:
+        # ── WILD1-F4 ────────────────────────────────────────────────────────────────
+        # `HTTPException` subclasses `Exception`, so the generic handler below used to
+        # catch the 422s raised INSIDE this try (unknown trigger, unknown action) and
+        # re-raise them as 500. On the real handset that turned four empty-trigger
+        # requests into "Internal server error", which Meta shows as its own generic
+        # failure — and it logged a client fault as a server fault, corrupting the one
+        # signal alerting would key on. An intended status is a decision already made:
+        # it passes through untouched, and is logged as the validation event it is.
+        raise
 
     except ValueError as exc:
         logger.warning("BOOKING_FLOW_VALIDATION_ERROR: %s", exc)

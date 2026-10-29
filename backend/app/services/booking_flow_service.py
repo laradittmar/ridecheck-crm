@@ -44,6 +44,8 @@ from .booking_authority import BookingOutcome
 
 logger = logging.getLogger(__name__)
 
+from .flow_contract import appointment_payload  # WILD1-F3
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 BOOKING_HORIZON_DAYS = 14
 TOKEN_MAX_AGE_SECONDS = 7200        # 2-hour Flow session window
@@ -535,7 +537,7 @@ class BookingFlowService:
         self,
         ctx: BookingContext,
         selected_date_str: Optional[str] = None,
-        error_message: Optional[str] = None,
+        refusal_message: Optional[str] = None,
     ) -> dict:
         date_items = self._available_dates(ctx.zone_group)
         time_items: list[dict] = []
@@ -571,18 +573,18 @@ class BookingFlowService:
                     # slot regardless, so a stale agreement is still caught there.
                     # GATE A: both selections are IDs that exist in their own data-source
                     # above, which is what makes the Flow render them as chosen.
-                    return {
-                        "booking_token": ctx.booking_token,
-                        "vehicle_summary": ctx.vehicle_summary,
-                        "location_summary": ctx.location_summary,
-                        "date": [{"id": agreed_day, "title": _date_title(agreed_date)}],
-                        "is_date_enabled": True,
-                        "time": still_free,
-                        "is_time_enabled": True,
-                        "selected_date": agreed_day,
-                        "selected_time": agreed_time,
-                        **self._identity_fields(ctx),
-                    }
+                    # WILD1-F3: every APPOINTMENT payload leaves through the one contract
+                    # builder, so no branch can be the one that ships a key the Flow does
+                    # not declare — or omits one it does.
+                    return appointment_payload(
+                        booking_token=ctx.booking_token,
+                        vehicle_summary=ctx.vehicle_summary,
+                        location_summary=ctx.location_summary,
+                        date=[{"id": agreed_day, "title": _date_title(agreed_date)}],
+                        is_date_enabled=True,
+                        time=still_free,
+                        is_time_enabled=True,
+                    )
                 logger.info(
                     "BOOKING_FLOW agreed slot %s %s no longer free — full picker offered",
                     agreed_day, agreed_time,
@@ -596,42 +598,46 @@ class BookingFlowService:
             except (ValueError, TypeError):
                 pass
 
-        # GATE A: a selection is offered ONLY when it exists in its own data-source. A day
-        # the customer named is selectable; a time they never chose is not, and preselecting
-        # the earliest would be us deciding for them.
-        selected_date = selected_date_str if any(
-            i.get("id") == selected_date_str for i in date_items) else ""
-        data: dict = {
-            "booking_token": ctx.booking_token,
-            "vehicle_summary": ctx.vehicle_summary,
-            "location_summary": ctx.location_summary,
-            "date": date_items,
-            "is_date_enabled": is_date_enabled,
-            "time": time_items,
-            "is_time_enabled": is_time_enabled,
-            "selected_date": selected_date or "",
-            "selected_time": "",
-            **self._identity_fields(ctx),
-        }
-        if error_message:
-            data["slot_conflict_message"] = error_message
+        # WILD1-F3-R1: there is no selection echo any more. `selected_date`/`selected_time`
+        # were init-values for an UNPUBLISHED candidate; published v7.3 declares its
+        # Dropdowns without `init-value`, so nothing the backend sent could preselect
+        # anything and the two keys were inert. What still works is the narrowing above —
+        # the option list itself — which is why that is kept and these are not.
+        data: dict = appointment_payload(
+            booking_token=ctx.booking_token,
+            vehicle_summary=ctx.vehicle_summary,
+            location_summary=ctx.location_summary,
+            date=date_items,
+            is_date_enabled=is_date_enabled,
+            time=time_items,
+            is_time_enabled=is_time_enabled,
+        )
+        if refusal_message:
+            # WILD1-F3: the message AND the flag that makes it visible. The target Flow
+            # renders `slot_conflict_message` only when `has_refusal` is true, so sending
+            # the text without the flag would be a silent refusal all over again.
+            #
+            # The parameter was called `error_message` and wrote `slot_conflict_message`.
+            # No caller ever passed it, and the name collided with the contract's real
+            # `error_message` key (the expired-session screen) — which is the kind of
+            # confusion that let F3 live. Renamed to what it actually is.
+            data["slot_conflict_message"] = refusal_message
+            data["has_refusal"] = True
         return data
 
-    def _identity_fields(self, ctx: BookingContext) -> dict:
-        """Canonical identity carried to DETAILS through the navigate payload.
-
-        APPOINTMENT → DETAILS is client-side `navigate`: the back end is never called
-        between those screens, so anything DETAILS needs has to leave from here.
-
-        `contact_phone` is `wa_id` — the transport identity WhatsApp already proved. It is
-        carried as data, never as an editable field, and it is re-asserted server-side at
-        prepare_summary and confirm_booking so the UI is not the thing enforcing it.
-        """
-        return {
-            "customer_name": _lead_display_name(ctx.lead),
-            "contact_phone": ctx.contact.wa_id or "",
-            "contact_phone_display": _mask_phone(ctx.contact.wa_id),
-        }
+    # ── the APPOINTMENT identity helper was removed here — WILD1-F3-R1, 2026-10-29 ──
+    #
+    # It supplied `customer_name`, `contact_phone` and `contact_phone_display` on every
+    # APPOINTMENT payload so DETAILS could render the WhatsApp number instead of asking
+    # for it. That needs the prefill candidate published: v7.3's navigate payload carries
+    # none of the three and its DETAILS screen declares none of them, so the three keys
+    # went to a Flow that ignored them. The prefill rollout is deferred past the November 1
+    # correction rather than bundled with it; the candidate artifacts and their Gate B
+    # certification tests stay in the repository, and the helper is recoverable from
+    # 1008434ca76c if that milestone is taken up.
+    #
+    # Nothing is lost: the phone an operator calls is `ctx.contact.wa_id`, re-asserted
+    # server-side in `_confirm_booking` whatever any screen shows.
 
     def _summary_screen_data(
         self,
@@ -1107,18 +1113,19 @@ class BookingFlowService:
     def _refusal_screen(self, ctx, date_str: str, message: str) -> dict:
         """The APPOINTMENT screen with what is free now and the reason nothing was booked."""
         if ctx is None:
+            # WILD1-F3: this branch used to send three keys and omit thirteen. A partial
+            # `data` is as unrenderable as an undeclared one, and this is the path a lost
+            # or already-completed context takes — the least-exercised one of all.
             return {"version": FLOW_VERSION, "screen": "APPOINTMENT",
-                    "data": {"selected_date": "", "selected_time": "",
-                             "slot_conflict_message": message}}
+                    "data": appointment_payload(slot_conflict_message=message,
+                                                has_refusal=True)}
+        data = dict(self._appointment_screen_data(ctx, selected_date_str=date_str))
+        data["slot_conflict_message"] = message
+        data["has_refusal"] = True
         return {
             "version": FLOW_VERSION,
             "screen": "APPOINTMENT",
-            "data": {
-                **self._appointment_screen_data(ctx, selected_date_str=date_str),
-                # the time they picked is exactly what was not booked
-                "selected_time": "",
-                "slot_conflict_message": message,
-            },
+            "data": appointment_payload(**data),
         }
 
     def _handoff_to_person(self, ctx, reason: str) -> None:

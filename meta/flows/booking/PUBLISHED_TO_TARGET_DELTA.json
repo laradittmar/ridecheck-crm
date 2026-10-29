@@ -1,0 +1,1499 @@
+{
+ "published": {
+  "path": "meta/flows/booking/PUBLISHED_28104222025943520_v7.3.json",
+  "sha256": "274038ba234a49fa4f99bae47c00f6cac640e248d56a373d40ae8fba6c1afb15",
+  "model": {
+   "version": "7.3",
+   "data_api_version": "3.0",
+   "routing_model": {
+    "APPOINTMENT": [
+     "DETAILS"
+    ],
+    "DETAILS": [
+     "SUMMARY"
+    ],
+    "SUMMARY": []
+   },
+   "screens": {
+    "APPOINTMENT": {
+     "terminal": false,
+     "declared": {
+      "booking_token": "string",
+      "date": "array",
+      "is_date_enabled": "boolean",
+      "is_time_enabled": "boolean",
+      "location_summary": "string",
+      "time": "array",
+      "vehicle_summary": "string"
+     },
+     "rendered": [
+      "booking_token",
+      "date",
+      "is_date_enabled",
+      "is_time_enabled",
+      "location_summary",
+      "time",
+      "vehicle_summary"
+     ],
+     "carried": [],
+     "components": [
+      {
+       "path": "layout",
+       "type": "SingleColumnLayout"
+      },
+      {
+       "path": "layout/children[0]",
+       "type": "TextHeading",
+       "text": "Reservá tu revisión"
+      },
+      {
+       "path": "layout/children[1]",
+       "type": "TextBody",
+       "text": "${data.vehicle_summary}"
+      },
+      {
+       "path": "layout/children[2]",
+       "type": "TextBody",
+       "text": "${data.location_summary}"
+      },
+      {
+       "path": "layout/children[3]",
+       "type": "Form",
+       "name": "appointment_form"
+      },
+      {
+       "path": "layout/children[3]/children[0]",
+       "type": "Dropdown",
+       "name": "date",
+       "label": "Día",
+       "enabled": "${data.is_date_enabled}",
+       "required": "${data.is_date_enabled}",
+       "data-source": "${data.date}",
+       "action": {
+        "name": "data_exchange",
+        "next": null,
+        "payload": {
+         "booking_token": "${data.booking_token}",
+         "date": "${form.date}",
+         "trigger": "date_selected"
+        }
+       }
+      },
+      {
+       "path": "layout/children[3]/children[1]",
+       "type": "Dropdown",
+       "name": "time",
+       "label": "Horario",
+       "enabled": "${data.is_time_enabled}",
+       "required": "${data.is_time_enabled}",
+       "data-source": "${data.time}"
+      },
+      {
+       "path": "layout/children[3]/children[2]",
+       "type": "Footer",
+       "label": "Continuar",
+       "action": {
+        "name": "navigate",
+        "next": "DETAILS",
+        "payload": {
+         "booking_token": "${data.booking_token}",
+         "date": "${form.date}",
+         "location_summary": "${data.location_summary}",
+         "time": "${form.time}",
+         "vehicle_summary": "${data.vehicle_summary}"
+        }
+       }
+      }
+     ],
+     "visibility": {},
+     "actions": {
+      "Dropdown:date:Día": {
+       "name": "data_exchange",
+       "next": null,
+       "payload": {
+        "booking_token": "${data.booking_token}",
+        "date": "${form.date}",
+        "trigger": "date_selected"
+       }
+      },
+      "Footer:-:Continuar": {
+       "name": "navigate",
+       "next": "DETAILS",
+       "payload": {
+        "booking_token": "${data.booking_token}",
+        "date": "${form.date}",
+        "location_summary": "${data.location_summary}",
+        "time": "${form.time}",
+        "vehicle_summary": "${data.vehicle_summary}"
+       }
+      }
+     }
+    },
+    "DETAILS": {
+     "terminal": false,
+     "declared": {
+      "booking_token": "string",
+      "date": "string",
+      "location_summary": "string",
+      "time": "string",
+      "vehicle_summary": "string"
+     },
+     "rendered": [
+      "booking_token",
+      "date",
+      "location_summary",
+      "time",
+      "vehicle_summary"
+     ],
+     "carried": [],
+     "components": [
+      {
+       "path": "layout",
+       "type": "SingleColumnLayout"
+      },
+      {
+       "path": "layout/children[0]",
+       "type": "TextBody",
+       "text": "Completá los datos necesarios para coordinar la revisión."
+      },
+      {
+       "path": "layout/children[1]",
+       "type": "Form",
+       "name": "details_form"
+      },
+      {
+       "path": "layout/children[1]/children[0]",
+       "type": "TextInput",
+       "name": "name",
+       "label": "Nombre y apellido",
+       "required": true
+      },
+      {
+       "path": "layout/children[1]/children[1]",
+       "type": "TextInput",
+       "name": "phone",
+       "label": "Teléfono",
+       "required": true
+      },
+      {
+       "path": "layout/children[1]/children[2]",
+       "type": "TextInput",
+       "name": "email",
+       "label": "Email",
+       "required": false
+      },
+      {
+       "path": "layout/children[1]/children[3]",
+       "type": "TextInput",
+       "name": "inspection_address",
+       "label": "Dirección exacta donde está el vehículo",
+       "required": true
+      },
+      {
+       "path": "layout/children[1]/children[4]",
+       "type": "TextInput",
+       "name": "seller_name",
+       "label": "Nombre del vendedor",
+       "required": false
+      },
+      {
+       "path": "layout/children[1]/children[5]",
+       "type": "TextInput",
+       "name": "seller_phone",
+       "label": "Teléfono del vendedor",
+       "required": false
+      },
+      {
+       "path": "layout/children[1]/children[6]",
+       "type": "TextInput",
+       "name": "listing_url",
+       "label": "Link de la publicación",
+       "required": false
+      },
+      {
+       "path": "layout/children[1]/children[7]",
+       "type": "Footer",
+       "label": "Revisar turno",
+       "action": {
+        "name": "data_exchange",
+        "next": null,
+        "payload": {
+         "booking_token": "${data.booking_token}",
+         "date": "${data.date}",
+         "email": "${form.email}",
+         "inspection_address": "${form.inspection_address}",
+         "listing_url": "${form.listing_url}",
+         "location_summary": "${data.location_summary}",
+         "name": "${form.name}",
+         "phone": "${form.phone}",
+         "seller_name": "${form.seller_name}",
+         "seller_phone": "${form.seller_phone}",
+         "time": "${data.time}",
+         "trigger": "prepare_summary",
+         "vehicle_summary": "${data.vehicle_summary}"
+        }
+       }
+      }
+     ],
+     "visibility": {},
+     "actions": {
+      "Footer:-:Revisar turno": {
+       "name": "data_exchange",
+       "next": null,
+       "payload": {
+        "booking_token": "${data.booking_token}",
+        "date": "${data.date}",
+        "email": "${form.email}",
+        "inspection_address": "${form.inspection_address}",
+        "listing_url": "${form.listing_url}",
+        "location_summary": "${data.location_summary}",
+        "name": "${form.name}",
+        "phone": "${form.phone}",
+        "seller_name": "${form.seller_name}",
+        "seller_phone": "${form.seller_phone}",
+        "time": "${data.time}",
+        "trigger": "prepare_summary",
+        "vehicle_summary": "${data.vehicle_summary}"
+       }
+      }
+     }
+    },
+    "SUMMARY": {
+     "terminal": true,
+     "declared": {
+      "appointment_summary": "string",
+      "booking_token": "string",
+      "customer_summary": "string",
+      "date": "string",
+      "email": "string",
+      "inspection_address": "string",
+      "listing_url": "string",
+      "name": "string",
+      "phone": "string",
+      "seller_name": "string",
+      "seller_phone": "string",
+      "time": "string"
+     },
+     "rendered": [
+      "appointment_summary",
+      "booking_token",
+      "customer_summary",
+      "date",
+      "email",
+      "inspection_address",
+      "listing_url",
+      "name",
+      "phone",
+      "seller_name",
+      "seller_phone",
+      "time"
+     ],
+     "carried": [],
+     "components": [
+      {
+       "path": "layout",
+       "type": "SingleColumnLayout"
+      },
+      {
+       "path": "layout/children[0]",
+       "type": "TextHeading",
+       "text": "Turno solicitado"
+      },
+      {
+       "path": "layout/children[1]",
+       "type": "TextBody",
+       "text": "${data.appointment_summary}"
+      },
+      {
+       "path": "layout/children[2]",
+       "type": "TextHeading",
+       "text": "Datos de coordinación"
+      },
+      {
+       "path": "layout/children[3]",
+       "type": "TextBody",
+       "text": "${data.customer_summary}"
+      },
+      {
+       "path": "layout/children[4]",
+       "type": "TextCaption",
+       "text": "El horario se valida nuevamente al confirmar para evitar superposiciones."
+      },
+      {
+       "path": "layout/children[5]",
+       "type": "Footer",
+       "label": "Solicitar turno",
+       "action": {
+        "name": "data_exchange",
+        "next": null,
+        "payload": {
+         "booking_token": "${data.booking_token}",
+         "date": "${data.date}",
+         "email": "${data.email}",
+         "inspection_address": "${data.inspection_address}",
+         "listing_url": "${data.listing_url}",
+         "name": "${data.name}",
+         "phone": "${data.phone}",
+         "seller_name": "${data.seller_name}",
+         "seller_phone": "${data.seller_phone}",
+         "time": "${data.time}",
+         "trigger": "confirm_booking"
+        }
+       }
+      }
+     ],
+     "visibility": {},
+     "actions": {
+      "Footer:-:Solicitar turno": {
+       "name": "data_exchange",
+       "next": null,
+       "payload": {
+        "booking_token": "${data.booking_token}",
+        "date": "${data.date}",
+        "email": "${data.email}",
+        "inspection_address": "${data.inspection_address}",
+        "listing_url": "${data.listing_url}",
+        "name": "${data.name}",
+        "phone": "${data.phone}",
+        "seller_name": "${data.seller_name}",
+        "seller_phone": "${data.seller_phone}",
+        "time": "${data.time}",
+        "trigger": "confirm_booking"
+       }
+      }
+     }
+    }
+   }
+  }
+ },
+ "variants": [
+  {
+   "path": "meta/flows/booking/TARGET_v7.6-minimal-refusal.json",
+   "sha256": "a25de8f43f5ada03650541cd84fa42cb4a2a5b2d772d89ac520afcd3219c43b4",
+   "model": {
+    "version": "7.3",
+    "data_api_version": "3.0",
+    "routing_model": {
+     "APPOINTMENT": [
+      "DETAILS"
+     ],
+     "DETAILS": [
+      "SUMMARY",
+      "APPOINTMENT"
+     ],
+     "SUMMARY": [
+      "APPOINTMENT"
+     ]
+    },
+    "screens": {
+     "APPOINTMENT": {
+      "terminal": false,
+      "declared": {
+       "booking_token": "string",
+       "date": "array",
+       "error_message": "string",
+       "has_error": "boolean",
+       "has_refusal": "boolean",
+       "is_date_enabled": "boolean",
+       "is_time_enabled": "boolean",
+       "location_summary": "string",
+       "slot_conflict_message": "string",
+       "time": "array",
+       "vehicle_summary": "string"
+      },
+      "rendered": [
+       "booking_token",
+       "date",
+       "error_message",
+       "has_error",
+       "has_refusal",
+       "is_date_enabled",
+       "is_time_enabled",
+       "location_summary",
+       "slot_conflict_message",
+       "time",
+       "vehicle_summary"
+      ],
+      "carried": [],
+      "components": [
+       {
+        "path": "layout",
+        "type": "SingleColumnLayout"
+       },
+       {
+        "path": "layout/children[0]",
+        "type": "TextHeading",
+        "text": "Reservá tu revisión"
+       },
+       {
+        "path": "layout/children[1]",
+        "type": "TextBody",
+        "text": "${data.slot_conflict_message}",
+        "visible": "${data.has_refusal}"
+       },
+       {
+        "path": "layout/children[2]",
+        "type": "TextBody",
+        "text": "${data.error_message}",
+        "visible": "${data.has_error}"
+       },
+       {
+        "path": "layout/children[3]",
+        "type": "TextBody",
+        "text": "${data.vehicle_summary}"
+       },
+       {
+        "path": "layout/children[4]",
+        "type": "TextBody",
+        "text": "${data.location_summary}"
+       },
+       {
+        "path": "layout/children[5]",
+        "type": "Form",
+        "name": "appointment_form"
+       },
+       {
+        "path": "layout/children[5]/children[0]",
+        "type": "Dropdown",
+        "name": "date",
+        "label": "Día",
+        "enabled": "${data.is_date_enabled}",
+        "required": "${data.is_date_enabled}",
+        "data-source": "${data.date}",
+        "action": {
+         "name": "data_exchange",
+         "next": null,
+         "payload": {
+          "booking_token": "${data.booking_token}",
+          "date": "${form.date}",
+          "trigger": "date_selected"
+         }
+        }
+       },
+       {
+        "path": "layout/children[5]/children[1]",
+        "type": "Dropdown",
+        "name": "time",
+        "label": "Horario",
+        "enabled": "${data.is_time_enabled}",
+        "required": "${data.is_time_enabled}",
+        "data-source": "${data.time}"
+       },
+       {
+        "path": "layout/children[5]/children[2]",
+        "type": "Footer",
+        "label": "Continuar",
+        "action": {
+         "name": "navigate",
+         "next": "DETAILS",
+         "payload": {
+          "booking_token": "${data.booking_token}",
+          "date": "${form.date}",
+          "location_summary": "${data.location_summary}",
+          "time": "${form.time}",
+          "vehicle_summary": "${data.vehicle_summary}"
+         }
+        }
+       }
+      ],
+      "visibility": {
+       "layout/children[1]": "${data.has_refusal}",
+       "layout/children[2]": "${data.has_error}"
+      },
+      "actions": {
+       "Dropdown:date:Día": {
+        "name": "data_exchange",
+        "next": null,
+        "payload": {
+         "booking_token": "${data.booking_token}",
+         "date": "${form.date}",
+         "trigger": "date_selected"
+        }
+       },
+       "Footer:-:Continuar": {
+        "name": "navigate",
+        "next": "DETAILS",
+        "payload": {
+         "booking_token": "${data.booking_token}",
+         "date": "${form.date}",
+         "location_summary": "${data.location_summary}",
+         "time": "${form.time}",
+         "vehicle_summary": "${data.vehicle_summary}"
+        }
+       }
+      }
+     },
+     "DETAILS": {
+      "terminal": false,
+      "declared": {
+       "booking_token": "string",
+       "date": "string",
+       "location_summary": "string",
+       "time": "string",
+       "vehicle_summary": "string"
+      },
+      "rendered": [
+       "booking_token",
+       "date",
+       "location_summary",
+       "time",
+       "vehicle_summary"
+      ],
+      "carried": [],
+      "components": [
+       {
+        "path": "layout",
+        "type": "SingleColumnLayout"
+       },
+       {
+        "path": "layout/children[0]",
+        "type": "TextBody",
+        "text": "Completá los datos necesarios para coordinar la revisión."
+       },
+       {
+        "path": "layout/children[1]",
+        "type": "Form",
+        "name": "details_form"
+       },
+       {
+        "path": "layout/children[1]/children[0]",
+        "type": "TextInput",
+        "name": "name",
+        "label": "Nombre y apellido",
+        "required": true
+       },
+       {
+        "path": "layout/children[1]/children[1]",
+        "type": "TextInput",
+        "name": "phone",
+        "label": "Teléfono",
+        "required": true
+       },
+       {
+        "path": "layout/children[1]/children[2]",
+        "type": "TextInput",
+        "name": "email",
+        "label": "Email",
+        "required": false
+       },
+       {
+        "path": "layout/children[1]/children[3]",
+        "type": "TextInput",
+        "name": "inspection_address",
+        "label": "Dirección exacta donde está el vehículo",
+        "required": true
+       },
+       {
+        "path": "layout/children[1]/children[4]",
+        "type": "TextInput",
+        "name": "seller_name",
+        "label": "Nombre del vendedor",
+        "required": false
+       },
+       {
+        "path": "layout/children[1]/children[5]",
+        "type": "TextInput",
+        "name": "seller_phone",
+        "label": "Teléfono del vendedor",
+        "required": false
+       },
+       {
+        "path": "layout/children[1]/children[6]",
+        "type": "TextInput",
+        "name": "listing_url",
+        "label": "Link de la publicación",
+        "required": false
+       },
+       {
+        "path": "layout/children[1]/children[7]",
+        "type": "Footer",
+        "label": "Revisar turno",
+        "action": {
+         "name": "data_exchange",
+         "next": null,
+         "payload": {
+          "booking_token": "${data.booking_token}",
+          "date": "${data.date}",
+          "email": "${form.email}",
+          "inspection_address": "${form.inspection_address}",
+          "listing_url": "${form.listing_url}",
+          "location_summary": "${data.location_summary}",
+          "name": "${form.name}",
+          "phone": "${form.phone}",
+          "seller_name": "${form.seller_name}",
+          "seller_phone": "${form.seller_phone}",
+          "time": "${data.time}",
+          "trigger": "prepare_summary",
+          "vehicle_summary": "${data.vehicle_summary}"
+         }
+        }
+       }
+      ],
+      "visibility": {},
+      "actions": {
+       "Footer:-:Revisar turno": {
+        "name": "data_exchange",
+        "next": null,
+        "payload": {
+         "booking_token": "${data.booking_token}",
+         "date": "${data.date}",
+         "email": "${form.email}",
+         "inspection_address": "${form.inspection_address}",
+         "listing_url": "${form.listing_url}",
+         "location_summary": "${data.location_summary}",
+         "name": "${form.name}",
+         "phone": "${form.phone}",
+         "seller_name": "${form.seller_name}",
+         "seller_phone": "${form.seller_phone}",
+         "time": "${data.time}",
+         "trigger": "prepare_summary",
+         "vehicle_summary": "${data.vehicle_summary}"
+        }
+       }
+      }
+     },
+     "SUMMARY": {
+      "terminal": true,
+      "declared": {
+       "appointment_summary": "string",
+       "booking_token": "string",
+       "customer_summary": "string",
+       "date": "string",
+       "email": "string",
+       "inspection_address": "string",
+       "listing_url": "string",
+       "name": "string",
+       "phone": "string",
+       "seller_name": "string",
+       "seller_phone": "string",
+       "time": "string"
+      },
+      "rendered": [
+       "appointment_summary",
+       "booking_token",
+       "customer_summary",
+       "date",
+       "email",
+       "inspection_address",
+       "listing_url",
+       "name",
+       "phone",
+       "seller_name",
+       "seller_phone",
+       "time"
+      ],
+      "carried": [],
+      "components": [
+       {
+        "path": "layout",
+        "type": "SingleColumnLayout"
+       },
+       {
+        "path": "layout/children[0]",
+        "type": "TextHeading",
+        "text": "Turno solicitado"
+       },
+       {
+        "path": "layout/children[1]",
+        "type": "TextBody",
+        "text": "${data.appointment_summary}"
+       },
+       {
+        "path": "layout/children[2]",
+        "type": "TextHeading",
+        "text": "Datos de coordinación"
+       },
+       {
+        "path": "layout/children[3]",
+        "type": "TextBody",
+        "text": "${data.customer_summary}"
+       },
+       {
+        "path": "layout/children[4]",
+        "type": "TextCaption",
+        "text": "El horario se valida nuevamente al confirmar para evitar superposiciones."
+       },
+       {
+        "path": "layout/children[5]",
+        "type": "Footer",
+        "label": "Solicitar turno",
+        "action": {
+         "name": "data_exchange",
+         "next": null,
+         "payload": {
+          "booking_token": "${data.booking_token}",
+          "date": "${data.date}",
+          "email": "${data.email}",
+          "inspection_address": "${data.inspection_address}",
+          "listing_url": "${data.listing_url}",
+          "name": "${data.name}",
+          "phone": "${data.phone}",
+          "seller_name": "${data.seller_name}",
+          "seller_phone": "${data.seller_phone}",
+          "time": "${data.time}",
+          "trigger": "confirm_booking"
+         }
+        }
+       }
+      ],
+      "visibility": {},
+      "actions": {
+       "Footer:-:Solicitar turno": {
+        "name": "data_exchange",
+        "next": null,
+        "payload": {
+         "booking_token": "${data.booking_token}",
+         "date": "${data.date}",
+         "email": "${data.email}",
+         "inspection_address": "${data.inspection_address}",
+         "listing_url": "${data.listing_url}",
+         "name": "${data.name}",
+         "phone": "${data.phone}",
+         "seller_name": "${data.seller_name}",
+         "seller_phone": "${data.seller_phone}",
+         "time": "${data.time}",
+         "trigger": "confirm_booking"
+        }
+       }
+      }
+     }
+    }
+   },
+   "delta_from_published": {
+    "routing_model": {
+     "DETAILS": {
+      "published": [
+       "SUMMARY"
+      ],
+      "variant": [
+       "SUMMARY",
+       "APPOINTMENT"
+      ]
+     },
+     "SUMMARY": {
+      "published": [],
+      "variant": [
+       "APPOINTMENT"
+      ]
+     }
+    },
+    "screens": {
+     "APPOINTMENT": {
+      "fields_added": [
+       "error_message",
+       "has_error",
+       "has_refusal",
+       "slot_conflict_message"
+      ],
+      "components_added": [
+       {
+        "text": "${data.slot_conflict_message}",
+        "type": "TextBody",
+        "visible": "${data.has_refusal}"
+       },
+       {
+        "text": "${data.error_message}",
+        "type": "TextBody",
+        "visible": "${data.has_error}"
+       }
+      ],
+      "visibility_changed": {
+       "published": {},
+       "variant": {
+        "layout/children[1]": "${data.has_refusal}",
+        "layout/children[2]": "${data.has_error}"
+       }
+      },
+      "classification": {
+       "booking_token": "RENDERED",
+       "date": "RENDERED",
+       "error_message": "RENDERED",
+       "has_error": "RENDERED",
+       "has_refusal": "RENDERED",
+       "is_date_enabled": "RENDERED",
+       "is_time_enabled": "RENDERED",
+       "location_summary": "RENDERED",
+       "slot_conflict_message": "RENDERED",
+       "time": "RENDERED",
+       "vehicle_summary": "RENDERED"
+      }
+     },
+     "DETAILS": {
+      "classification": {
+       "booking_token": "RENDERED",
+       "date": "RENDERED",
+       "location_summary": "RENDERED",
+       "time": "RENDERED",
+       "vehicle_summary": "RENDERED"
+      }
+     },
+     "SUMMARY": {
+      "classification": {
+       "appointment_summary": "RENDERED",
+       "booking_token": "RENDERED",
+       "customer_summary": "RENDERED",
+       "date": "RENDERED",
+       "email": "RENDERED",
+       "inspection_address": "RENDERED",
+       "listing_url": "RENDERED",
+       "name": "RENDERED",
+       "phone": "RENDERED",
+       "seller_name": "RENDERED",
+       "seller_phone": "RENDERED",
+       "time": "RENDERED"
+      }
+     }
+    }
+   }
+  },
+  {
+   "path": "meta/flows/booking/CANDIDATE_v7.4-prefill-r3.json",
+   "sha256": "53a3d88f3dd57c9bf3089c97c9edfe83bc907afc428e7ef19e3c1538efb1bc04",
+   "model": {
+    "version": "7.3",
+    "data_api_version": "3.0",
+    "routing_model": {
+     "APPOINTMENT": [
+      "DETAILS"
+     ],
+     "DETAILS": [
+      "SUMMARY"
+     ],
+     "SUMMARY": []
+    },
+    "screens": {
+     "APPOINTMENT": {
+      "terminal": false,
+      "declared": {
+       "booking_token": "string",
+       "contact_phone": "string",
+       "contact_phone_display": "string",
+       "customer_name": "string",
+       "date": "array",
+       "is_date_enabled": "boolean",
+       "is_time_enabled": "boolean",
+       "location_summary": "string",
+       "selected_date": "string",
+       "selected_time": "string",
+       "time": "array",
+       "vehicle_summary": "string"
+      },
+      "rendered": [
+       "booking_token",
+       "contact_phone",
+       "contact_phone_display",
+       "customer_name",
+       "date",
+       "is_date_enabled",
+       "is_time_enabled",
+       "location_summary",
+       "time",
+       "vehicle_summary"
+      ],
+      "carried": [
+       "selected_date",
+       "selected_time"
+      ],
+      "components": [
+       {
+        "path": "layout",
+        "type": "SingleColumnLayout"
+       },
+       {
+        "path": "layout/children[0]",
+        "type": "TextHeading",
+        "text": "Reservá tu revisión"
+       },
+       {
+        "path": "layout/children[1]",
+        "type": "TextBody",
+        "text": "${data.vehicle_summary}"
+       },
+       {
+        "path": "layout/children[2]",
+        "type": "TextBody",
+        "text": "${data.location_summary}"
+       },
+       {
+        "path": "layout/children[3]",
+        "type": "Form",
+        "name": "appointment_form"
+       },
+       {
+        "path": "layout/children[3]/children[0]",
+        "type": "Dropdown",
+        "name": "date",
+        "label": "Día",
+        "enabled": "${data.is_date_enabled}",
+        "required": "${data.is_date_enabled}",
+        "data-source": "${data.date}",
+        "action": {
+         "name": "data_exchange",
+         "next": null,
+         "payload": {
+          "booking_token": "${data.booking_token}",
+          "date": "${form.date}",
+          "trigger": "date_selected"
+         }
+        }
+       },
+       {
+        "path": "layout/children[3]/children[1]",
+        "type": "Dropdown",
+        "name": "time",
+        "label": "Horario",
+        "enabled": "${data.is_time_enabled}",
+        "required": "${data.is_time_enabled}",
+        "data-source": "${data.time}"
+       },
+       {
+        "path": "layout/children[3]/children[2]",
+        "type": "Footer",
+        "label": "Continuar",
+        "action": {
+         "name": "navigate",
+         "next": "DETAILS",
+         "payload": {
+          "booking_token": "${data.booking_token}",
+          "contact_phone": "${data.contact_phone}",
+          "contact_phone_display": "${data.contact_phone_display}",
+          "customer_name": "${data.customer_name}",
+          "date": "${form.date}",
+          "location_summary": "${data.location_summary}",
+          "time": "${form.time}",
+          "vehicle_summary": "${data.vehicle_summary}"
+         }
+        }
+       }
+      ],
+      "visibility": {},
+      "actions": {
+       "Dropdown:date:Día": {
+        "name": "data_exchange",
+        "next": null,
+        "payload": {
+         "booking_token": "${data.booking_token}",
+         "date": "${form.date}",
+         "trigger": "date_selected"
+        }
+       },
+       "Footer:-:Continuar": {
+        "name": "navigate",
+        "next": "DETAILS",
+        "payload": {
+         "booking_token": "${data.booking_token}",
+         "contact_phone": "${data.contact_phone}",
+         "contact_phone_display": "${data.contact_phone_display}",
+         "customer_name": "${data.customer_name}",
+         "date": "${form.date}",
+         "location_summary": "${data.location_summary}",
+         "time": "${form.time}",
+         "vehicle_summary": "${data.vehicle_summary}"
+        }
+       }
+      }
+     },
+     "DETAILS": {
+      "terminal": false,
+      "declared": {
+       "booking_token": "string",
+       "contact_phone": "string",
+       "contact_phone_display": "string",
+       "customer_name": "string",
+       "date": "string",
+       "location_summary": "string",
+       "time": "string",
+       "vehicle_summary": "string"
+      },
+      "rendered": [
+       "booking_token",
+       "contact_phone",
+       "contact_phone_display",
+       "date",
+       "location_summary",
+       "time",
+       "vehicle_summary"
+      ],
+      "carried": [
+       "customer_name"
+      ],
+      "components": [
+       {
+        "path": "layout",
+        "type": "SingleColumnLayout"
+       },
+       {
+        "path": "layout/children[0]",
+        "type": "TextBody",
+        "text": "Completá los datos necesarios para coordinar la revisión."
+       },
+       {
+        "path": "layout/children[1]",
+        "type": "TextCaption",
+        "text": "Te contactamos a este WhatsApp:"
+       },
+       {
+        "path": "layout/children[2]",
+        "type": "TextBody",
+        "text": "${data.contact_phone_display}"
+       },
+       {
+        "path": "layout/children[3]",
+        "type": "Form",
+        "name": "details_form"
+       },
+       {
+        "path": "layout/children[3]/children[0]",
+        "type": "TextInput",
+        "name": "name",
+        "label": "Nombre y apellido",
+        "required": true
+       },
+       {
+        "path": "layout/children[3]/children[1]",
+        "type": "TextInput",
+        "name": "email",
+        "label": "Email",
+        "required": false
+       },
+       {
+        "path": "layout/children[3]/children[2]",
+        "type": "TextInput",
+        "name": "inspection_address",
+        "label": "Dirección exacta donde está el vehículo",
+        "required": true
+       },
+       {
+        "path": "layout/children[3]/children[3]",
+        "type": "TextInput",
+        "name": "seller_name",
+        "label": "Nombre del vendedor",
+        "required": false
+       },
+       {
+        "path": "layout/children[3]/children[4]",
+        "type": "TextInput",
+        "name": "seller_phone",
+        "label": "Teléfono del vendedor",
+        "required": false
+       },
+       {
+        "path": "layout/children[3]/children[5]",
+        "type": "TextInput",
+        "name": "listing_url",
+        "label": "Link de la publicación",
+        "required": false
+       },
+       {
+        "path": "layout/children[3]/children[6]",
+        "type": "Footer",
+        "label": "Revisar turno",
+        "action": {
+         "name": "data_exchange",
+         "next": null,
+         "payload": {
+          "booking_token": "${data.booking_token}",
+          "date": "${data.date}",
+          "email": "${form.email}",
+          "inspection_address": "${form.inspection_address}",
+          "listing_url": "${form.listing_url}",
+          "location_summary": "${data.location_summary}",
+          "name": "${form.name}",
+          "phone": "${data.contact_phone}",
+          "seller_name": "${form.seller_name}",
+          "seller_phone": "${form.seller_phone}",
+          "time": "${data.time}",
+          "trigger": "prepare_summary",
+          "vehicle_summary": "${data.vehicle_summary}"
+         }
+        }
+       }
+      ],
+      "visibility": {},
+      "actions": {
+       "Footer:-:Revisar turno": {
+        "name": "data_exchange",
+        "next": null,
+        "payload": {
+         "booking_token": "${data.booking_token}",
+         "date": "${data.date}",
+         "email": "${form.email}",
+         "inspection_address": "${form.inspection_address}",
+         "listing_url": "${form.listing_url}",
+         "location_summary": "${data.location_summary}",
+         "name": "${form.name}",
+         "phone": "${data.contact_phone}",
+         "seller_name": "${form.seller_name}",
+         "seller_phone": "${form.seller_phone}",
+         "time": "${data.time}",
+         "trigger": "prepare_summary",
+         "vehicle_summary": "${data.vehicle_summary}"
+        }
+       }
+      }
+     },
+     "SUMMARY": {
+      "terminal": true,
+      "declared": {
+       "appointment_summary": "string",
+       "booking_token": "string",
+       "customer_summary": "string",
+       "date": "string",
+       "email": "string",
+       "inspection_address": "string",
+       "listing_url": "string",
+       "name": "string",
+       "phone": "string",
+       "seller_name": "string",
+       "seller_phone": "string",
+       "time": "string"
+      },
+      "rendered": [
+       "appointment_summary",
+       "booking_token",
+       "customer_summary",
+       "date",
+       "email",
+       "inspection_address",
+       "listing_url",
+       "name",
+       "phone",
+       "seller_name",
+       "seller_phone",
+       "time"
+      ],
+      "carried": [],
+      "components": [
+       {
+        "path": "layout",
+        "type": "SingleColumnLayout"
+       },
+       {
+        "path": "layout/children[0]",
+        "type": "TextHeading",
+        "text": "Turno solicitado"
+       },
+       {
+        "path": "layout/children[1]",
+        "type": "TextBody",
+        "text": "${data.appointment_summary}"
+       },
+       {
+        "path": "layout/children[2]",
+        "type": "TextHeading",
+        "text": "Datos de coordinación"
+       },
+       {
+        "path": "layout/children[3]",
+        "type": "TextBody",
+        "text": "${data.customer_summary}"
+       },
+       {
+        "path": "layout/children[4]",
+        "type": "TextCaption",
+        "text": "El horario se valida nuevamente al confirmar para evitar superposiciones."
+       },
+       {
+        "path": "layout/children[5]",
+        "type": "Footer",
+        "label": "Solicitar turno",
+        "action": {
+         "name": "data_exchange",
+         "next": null,
+         "payload": {
+          "booking_token": "${data.booking_token}",
+          "date": "${data.date}",
+          "email": "${data.email}",
+          "inspection_address": "${data.inspection_address}",
+          "listing_url": "${data.listing_url}",
+          "name": "${data.name}",
+          "phone": "${data.phone}",
+          "seller_name": "${data.seller_name}",
+          "seller_phone": "${data.seller_phone}",
+          "time": "${data.time}",
+          "trigger": "confirm_booking"
+         }
+        }
+       }
+      ],
+      "visibility": {},
+      "actions": {
+       "Footer:-:Solicitar turno": {
+        "name": "data_exchange",
+        "next": null,
+        "payload": {
+         "booking_token": "${data.booking_token}",
+         "date": "${data.date}",
+         "email": "${data.email}",
+         "inspection_address": "${data.inspection_address}",
+         "listing_url": "${data.listing_url}",
+         "name": "${data.name}",
+         "phone": "${data.phone}",
+         "seller_name": "${data.seller_name}",
+         "seller_phone": "${data.seller_phone}",
+         "time": "${data.time}",
+         "trigger": "confirm_booking"
+        }
+       }
+      }
+     }
+    }
+   },
+   "delta_from_published": {
+    "routing_model": {},
+    "screens": {
+     "APPOINTMENT": {
+      "fields_added": [
+       "contact_phone",
+       "contact_phone_display",
+       "customer_name",
+       "selected_date",
+       "selected_time"
+      ],
+      "components_added": [
+       {
+        "action": {
+         "name": "navigate",
+         "next": "DETAILS",
+         "payload": {
+          "booking_token": "${data.booking_token}",
+          "contact_phone": "${data.contact_phone}",
+          "contact_phone_display": "${data.contact_phone_display}",
+          "customer_name": "${data.customer_name}",
+          "date": "${form.date}",
+          "location_summary": "${data.location_summary}",
+          "time": "${form.time}",
+          "vehicle_summary": "${data.vehicle_summary}"
+         }
+        },
+        "label": "Continuar",
+        "type": "Footer"
+       }
+      ],
+      "components_removed": [
+       {
+        "action": {
+         "name": "navigate",
+         "next": "DETAILS",
+         "payload": {
+          "booking_token": "${data.booking_token}",
+          "date": "${form.date}",
+          "location_summary": "${data.location_summary}",
+          "time": "${form.time}",
+          "vehicle_summary": "${data.vehicle_summary}"
+         }
+        },
+        "label": "Continuar",
+        "type": "Footer"
+       }
+      ],
+      "actions_changed": {
+       "published": {
+        "Dropdown:date:Día": {
+         "name": "data_exchange",
+         "next": null,
+         "payload": {
+          "booking_token": "${data.booking_token}",
+          "date": "${form.date}",
+          "trigger": "date_selected"
+         }
+        },
+        "Footer:-:Continuar": {
+         "name": "navigate",
+         "next": "DETAILS",
+         "payload": {
+          "booking_token": "${data.booking_token}",
+          "date": "${form.date}",
+          "location_summary": "${data.location_summary}",
+          "time": "${form.time}",
+          "vehicle_summary": "${data.vehicle_summary}"
+         }
+        }
+       },
+       "variant": {
+        "Dropdown:date:Día": {
+         "name": "data_exchange",
+         "next": null,
+         "payload": {
+          "booking_token": "${data.booking_token}",
+          "date": "${form.date}",
+          "trigger": "date_selected"
+         }
+        },
+        "Footer:-:Continuar": {
+         "name": "navigate",
+         "next": "DETAILS",
+         "payload": {
+          "booking_token": "${data.booking_token}",
+          "contact_phone": "${data.contact_phone}",
+          "contact_phone_display": "${data.contact_phone_display}",
+          "customer_name": "${data.customer_name}",
+          "date": "${form.date}",
+          "location_summary": "${data.location_summary}",
+          "time": "${form.time}",
+          "vehicle_summary": "${data.vehicle_summary}"
+         }
+        }
+       }
+      },
+      "classification": {
+       "booking_token": "RENDERED",
+       "contact_phone": "RENDERED",
+       "contact_phone_display": "RENDERED",
+       "customer_name": "RENDERED",
+       "date": "RENDERED",
+       "is_date_enabled": "RENDERED",
+       "is_time_enabled": "RENDERED",
+       "location_summary": "RENDERED",
+       "time": "RENDERED",
+       "vehicle_summary": "RENDERED",
+       "selected_date": "CARRIED (declared, bound nowhere)",
+       "selected_time": "CARRIED (declared, bound nowhere)"
+      }
+     },
+     "DETAILS": {
+      "fields_added": [
+       "contact_phone",
+       "contact_phone_display",
+       "customer_name"
+      ],
+      "components_added": [
+       {
+        "text": "Te contactamos a este WhatsApp:",
+        "type": "TextCaption"
+       },
+       {
+        "text": "${data.contact_phone_display}",
+        "type": "TextBody"
+       },
+       {
+        "action": {
+         "name": "data_exchange",
+         "next": null,
+         "payload": {
+          "booking_token": "${data.booking_token}",
+          "date": "${data.date}",
+          "email": "${form.email}",
+          "inspection_address": "${form.inspection_address}",
+          "listing_url": "${form.listing_url}",
+          "location_summary": "${data.location_summary}",
+          "name": "${form.name}",
+          "phone": "${data.contact_phone}",
+          "seller_name": "${form.seller_name}",
+          "seller_phone": "${form.seller_phone}",
+          "time": "${data.time}",
+          "trigger": "prepare_summary",
+          "vehicle_summary": "${data.vehicle_summary}"
+         }
+        },
+        "label": "Revisar turno",
+        "type": "Footer"
+       }
+      ],
+      "components_removed": [
+       {
+        "label": "Teléfono",
+        "name": "phone",
+        "required": true,
+        "type": "TextInput"
+       },
+       {
+        "action": {
+         "name": "data_exchange",
+         "next": null,
+         "payload": {
+          "booking_token": "${data.booking_token}",
+          "date": "${data.date}",
+          "email": "${form.email}",
+          "inspection_address": "${form.inspection_address}",
+          "listing_url": "${form.listing_url}",
+          "location_summary": "${data.location_summary}",
+          "name": "${form.name}",
+          "phone": "${form.phone}",
+          "seller_name": "${form.seller_name}",
+          "seller_phone": "${form.seller_phone}",
+          "time": "${data.time}",
+          "trigger": "prepare_summary",
+          "vehicle_summary": "${data.vehicle_summary}"
+         }
+        },
+        "label": "Revisar turno",
+        "type": "Footer"
+       }
+      ],
+      "actions_changed": {
+       "published": {
+        "Footer:-:Revisar turno": {
+         "name": "data_exchange",
+         "next": null,
+         "payload": {
+          "booking_token": "${data.booking_token}",
+          "date": "${data.date}",
+          "email": "${form.email}",
+          "inspection_address": "${form.inspection_address}",
+          "listing_url": "${form.listing_url}",
+          "location_summary": "${data.location_summary}",
+          "name": "${form.name}",
+          "phone": "${form.phone}",
+          "seller_name": "${form.seller_name}",
+          "seller_phone": "${form.seller_phone}",
+          "time": "${data.time}",
+          "trigger": "prepare_summary",
+          "vehicle_summary": "${data.vehicle_summary}"
+         }
+        }
+       },
+       "variant": {
+        "Footer:-:Revisar turno": {
+         "name": "data_exchange",
+         "next": null,
+         "payload": {
+          "booking_token": "${data.booking_token}",
+          "date": "${data.date}",
+          "email": "${form.email}",
+          "inspection_address": "${form.inspection_address}",
+          "listing_url": "${form.listing_url}",
+          "location_summary": "${data.location_summary}",
+          "name": "${form.name}",
+          "phone": "${data.contact_phone}",
+          "seller_name": "${form.seller_name}",
+          "seller_phone": "${form.seller_phone}",
+          "time": "${data.time}",
+          "trigger": "prepare_summary",
+          "vehicle_summary": "${data.vehicle_summary}"
+         }
+        }
+       }
+      },
+      "classification": {
+       "booking_token": "RENDERED",
+       "contact_phone": "RENDERED",
+       "contact_phone_display": "RENDERED",
+       "date": "RENDERED",
+       "location_summary": "RENDERED",
+       "time": "RENDERED",
+       "vehicle_summary": "RENDERED",
+       "customer_name": "CARRIED (declared, bound nowhere)"
+      }
+     },
+     "SUMMARY": {
+      "classification": {
+       "appointment_summary": "RENDERED",
+       "booking_token": "RENDERED",
+       "customer_summary": "RENDERED",
+       "date": "RENDERED",
+       "email": "RENDERED",
+       "inspection_address": "RENDERED",
+       "listing_url": "RENDERED",
+       "name": "RENDERED",
+       "phone": "RENDERED",
+       "seller_name": "RENDERED",
+       "seller_phone": "RENDERED",
+       "time": "RENDERED"
+      }
+     }
+    }
+   }
+  }
+ ]
+}

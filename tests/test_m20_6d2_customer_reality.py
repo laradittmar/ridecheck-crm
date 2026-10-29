@@ -227,6 +227,10 @@ def _make_settings(vehicle_flow_id: str = "FAKE_VEH_FLOW",
     s.whatsapp_location_fallback_flow_id = location_flow_id
     s.whatsapp_website_flow_id = ""
     s.resend_api_key = ""
+    # WILD1-F1: dispatching the booking Flow is gated on SMART_BOOKING_CE_ENABLED, and a
+    # bare MagicMock reads as OFF under the gate's `is True` test. RC32/33/34 assert that
+    # an available time DOES open the booking Flow, so the fixture must permit dispatch.
+    s.smart_booking_ce_enabled = True
     return s
 
 

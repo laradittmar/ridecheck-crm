@@ -113,6 +113,12 @@ def _make_engine(flow_id="whatsapp-flow-999"):
     db.commit = lambda: None
     settings = MagicMock()
     settings.openai_api_key = "sk-fake"
+    # WILD1-F1: dispatching the booking Flow is now gated on
+    # SMART_BOOKING_CE_ENABLED. These tests assert that a valid slot DOES dispatch,
+    # so the fixture must say it wants dispatch. A bare MagicMock answers the gate's
+    # `is True` test with a MagicMock, which reads as OFF — the engine would refuse
+    # and the tests would be asserting the refusal path by accident.
+    settings.smart_booking_ce_enabled = True
     settings.openai_model = "gpt-4o-mini"
     settings.backend_url = "http://localhost:8000"
     settings.whatsapp_flow_id = flow_id

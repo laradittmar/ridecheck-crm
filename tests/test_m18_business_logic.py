@@ -100,6 +100,12 @@ def _make_engine(repo=None):
 
     settings = MagicMock()
     settings.openai_api_key = "sk-fake"
+    # WILD1-F1: dispatching the booking Flow is gated on SMART_BOOKING_CE_ENABLED.
+    # A bare MagicMock answers the gate's `is True` test with a MagicMock, which reads
+    # as OFF, so a suite asserting that a valid slot DOES dispatch must say it wants
+    # dispatch. Individual tests already override this both ways (see the
+    # smart_booking_ce_enabled assignments further down this file).
+    settings.smart_booking_ce_enabled = True
     settings.openai_model = "gpt-4o-mini"
     settings.backend_url = "http://localhost:8000"
     # Blank out fallback-specific flow IDs so helpers that check them fall through
@@ -3967,6 +3973,9 @@ class TestWebsiteFlowSelection(unittest.TestCase):
 
         eng._send_flow_button = fake_send_flow
         eng.settings = MagicMock()
+        # WILD1-F1: replacing `settings` discards what `_make_engine` set, and a bare
+        # MagicMock reads as OFF under the gate's `is True` test.
+        eng.settings.smart_booking_ce_enabled = True
         eng.settings.whatsapp_flow_id = "generic-flow-123"
         eng.settings.whatsapp_website_flow_id = "website-flow-456"
 
@@ -3996,6 +4005,9 @@ class TestWebsiteFlowSelection(unittest.TestCase):
 
         eng._send_flow_button = fake_send_flow
         eng.settings = MagicMock()
+        # WILD1-F1: replacing `settings` discards what `_make_engine` set, and a bare
+        # MagicMock reads as OFF under the gate's `is True` test.
+        eng.settings.smart_booking_ce_enabled = True
         eng.settings.whatsapp_flow_id = "generic-flow-123"
         eng.settings.whatsapp_website_flow_id = "website-flow-456"
 
@@ -4022,6 +4034,9 @@ class TestWebsiteFlowSelection(unittest.TestCase):
         texts_sent: list[str] = []
         eng._send_text_to_wa = lambda ctx, txt: texts_sent.append(txt) or "id"
         eng.settings = MagicMock()
+        # WILD1-F1: replacing `settings` discards what `_make_engine` set, and a bare
+        # MagicMock reads as OFF under the gate's `is True` test.
+        eng.settings.smart_booking_ce_enabled = True
         eng.settings.whatsapp_flow_id = "generic-flow-123"
         eng.settings.whatsapp_website_flow_id = ""  # not configured
 
@@ -4051,6 +4066,9 @@ class TestWebsiteFlowSelection(unittest.TestCase):
         texts_sent: list[str] = []
         eng._send_text_to_wa = lambda ctx, txt: texts_sent.append(txt) or "id"
         eng.settings = MagicMock()
+        # WILD1-F1: replacing `settings` discards what `_make_engine` set, and a bare
+        # MagicMock reads as OFF under the gate's `is True` test.
+        eng.settings.smart_booking_ce_enabled = True
         eng.settings.whatsapp_flow_id = ""  # not configured
         eng.settings.whatsapp_website_flow_id = ""
 
@@ -4329,6 +4347,9 @@ class TestWebsiteFlowInitialScreen(unittest.TestCase):
         eng = _make_engine()
         eng._schedule = self._make_svc(valid=True)
         eng.settings = MagicMock()
+        # WILD1-F1: replacing `settings` discards what `_make_engine` set, and a bare
+        # MagicMock reads as OFF under the gate's `is True` test.
+        eng.settings.smart_booking_ce_enabled = True
         eng.settings.whatsapp_flow_id = "generic-111"
         eng.settings.whatsapp_website_flow_id = "website-222"
 
@@ -4375,6 +4396,9 @@ class TestWebsiteFlowInitialScreen(unittest.TestCase):
         eng = _make_engine()
         eng._schedule = self._make_svc(valid=True)
         eng.settings = MagicMock()
+        # WILD1-F1: replacing `settings` discards what `_make_engine` set, and a bare
+        # MagicMock reads as OFF under the gate's `is True` test.
+        eng.settings.smart_booking_ce_enabled = True
         eng.settings.whatsapp_flow_id = "generic-111"
         eng.settings.whatsapp_website_flow_id = "website-222"
 
@@ -4404,6 +4428,9 @@ class TestWebsiteFlowInitialScreen(unittest.TestCase):
         eng = _make_engine()
         eng._schedule = self._make_svc(valid=True)
         eng.settings = MagicMock()
+        # WILD1-F1: replacing `settings` discards what `_make_engine` set, and a bare
+        # MagicMock reads as OFF under the gate's `is True` test.
+        eng.settings.smart_booking_ce_enabled = True
         eng.settings.whatsapp_flow_id = "generic-111"
         eng.settings.whatsapp_website_flow_id = "website-222"
 
@@ -4429,6 +4456,9 @@ class TestWebsiteFlowInitialScreen(unittest.TestCase):
         from unittest.mock import patch, MagicMock
         eng = _make_engine()
         eng.settings = MagicMock()
+        # WILD1-F1: replacing `settings` discards what `_make_engine` set, and a bare
+        # MagicMock reads as OFF under the gate's `is True` test.
+        eng.settings.smart_booking_ce_enabled = True
         eng.settings.whatsapp_flow_id = "generic-111"
         eng.db.add = lambda x: None
         eng.db.commit = lambda: None
@@ -4669,6 +4699,9 @@ class TestCheckFallbackFlowTriggers(unittest.TestCase):
         from unittest.mock import MagicMock
         eng = _make_engine()
         eng.settings = MagicMock()
+        # WILD1-F1: replacing `settings` discards what `_make_engine` set, and a bare
+        # MagicMock reads as OFF under the gate's `is True` test.
+        eng.settings.smart_booking_ce_enabled = True
         eng.settings.whatsapp_vehicle_fallback_flow_id = vehicle_id
         eng.settings.whatsapp_location_fallback_flow_id = location_id
         eng.db.commit = lambda: None
@@ -5223,6 +5256,9 @@ class TestBookingFlowUnchanged(unittest.TestCase):
         from unittest.mock import MagicMock
         eng = _make_engine()
         eng.settings = MagicMock()
+        # WILD1-F1: replacing `settings` discards what `_make_engine` set, and a bare
+        # MagicMock reads as OFF under the gate's `is True` test.
+        eng.settings.smart_booking_ce_enabled = True
         eng.settings.whatsapp_flow_id = "generic-999"
         eng.settings.whatsapp_website_flow_id = "website-888"
         eng.settings.whatsapp_vehicle_fallback_flow_id = "veh-111"
@@ -5257,6 +5293,9 @@ class TestBookingFlowUnchanged(unittest.TestCase):
         from unittest.mock import MagicMock
         eng = _make_engine()
         eng.settings = MagicMock()
+        # WILD1-F1: replacing `settings` discards what `_make_engine` set, and a bare
+        # MagicMock reads as OFF under the gate's `is True` test.
+        eng.settings.smart_booking_ce_enabled = True
         eng.settings.whatsapp_flow_id = "generic-999"
         eng.settings.whatsapp_website_flow_id = "website-888"
         eng.settings.whatsapp_vehicle_fallback_flow_id = "veh-111"
@@ -5300,6 +5339,9 @@ class TestFallbackFlowInitialScreens(unittest.TestCase):
         from unittest.mock import MagicMock
         eng = _make_engine()
         eng.settings = MagicMock()
+        # WILD1-F1: replacing `settings` discards what `_make_engine` set, and a bare
+        # MagicMock reads as OFF under the gate's `is True` test.
+        eng.settings.smart_booking_ce_enabled = True
         eng.settings.whatsapp_vehicle_fallback_flow_id = vehicle_id
         eng.settings.whatsapp_location_fallback_flow_id = location_id
         eng.settings.whatsapp_flow_id = generic_id
@@ -5801,6 +5843,9 @@ class TestProdRegressionVehicleFlowTrigger(unittest.TestCase):
         from unittest.mock import MagicMock
         eng = _make_engine()
         eng.settings = MagicMock()
+        # WILD1-F1: replacing `settings` discards what `_make_engine` set, and a bare
+        # MagicMock reads as OFF under the gate's `is True` test.
+        eng.settings.smart_booking_ce_enabled = True
         eng.settings.whatsapp_vehicle_fallback_flow_id = vehicle_id
         eng.settings.whatsapp_location_fallback_flow_id = location_id
         eng.db.commit = lambda: None

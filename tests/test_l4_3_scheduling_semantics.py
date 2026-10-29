@@ -133,6 +133,12 @@ def _make_engine(schedule_db: Session | None = None):
 
     settings = MagicMock()
     settings.openai_api_key = "sk-fake"
+    # WILD1-F1: dispatching the booking Flow is now gated on
+    # SMART_BOOKING_CE_ENABLED. These tests assert that a valid slot DOES dispatch,
+    # so the fixture must say it wants dispatch. A bare MagicMock answers the gate's
+    # `is True` test with a MagicMock, which reads as OFF — the engine would refuse
+    # and the tests would be asserting the refusal path by accident.
+    settings.smart_booking_ce_enabled = True
     settings.whatsapp_flow_id = "1644218879979041"      # legacy data-collection Flow
     settings.whatsapp_website_flow_id = ""
     settings.booking_flow_id = BOOKING_FLOW_ID          # authoritative booking Flow
@@ -692,6 +698,9 @@ class TestBookingFlowEndToEndContract(unittest.TestCase):
         from app.services.booking_flow_service import BookingFlowService
         settings = MagicMock()
         settings.whatsapp_flow_id = "1644218879979041"
+        # WILD1-F1: this test asserts the real contract accepts a MINTED token, so the
+        # dispatch that mints it must be permitted. See `_make_engine`.
+        settings.smart_booking_ce_enabled = True
         settings.whatsapp_website_flow_id = ""
         settings.booking_flow_id = BOOKING_FLOW_ID
         eng = ConversationEngine(db=self.db, settings=settings)

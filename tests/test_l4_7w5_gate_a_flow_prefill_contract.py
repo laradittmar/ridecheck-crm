@@ -162,57 +162,88 @@ class _World(unittest.TestCase):
 
 class TestDateTimeSelection(_World):
 
-    def test_date_time_01_an_agreed_valid_slot_is_selected(self):
-        """DATE-TIME-01 — both selections must be IDs present in their own data-source,
-        which is what makes the Flow render them chosen rather than silently ignore them."""
+    # ── WILD1-F3-R1, 2026-10-29: the six DATE-TIME selection-echo assertions ────────
+    #
+    # BEFORE  each asserted `data["selected_date"]` / `data["selected_time"]` in the
+    #         APPOINTMENT payload.
+    # AFTER   each asserts the key is ABSENT, and keeps the guarantee it was really
+    #         protecting: the option LIST.
+    # WHY     the two keys were init-values for `CANDIDATE_v7.4-prefill-r3.json`, which has
+    #         never been published. Published v7.3 declares both Dropdowns without
+    #         `init-value`, so no value the backend sent could preselect anything — the
+    #         module's own comment said so while the payload kept sending them. The owner
+    #         has excluded the prefill rollout from the November 1 correction, so the keys
+    #         are gone from the payload and the assertions follow the behaviour.
+    # NOT WEAKENED  every test below still asserts the same observable outcome through the
+    #         mechanism that actually works: `date` and `time` carry exactly the options the
+    #         customer may pick, narrowed to one when a slot is agreed and still free, and
+    #         restored to the full picker when it is not.
+
+    ECHO = ("selected_date", "selected_time")
+
+    def assertNoEcho(self, data):
+        for key in self.ECHO:
+            self.assertNotIn(key, data,
+                             f"{key} is back in the payload — the prefill rollout is "
+                             f"deferred (flow_contract.DEFERRED_PREFILL_KEYS)")
+
+    def test_date_time_01_an_agreed_valid_slot_is_narrowed_to_one_option(self):
+        """DATE-TIME-01 — the agreed slot is the ONLY option offered, which is how the
+        published Flow can show a chosen slot at all."""
         self.agree()
         data = self.svc.handle_init(self.token)["data"]
-        self.assertEqual(data["selected_date"], FUTURE.isoformat())
-        self.assertEqual(data["selected_time"], "11:00")
-        self.assertIn(data["selected_date"], [i["id"] for i in data["date"]])
-        self.assertIn(data["selected_time"], [i["id"] for i in data["time"]])
+        self.assertNoEcho(data)
+        self.assertEqual([i["id"] for i in data["date"]], [FUTURE.isoformat()])
+        self.assertEqual([i["id"] for i in data["time"]], ["11:00"])
+        self.assertTrue(data["is_date_enabled"])
+        self.assertTrue(data["is_time_enabled"])
 
     def test_date_time_02_day_only_never_preselects_a_time(self):
         """DATE-TIME-02 — choosing the earliest for them would be us deciding."""
         data = self.svc.handle_date_selected(self.token, FUTURE.isoformat())["data"]
-        self.assertEqual(data["selected_date"], FUTURE.isoformat())
-        self.assertEqual(data["selected_time"], "")
+        self.assertNoEcho(data)
         self.assertTrue(data["time"], "real times are still offered")
+        self.assertGreater(len(data["time"]), 1,
+                           "a day-only request must leave the time choice open")
 
     def test_date_time_03_open_picker_selects_nothing(self):
         data = self.svc.handle_init(self.token)["data"]
-        self.assertEqual(data["selected_date"], "")
-        self.assertEqual(data["selected_time"], "")
+        self.assertNoEcho(data)
+        self.assertEqual(data["time"], [], "no times before a day is chosen")
+        self.assertFalse(data["is_time_enabled"])
+        self.assertTrue(data["date"])
 
-    def test_date_time_04_an_agreed_time_that_went_stale_is_not_selected(self):
+    def test_date_time_04_an_agreed_time_that_went_stale_is_not_offered(self):
         """DATE-TIME-04 — the agreement is honoured only while it is still true."""
         self.agree(hhmm="11:00")
         self._mock_schedule(slots=["15:00", "16:00"])      # 11:00 is gone
         data = self.svc.handle_init(self.token)["data"]
-        self.assertNotEqual(data["selected_time"], "11:00",
-                            "a slot that vanished must not come back selected")
-        self.assertEqual(data["selected_time"], "")
-        # the narrowed one-option list is abandoned too: INIT falls back to the normal
-        # picker, where times load only after a date is chosen
+        self.assertNoEcho(data)
+        # the narrowed one-option list is abandoned: INIT falls back to the normal picker,
+        # where times load only after a date is chosen
         self.assertEqual([i["id"] for i in data["time"]], [])
+        self.assertNotIn("11:00", [i["id"] for i in data["time"]],
+                         "a slot that vanished must not come back offered")
         self.assertTrue(data["date"], "dates are still offered")
         later = self.svc.handle_date_selected(self.token, FUTURE.isoformat())["data"]
         self.assertEqual([i["id"] for i in later["time"]], ["15:00", "16:00"])
-        self.assertEqual(later["selected_time"], "", "no dead slot is reselected")
+        self.assertNotIn("11:00", [i["id"] for i in later["time"]])
 
-    def test_date_time_05_date_selected_refresh_keeps_the_day(self):
+    def test_date_time_05_date_selected_refresh_offers_that_day_s_times(self):
         data = self.svc.handle_date_selected(self.token, FUTURE.isoformat())["data"]
-        self.assertEqual(data["selected_date"], FUTURE.isoformat())
+        self.assertNoEcho(data)
         self.assertEqual([i["id"] for i in data["time"]], SLOTS)
+        self.assertTrue(data["is_time_enabled"])
 
     def test_date_time_06_a_slot_conflict_carries_no_stale_selection(self):
-        """DATE-TIME-06 — the time that just vanished must not come back selected."""
+        """DATE-TIME-06 — the time that just vanished must not come back offered."""
         self._mock_schedule(valid=False)
         with self.assertRaises(BookingSlotConflictError) as ctx:
             self.svc.handle_confirm_booking(self.token, self.confirm_payload())
         data = ctx.exception.refreshed_data["data"]
-        self.assertEqual(data["selected_time"], "")
-        self.assertIn("selected_date", data)
+        self.assertNoEcho(data)
+        self.assertTrue(data["has_refusal"], "the refusal must be visible")
+        self.assertTrue(data["slot_conflict_message"])
 
     def test_date_time_08_confirm_still_revalidates(self):
         """DATE-TIME-08 — prefill is UX; safety is unchanged.
@@ -229,10 +260,26 @@ class TestDateTimeSelection(_World):
 
 class TestCanonicalPhone(_World):
 
-    def test_phone_01_canonical_identity_is_supplied_not_requested(self):
+    def test_phone_01_canonical_identity_is_not_offered_to_the_published_flow(self):
+        """PHONE-01 — WILD1-F3-R1.
+
+        BEFORE  asserted `contact_phone` == WA_ID and `contact_phone_display` == "…0001"
+                in the APPOINTMENT payload.
+        AFTER   asserts both are absent.
+        WHY     published v7.3's DETAILS screen declares neither key and its navigate
+                payload carries neither, so the two keys went to a Flow that ignored them.
+                The screen that would render them is in the unpublished prefill candidate,
+                whose rollout the owner has deferred past November 1.
+        NOT WEAKENED  the guarantee this test was named for — that the phone is SUPPLIED by
+                us and never taken from the customer's form — is server-side and is
+                asserted whole by PHONE-02 and PHONE-03, which are unchanged and still
+                pass. The masking helper keeps its own unit assertions in PHONE-05.
+        """
         data = self.svc.handle_init(self.token)["data"]
-        self.assertEqual(data["contact_phone"], WA_ID)
-        self.assertEqual(data["contact_phone_display"], "…0001")
+        self.assertNotIn("contact_phone", data)
+        self.assertNotIn("contact_phone_display", data)
+        # the helper is retained for the deferred rollout and must still be correct
+        self.assertEqual(_mask_phone(WA_ID), "…0001")
 
     def test_phone_02_a_tampered_payload_phone_cannot_replace_wa_id(self):
         """PHONE-02 — enforced server-side, not by the absence of a UI field."""
@@ -247,10 +294,16 @@ class TestCanonicalPhone(_World):
         rev = self.db.query(ThreadRevision).one()
         self.assertEqual(rev.buyer_phone, WA_ID)
 
-    def test_phone_05_no_full_number_is_rendered_on_screen(self):
-        """PHONE-05 — the screen shows a mask; the full value travels as data only."""
+    def test_phone_05_no_full_number_reaches_the_flow_at_all(self):
+        """PHONE-05 — WILD1-F3-R1. Strictly stronger than before.
+
+        BEFORE  the full number travelled as data and only the masked copy was checked for
+                not containing it.
+        AFTER   the number appears NOWHERE in the payload. A value we do not send cannot
+                leak from a screen, a log or a Meta-side error report.
+        """
         data = self.svc.handle_init(self.token)["data"]
-        self.assertNotIn(WA_ID, data["contact_phone_display"])
+        self.assertNotIn(WA_ID, json.dumps(data))
         self.assertTrue(_mask_phone(WA_ID).startswith("…"))
         self.assertEqual(_mask_phone(None), "")
 
@@ -265,19 +318,32 @@ class TestCanonicalPhone(_World):
 
 class TestNamePrefill(_World):
 
-    def test_name_01_a_lead_name_is_offered(self):
+    # ── WILD1-F3-R1: NAME-01/02/04 ─────────────────────────────────────────────────
+    #
+    # BEFORE  each read `data["customer_name"]` from the APPOINTMENT payload.
+    # AFTER   each asserts the key is absent, and tests `_lead_display_name` directly.
+    # WHY     published v7.3's DETAILS `name` TextInput declares no `init-value`, so the
+    #         name could not be prefilled; only the unpublished candidate binds it. The
+    #         helper is retained for that deferred milestone, so its behaviour — the actual
+    #         subject of all three tests — is still asserted, now at its source.
+    # NOT WEAKENED  NAME-03, which proves a typed correction survives to the booking row,
+    #         is unchanged and still passes.
+
+    def test_name_01_a_lead_name_is_computed_but_not_offered(self):
         self.lead.nombre, self.lead.apellido = "Juan", "Pérez"
         self.db.commit()
-        self.assertEqual(self.svc.handle_init(self.token)["data"]["customer_name"], "Juan Pérez")
+        self.assertEqual(_lead_display_name(self.lead), "Juan Pérez")
+        self.assertNotIn("customer_name", self.svc.handle_init(self.token)["data"])
 
     def test_name_02_no_lead_name_invents_nothing(self):
-        self.assertEqual(self.svc.handle_init(self.token)["data"]["customer_name"], "")
+        self.assertEqual(_lead_display_name(self.lead), "")
+        self.assertNotIn("customer_name", self.svc.handle_init(self.token)["data"])
 
     def test_name_04_whatsapp_display_name_is_not_verified_identity(self):
         """NAME-04 — display_name is a profile label the customer sets; it is not a name we
         may put on a booking."""
         data = self.svc.handle_init(self.token)["data"]
-        self.assertEqual(data["customer_name"], "")
+        self.assertNotIn("customer_name", data)
         self.assertNotIn("perfil_de_whatsapp", json.dumps(data))
         self.assertEqual(_lead_display_name(self.lead), "")
 
@@ -322,19 +388,31 @@ class TestFlowContract(unittest.TestCase):
             check(s.get("layout") or {})
 
     def test_flow_01_the_backend_supplies_every_key_the_candidate_declares(self):
-        """FLOW-01 — screen data and response contract must agree, in both directions."""
-        cand = _screens(CANDIDATE)
-        appt_declared = set(cand["APPOINTMENT"]["data"].keys())
-        supplied = set()
-        for node in ast.walk(ast.parse(BFS_SOURCE)):
-            if isinstance(node, ast.FunctionDef) and node.name in (
-                    "_appointment_screen_data", "_identity_fields"):
-                for d in ast.walk(node):
-                    if isinstance(d, ast.Dict):
-                        supplied |= {k.value for k in d.keys
-                                     if isinstance(k, ast.Constant) and isinstance(k.value, str)}
-        missing = appt_declared - supplied - {"slot_conflict_message", "error_message"}
-        self.assertEqual(missing, set(), f"backend never supplies: {missing}")
+        """FLOW-01 — screen data and response contract must agree, in both directions.
+
+        WILD1-F5 — corrected 2026-10-29. This assertion claimed "both directions" and
+        checked one: `declared - supplied`, then minus `{slot_conflict_message,
+        error_message}`. Those two subtracted names were exactly the keys the backend
+        SUPPLIED and no Flow version DECLARED, so the direction that mattered was never
+        compared and the two fields that broke the live Flow were named as acceptable. The
+        2026-10-29 Wild then showed every booking refusal reaching the handset as Meta's
+        generic error.
+
+        It now compares both directions with no exclusion set, against the TARGET artifact
+        pinned by path and content hash. The exhaustive per-screen suite lives in
+        `test_wild1_booking_flow_gate_and_contract.py`; this keeps Gate A's own check
+        honest where it was written.
+        """
+        from app.services import flow_contract as FC
+        target = ROOT / FC.TARGET_FLOW_PATH
+        self.assertEqual(hashlib.sha256(target.read_bytes()).hexdigest(),
+                         FC.TARGET_FLOW_SHA256, "target Flow drifted from the contract")
+        declared = set(_screens(target)["APPOINTMENT"]["data"].keys())
+        supplied = set(FC.appointment_payload())
+        self.assertEqual(declared - supplied, set(),
+                         f"declared but never supplied: {sorted(declared - supplied)}")
+        self.assertEqual(supplied - declared, set(),
+                         f"supplied but never declared: {sorted(supplied - declared)}")
 
     def test_the_navigate_payload_carries_identity_to_details(self):
         """The only bridge: the back end is not called between APPOINTMENT and DETAILS."""

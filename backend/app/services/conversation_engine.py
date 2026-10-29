@@ -4695,6 +4695,53 @@ class ConversationEngine:
         out.reply_produced = bool(sent_id)
         return out
 
+    def _booking_dispatch_refusal(self, ctx, state, *, source: str):
+        """WILD1-F1: the deterministic answer when booking dispatch is OFF.
+
+        Deliberately NOT `_sb_handoff`. That helper is for a Flow submission that was
+        refused, and it fires `_send_fallback_human_review_notification` — a Resend e-mail.
+        This milestone's boundary must attempt no e-mail at all, so the handoff is done
+        here, narrowly: the thread goes to a person, the customer gets the approved
+        non-Flow text, and a durable attempt event records the typed reason. No offer, no
+        token, no Flow, no provider call beyond the one customer message.
+        """
+        from .booking_dispatch_gate import SMART_BOOKING_DISABLED
+        from .booking_flow_service import BOOKING_HANDOFF_TEXT
+        tid = int(ctx.thread.id)
+        logger.info(
+            "BOOKING_DISPATCH_REFUSED thread_id=%s source=%s reason=%s — "
+            "no offer, no token, no Flow", tid, source, SMART_BOOKING_DISABLED)
+        # durable observability, on the same pre-execute footing as the writer's OFF switch
+        try:
+            from .booking_attempt_events import record_attempt_event
+            record_attempt_event(
+                self.db, thread_id=tid, stage="PRE_EXECUTE", outcome="REFUSED",
+                reason=SMART_BOOKING_DISABLED, source=source)
+        except Exception as exc:                         # never let telemetry break a turn
+            # No rollback here on purpose: `record_attempt_event` owns an isolated session
+            # and never raises, so this branch is unreachable in practice — and rolling
+            # `self.db` back would discard the turn's own legitimate state if it ever ran.
+            logger.warning("BOOKING_DISPATCH_REFUSED event not recorded thread_id=%s: %s",
+                           tid, type(exc).__name__)
+        state.needs_human = True
+        if ctx.lead is not None:
+            ctx.lead.necesita_humano = True
+        self.db.commit()
+        self._decision_log(ctx, "booking_dispatch_refused",
+                           reason=SMART_BOOKING_DISABLED, source=source)
+        sent_id = None
+        try:
+            sent_id = self._send_text_to_wa(ctx, BOOKING_HANDOFF_TEXT)
+        except OutboundBlockedError as exc:
+            # the handoff is already committed; a blocked transport changes nothing
+            logger.warning("BOOKING_DISPATCH_REFUSED text not sent thread_id=%s outcome=%s",
+                           tid, getattr(exc, "gate_outcome", "?"))
+        out = _out("replied", wa_message_id=sent_id, detail=SMART_BOOKING_DISABLED)
+        out.reply_required = True
+        out.alert_eligible = True
+        out.reply_produced = bool(sent_id)
+        return out
+
     def _sb_notify_booking(self, ctx, result, **kw) -> None:
         """B-8: the operator e-mail, only after the authority committed AND CE committed. A
         failed notification never touches the booking (and `notification_sent_at` keeps it
@@ -13021,6 +13068,13 @@ class ConversationEngine:
             # `f"{thread}-{seconds}"` shape collides for two dispatches in the same second.
             from .offer_lifecycle import OfferLifecycle as _OfferLifecycle
             from .booking_flow_service import make_booking_token as _mk_token
+            from .booking_dispatch_gate import booking_dispatch_allowed as _dispatch_ok
+            # WILD1-F1: this legacy Flow's token IS accepted by `_process_flow_response`,
+            # so it is a booking offer and sits behind the same boundary. Checked before
+            # the token is minted, so no context exists either.
+            if not _dispatch_ok(getattr(self, "settings", None)):
+                return self._booking_dispatch_refusal(
+                    ctx, state, source="ConversationEngine._legacy_data_collection_flow")
             _legacy_offers = _OfferLifecycle(self.db)
             flow_token = _mk_token(ctx.thread.id)
             _lz_group, _lz_detail = self._get_active_inspection_location(ctx, state)
@@ -13161,6 +13215,15 @@ class ConversationEngine:
         """
         from .booking_flow_service import BookingFlowService, make_booking_token
         from .outbound_path_registry import OutboundPathId
+        from .booking_dispatch_gate import booking_dispatch_allowed
+
+        # ── WILD1-F1: the dispatch boundary, ahead of everything ────────────────────
+        # Before the prerequisites, before the token, before the offer. The Wild dispatched
+        # a real Flow from here with SMART_BOOKING_CE_ENABLED=false because the flag was
+        # only ever tested further downstream, at the writer and at the confirm step.
+        if not booking_dispatch_allowed(getattr(self, "settings", None)):
+            return self._booking_dispatch_refusal(
+                ctx, state, source="ConversationEngine._send_booking_flow")
 
         # Prerequisites the published Flow needs before it can render a booking:
         # accepted quote (caller reached the valid-slot branch), an active candidate
