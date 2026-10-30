@@ -55,6 +55,15 @@ PUBLISHED = FLOW_DIR / "PUBLISHED_28104222025943520_v7.3.json"
 CANDIDATE = FLOW_DIR / "CANDIDATE_v7.4-prefill.json"
 PUBLISHED_SHA = "274038ba234a49fa4f99bae47c00f6cac640e248d56a373d40ae8fba6c1afb15"
 
+#: WILD1-F3-R2, 2026-10-30. `PUBLISHED` above is the PRE-16-SEPTEMBER baseline: the 2026-09-16
+#: Gate B Final Certification downloaded the live definition from the Flows API and proved deep
+#: structural equality with r3, and the owner re-exported the published JSON from Meta on
+#: 2026-10-30 and confirmed r3's structure field by field. `PUBLISHED` keeps its name and its
+#: drift check because it is cited by name throughout the certification record; this is the
+#: artifact that matches what is live.
+PUBLISHED_LIVE = FLOW_DIR / "CANDIDATE_v7.4-prefill-r3.json"
+PUBLISHED_LIVE_SHA = "53a3d88f3dd57c9bf3089c97c9edfe83bc907afc428e7ef19e3c1538efb1bc04"
+
 BFS_SOURCE = (ROOT / "backend" / "app" / "services"
               / "booking_flow_service.py").read_text(encoding="utf-8-sig")
 
@@ -111,6 +120,7 @@ class _World(unittest.TestCase):
         self.db.add(ViaticosZone(zone_group="CABA", zone_detail="Palermo", viaticos=0))
         contact = WhatsAppContact(wa_id=WA_ID, display_name="perfil_de_whatsapp")
         self.db.add(contact); self.db.flush()
+        self.contact = contact
         self.lead = Lead(estado="COTIZACION", flag="ACEPTADO")
         self.db.add(self.lead); self.db.flush()
         self.thread = WhatsAppThread(contact_id=contact.id, lead_id=self.lead.id)
@@ -162,37 +172,43 @@ class _World(unittest.TestCase):
 
 class TestDateTimeSelection(_World):
 
-    # ── WILD1-F3-R1, 2026-10-29: the six DATE-TIME selection-echo assertions ────────
+    # ── WILD1-F3-R2, 2026-10-30: the six DATE-TIME selection-echo assertions, twice moved
     #
-    # BEFORE  each asserted `data["selected_date"]` / `data["selected_time"]` in the
-    #         APPOINTMENT payload.
-    # AFTER   each asserts the key is ABSENT, and keeps the guarantee it was really
-    #         protecting: the option LIST.
-    # WHY     the two keys were init-values for `CANDIDATE_v7.4-prefill-r3.json`, which has
-    #         never been published. Published v7.3 declares both Dropdowns without
-    #         `init-value`, so no value the backend sent could preselect anything — the
-    #         module's own comment said so while the payload kept sending them. The owner
-    #         has excluded the prefill rollout from the November 1 correction, so the keys
-    #         are gone from the payload and the assertions follow the behaviour.
-    # NOT WEAKENED  every test below still asserts the same observable outcome through the
-    #         mechanism that actually works: `date` and `time` carry exactly the options the
-    #         customer may pick, narrowed to one when a slot is agreed and still free, and
-    #         restored to the full picker when it is not.
+    # ORIGINAL (L4.7W5-GATE-A)  each asserted `data["selected_date"]` / `selected_time"]`.
+    # R1 (2026-10-29)           each asserted the key was ABSENT, on the reading that the
+    #                           two keys were init-values for an unpublished candidate and
+    #                           the live Flow was `PUBLISHED_…v7.3.json`, which declares
+    #                           neither.
+    # R2 (2026-10-30)           the original assertions are restored, because R1's premise
+    #                           was false. The owner exported the published definition for
+    #                           asset 28104222025943520 from Meta and it declares both keys
+    #                           on APPOINTMENT: it is r3's structure, not v7.3's. R1 had
+    #                           stopped supplying five values a SHIPPED screen declares.
+    #
+    # WHAT R2 KEEPS FROM R1     the option-list assertions R1 added are strictly additional
+    #                           and all still true, so they stay. Every test below now
+    #                           asserts BOTH halves: the echoed selection AND the list it
+    #                           must be a member of. That pairing is the actual guarantee —
+    #                           an id that is not in its own data-source is an id the Flow
+    #                           cannot render as chosen, which is what GATE A was for.
+    #
+    # NOT A ROLLBACK OF BEHAVIOUR  `init-value` is still absent from every Dropdown in every
+    #                           artifact, and `scripts/validate_flow_json.py` still forbids
+    #                           it. `selected_date`/`selected_time` are declared and bound
+    #                           nowhere (flow_contract.APPOINTMENT_CARRIED). They are
+    #                           supplied because the published Flow declares them, not
+    #                           because they preselect anything.
 
-    ECHO = ("selected_date", "selected_time")
-
-    def assertNoEcho(self, data):
-        for key in self.ECHO:
-            self.assertNotIn(key, data,
-                             f"{key} is back in the payload — the prefill rollout is "
-                             f"deferred (flow_contract.DEFERRED_PREFILL_KEYS)")
-
-    def test_date_time_01_an_agreed_valid_slot_is_narrowed_to_one_option(self):
-        """DATE-TIME-01 — the agreed slot is the ONLY option offered, which is how the
-        published Flow can show a chosen slot at all."""
+    def test_date_time_01_an_agreed_valid_slot_is_selected(self):
+        """DATE-TIME-01 — both selections must be IDs present in their own data-source,
+        which is what makes the Flow render them chosen rather than silently ignore them."""
         self.agree()
         data = self.svc.handle_init(self.token)["data"]
-        self.assertNoEcho(data)
+        self.assertEqual(data["selected_date"], FUTURE.isoformat())
+        self.assertEqual(data["selected_time"], "11:00")
+        self.assertIn(data["selected_date"], [i["id"] for i in data["date"]])
+        self.assertIn(data["selected_time"], [i["id"] for i in data["time"]])
+        # R1's addition: the list is narrowed to exactly the agreed slot
         self.assertEqual([i["id"] for i in data["date"]], [FUTURE.isoformat()])
         self.assertEqual([i["id"] for i in data["time"]], ["11:00"])
         self.assertTrue(data["is_date_enabled"])
@@ -201,49 +217,70 @@ class TestDateTimeSelection(_World):
     def test_date_time_02_day_only_never_preselects_a_time(self):
         """DATE-TIME-02 — choosing the earliest for them would be us deciding."""
         data = self.svc.handle_date_selected(self.token, FUTURE.isoformat())["data"]
-        self.assertNoEcho(data)
+        self.assertEqual(data["selected_date"], FUTURE.isoformat())
+        self.assertEqual(data["selected_time"], "")
         self.assertTrue(data["time"], "real times are still offered")
         self.assertGreater(len(data["time"]), 1,
                            "a day-only request must leave the time choice open")
 
     def test_date_time_03_open_picker_selects_nothing(self):
         data = self.svc.handle_init(self.token)["data"]
-        self.assertNoEcho(data)
+        self.assertEqual(data["selected_date"], "")
+        self.assertEqual(data["selected_time"], "")
         self.assertEqual(data["time"], [], "no times before a day is chosen")
         self.assertFalse(data["is_time_enabled"])
         self.assertTrue(data["date"])
 
-    def test_date_time_04_an_agreed_time_that_went_stale_is_not_offered(self):
+    def test_date_time_04_an_agreed_time_that_went_stale_is_not_selected(self):
         """DATE-TIME-04 — the agreement is honoured only while it is still true."""
         self.agree(hhmm="11:00")
         self._mock_schedule(slots=["15:00", "16:00"])      # 11:00 is gone
         data = self.svc.handle_init(self.token)["data"]
-        self.assertNoEcho(data)
-        # the narrowed one-option list is abandoned: INIT falls back to the normal picker,
-        # where times load only after a date is chosen
+        self.assertNotEqual(data["selected_time"], "11:00",
+                            "a slot that vanished must not come back selected")
+        self.assertEqual(data["selected_time"], "")
+        # the narrowed one-option list is abandoned too: INIT falls back to the normal
+        # picker, where times load only after a date is chosen
         self.assertEqual([i["id"] for i in data["time"]], [])
-        self.assertNotIn("11:00", [i["id"] for i in data["time"]],
-                         "a slot that vanished must not come back offered")
         self.assertTrue(data["date"], "dates are still offered")
         later = self.svc.handle_date_selected(self.token, FUTURE.isoformat())["data"]
         self.assertEqual([i["id"] for i in later["time"]], ["15:00", "16:00"])
+        self.assertEqual(later["selected_time"], "", "no dead slot is reselected")
         self.assertNotIn("11:00", [i["id"] for i in later["time"]])
 
-    def test_date_time_05_date_selected_refresh_offers_that_day_s_times(self):
+    def test_date_time_05_date_selected_refresh_keeps_the_day(self):
         data = self.svc.handle_date_selected(self.token, FUTURE.isoformat())["data"]
-        self.assertNoEcho(data)
+        self.assertEqual(data["selected_date"], FUTURE.isoformat())
         self.assertEqual([i["id"] for i in data["time"]], SLOTS)
         self.assertTrue(data["is_time_enabled"])
 
     def test_date_time_06_a_slot_conflict_carries_no_stale_selection(self):
-        """DATE-TIME-06 — the time that just vanished must not come back offered."""
+        """DATE-TIME-06 — the time that just vanished must not come back selected."""
         self._mock_schedule(valid=False)
         with self.assertRaises(BookingSlotConflictError) as ctx:
             self.svc.handle_confirm_booking(self.token, self.confirm_payload())
         data = ctx.exception.refreshed_data["data"]
-        self.assertNoEcho(data)
+        self.assertEqual(data["selected_time"], "")
+        self.assertIn("selected_date", data)
+        # R1's addition, and the point of the whole correction: the reason is VISIBLE
         self.assertTrue(data["has_refusal"], "the refusal must be visible")
         self.assertTrue(data["slot_conflict_message"])
+
+    def test_date_time_07_r2_a_day_the_backend_does_not_offer_is_never_echoed(self):
+        """DATE-TIME-07 — WILD1-F3-R2. The echo is derived, not copied.
+
+        R1's stated worry about restoring the echo was a stale selection from another offer
+        or cycle coming back as a preselection. This asserts the guard that prevents it:
+        `selected_date` is the request's value ONLY if the backend's own `date_items` — read
+        from `ScheduleService` for this context — contains it. A day outside the horizon,
+        a day with no slots, or a replayed day from a previous cycle collapses to "".
+        """
+        stale = (FUTURE + timedelta(days=400)).isoformat()      # far outside the horizon
+        data = self.svc.handle_date_selected(self.token, stale)["data"]
+        self.assertEqual(data["selected_date"], "",
+                         "a day the backend never offered was echoed back as chosen")
+        self.assertNotIn(stale, [i["id"] for i in data["date"]])
+        self.assertEqual(data["selected_time"], "")
 
     def test_date_time_08_confirm_still_revalidates(self):
         """DATE-TIME-08 — prefill is UX; safety is unchanged.
@@ -260,26 +297,29 @@ class TestDateTimeSelection(_World):
 
 class TestCanonicalPhone(_World):
 
-    def test_phone_01_canonical_identity_is_not_offered_to_the_published_flow(self):
-        """PHONE-01 — WILD1-F3-R1.
+    def test_phone_01_canonical_identity_is_supplied_not_requested(self):
+        """PHONE-01 — restored by WILD1-F3-R2 (see the note on TestDateTimeSelection).
 
-        BEFORE  asserted `contact_phone` == WA_ID and `contact_phone_display` == "…0001"
-                in the APPOINTMENT payload.
-        AFTER   asserts both are absent.
-        WHY     published v7.3's DETAILS screen declares neither key and its navigate
-                payload carries neither, so the two keys went to a Flow that ignored them.
-                The screen that would render them is in the unpublished prefill candidate,
-                whose rollout the owner has deferred past November 1.
-        NOT WEAKENED  the guarantee this test was named for — that the phone is SUPPLIED by
-                us and never taken from the customer's form — is server-side and is
-                asserted whole by PHONE-02 and PHONE-03, which are unchanged and still
-                pass. The masking helper keeps its own unit assertions in PHONE-05.
+        The published DETAILS screen renders `${data.contact_phone_display}` under
+        "Te contactamos a este WhatsApp:" and asks the customer for no number of their own,
+        so these two values are what that screen reads. R1 withheld them, which would have
+        left a shipped caption with nothing under it.
         """
         data = self.svc.handle_init(self.token)["data"]
-        self.assertNotIn("contact_phone", data)
-        self.assertNotIn("contact_phone_display", data)
-        # the helper is retained for the deferred rollout and must still be correct
+        self.assertEqual(data["contact_phone"], WA_ID)
+        self.assertEqual(data["contact_phone_display"], "…0001")
         self.assertEqual(_mask_phone(WA_ID), "…0001")
+
+    def test_phone_01b_r2_the_phone_is_digits_only_and_from_the_contact(self):
+        """PHONE-01b — WILD1-F3-R2. The value is derived from `ctx.contact.wa_id`, digits
+        only, so a formatted or punctuated identity cannot reach a payload the operator's
+        screen later reads."""
+        self.contact.wa_id = "+54 9 11 0000-0001"
+        self.db.commit()
+        data = self.svc.handle_init(self.token)["data"]
+        self.assertEqual(data["contact_phone"], "5491100000001")
+        self.assertTrue(data["contact_phone"].isdigit())
+        self.assertEqual(data["contact_phone_display"], "…0001")
 
     def test_phone_02_a_tampered_payload_phone_cannot_replace_wa_id(self):
         """PHONE-02 — enforced server-side, not by the absence of a UI field."""
@@ -289,61 +329,84 @@ class TestCanonicalPhone(_World):
         self.assertEqual(out["data"]["phone"], WA_ID)
 
     def test_phone_03_the_booking_records_canonical_identity(self):
-        self.svc.handle_confirm_booking(
-            self.token, self.confirm_payload(phone="5491199999999"))
+        self.svc.handle_confirm_booking(self.token, self.confirm_payload(
+            phone="5491199999999"))
         rev = self.db.query(ThreadRevision).one()
         self.assertEqual(rev.buyer_phone, WA_ID)
 
-    def test_phone_05_no_full_number_reaches_the_flow_at_all(self):
-        """PHONE-05 — WILD1-F3-R1. Strictly stronger than before.
+    def test_phone_05_no_full_number_is_rendered_on_screen(self):
+        """PHONE-05 — the screen shows a mask; the full value travels as data only.
 
-        BEFORE  the full number travelled as data and only the masked copy was checked for
-                not containing it.
-        AFTER   the number appears NOWHERE in the payload. A value we do not send cannot
-                leak from a screen, a log or a Meta-side error report.
+        WILD1-F3-R2: R1 replaced this with "the number appears nowhere in the payload",
+        which was true only because R1 had stopped sending it. The published Flow carries
+        `contact_phone` in two action payloads and renders ONLY the mask, so the original
+        assertion is the one that matches the published asset: nothing drawn on a screen
+        contains the full number, and that is asserted here against the artifact as well as
+        against the payload.
         """
         data = self.svc.handle_init(self.token)["data"]
-        self.assertNotIn(WA_ID, json.dumps(data))
+        self.assertNotIn(WA_ID, data["contact_phone_display"])
         self.assertTrue(_mask_phone(WA_ID).startswith("…"))
         self.assertEqual(_mask_phone(None), "")
+        # and no COMPONENT in the published Flow binds the unmasked key — only actions do
+        import re as _re
+        for sid, s in _screens(PUBLISHED_LIVE).items():
+            def visible_text(node, out):
+                if isinstance(node, dict):
+                    if node.get("type") in ("TextBody", "TextHeading", "TextCaption",
+                                            "TextSubheading", "RichText"):
+                        out.append(json.dumps(node.get("text"), ensure_ascii=False))
+                    for k, v in node.items():
+                        if k not in ("on-click-action", "on-select-action"):
+                            visible_text(v, out)
+                elif isinstance(node, list):
+                    for v in node:
+                        visible_text(v, out)
+                return out
+            drawn = " ".join(visible_text(s.get("layout", {}), []))
+            self.assertNotIn("${data.contact_phone}", drawn,
+                             f"{sid} draws the unmasked number on screen")
 
     def test_the_candidate_flow_has_no_editable_phone_input(self):
-        det = _screens(CANDIDATE)["DETAILS"]
-        phone_input = _find(det["layout"],
-                            lambda c: c.get("type") == "TextInput" and c.get("name") == "phone")
-        self.assertIsNone(phone_input, "the editable phone field must be gone")
-        footer = _find(det["layout"], lambda c: c.get("type") == "Footer")
-        self.assertEqual(footer["on-click-action"]["payload"]["phone"], "${data.contact_phone}")
+        for s in _screens(CANDIDATE).values():
+            def check(node):
+                if isinstance(node, dict):
+                    if node.get("type") == "TextInput":
+                        self.assertNotEqual(node.get("name"), "phone",
+                                            "a phone input is back on a screen")
+                    for v in node.values():
+                        check(v)
+                elif isinstance(node, list):
+                    for v in node:
+                        check(v)
+            check(s.get("layout") or {})
 
 
 class TestNamePrefill(_World):
 
-    # ── WILD1-F3-R1: NAME-01/02/04 ─────────────────────────────────────────────────
+    # ── WILD1-F3-R2: NAME-01/02/04 restored ────────────────────────────────────────
     #
-    # BEFORE  each read `data["customer_name"]` from the APPOINTMENT payload.
-    # AFTER   each asserts the key is absent, and tests `_lead_display_name` directly.
-    # WHY     published v7.3's DETAILS `name` TextInput declares no `init-value`, so the
-    #         name could not be prefilled; only the unpublished candidate binds it. The
-    #         helper is retained for that deferred milestone, so its behaviour — the actual
-    #         subject of all three tests — is still asserted, now at its source.
-    # NOT WEAKENED  NAME-03, which proves a typed correction survives to the booking row,
-    #         is unchanged and still passes.
+    # R1 rewrote these to read `_lead_display_name(self.lead)` and assert
+    # `customer_name` was absent from the payload. The published DETAILS screen declares
+    # `customer_name`, so the key belongs in the payload; the helper's own behaviour stays
+    # asserted alongside it rather than instead of it.
 
-    def test_name_01_a_lead_name_is_computed_but_not_offered(self):
+    def test_name_01_a_lead_name_is_offered(self):
         self.lead.nombre, self.lead.apellido = "Juan", "Pérez"
         self.db.commit()
         self.assertEqual(_lead_display_name(self.lead), "Juan Pérez")
-        self.assertNotIn("customer_name", self.svc.handle_init(self.token)["data"])
+        self.assertEqual(self.svc.handle_init(self.token)["data"]["customer_name"],
+                         "Juan Pérez")
 
     def test_name_02_no_lead_name_invents_nothing(self):
         self.assertEqual(_lead_display_name(self.lead), "")
-        self.assertNotIn("customer_name", self.svc.handle_init(self.token)["data"])
+        self.assertEqual(self.svc.handle_init(self.token)["data"]["customer_name"], "")
 
     def test_name_04_whatsapp_display_name_is_not_verified_identity(self):
         """NAME-04 — display_name is a profile label the customer sets; it is not a name we
         may put on a booking."""
         data = self.svc.handle_init(self.token)["data"]
-        self.assertNotIn("customer_name", data)
+        self.assertEqual(data["customer_name"], "")
         self.assertNotIn("perfil_de_whatsapp", json.dumps(data))
         self.assertEqual(_lead_display_name(self.lead), "")
 
@@ -364,7 +427,15 @@ class TestNamePrefill(_World):
 class TestFlowContract(unittest.TestCase):
 
     def test_flow_07_the_published_baseline_is_byte_identical(self):
-        """FLOW-07 — the rollback artifact must not drift."""
+        """FLOW-07 — neither preserved artifact may drift.
+
+        WILD1-F3-R2: `PUBLISHED` is the preserved PRE-16-SEPTEMBER baseline and
+        `PUBLISHED_LIVE` (r3) is the structure of what is published now. Both are pinned:
+        the first because the record cites it, the second because it is the rollback
+        artifact and the baseline every target is derived from.
+        """
+        self.assertEqual(hashlib.sha256(PUBLISHED_LIVE.read_bytes()).hexdigest(),
+                         PUBLISHED_LIVE_SHA, "the live-structure artifact drifted")
         self.assertEqual(hashlib.sha256(PUBLISHED.read_bytes()).hexdigest(), PUBLISHED_SHA)
         pub = json.loads(PUBLISHED.read_text())
         self.assertEqual(pub["version"], "7.3")

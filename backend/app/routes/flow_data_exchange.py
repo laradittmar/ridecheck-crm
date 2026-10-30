@@ -172,7 +172,15 @@ async def booking_flow_data_exchange(
         # WILD1-F3: built by the one contract builder, which supplies every declared key
         # and refuses an undeclared one. `has_error` is what makes the message visible on
         # the target Flow; the hand-rolled dict that stood here carried `error_message`
-        # with no flag and, on the PUBLISHED v7.3, five keys it does not declare at all.
+        # with no flag at all.
+        #
+        # WILD1-F3-R2: the builder's defaults supply the five prefill keys as empty
+        # strings, which is the same thing the hand-rolled dict did deliberately and for
+        # the same reason — an expired or tampered session HAS no authoritative identity to
+        # assert. The token is what names the contact, and the token is what just failed, so
+        # there is nothing to read `ctx.contact.wa_id` from. Empty is the honest value and a
+        # declared-but-empty key is renderable where a missing one is not; the screen's own
+        # message tells the customer to start again rather than continue.
         error_response = {
             "version": FLOW_VERSION,
             "screen": "APPOINTMENT",

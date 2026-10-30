@@ -549,12 +549,16 @@ class BookingFlowService:
         # In the live Wild the customer negotiated Monday 17:00 in chat and the Flow then
         # made them pick the day and the time over again from full lists.
         #
-        # The published Flow (id 28104222025943520, v7.3) declares its Dropdowns WITHOUT an
-        # `init-value`, so nothing the back end sends can preselect them — that needs a Flow
-        # republish on Meta, which is an owner action. What IS available to us is the option
-        # list itself: when an exact slot is already agreed AND still free, the picker is
-        # narrowed to that one date and that one time. The customer confirms rather than
-        # re-chooses, the date→time round trip disappears, and a wrong slot cannot be picked.
+        # The published Flow (id 28104222025943520) declares its Dropdowns WITHOUT an
+        # `init-value` — true of the live definition the owner exported on 2026-10-30 and of
+        # every artifact in `meta/flows/booking/`, and enforced by `scripts/validate_flow_json.py`,
+        # which treats `init-value` on a Dropdown or TextInput as a forbidden property. So
+        # nothing the back end sends can preselect a Dropdown; `selected_date`/`selected_time`
+        # are declared and bound nowhere (flow_contract.APPOINTMENT_CARRIED). What IS
+        # available to us is the option list itself: when an exact slot is already agreed AND
+        # still free, the picker is narrowed to that one date and that one time. The customer
+        # confirms rather than re-chooses, the date→time round trip disappears, and a wrong
+        # slot cannot be picked.
         #
         # Only when a slot is genuinely agreed. A day-only or NEXT_AVAILABLE dispatch keeps
         # the full picker, because there the choice is still real (Part 9).
@@ -576,6 +580,17 @@ class BookingFlowService:
                     # WILD1-F3: every APPOINTMENT payload leaves through the one contract
                     # builder, so no branch can be the one that ships a key the Flow does
                     # not declare — or omits one it does.
+                    #
+                    # WILD1-F3-R2: both selection ids are supplied again. R1 removed them
+                    # on the reading that no published screen declared them; the owner's
+                    # 2026-10-30 Meta export shows the live Flow declares both. They are
+                    # safe to send because of the invariant above them, not because the
+                    # Flow is forgiving: each id exists in the data-source it is selected
+                    # from — `agreed_day` is the one item in `date` and `agreed_time` is in
+                    # `still_free`, which was just re-read from the schedule. A selection
+                    # from another offer or an earlier cycle cannot reach here: it would
+                    # not be in `still_free`, and the branch falls through to the full
+                    # picker below.
                     return appointment_payload(
                         booking_token=ctx.booking_token,
                         vehicle_summary=ctx.vehicle_summary,
@@ -584,6 +599,9 @@ class BookingFlowService:
                         is_date_enabled=True,
                         time=still_free,
                         is_time_enabled=True,
+                        selected_date=agreed_day,
+                        selected_time=agreed_time,
+                        **self._identity_fields(ctx),
                     )
                 logger.info(
                     "BOOKING_FLOW agreed slot %s %s no longer free — full picker offered",
@@ -598,11 +616,20 @@ class BookingFlowService:
             except (ValueError, TypeError):
                 pass
 
-        # WILD1-F3-R1: there is no selection echo any more. `selected_date`/`selected_time`
-        # were init-values for an UNPUBLISHED candidate; published v7.3 declares its
-        # Dropdowns without `init-value`, so nothing the backend sent could preselect
-        # anything and the two keys were inert. What still works is the narrowing above —
-        # the option list itself — which is why that is kept and these are not.
+        # GATE A: a selection is offered ONLY when it exists in its own data-source. A day
+        # the customer named is selectable; a time they never chose is not, and preselecting
+        # the earliest would be us deciding for them.
+        #
+        # WILD1-F3-R2: this is the guard that makes a restored echo safe, and it is why the
+        # echo is derived here rather than copied from the request. `selected_date_str`
+        # arrives from the Flow; it becomes a selection only if the backend's own
+        # `date_items` — built above from `ScheduleService` for this context's zone group —
+        # contains it. A day from another offer, another cycle or a replayed payload is not
+        # in that list and collapses to "". `selected_time` is never echoed from input at
+        # all: the only path that sets it is the agreed-slot branch above, which re-reads
+        # the schedule first.
+        selected_date = selected_date_str if any(
+            i.get("id") == selected_date_str for i in date_items) else ""
         data: dict = appointment_payload(
             booking_token=ctx.booking_token,
             vehicle_summary=ctx.vehicle_summary,
@@ -611,6 +638,9 @@ class BookingFlowService:
             is_date_enabled=is_date_enabled,
             time=time_items,
             is_time_enabled=is_time_enabled,
+            selected_date=selected_date or "",
+            selected_time="",
+            **self._identity_fields(ctx),
         )
         if refusal_message:
             # WILD1-F3: the message AND the flag that makes it visible. The target Flow
@@ -625,19 +655,40 @@ class BookingFlowService:
             data["has_refusal"] = True
         return data
 
-    # ── the APPOINTMENT identity helper was removed here — WILD1-F3-R1, 2026-10-29 ──
-    #
-    # It supplied `customer_name`, `contact_phone` and `contact_phone_display` on every
-    # APPOINTMENT payload so DETAILS could render the WhatsApp number instead of asking
-    # for it. That needs the prefill candidate published: v7.3's navigate payload carries
-    # none of the three and its DETAILS screen declares none of them, so the three keys
-    # went to a Flow that ignored them. The prefill rollout is deferred past the November 1
-    # correction rather than bundled with it; the candidate artifacts and their Gate B
-    # certification tests stay in the repository, and the helper is recoverable from
-    # 1008434ca76c if that milestone is taken up.
-    #
-    # Nothing is lost: the phone an operator calls is `ctx.contact.wa_id`, re-asserted
-    # server-side in `_confirm_booking` whatever any screen shows.
+    def _identity_fields(self, ctx: BookingContext) -> dict:
+        """Canonical identity carried to DETAILS through the navigate payload.
+
+        APPOINTMENT → DETAILS is client-side `navigate`: the back end is never called
+        between those screens, so anything DETAILS needs has to leave from here.
+
+        `contact_phone` is `wa_id` — the transport identity WhatsApp already proved. It is
+        carried as data, never as an editable field, and it is re-asserted server-side at
+        prepare_summary and confirm_booking so the UI is not the thing enforcing it.
+
+        WILD1-F3-R2 restored this helper, which R1 deleted. R1's premise was that the live
+        Flow was v7.3, which declares none of the three keys. The owner's 2026-10-30 export
+        of the published definition for asset 28104222025943520 shows it declares all three
+        on APPOINTMENT and all three on DETAILS, renders the mask under "Te contactamos a
+        este WhatsApp:" and asks the customer for no number of their own. Withholding them
+        would blank a shipped screen, so they are supplied again — unchanged, from the same
+        authoritative sources:
+
+          contact_phone          digits of `ctx.contact.wa_id`, the identity WhatsApp
+                                 proved. Never read from Flow input; `handle_prepare_summary`
+                                 and `_confirm_booking` rebind it server-side regardless of
+                                 what any payload claims.
+          contact_phone_display  derived from that same value by `_mask_phone` — last four
+                                 digits only, so no complete number is drawn on a screen.
+          customer_name          `_lead_display_name`: the operator-or-Flow-persisted name,
+                                 or empty. A WhatsApp profile label is NOT elevated into a
+                                 verified name, and nothing is invented.
+        """
+        wa_id = "".join(ch for ch in (ctx.contact.wa_id or "") if ch.isdigit())
+        return {
+            "customer_name": _lead_display_name(ctx.lead),
+            "contact_phone": wa_id,
+            "contact_phone_display": _mask_phone(wa_id),
+        }
 
     def _summary_screen_data(
         self,
@@ -1122,6 +1173,14 @@ class BookingFlowService:
         data = dict(self._appointment_screen_data(ctx, selected_date_str=date_str))
         data["slot_conflict_message"] = message
         data["has_refusal"] = True
+        # The time they picked is exactly what was not booked, so it is not offered back as
+        # a selection. WILD1-F3-R2: this override was in the pre-R1 code and is restored
+        # with the echo it defends. `_appointment_screen_data` would normally leave
+        # `selected_time` empty here anyway, but not on every path: a refusal whose reason
+        # is not the slot (an offer that may not be accepted, say) can reach this with the
+        # slot still free and an agreed day/time on the state, and the narrowing branch
+        # would then echo the time. One line, and no refusal can preselect a time again.
+        data["selected_time"] = ""
         return {
             "version": FLOW_VERSION,
             "screen": "APPOINTMENT",

@@ -26,7 +26,25 @@ Four defects, one suite, each with a regression that fails against the parent be
   F5  The contract test asserted one direction and subtracted the two keys that break the
       live Flow, while claiming "both directions" in its docstring.
 
-GATE-01..08 · CONTRACT-01..09 · ROUTING-01..06 · HTTP-01..06 · REFUSAL-01..08
+R2 BASELINE CORRECTION — 2026-10-30
+    Everything above is unchanged except WHICH artifact "published v7.3" names. R1 read
+    `meta/flows/booking/README.md`, which calls `PUBLISHED_28104222025943520_v7.3.json` "a
+    byte-exact copy of what is PUBLISHED right now" two lines after recording that r1 was
+    "PUBLISHED live on 2026-09-16". The 2026-09-16 Gate B Final Certification settles it:
+    it downloaded the live definition from the Flows API, canonicalised it to
+    `5c4c68d1…` and proved deep structural equality with `CANDIDATE_v7.4-prefill-r3.json`.
+    On 2026-10-30 the owner exported the published JSON for asset 28104222025943520 from
+    Meta and confirmed r3's structure field by field.
+
+    The F3a diagnosis survives untouched, because v7.3 and r3 declare the IDENTICAL routing
+    model — `{"APPOINTMENT": ["DETAILS"], "DETAILS": ["SUMMARY"], "SUMMARY": []}` — which
+    CONTRACT-09b asserts. What changes is the SIZE of the published-to-target delta: four
+    keys, not nine. R1 had read five published prefill fields as part of the gap and removed
+    them from the payload, withdrawing a shipped, handset-certified feature. CONTRACT-08b
+    now asserts their restoration where it asserted their absence, and CONTRACT-08d keeps
+    the wrongly-derived `TARGET_v7.6` artifact out of publication without deleting it.
+
+GATE-01..08 · CONTRACT-01..09b · ROUTING-01..06 · HTTP-01..06 · REFUSAL-01..08
 """
 from __future__ import annotations
 
@@ -65,7 +83,12 @@ from app.services.booking_dispatch_gate import (
 FLOW_DIR = ROOT / "meta" / "flows" / "booking"
 TARGET = ROOT / FC.TARGET_FLOW_PATH
 PUBLISHED = ROOT / FC.PUBLISHED_FLOW_PATH
-PUBLISHED_SHA = "274038ba234a49fa4f99bae47c00f6cac640e248d56a373d40ae8fba6c1afb15"
+PUBLISHED_SHA = FC.PUBLISHED_FLOW_SHA256
+#: The pre-16-September baseline, still pinned so it cannot drift, and still asserted to be
+#: refusal-incapable. It is NOT what is live (see the R2 note in the module docstring).
+PRESERVED = ROOT / FC.PRESERVED_BASELINE_PATH
+PRESERVED_SHA = FC.PRESERVED_BASELINE_SHA256
+SUPERSEDED = ROOT / FC.SUPERSEDED_TARGET_PATH
 
 BFS_PATH = ROOT / "backend" / "app" / "services" / "booking_flow_service.py"
 DX_PATH = ROOT / "backend" / "app" / "routes" / "flow_data_exchange.py"
@@ -83,6 +106,28 @@ def _screens(path):
 
 def _declared(path):
     return {sid: set(s.get("data", {})) for sid, s in _screens(path).items()}
+
+
+def _input_names(layout):
+    """Every `TextInput` name in a layout, in document order.
+
+    A module-level reader rather than a closure inside each test: the two baselines are
+    distinguished by whether DETAILS asks the customer for a telephone number, and a check
+    that important should be one function that several tests call.
+    """
+    out = []
+
+    def walk(n):
+        if isinstance(n, dict):
+            if n.get("type") == "TextInput":
+                out.append(n.get("name"))
+            for v in n.values():
+                walk(v)
+        elif isinstance(n, list):
+            for v in n:
+                walk(v)
+    walk(layout)
+    return out
 
 
 def _rendered(path):
@@ -222,40 +267,88 @@ class TestFlowContract(unittest.TestCase):
             self.assertEqual(leaked, set(),
                              f"a set-difference exclusion masks {sorted(leaked)}")
 
-    def test_contract_08b_the_deferred_prefill_is_gone_from_every_surface(self):
-        """CONTRACT-08b — the unpublished prefill rollout is not in the launch correction.
+    def test_contract_08b_the_published_prefill_is_supplied_on_every_surface(self):
+        """CONTRACT-08b — WILD1-F3-R2. The inverse of what this test asserted yesterday.
 
-        Five keys were carried into the first target because it was derived from an
-        unpublished candidate rather than from the published baseline. They must now be
-        absent from the contract, from the payload builder and from the target artifact,
-        and present in `DEFERRED_PREFILL_KEYS` so a future reader knows they were removed
-        on purpose and where to find them.
+        R1 asserted that five keys — `selected_date`, `selected_time`, `customer_name`,
+        `contact_phone`, `contact_phone_display` — were ABSENT from the contract, the
+        payload builder and the target artifact, on the reading that they belonged to an
+        unpublished candidate and the live Flow was `PUBLISHED_…v7.3.json`.
+
+        The owner exported the published definition for asset 28104222025943520 from Meta
+        on 2026-10-30. It declares all five on APPOINTMENT, carries three of them in the
+        APPOINTMENT -> DETAILS navigate payload, and renders the masked number on DETAILS
+        under "Te contactamos a este WhatsApp:" — r3's structure, which the 2026-09-16 Gate
+        B Final Certification had already proved live by downloading the definition from the
+        Flows API. R1's removal was therefore the withdrawal of a shipped feature.
+
+        So the assertion is reversed, in the same places and in both directions: declared by
+        the published Flow, declared by the target, in the contract, and supplied by the
+        builder. The reversal is deliberate and recorded, not a weakening — a test that
+        asserts absence and a test that asserts presence cannot both be satisfied, and the
+        artifact decides which is right.
         """
         self.assertEqual(
-            FC.DEFERRED_PREFILL_KEYS,
+            FC.RESTORED_PREFILL_KEYS,
             {"selected_date", "selected_time", "customer_name",
              "contact_phone", "contact_phone_display"})
-        for key in FC.DEFERRED_PREFILL_KEYS:
-            for sid, keys in FC.SCREEN_KEYS.items():
-                self.assertNotIn(key, keys, f"{key} is back in the {sid} contract")
-            self.assertNotIn(key, FC.appointment_payload(),
-                             f"the backend still supplies {key}")
-            self.assertNotIn(key, FC.APPOINTMENT_DEFAULTS)
-        declared = _declared(TARGET)
-        for sid, keys in declared.items():
-            leaked = keys & FC.DEFERRED_PREFILL_KEYS
-            self.assertEqual(leaked, set(),
-                             f"the target's {sid} screen declares deferred {sorted(leaked)}")
-        # and the service no longer builds them
+        self.assertFalse(hasattr(FC, "DEFERRED_PREFILL_KEYS"),
+                         "the deferral constant is back — its premise was refuted by the "
+                         "owner's 2026-10-30 Meta export")
+        payload = FC.appointment_payload()
+        declared_live = _declared(PUBLISHED)["APPOINTMENT"]
+        declared_target = _declared(TARGET)["APPOINTMENT"]
+        for key in FC.RESTORED_PREFILL_KEYS:
+            self.assertIn(key, declared_live,
+                          f"the published Flow does not declare {key} — re-derive R2")
+            self.assertIn(key, declared_target, f"the target dropped {key}")
+            self.assertIn(key, FC.APPOINTMENT_KEYS, f"{key} is in no screen contract")
+            self.assertIn(key, payload, f"the backend does not supply {key}")
+            self.assertIn(key, FC.APPOINTMENT_DEFAULTS, f"{key} has no absent-value")
+        # and the service builds them, from the identity helper R1 deleted
         bfs = (ROOT / "backend" / "app" / "services" / "booking_flow_service.py").read_text()
         tree = ast.parse(bfs)
-        for fn in (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
-                   and n.name in ("_appointment_screen_data", "_refusal_screen")):
-            body = ast.unparse(fn)
-            for key in FC.DEFERRED_PREFILL_KEYS:
-                self.assertNotIn(f"{key}=", body, f"{fn.name} still passes {key}")
-                self.assertNotIn(f"'{key}'", body, f"{fn.name} still writes {key}")
-                self.assertNotIn(f'"{key}"', body, f"{fn.name} still writes {key}")
+        fns = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+        self.assertIn("_identity_fields", fns,
+                      "the identity helper is gone again — DETAILS renders a blank mask")
+        identity = ast.unparse(fns["_identity_fields"])
+        for key in ("customer_name", "contact_phone", "contact_phone_display"):
+            self.assertIn(key, identity, f"_identity_fields no longer supplies {key}")
+        # the number is derived from the proven transport identity, never from Flow input
+        self.assertIn("ctx.contact.wa_id", identity)
+        self.assertIn("_mask_phone", identity)
+        self.assertIn("_lead_display_name", identity)
+        appt = ast.unparse(fns["_appointment_screen_data"])
+        self.assertIn("selected_date", appt)
+        self.assertIn("selected_time", appt)
+        self.assertIn("self._identity_fields(ctx)", appt)
+
+    def test_contract_08d_the_superseded_target_is_preserved_and_never_published(self):
+        """CONTRACT-08d — WILD1-F3-R2.
+
+        `TARGET_v7.6-minimal-refusal.json` was derived from the pre-16-September baseline.
+        Publishing it would remove five APPOINTMENT fields and three DETAILS fields,
+        re-add a required customer telephone input and revert two action payloads. It is
+        kept as audit evidence and must not be the artifact the backend points at.
+        """
+        self.assertTrue(SUPERSEDED.exists(), "the superseded target was deleted")
+        self.assertEqual(_sha(SUPERSEDED), FC.SUPERSEDED_TARGET_SHA256)
+        self.assertNotEqual(FC.TARGET_FLOW_PATH, FC.SUPERSEDED_TARGET_PATH)
+        self.assertNotEqual(FC.TARGET_FLOW_SHA256, FC.SUPERSEDED_TARGET_SHA256)
+        # the concrete regression it would have shipped, measured rather than asserted
+        sup, live = _screens(SUPERSEDED), _screens(PUBLISHED)
+        for sid in ("APPOINTMENT", "DETAILS"):
+            lost = set(live[sid]["data"]) - set(sup[sid]["data"])
+            self.assertTrue(lost, f"{sid}: the superseded target lost nothing — re-derive")
+        self.assertIn("phone", _input_names(sup["DETAILS"]["layout"]),
+                      "the superseded target no longer re-adds the phone input — its "
+                      "preserved content changed")
+        # and the artifact actually in use adds no input at all
+        self.assertNotIn("phone", _input_names(_screens(TARGET)["DETAILS"]["layout"]),
+                         "the live target asks the customer for a phone number")
+        self.assertEqual(_input_names(_screens(TARGET)["DETAILS"]["layout"]),
+                         _input_names(live["DETAILS"]["layout"]),
+                         "the target changed which questions DETAILS asks")
 
     def test_contract_08c_the_published_journey_is_untouched(self):
         """CONTRACT-08c — the target may add; it may not alter or remove.
@@ -310,25 +403,63 @@ class TestFlowContract(unittest.TestCase):
             self.assertIn("TextBody", c)
             self.assertTrue("has_refusal" in c or "has_error" in c, c)
 
-    def test_contract_09_published_v73_fails_the_target_contract(self):
+    def test_contract_09_the_published_flow_fails_the_target_contract(self):
         """CONTRACT-09 — the live mismatch is preserved as a regression.
 
         This is the defect, asserted as a fact rather than a memory: the PUBLISHED Flow
-        cannot carry a refusal. If someone "fixes" this by pointing the contract at v7.3,
-        this test fails and says why. It is also the proof that publication is required.
+        cannot carry a refusal. If someone "fixes" this by pointing the contract at the
+        published artifact, this test fails and says why. It is also the proof that
+        publication is required.
+
+        WILD1-F3-R2: the gap is now exactly four keys, not nine. R1 measured it against the
+        pre-16-September baseline and read five published prefill fields as part of the
+        gap; against what is actually live the gap is the refusal contract and nothing
+        else — which is the whole claim this correction rests on.
         """
         self.assertEqual(_sha(PUBLISHED), PUBLISHED_SHA, "the published artifact changed")
         pub = _declared(PUBLISHED)["APPOINTMENT"]
         supplied = set(FC.appointment_payload())
         undeclared = supplied - pub
         self.assertIn("slot_conflict_message", undeclared,
-                      "v7.3 now declares slot_conflict_message — re-derive the contract")
+                      "the published Flow now declares slot_conflict_message — re-derive")
         self.assertIn("error_message", undeclared)
         self.assertEqual(
             undeclared, set(FC.REFUSAL_KEYS),
             "the published-vs-target gap moved; the publication boundary must be re-stated")
-        # and v7.3 binds no component capable of showing a refusal
+        self.assertEqual(len(undeclared), 4, sorted(undeclared))
+        # the published Flow supplies no key the backend withholds: the delta is additive
+        self.assertEqual(pub - supplied, set(),
+                         f"the backend withholds published keys: {sorted(pub - supplied)}")
+        # and it binds no component capable of showing a refusal
         self.assertNotIn("slot_conflict_message", _rendered(PUBLISHED)["APPOINTMENT"])
+
+    def test_contract_09b_the_preserved_baseline_is_pinned_and_is_not_live(self):
+        """CONTRACT-09b — WILD1-F3-R2.
+
+        `PUBLISHED_28104222025943520_v7.3.json` must not drift and must not be mistaken for
+        the live asset again. The distinguishing facts are structural and are asserted here
+        so the next reader does not have to trust a README: v7.3 asks the customer for their
+        own telephone number and declares none of the five prefill keys; the live structure
+        does the opposite.
+        """
+        self.assertEqual(_sha(PRESERVED), PRESERVED_SHA, "the preserved baseline drifted")
+        self.assertNotEqual(_sha(PRESERVED), PUBLISHED_SHA)
+        pre, live = _screens(PRESERVED), _screens(PUBLISHED)
+        for key in FC.RESTORED_PREFILL_KEYS:
+            self.assertNotIn(key, pre["APPOINTMENT"]["data"],
+                             f"v7.3 declares {key} — the baselines are no longer distinct")
+            self.assertIn(key, live["APPOINTMENT"]["data"])
+
+        self.assertIn("phone", _input_names(pre["DETAILS"]["layout"]),
+                      "v7.3 no longer asks for a phone — re-derive the distinction")
+        self.assertNotIn("phone", _input_names(live["DETAILS"]["layout"]),
+                         "the live DETAILS screen asks the customer for a phone number")
+        self.assertIn("${data.contact_phone_display}",
+                      json.dumps(live["DETAILS"]["layout"], ensure_ascii=False))
+        # both baselines share the routing model that broke the refusal, so the F3a
+        # diagnosis and the deployed backend correction stand whichever one is live
+        self.assertEqual(json.load(open(PRESERVED))["routing_model"],
+                         json.load(open(PUBLISHED))["routing_model"])
 
 
 # ══════════════════════════════════════════════════════════════════════════════

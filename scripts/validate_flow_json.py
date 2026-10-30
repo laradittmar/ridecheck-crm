@@ -11,8 +11,12 @@ This validator encodes what Meta told us, plus one precedent rule. It is deliber
 NOT a reimplementation of Meta's schema: nothing here is invented. Rules come only from
 
   * the errors returned by Ejecutar on 2026-09-16, as corrected by the executions below, and
-  * the live PUBLISHED asset, which is the only Flow JSON we hold that Meta has
-    demonstrably accepted.
+  * the Flow JSON Meta has demonstrably accepted. Note, corrected 2026-10-30: that is
+    `PUBLISHED_28104222025943520_v7.3.json` AND `CANDIDATE_v7.4-prefill-r3.json`, and it is
+    r3 that is live — v7.3 is the preserved pre-16-September baseline. Both passed Ejecutar
+    clean, so the precedent rules below stand unchanged; the Ejecutar table that follows is
+    the 2026-09-16 record and is left exactly as it was written. See
+    `meta/flows/booking/README.md` for which artifact is published and the evidence for it.
 
 Owner Ejecutar results, 2026-09-16 — these are the authority, and they corrected this file:
 
