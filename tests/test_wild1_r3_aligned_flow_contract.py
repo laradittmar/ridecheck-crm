@@ -310,18 +310,30 @@ class TestExactDelta(unittest.TestCase):
         self.assertEqual(kids[5]["type"], "Form")
         self.assertEqual(len(kids), 6)
 
-    def test_r2_d04_exactly_two_routing_edges_are_added(self):
+    def test_r2_d04_no_routing_edge_is_added_or_removed(self):
+        """WILD1-R3, 2026-10-30. This test used to assert the OPPOSITE: that exactly two
+        backward edges were added, and that they equalled `FC.REQUIRED_ROUTING_EDGES`.
+
+        Meta rejected that artifact in the owner-present run. A backward route mirroring a
+        forward one is not allowed at any price, and adding one also destroys the single
+        entry screen Meta requires. The published artifact's `routing_model` is therefore
+        byte-identical to r3's, and the return to APPOINTMENT is a server recovery
+        response, not an edge. See `TestForwardOnlyRouting` in
+        `test_wild1_forward_only_recovery_contract.py`.
+        """
         b = json.load(open(R3))["routing_model"]
         v = json.load(open(TARGET))["routing_model"]
         self.assertEqual(set(b), set(v), "a screen appeared in or left the routing model")
         added = {(k, d) for k in v for d in v[k] if d not in b[k]}
         removed = {(k, d) for k in b for d in b[k] if d not in v[k]}
-        self.assertEqual(added, set(FC.REQUIRED_ROUTING_EDGES))
-        self.assertEqual(added, {("DETAILS", "APPOINTMENT"), ("SUMMARY", "APPOINTMENT")})
+        self.assertEqual(added, set(), f"edges were added: {added}")
         self.assertEqual(removed, set(), f"edges were removed: {removed}")
-        # the forward journey is untouched
+        self.assertEqual(v, b, "routing_model must be identical to the published r3 graph")
+        # the forward journey, unchanged and forward-only
         self.assertEqual(v["APPOINTMENT"], ["DETAILS"])
-        self.assertIn("SUMMARY", v["DETAILS"])
+        self.assertEqual(v["DETAILS"], ["SUMMARY"])
+        self.assertEqual(v["SUMMARY"], [])
+        FC.assert_forward_only(v)
 
     def test_r2_d05_no_action_or_payload_anywhere_is_changed(self):
         for sid in self.base:
@@ -816,15 +828,33 @@ class TestRefusalPaths(_Converged, _World):
         with self.assertRaises(BookingTokenError):
             self.svc.handle_prepare_summary("1-0-deadbeefdeadbeef", self.payload())
 
-    def test_r2_r04_both_refusals_are_legal_transitions_on_the_target(self):
+    def test_r2_r04_both_refusals_are_recovery_returns_not_transitions(self):
+        """WILD1-R3, 2026-10-30. This test used to assert that both refusals were legal
+        *transitions* on the target and illegal on the published Flow — "which is why
+        publication is required". That reasoning is superseded: no routing model will ever
+        make them legal transitions, on either artifact.
+
+        What authorises them is the recovery allowlist, from server-known facts.
+        """
         rm = json.load(open(TARGET))["routing_model"]
-        FC.validate_transition("SUMMARY", "APPOINTMENT", rm)
-        FC.validate_transition("DETAILS", "APPOINTMENT", rm)
-        # and illegal on the published Flow, which is why publication is required
         rm_live = json.load(open(R3))["routing_model"]
-        for origin in ("SUMMARY", "DETAILS"):
-            with self.assertRaises(ValueError):
-                FC.validate_transition(origin, "APPOINTMENT", rm_live)
+        self.assertEqual(rm, rm_live, "the published graph and the target graph are one")
+
+        # As ordinary navigation both are refused, on BOTH artifacts, now and forever.
+        for routing in (rm, rm_live):
+            for origin in ("SUMMARY", "DETAILS"):
+                with self.assertRaises(ValueError):
+                    FC.validate_forward_route(origin, "APPOINTMENT", routing)
+
+        # As server-selected recovery returns, the real producers are authorised.
+        FC.validate_recovery_return("SUMMARY", "confirm_booking",
+                                    FC.RECOVERY_SLOT_CONFLICT, "APPOINTMENT")
+        FC.validate_recovery_return("DETAILS", "prepare_summary",
+                                    FC.RECOVERY_TOKEN_INVALID, "APPOINTMENT")
+        # and a slot conflict from DETAILS is NOT, because nothing produces one there
+        with self.assertRaises(ValueError):
+            FC.validate_recovery_return("DETAILS", "prepare_summary",
+                                        FC.RECOVERY_SLOT_CONFLICT, "APPOINTMENT")
 
     def test_r2_r05_an_empty_or_unknown_trigger_is_a_422_not_a_500(self):
         from app.routes import flow_data_exchange as DX

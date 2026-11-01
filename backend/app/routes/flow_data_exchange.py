@@ -38,11 +38,31 @@ from ..services.booking_flow_service import (
 
 logger = logging.getLogger(__name__)
 
-from ..services.flow_contract import appointment_payload  # WILD1-F3
+from ..services.flow_contract import (  # WILD1-F3, WILD1-R3
+    RECOVERY_SLOT_CONFLICT,
+    RECOVERY_TOKEN_INVALID,
+    appointment_payload,
+    validate_response_screen,
+)
+from ..services.flow_contract import FORWARD_ROUTES as _FORWARD_ROUTES
+from ..services.flow_contract import assert_forward_only as _assert_forward_only
 
 router = APIRouter(tags=["flows"])
 
 _TEXT_PLAIN = "text/plain"
+
+
+#: The routing model as a plain dict, for the forward-route check. `FORWARD_ROUTES` is the
+#: published graph, and it is the published graph that the check must be made against —
+#: not a copy that could drift from the artifact.
+_ROUTING_MODEL = {screen: list(targets) for screen, targets in _FORWARD_ROUTES.items()}
+
+# WILD1-R3-C1 (review finding R-F05): the forward-only rules are now enforced BY THE RUNNING
+# PROCESS, not only by the test suite. Until this line, `assert_forward_only` was defined and
+# called from nowhere outside tests, so an edit reintroducing a backward edge into
+# `FORWARD_ROUTES` would have been caught by CI and by nothing in the deployed container.
+# Import fails loudly rather than serving a graph Meta would reject.
+_assert_forward_only(_ROUTING_MODEL)
 
 
 def _encrypt_and_return(response_dict: dict, aes_key: bytes, iv: bytes) -> Response:
@@ -50,6 +70,43 @@ def _encrypt_and_return(response_dict: dict, aes_key: bytes, iv: bytes) -> Respo
     encrypted = encrypt_flow_response(response_dict, aes_key, iv)
     b64_body = base64.b64encode(encrypted).decode("ascii")
     return Response(content=b64_body, media_type=_TEXT_PLAIN)
+
+
+def _guarded_return(response_dict: dict, trigger: str, aes_key: bytes, iv: bytes,
+                    *, outcome: str | None = None) -> Response:
+    """WILD1-R3 — the ONE place a Data API response screen is authorised.
+
+    Every response that names a screen passes through here, and the screen is authorised
+    one of exactly three ways:
+
+      * an ordinary forward route in Meta's published `routing_model` (or a self-refresh,
+        or the Flow opening);
+      * the Data API terminate instruction, carrying a real extension payload;
+      * a recognised typed refusal whose (origin, trigger, outcome) triple is on the
+        narrow recovery allowlist in `flow_contract`.
+
+    `outcome` is supplied by the backend's own `except` clause from the typed exception it
+    caught. It is never read from request data, and neither is the screen: the response
+    dicts are built by `booking_flow_service`, and nothing in this module copies a screen
+    name out of `data`. A client that sends `{"screen": "APPOINTMENT"}` or
+    `{"target": "APPOINTMENT"}` changes nothing — those keys are not read anywhere.
+
+    A response this guard refuses is a server defect, so it is logged and never emitted.
+    Emitting it is the failure mode this guard exists to prevent: the 2026-10-29 Wild sent
+    ten responses naming a screen the Flow could not accept, and the customer saw Meta's
+    generic error ten times.
+    """
+    screen = str(response_dict.get("screen", ""))
+    try:
+        validate_response_screen(
+            trigger, screen, _ROUTING_MODEL, outcome=outcome,
+            terminal_payload=response_dict.get("data"))
+    except ValueError as exc:
+        logger.error("BOOKING_FLOW_RESPONSE_REFUSED trigger=%r screen=%r outcome=%r: %s",
+                     trigger, screen, outcome, exc)
+        raise HTTPException(status_code=500,
+                            detail="Response screen not authorised") from exc
+    return _encrypt_and_return(response_dict, aes_key, iv)
 
 
 @router.post(
@@ -97,6 +154,13 @@ async def booking_flow_data_exchange(
 
     svc = BookingFlowService(db)
 
+    # The trigger, derived once from the envelope, so the refusal handlers below can name
+    # the same one the dispatch used. `INIT` is its own trigger; anything unrecognised
+    # stays as it arrived and is refused by the dispatch and by the guard alike.
+    trigger: str = ("INIT" if action == "INIT"
+                    else str(data.get("trigger", "")).strip() if action == "data_exchange"
+                    else "")
+
     # ── Booking token ─────────────────────────────────────────────────────────
     # The Flow sends booking_token in data (or falls back to flow_token).
     booking_token = str(data.get("booking_token") or flow_token or "").strip()
@@ -107,8 +171,6 @@ async def booking_flow_data_exchange(
             result = svc.handle_init(booking_token)
 
         elif action == "data_exchange":
-            trigger = str(data.get("trigger", "")).strip()
-
             if trigger == "date_selected":
                 selected_date = str(data.get("date", "")).strip()
                 result = svc.handle_date_selected(booking_token, selected_date)
@@ -150,7 +212,7 @@ async def booking_flow_data_exchange(
         # transport that created the booking already sent one.
         logger.info("BOOKING_FLOW_REPLAY offer_id=%s thread_rev=%s — returning completion",
                     exc.offer_id, exc.thread_revision_id)
-        return _encrypt_and_return({
+        return _guarded_return({
             "version": FLOW_VERSION,
             "screen": "SUCCESS",
             "data": {
@@ -160,11 +222,16 @@ async def booking_flow_data_exchange(
                     }
                 }
             },
-        }, aes_key, iv)
+        }, trigger, aes_key, iv)
 
     except BookingSlotConflictError as exc:
-        # Return the conflict screen encrypted (not an HTTP error — Flow expects a valid encrypted response)
-        return _encrypt_and_return(exc.refreshed_data, aes_key, iv)
+        # Return the conflict screen encrypted (not an HTTP error — Flow expects a valid
+        # encrypted response). WILD1-R3: this is the one RECOVERABLE refusal. The context
+        # is valid, the screen comes back populated with what is free now, and picking
+        # again is a real path — which is why the bounded handset Wild must prove recovery
+        # with a real slot conflict and never with a deliberately expired token.
+        return _guarded_return(exc.refreshed_data, trigger, aes_key, iv,
+                               outcome=RECOVERY_SLOT_CONFLICT)
 
     except BookingTokenError as exc:
         logger.warning("BOOKING_FLOW_TOKEN_ERROR: %s", exc)
@@ -189,7 +256,13 @@ async def booking_flow_data_exchange(
                 has_error=True,
             ),
         }
-        return _encrypt_and_return(error_response, aes_key, iv)
+        # WILD1-R3: FAIL-CLOSED, and classified separately from the slot conflict above.
+        # The token is what names the contact and the token is what just failed, so the
+        # screen carries no identity and no availability. Continuing from it is not a
+        # recovery path; the copy tells the customer to start again, and it must never
+        # claim retry is supported here.
+        return _guarded_return(error_response, trigger, aes_key, iv,
+                               outcome=RECOVERY_TOKEN_INVALID)
 
     except HTTPException:
         # ── WILD1-F4 ────────────────────────────────────────────────────────────────
@@ -210,4 +283,4 @@ async def booking_flow_data_exchange(
         logger.error("BOOKING_FLOW_INTERNAL_ERROR: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
-    return _encrypt_and_return(result, aes_key, iv)
+    return _guarded_return(result, trigger, aes_key, iv)

@@ -1,5 +1,49 @@
 # Booking Flow — publication and rollback runbook (PREPARED, NOT EXECUTED)
 
+> ## SUPERSEDED IN PART — 2026-10-30 (WILD1-R3)
+>
+> This document states or assumes that the publication target declares two backward
+> `routing_model` edges, `DETAILS → APPOINTMENT` and `SUMMARY → APPOINTMENT`, and that
+> publishing them is what makes the booking refusal renderable.
+>
+> **Meta's own validator rejected that artifact**, in an owner-present run on 2026-10-30,
+> with two errors:
+>
+> 1. *"Backward route [DETAILS->APPOINTMENT] corresponding to forward route
+>    [APPOINTMENT->DETAILS] is not allowed in the routing model. Only forward routes can
+>    be specified."*
+> 2. *"No entry screen found in the routing model. Expected a screen with no inbound edges
+>    as the entry screen."*
+>
+> The published artifact is **forward-only** — `routing_model` identical to r3's — raw
+> sha256 `4ce27122a55f3efd4fbae117d620abf34024c5a86343bb23ce878182ba2bbd9d`, canonical
+> `dccd3bc973b1b51526c5064027b5d8f61ee885293dfa9815a272609092aca17d`. The return to
+> APPOINTMENT is a **server-controlled recovery response**, not a routing edge.
+>
+> The cyclic hashes `98981193109ce426…` / `53dfe8fef7ca66c4…` are superseded and must
+> never be republished. The body below is left as written, as evidence of what was believed
+> when it was written.
+>
+> **CORRECTED 2026-11-01 (WILD1-R3-C1, review finding R-F04).** This banner used to say
+> *"Everything else in this document stands."* It does not, and that sentence blessed the
+> one forward-looking recommendation in the body:
+>
+> * The **title** still reads *"PREPARED, NOT EXECUTED"*. Publication **has** happened —
+>   owner-present, 2026-10-30, `Publicado`. This document is a historical record, not a
+>   pending procedure, and **must not be executed**.
+> * The fallback suggested near the end — *"a dedicated refusal screen reached by the same
+>   two routing edges"* — is **impossible**. Those edges cannot exist in any artifact. A
+>   dedicated refusal screen would have to be reached by a **forward** edge
+>   (`SUMMARY -> REFUSAL`) and would itself be terminal, because a route back to APPOINTMENT
+>   is backward and forbidden. That is a **contingent option only**, not an authorised
+>   change, and nothing in this document proves it.
+> * Returning to APPOINTMENT is **not proven**. It is a server-selected recovery response
+>   that Meta accepted as a *static artifact*; whether Meta's runtime delivers it is
+>   untested (F3a, OPEN).
+>
+> Correction: `docs/Launch/2026-10-30_RIDECHECK_CRM_PRELAUNCH-WILD1-BOOKING-FLOW-V7.7-FORWARD-ONLY-RECOVERY-CONTRACT-CORRECTION_CLOSEOUT_001.md`
+
+
 **No Meta contact has occurred. Nothing below has been run.** Supersedes the
 `TARGET_v7.5` runbook of the same date, which proposed a candidate-derived artifact.
 

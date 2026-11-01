@@ -97,8 +97,46 @@ def walk(node, path="", out=None):
     return out
 
 
-def check(doc, precedent=None):
-    findings = []
+def _load_flow_contract():
+    """Load THE canonical routing validator from `flow_contract.py`, by file path.
+
+    WILD1-R3-C1 (2026-11-01), review finding R-F05. Until this correction THIS FILE — the
+    general-purpose Flow validator — examined **no routing property at all**, and said so in
+    its own docstring. That is why it passed the cyclic v7.7 artifact that Meta then
+    rejected with two routing errors. The rules are not reimplemented here: there is one
+    implementation, in `backend/app/services/flow_contract.py`, and this is a caller.
+    """
+    import importlib.util
+    root = Path(__file__).resolve().parents[1]
+    path = root / "backend" / "app" / "services" / "flow_contract.py"
+    if not path.exists():                                    # pragma: no cover
+        return None
+    spec = importlib.util.spec_from_file_location("_flow_contract", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def routing_findings(doc, *, pin_published_graph=False):
+    """ROUTING findings, from the one canonical validator. Never a second copy of the rules."""
+    fc = _load_flow_contract()
+    if fc is None:                                           # pragma: no cover
+        return [("ERROR", "routing_model",
+                 "cannot load the canonical routing validator; refusing to report a PASS")]
+    rm = doc.get("routing_model")
+    screens = [s.get("id") for s in doc.get("screens", []) if isinstance(s, dict)]
+    assertion = (fc.assert_required_forward_graph if pin_published_graph
+                 else fc.assert_forward_only)
+    try:
+        assertion(rm, screens=screens)
+    except ValueError as exc:
+        return [("ROUTING", "routing_model", str(exc))]
+    return []
+
+
+def check(doc, precedent=None, *, pin_published_graph=False):
+    # ROUTING first: a graph Meta will reject makes every other finding moot.
+    findings = routing_findings(doc, pin_published_graph=pin_published_graph)
     for path, comp in walk(doc):
         ctype = comp.get("type")
         if not isinstance(ctype, str):
@@ -144,21 +182,28 @@ def main() -> int:
     ap.add_argument("flow_json")
     ap.add_argument("--precedent", help="a Meta-accepted asset to compare component properties against")
     ap.add_argument("--warn-only", action="store_true", help="exit 0 even with UNPROVEN findings")
+    ap.add_argument("--pin-published-graph", action="store_true",
+                    help="additionally require routing_model to BE the published forward "
+                         "graph for Flow 28104222025943520, not merely a legal one")
     a = ap.parse_args()
 
     doc = json.loads(Path(a.flow_json).read_text(encoding="utf-8"))
     prec = json.loads(Path(a.precedent).read_text(encoding="utf-8")) if a.precedent else None
-    findings = check(doc, prec)
+    findings = check(doc, prec, pin_published_graph=a.pin_published_graph)
 
+    routing = [f for f in findings if f[0] == "ROUTING"]
     errors = [f for f in findings if f[0] == "ERROR"]
     render = [f for f in findings if f[0] == "RENDER"]
     unproven = [f for f in findings if f[0] == "UNPROVEN"]
     for level, where, msg in findings:
         print(f"{level:9} {where}\n          {msg}")
-    print(f"\n{len(errors)} error(s), {len(render)} render, {len(unproven)} unproven")
+    print(f"\n{len(routing)} routing, {len(errors)} error(s), {len(render)} render, "
+          f"{len(unproven)} unproven")
     print("NOTE: local PASS is not Meta validation. Only Ejecutar can confirm the asset.")
+    print("NOTE: a clean ROUTING result is not a handset result either — whether Meta's")
+    print("      runtime accepts a server-selected recovery return is UNPROVEN (F3a).")
     print("NOTE: Meta Ejecutar does not catch RENDER findings — only a handset does.")
-    return 1 if (errors or render) else 0
+    return 1 if (routing or errors or render) else 0
 
 
 if __name__ == "__main__":

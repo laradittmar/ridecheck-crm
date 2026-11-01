@@ -6,12 +6,9 @@
       "DETAILS"
     ],
     "DETAILS": [
-      "SUMMARY",
-      "APPOINTMENT"
+      "SUMMARY"
     ],
-    "SUMMARY": [
-      "APPOINTMENT"
-    ]
+    "SUMMARY": []
   },
   "screens": [
     {

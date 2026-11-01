@@ -504,28 +504,40 @@ class TestRefusalRouting(unittest.TestCase):
         # the target must not have moved a trigger to another screen
         self.assertEqual(self._origins_from_artifact(TARGET), found)
 
-    def test_routing_02_the_target_declares_every_edge_the_backend_uses(self):
-        """ROUTING-02 — the positive assertion: publishing the target makes the refusals
-        legal transitions.
+    def test_routing_02_the_target_declares_no_edge_for_the_refusals(self):
+        """ROUTING-02 — SUPERSEDED AND INVERTED, WILD1-R3, 2026-10-30.
 
-        The required set is DERIVED here, from the triggers that can refuse, and then
-        compared with the constant. An earlier version only iterated the constant, so
-        emptying it made the whole test vacuous and a mutant survived — the same shape of
-        hole as F5. The derivation is what closes it: the set cannot be shrunk without
-        disagreeing with `TRIGGER_ORIGIN`.
+        This test used to be "the positive assertion: publishing the target makes the
+        refusals legal transitions", and it compared a derived edge set against
+        `FC.REQUIRED_ROUTING_EDGES`. Meta rejected that artifact. The constant is gone and
+        the premise with it: no routing model makes a refusal a legal transition, because
+        the backward edge cannot be declared.
+
+        What replaces it is this: the target declares NO edge for either refusal, and the
+        refusals are authorised by the recovery allowlist instead. The derivation that
+        closed the old vacuity hole is kept, pointed the other way.
         """
         refusing = ("prepare_summary", "confirm_booking")
         derived = {(FC.TRIGGER_ORIGIN[t], FC.REFUSAL_RETURN_SCREEN) for t in refusing}
         derived = {e for e in derived if e[0] != e[1]}     # a self-refresh needs no edge
-        self.assertEqual(set(FC.REQUIRED_ROUTING_EDGES), derived,
-                         "REQUIRED_ROUTING_EDGES disagrees with the refusing triggers")
-        self.assertEqual(len(derived), 2, derived)
+        self.assertEqual(derived, {("DETAILS", "APPOINTMENT"),
+                                   ("SUMMARY", "APPOINTMENT")}, derived)
+        self.assertFalse(hasattr(FC, "REQUIRED_ROUTING_EDGES"),
+                         "REQUIRED_ROUTING_EDGES is superseded; Meta forbids both edges")
 
         rm = json.load(open(TARGET))["routing_model"]
         for origin, dest in derived:
-            self.assertIn(dest, rm.get(origin, []),
-                          f"the target does not allow {origin} -> {dest}")
-            FC.validate_transition(origin, dest, rm)
+            self.assertNotIn(dest, rm.get(origin, []),
+                             f"the target declares {origin} -> {dest}, which Meta rejects")
+            with self.assertRaises(ValueError):
+                FC.validate_forward_route(origin, dest, rm)
+        # every one of them IS authorised as a recovery return, from server-known facts
+        for trigger in refusing:
+            origin = FC.TRIGGER_ORIGIN[trigger]
+            outcome = (FC.RECOVERY_SLOT_CONFLICT if trigger == "confirm_booking"
+                       else FC.RECOVERY_TOKEN_INVALID)
+            FC.validate_recovery_return(origin, trigger, outcome,
+                                        FC.REFUSAL_RETURN_SCREEN)
 
     def test_routing_03_published_v73_forbids_them_all(self):
         """ROUTING-03 — the live defect, preserved. This is the Wild's root cause asserted
@@ -533,10 +545,19 @@ class TestRefusalRouting(unittest.TestCase):
         rm = json.load(open(PUBLISHED))["routing_model"]
         self.assertEqual(rm.get("SUMMARY"), [],
                          "v7.3 now routes out of SUMMARY — re-derive the publication boundary")
-        for origin, dest in FC.REQUIRED_ROUTING_EDGES:
+        # WILD1-R3: the pair is named here directly. It used to come from
+        # `FC.REQUIRED_ROUTING_EDGES`, a constant whose premise Meta refuted.
+        for origin, dest in (("DETAILS", "APPOINTMENT"), ("SUMMARY", "APPOINTMENT")):
             with self.assertRaises(ValueError) as cm:
-                FC.validate_transition(origin, dest, rm)
-            self.assertIn("not a declared transition", str(cm.exception))
+                FC.validate_forward_route(origin, dest, rm)
+            self.assertIn("not a declared forward route", str(cm.exception))
+        # and the published target forbids them identically — that is now the point
+        rm_target = json.load(open(TARGET))["routing_model"]
+        self.assertEqual(rm_target, rm,
+                         "the published graph and the target graph must be one")
+        for origin, dest in (("DETAILS", "APPOINTMENT"), ("SUMMARY", "APPOINTMENT")):
+            with self.assertRaises(ValueError):
+                FC.validate_forward_route(origin, dest, rm_target)
 
     def test_routing_04_a_self_refresh_needs_no_edge(self):
         """ROUTING-04 — why `date_selected` worked in the Wild while every refusal failed.
@@ -546,8 +567,8 @@ class TestRefusalRouting(unittest.TestCase):
         """
         rm = json.load(open(PUBLISHED))["routing_model"]
         self.assertNotIn("APPOINTMENT", rm["APPOINTMENT"])
-        FC.validate_transition("APPOINTMENT", "APPOINTMENT", rm)      # must not raise
-        FC.validate_transition(None, "APPOINTMENT", rm)               # INIT has no origin
+        FC.validate_forward_route("APPOINTMENT", "APPOINTMENT", rm)   # must not raise
+        FC.validate_forward_route(None, "APPOINTMENT", rm)            # INIT has no origin
 
     def test_routing_05_every_backend_refusal_response_is_checked(self):
         """ROUTING-05 — the refusal screens the service actually returns, enumerated from
@@ -580,10 +601,19 @@ class TestRefusalRouting(unittest.TestCase):
                         dx_screens.add(v.value)
         self.assertIn(FC.REFUSAL_RETURN_SCREEN, dx_screens)
 
+        # WILD1-R3: every enumerated refusal screen is checked through the ONE centralised
+        # entry point, with the typed outcome its producer actually raises. The old version
+        # checked them as routing transitions, which Meta has since made impossible.
         rm = json.load(open(TARGET))["routing_model"]
-        for trig in ("prepare_summary", "confirm_booking"):
-            FC.validate_transition(FC.TRIGGER_ORIGIN[trig],
-                                   FC.REFUSAL_RETURN_SCREEN, rm)
+        for trig, outcome in (("prepare_summary", FC.RECOVERY_TOKEN_INVALID),
+                              ("confirm_booking", FC.RECOVERY_SLOT_CONFLICT),
+                              ("confirm_booking", FC.RECOVERY_TOKEN_INVALID)):
+            FC.validate_response_screen(trig, FC.REFUSAL_RETURN_SCREEN, rm,
+                                        outcome=outcome)
+            # and the same screen with NO typed outcome is refused: an ordinary response
+            # may not reach it, which is the whole distinction this correction draws.
+            with self.assertRaises(ValueError):
+                FC.validate_response_screen(trig, FC.REFUSAL_RETURN_SCREEN, rm)
 
     def test_routing_06_the_validator_refuses_an_unknown_origin(self):
         """ROUTING-06 — a routing model that does not mention the origin is not a pass."""
@@ -971,9 +1001,17 @@ class TestHttpStatusPreservation(unittest.TestCase):
                  if isinstance(x.type, ast.Name)
                  and x.type.id == "BookingSlotConflictError")
         body = ast.dump(ast.Module(body=h.body, type_ignores=[]))
-        self.assertIn("_encrypt_and_return", body,
+        # WILD1-R3: the return goes through `_guarded_return`, which validates the screen
+        # and then calls `_encrypt_and_return`. Both facts are asserted, so renaming the
+        # wrapper cannot quietly drop the encryption.
+        self.assertIn("_guarded_return", body,
                       "a slot conflict must return an encrypted Flow response")
+        self.assertIn("RECOVERY_SLOT_CONFLICT", body,
+                      "the slot conflict must declare its typed recovery outcome")
         self.assertNotIn("HTTPException", body)
+        dx_src = DX_PATH.read_text()
+        self.assertIn("_encrypt_and_return(response_dict, aes_key, iv)", dx_src,
+                      "_guarded_return must still encrypt the response")
 
     def test_http_04_unknown_trigger_raises_422_not_500(self):
         """HTTP-04 — the empty trigger the real handset sent, four times."""
