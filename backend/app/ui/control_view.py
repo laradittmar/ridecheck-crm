@@ -1589,6 +1589,31 @@ def render_control_page(user_email: str) -> str:
                      + '</div>';
                  }}).join(''))
             : '';
+          // PRELAUNCH-MINIMUM-LAUNCH-R1: slot-conflict recoveries a customer is owed or that
+          // ended degraded, and typed booking attention conditions — each with its thread.
+          var recs = (data && data.slot_recoveries) || [];
+          var acs = (data && data.attention_conditions) || [];
+          var link = function(x) {{
+            return x.thread_url ? ' · <a href="' + esc(x.thread_url)
+              + '" target="_blank" rel="noopener">' + esc(x.thread_id) + '</a>' : '';
+          }};
+          condBox.innerHTML += (recs.length
+            ? ('<strong>Recuperación de turno perdido (' + recs.length + ')</strong>'
+               + recs.map(function(r) {{
+                   return '<div data-slot-recovery="' + esc(r.job_id) + '">'
+                     + fmtDateTime(r.created_at) + ' · ' + esc(r.state)
+                     + (r.outcome ? ' · ' + esc(r.outcome) : '')
+                     + ' · ' + esc((r.reasons || []).join(', ')) + link(r) + '</div>';
+                 }}).join(''))
+            : '')
+            + (acs.length
+            ? ('<strong>Datos de reserva no guardados (' + acs.length + ')</strong>'
+               + acs.map(function(c) {{
+                   return '<div data-attention-condition="' + esc(c.condition_id) + '">'
+                     + fmtDateTime(c.created_at) + ' · ' + esc(c.kind) + ' · ' + esc(c.reason)
+                     + link(c) + '</div>';
+                 }}).join(''))
+            : '');
         }}
         var tbody = document.getElementById('bookings-tbody');
         if (!tbody) return;

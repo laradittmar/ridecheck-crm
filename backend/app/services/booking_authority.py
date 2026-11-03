@@ -615,6 +615,8 @@ class ThreadRevisionAttachment:
     buyer_email: Optional[str] = None
     seller_type: Optional[str] = None
     seller_name: Optional[str] = None
+    #: PRELAUNCH-MINIMUM-LAUNCH-R1 (C-3): written in the booking's own transaction.
+    seller_phone: Optional[str] = None
     address: Optional[str] = None
     tipo_vehiculo: Optional[str] = None
     marca: Optional[str] = None
@@ -724,8 +726,9 @@ _PLAN_SCHEMA: dict = {
     "ThreadRevisionAttachment": {
         "thread_id": ("int", False, 1), "candidate_id": ("int", True, 1),
         **{f: ("str", True, ("ThreadRevision", f)) for f in (
-            "buyer_name", "buyer_phone", "buyer_email", "seller_type", "seller_name", "address",
-            "tipo_vehiculo", "marca", "modelo", "publication_url", "zone_group")},
+            "buyer_name", "buyer_phone", "buyer_email", "seller_type", "seller_name",
+            "seller_phone", "address", "tipo_vehiculo", "marca", "modelo", "publication_url",
+            "zone_group")},
         "anio": ("int", True, 1900), "request_approval": ("bool", False, None),
         "non_occupying_status": ("choice", False, ("provisional", "collecting_data", "draft"))},
     "LeadIdentity": {
@@ -1849,7 +1852,8 @@ class BookingAuthority:
                 thread_id=a.thread_id, candidate_id=a.candidate_id, status=status,
                 offer_id=offer_id,
                 buyer_name=a.buyer_name, buyer_phone=a.buyer_phone, buyer_email=a.buyer_email,
-                seller_type=a.seller_type, seller_name=a.seller_name, address=a.address,
+                seller_type=a.seller_type, seller_name=a.seller_name,
+                seller_phone=a.seller_phone, address=a.address,
                 scheduled_date=target.day, scheduled_time=target.at,
                 tipo_vehiculo=a.tipo_vehiculo, marca=a.marca, modelo=a.modelo, anio=a.anio,
                 publication_url=a.publication_url, zone_group=a.zone_group)

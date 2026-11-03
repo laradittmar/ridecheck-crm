@@ -6,6 +6,7 @@ import logging
 import json
 import os as _os
 import html as html_lib
+import re
 from datetime import datetime, date, timedelta, time
 from urllib.parse import urlencode, quote as _urlquote
 
@@ -37,6 +38,16 @@ def _txt(v: Any) -> str:
             return "-"
         return s
     return str(v)
+
+def _esc_val(v: Any) -> str:
+    """`_val`, HTML-escaped once, attribute-safe (R1, review F-04) — for `value="…"`."""
+    return html_lib.escape(_val(v), quote=True)
+
+
+def _esc_txt(v: Any) -> str:
+    """`_txt`, HTML-escaped once (R1, review F-04) — for a value interpolated into markup."""
+    return html_lib.escape(_txt(v), quote=True)
+
 
 def _val(v: Any) -> str:
     if v is None:
@@ -82,10 +93,16 @@ def _safe_url(u: str | None) -> str | None:
     return s
 
 def _url_link(u: str | None, label: str = "Abrir") -> str:
+    """PRELAUNCH-MINIMUM-LAUNCH-R1 (review F-04): the URL is customer- or operator-typed, so it
+    is HTML-escaped (attribute-safe) exactly once here, and only http(s) becomes a link — a
+    `javascript:` or other scheme is shown as escaped text, never as an executable href."""
     url = _safe_url(u)
     if not url:
         return "-"
-    return f'<a href="{url}" target="_blank" rel="noopener">{label}</a>'
+    if not re.match(r"(?i)^https?://", url):
+        return html_lib.escape(url, quote=True)
+    return (f'<a href="{html_lib.escape(url, quote=True)}" target="_blank" rel="noopener">'
+            f'{html_lib.escape(label)}</a>')
 
 
 def _profesional_label(p: Profesional) -> str:
@@ -1119,11 +1136,11 @@ def _filters_form_html(
           <div class="grid" style="margin-top:8px;">
             <div>
               <div class="label">Zona grupo</div>
-              <input name="zone_group" value="{zone_group_val}"/>
+              <input name="zone_group" value="{html_lib.escape(zone_group_val, quote=True)}"/>
             </div>
             <div>
               <div class="label">Zona detalle</div>
-              <input name="zone_detail" value="{zone_detail_val}"/>
+              <input name="zone_detail" value="{html_lib.escape(zone_detail_val, quote=True)}"/>
             </div>
           </div>
         """
@@ -1190,7 +1207,7 @@ def _filters_form_html(
 
     prof_val = _val(profesional_id)
     prof_options = "".join(
-        f'<option value="{p.id}" {"selected" if str(p.id) == prof_val else ""}>{_profesional_label(p)}</option>'
+        f'<option value="{p.id}" {"selected" if str(p.id) == prof_val else ""}>{html_lib.escape(_profesional_label(p), quote=True)}</option>'
         for p in (profesionales or [])
     )
     profesional_html = f"""
@@ -1213,7 +1230,7 @@ def _filters_form_html(
         <div class="grid">
           <div>
             <div class="label">Buscar (cliente / tel / email / vehículo)</div>
-            <input name="q" value="{_val(q)}" placeholder="Juan / +54... / mail@..."/>
+            <input name="q" value="{_esc_val(q)}" placeholder="Juan / +54... / mail@..."/>
           </div>
           {estado_html}
         </div>
@@ -1240,17 +1257,17 @@ def _filters_form_html(
         <div class="grid" style="margin-top:8px;">
           <div>
             <div class="label">Marca</div>
-            <input name="marca" value="{_val(marca)}"/>
+            <input name="marca" value="{_esc_val(marca)}"/>
           </div>
           <div>
             <div class="label">Modelo</div>
-            <input name="modelo" value="{_val(modelo)}"/>
+            <input name="modelo" value="{_esc_val(modelo)}"/>
           </div>
         </div>
         <div class="grid" style="margin-top:8px;">
           <div>
             <div class="label">Año</div>
-            <input name="anio" type="number" value="{_val(anio)}"/>
+            <input name="anio" type="number" value="{_esc_val(anio)}"/>
           </div>
           <div>
             <div class="label">Estado operativo</div>
@@ -1264,11 +1281,11 @@ def _filters_form_html(
         <div class="grid" style="margin-top:8px;">
           <div>
             <div class="label">Desde</div>
-            <input type="date" name="from_date" value="{_val(from_date)}"/>
+            <input type="date" name="from_date" value="{_esc_val(from_date)}"/>
           </div>
           <div>
             <div class="label">Hasta</div>
-            <input type="date" name="to_date" value="{_val(to_date)}"/>
+            <input type="date" name="to_date" value="{_esc_val(to_date)}"/>
           </div>
         </div>
         <div class="grid" style="margin-top:8px;">
@@ -1539,6 +1556,13 @@ def _get(obj: Any, field: str) -> Any:
     return getattr(obj, field, None)
 
 
+def _flag_class(flag_val: Any) -> str:
+    """The CSS class of a lead flag (R2, review R1-03): ONLY a known flag names its style;
+    any other value — `lead.flag` is writable through the API — gets the neutral
+    `flag-other`, so it can neither create a class nor leave the attribute."""
+    return f"flag-{flag_val}" if isinstance(flag_val, str) and flag_val in FLAG_LABELS else "flag-other"
+
+
 def _lead_flag_value(lead: Lead) -> str | None:
     flag_val = _get(lead, "flag")
     if flag_val:
@@ -1614,6 +1638,7 @@ def render_page(
     turno_fecha_from: str = "",
     turno_fecha_to: str = "",
     zones_map: dict[str, list[str]] | None = None,
+    booking_details: dict | None = None,
 ) -> str:
     css = _base_css()
 
@@ -1761,7 +1786,8 @@ def render_page(
             f'<div class="kanban-column-cards">'
         )
         for l in col:
-            html.append(render_lead_card(l, zones_map, profesionales=profesionales or [], agencias=agencias or []))
+            html.append(render_lead_card(l, zones_map, profesionales=profesionales or [], agencias=agencias or [],
+                                         booking_details=(booking_details or {}).get(l.id)))
         html.append("</div></div>")
 
     html.append("</div>")  # board
@@ -3143,7 +3169,7 @@ def render_table_page(
         flag_val = _lead_flag_value(l)
         flag_label = FLAG_LABELS.get(flag_val, flag_val) if flag_val else None
         flag_html = (
-            f'<span class="flagPill flag-{flag_val}">{flag_label}</span>' if flag_val else "-"
+            f'<span class="flagPill {_flag_class(flag_val)}">{html_lib.escape(str(flag_label), quote=True)}</span>' if flag_val else "-"
         )
         estado_val = _lead_operational_estado(_get(l, "estado"))
         estado_label = KANBAN_LABELS.get(estado_val, estado_val)
@@ -5115,15 +5141,49 @@ def render_profesionales_page(profesionales: list[Profesional], user_email: str 
     return "\n".join(html)
 
 
+def render_booking_details_block(details) -> str:
+    """PRELAUNCH-MINIMUM-LAUNCH (B): the booking attempt as the canonical rows record it —
+    the current-focus candidate and the live Booking Flow details — for a lead whose booking
+    committed AND for one whose booking was refused. Every value is HTML-escaped."""
+    if details is None or not details.has_content():
+        return ""
+    rows = (
+        ("Nombre (Flow)", details.customer_name), ("Email (Flow)", details.email),
+        ("Vehículo", details.vehicle), ("Zona", details.locality),
+        ("Dirección de inspección", details.inspection_address),
+        ("Turno solicitado", details.requested_slot),
+        ("Vendedor", details.seller_name), ("Tel. vendedor", details.seller_phone),
+        ("Publicación", details.listing_url),
+    )
+    lines = "".join(
+        f'<div><span class="muted">{html_lib.escape(k)}:</span> {html_lib.escape(str(v))}</div>'
+        for k, v in rows if v)
+    return (f'<div class="leadBookingDetails" data-thread-id="{int(details.thread_id)}">'
+            f'<div class="muted">Datos de reserva</div>{lines}</div>')
+
+
 def render_lead_card(
     l: Lead,
     zones_map: dict[str, list[str]] | None = None,
     profesionales: list[Profesional] | None = None,
     agencias: list[Agencia] | None = None,
+    booking_details=None,
 ) -> str:
+    # PRELAUNCH-MINIMUM-LAUNCH-R1 (review F-04, stored HTML injection): every value below that
+    # a customer, the Booking Flow, the Conversation Engine or an operator form can supply is
+    # HTML-escaped EXACTLY ONCE, at the point it is interpolated (`_t` for text, `_a` for an
+    # attribute). Raw values are kept raw until then; the renderer's own structural HTML is
+    # never escaped.
+    _t = lambda v: html_lib.escape(_txt(v), quote=True)      # noqa: E731
+    _a = lambda v: html_lib.escape(_val(v), quote=True)      # noqa: E731
     n = f"{(_get(l,'nombre') or '').strip()} {(_get(l,'apellido') or '').strip()}".strip() or "-"
-    tel = _txt(_get(l, "telefono"))
-    email = _txt(_get(l, "email"))
+    # PRELAUNCH-MINIMUM-LAUNCH (B): a lead with no name of its own shows the name the customer
+    # typed in the Booking Flow (read model; nothing is copied into the lead).
+    if n == "-" and booking_details is not None and getattr(booking_details, "customer_name", None):
+        n = booking_details.customer_name
+    n = html_lib.escape(n, quote=True)
+    tel = _t(_get(l, "telefono"))
+    email = _t(_get(l, "email"))
 
     revs = sorted(list(_get(l, "revisions") or []), key=lambda r: r.created_at, reverse=True)
     last_rev = revs[0] if revs else None
@@ -5143,6 +5203,10 @@ def render_lead_card(
     vehicle_badge = "Vehículo"
     if last_rev and last_rev.tipo_vehiculo:
         vehicle_badge = _friendly_tipo_vehiculo(last_rev.tipo_vehiculo)
+    elif booking_details is not None and getattr(booking_details, "vehicle", None):
+        vehicle_badge = booking_details.vehicle
+    vehicle_badge = html_lib.escape(vehicle_badge, quote=True)
+    booking_details_html = render_booking_details_block(booking_details)
 
     base_cls = "card leadCard"
     if bool(_get(l, "necesita_humano")):
@@ -5156,7 +5220,7 @@ def render_lead_card(
     status_label = KANBAN_LABELS.get(current_estado, current_estado)
     status_cls = "leadStatus status-default"
     status_locked = "0"
-    header_flag_txt = _txt(flag_label) if flag_label else "Sin flag"
+    header_flag_txt = _t(flag_label) if flag_label else "Sin flag"
     header_flag_html = f'<span class="headerFlag">{header_flag_txt}</span>'
 
     prof_name_search = ""
@@ -5195,16 +5259,16 @@ def render_lead_card(
 
     _attr_parts: list[str] = []
     if inbound_ch_val:
-        _attr_parts.append(f"Canal: <strong>{_txt(inbound_ch_val)}</strong>")
+        _attr_parts.append(f"Canal: <strong>{_t(inbound_ch_val)}</strong>")
     if acq_source_val:
-        _attr_parts.append(f"Origen: <strong>{_txt(acq_source_val)}</strong>")
+        _attr_parts.append(f"Origen: <strong>{_t(acq_source_val)}</strong>")
     if ref_code_val:
-        ref_label = f"ref:{_txt(ref_code_val)}"
+        ref_label = f"ref:{_t(ref_code_val)}"
         if rc_code_val:
-            ref_label += f" · {_txt(rc_code_val)}"
+            ref_label += f" · {_t(rc_code_val)}"
         _attr_parts.append(ref_label)
     elif rc_code_val:
-        _attr_parts.append(_txt(rc_code_val))
+        _attr_parts.append(_t(rc_code_val))
     attribution_html = (
         f'<div class="muted leadAttribution">{" · ".join(_attr_parts)}</div>'
         if _attr_parts else ""
@@ -5278,22 +5342,22 @@ def render_lead_card(
               <div class="grid">
                 <div>
                   <div class="label">Nombre</div>
-                  <input name="nombre" value="{_val(_get(l,'nombre'))}"/>
+                  <input name="nombre" value="{_a(_get(l,'nombre'))}"/>
                 </div>
                 <div>
                   <div class="label">Apellido</div>
-                  <input name="apellido" value="{_val(_get(l,'apellido'))}"/>
+                  <input name="apellido" value="{_a(_get(l,'apellido'))}"/>
                 </div>
               </div>
 
               <div class="grid" style="margin-top:8px;">
                 <div>
                   <div class="label">Teléfono</div>
-                  <input name="telefono" value="{_val(_get(l,'telefono'))}"/>
+                  <input name="telefono" value="{_a(_get(l,'telefono'))}"/>
                 </div>
                 <div>
                   <div class="label">Email</div>
-                  <input name="email" value="{_val(_get(l,'email'))}"/>
+                  <input name="email" value="{_a(_get(l,'email'))}"/>
                 </div>
               </div>
 
@@ -5346,7 +5410,7 @@ def render_lead_card(
             str(last_rev.anio) if last_rev.anio else "",
         ] if x])
         if veh_line:
-            rev_lines.append(f"Vehículo: {_txt(veh_line)}")
+            rev_lines.append(f"Vehículo: {_t(veh_line)}")
 
         if last_rev.precio_total is not None or last_rev.precio_base is not None or last_rev.viaticos is not None:
             rev_lines.append(
@@ -5362,10 +5426,10 @@ def render_lead_card(
 
     header_cls = "cardHeaderRow"
     if flag_val:
-        header_cls = f"cardHeaderRow flag-{flag_val}"
+        header_cls = f"cardHeaderRow {_flag_class(flag_val)}"
     vehicle_pill_html = ""
     if vehicle_bits:
-        vehicle_pill_html = f'<div class="leadVehicleRow"><span class="pill pill-gray">{" / ".join(vehicle_bits)}</span></div>'
+        vehicle_pill_html = f'<div class="leadVehicleRow"><span class="pill pill-gray">{html_lib.escape(" / ".join(vehicle_bits), quote=True)}</span></div>'
 
     return f"""
         <div class="{card_cls}" id="lead-{l.id}" data-lead-id="{l.id}" data-current-estado="{current_estado}" data-search="{search_attr}">
@@ -5440,7 +5504,7 @@ def render_lead_card(
             </div>
             <div class="cardHeaderBottom">
               <span class="pill pill-veh">{vehicle_badge}</span>
-              <span class="pill pill-prof">Profesional: {_txt(last_prof_label)}</span>
+              <span class="pill pill-prof">Profesional: {_t(last_prof_label)}</span>
               {(_render_revision_approval_ui(last_rev, lead_id=l.id) if last_rev else "")}
             </div>
           </div>
@@ -5456,17 +5520,18 @@ def render_lead_card(
 
         <div class="leadDetailsBody" id="lead-details-{l.id}">
           <div class="muted leadContact">Tel: {tel} · Email: {email}</div>
+          {booking_details_html}
           {attribution_html}
           <div class="leadRevPanel">
             <div class="leadRevTotal">Total presupuestado: {total_presu_txt}</div>
             <div class="leadRevLines">
               {(
-                f'<div>Motivo pérdida: {_txt(_get(l, "motivo_perdida"))}</div>'
+                f'<div>Motivo pérdida: {_t(_get(l, "motivo_perdida"))}</div>'
                 if _get(l, "motivo_perdida")
                 else ""
               )}
               {''.join(f"<div>{x}</div>" for x in rev_lines)}
-              <div>Estado operativo: {_txt(last_rev.estado_revision) if last_rev else "-"}</div>
+              <div>Estado operativo: {_t(last_rev.estado_revision) if last_rev else "-"}</div>
               {(_render_revision_approval_ui(last_rev, lead_id=l.id) if last_rev else "")}
             </div>
           </div>
@@ -5565,10 +5630,10 @@ def render_revisions_block(
                 prof = prof_by_id.get(pid) if pid else None
             prof_label = _profesional_label(prof) if prof else "-"
 
-            tipo_vendedor_txt = _txt(getattr(r, "tipo_vendedor", None) or r.vendedor_tipo)
+            tipo_vendedor_txt = _esc_txt(getattr(r, "tipo_vendedor", None) or r.vendedor_tipo)
             agencia_txt = "-"
             if getattr(r, "agencia", None):
-                agencia_txt = _txt(getattr(r.agencia, "nombre_agencia", None))
+                agencia_txt = _esc_txt(getattr(r.agencia, "nombre_agencia", None))
             elif getattr(r, "agencia_id", None):
                 agencia_txt = str(getattr(r, "agencia_id"))
             approval_status = _val(getattr(r, "appointment_approval_status", None)).upper()
@@ -5596,48 +5661,48 @@ def render_revisions_block(
                 <div class="revHead">
                   <div class="revHeadLine1">
                     <span class="revHeadTitle">Revisión {rev_num}</span>
-                    <span class="revHeadTurno">Turno: {_txt(turno_txt)}</span>
+                    <span class="revHeadTurno">Turno: {_esc_txt(turno_txt)}</span>
                     {_agenda_link}
                   </div>
                   <div class="revHeadLine2">
-                    <span class="pill pill-prof">Profesional: {_txt(prof_label)}</span>
+                    <span class="pill pill-prof">Profesional: {_esc_txt(prof_label)}</span>
                   </div>
                   <div class="revHeadLine3">
-                    <span class="pill revEstadoPill">Estado: {_txt(r.estado_revision)}</span>
+                    <span class="pill revEstadoPill">Estado: {_esc_txt(r.estado_revision)}</span>
                   </div>
                 </div>
 
                 <div class="box">
                   <div class="small"><b>Vehículo</b></div>
-                  <div class="muted small">Tipo: {_txt(r.tipo_vehiculo)} | Marca: {_txt(r.marca)} | Modelo: {_txt(r.modelo)} | Año: {str(r.anio) if r.anio else "-"}</div>
+                  <div class="muted small">Tipo: {_esc_txt(r.tipo_vehiculo)} | Marca: {_esc_txt(r.marca)} | Modelo: {_esc_txt(r.modelo)} | Año: {str(r.anio) if r.anio else "-"}</div>
                   <div class="muted small">Compra: {_url_link(r.link_compra)} | Presu compra: {_fmt_money(r.presupuesto_compra)} | Tipo vendedor: {tipo_vendedor_txt} | Agencia: {agencia_txt}</div>
-                  <div class="muted small">Compró: {_txt(getattr(r, "compro", None))} | Comisión: {_fmt_money(getattr(r, "comision", None))} | Cobrado: {_txt(getattr(r, "cobrado", None))} | Fecha cobro: {_txt(getattr(r, "fecha_cobro", None))}</div>
+                  <div class="muted small">Compró: {_esc_txt(getattr(r, "compro", None))} | Comisión: {_fmt_money(getattr(r, "comision", None))} | Cobrado: {_esc_txt(getattr(r, "cobrado", None))} | Fecha cobro: {_esc_txt(getattr(r, "fecha_cobro", None))}</div>
                 </div>
 
                 <div class="box">
                   <div class="small"><b>Zona / Dirección</b></div>
-                  <div class="muted small">Zona: {_txt(r.zone_group)} / {_txt(r.zone_detail)}</div>
-                  <div class="muted small">Dirección: {_txt(r.direccion_texto)}</div>
+                  <div class="muted small">Zona: {_esc_txt(r.zone_group)} / {_esc_txt(r.zone_detail)}</div>
+                  <div class="muted small">Dirección: {_esc_txt(r.direccion_texto)}</div>
                   <div class="muted small">Maps: {_url_link(r.link_maps)}</div>
                 </div>
 
                 <div class="box">
                   <div class="small"><b>Presupuesto / Pago</b></div>
                   <div class="muted small">Presupuesto: {presu_txt}</div>
-                  <div class="muted small">Pago: {("SI" if r.pago else ("NO" if r.pago is False else "-"))} | Medio: {_txt(r.medio_pago)}</div>
+                  <div class="muted small">Pago: {("SI" if r.pago else ("NO" if r.pago is False else "-"))} | Medio: {_esc_txt(r.medio_pago)}</div>
                 </div>
 
                 <div class="box">
                   <div class="small"><b>Turno</b></div>
                   <div class="muted small">Inicio: {turno_txt}</div>
                   <div class="muted small">Cliente presente: {("SI" if r.cliente_presente else ("NO" if r.cliente_presente is False else "-"))}</div>
-                  <div class="muted small">Notas: {_txt(r.turno_notas)}</div>
+                  <div class="muted small">Notas: {_esc_txt(r.turno_notas)}</div>
                   {approval_html}
                 </div>
 
                 <div class="box">
                   <div class="small"><b>Resultado</b></div>
-                  <div class="muted small">Resultado: {_txt(r.resultado)} | Motivo rechazo: {_txt(r.motivo_rechazo)} | Link técnico: {_url_link(getattr(r, "resultado_link", None))}</div>
+                  <div class="muted small">Resultado: {_esc_txt(r.resultado)} | Motivo rechazo: {_esc_txt(r.motivo_rechazo)} | Link técnico: {_url_link(getattr(r, "resultado_link", None))}</div>
                 </div>
               </div>
             """)
@@ -5708,14 +5773,14 @@ def render_edit_latest_revision_form(
 
     profesionales = profesionales or []
     profesional_options = "".join(
-        f'<option value="{p.id}" {"selected" if last_rev.profesional_id == p.id else ""}>{_profesional_label(p)}</option>'
+        f'<option value="{p.id}" {"selected" if last_rev.profesional_id == p.id else ""}>{html_lib.escape(_profesional_label(p), quote=True)}</option>'
         for p in profesionales
     )
     agencias = agencias or []
     selected_tipo_vendedor = _val(getattr(last_rev, "tipo_vendedor", None) or last_rev.vendedor_tipo)
     selected_agencia_id = _val(getattr(last_rev, "agencia_id", None))
     agencia_options = "".join(
-        f'<option value="{a.id}" {"selected" if selected_agencia_id == str(a.id) else ""}>{_txt(a.nombre_agencia)}</option>'
+        f'<option value="{a.id}" {"selected" if selected_agencia_id == str(a.id) else ""}>{_esc_txt(a.nombre_agencia)}</option>'
         for a in agencias
     )
 
@@ -5751,11 +5816,11 @@ def render_edit_latest_revision_form(
           <div class="grid" style="margin-top:8px;">
             <div>
               <div class="label">Zona grupo</div>
-              <input name="zone_group" value="{zone_group_val}"/>
+              <input name="zone_group" value="{html_lib.escape(zone_group_val, quote=True)}"/>
             </div>
             <div>
               <div class="label">Zona detalle</div>
-              <input name="zone_detail" value="{zone_detail_val}"/>
+              <input name="zone_detail" value="{html_lib.escape(zone_detail_val, quote=True)}"/>
             </div>
           </div>
         """
@@ -5806,11 +5871,11 @@ def render_edit_latest_revision_form(
                   <div class="grid" style="margin-top:8px;">
                     <div>
                       <div class="label">Marca</div>
-                      <input name="marca" value="{_val(last_rev.marca)}"/>
+                      <input name="marca" value="{_esc_val(last_rev.marca)}"/>
                     </div>
                     <div>
                       <div class="label">Modelo</div>
-                      <input name="modelo" value="{_val(last_rev.modelo)}"/>
+                      <input name="modelo" value="{_esc_val(last_rev.modelo)}"/>
                     </div>
                   </div>
 
@@ -5828,7 +5893,7 @@ def render_edit_latest_revision_form(
                   <div class="grid-1" style="margin-top:8px;">
                     <div>
                       <div class="label">Link compra</div>
-                      <input name="link_compra" value="{_val(last_rev.link_compra)}"/>
+                      <input name="link_compra" value="{_esc_val(last_rev.link_compra)}"/>
                     </div>
                   </div>
 
@@ -5888,7 +5953,7 @@ def render_edit_latest_revision_form(
                   <div class="grid-1" style="margin-top:8px;">
                     <div>
                       <div class="label">Resultado técnico (link/doc)</div>
-                      <input name="resultado_link" value="{_val(getattr(last_rev, 'resultado_link', None))}"/>
+                      <input name="resultado_link" value="{_esc_val(getattr(last_rev, 'resultado_link', None))}"/>
                     </div>
                   </div>
                 </div>
@@ -5901,11 +5966,11 @@ def render_edit_latest_revision_form(
                   <div class="grid-1" style="margin-top:8px;">
                     <div>
                       <div class="label">Dirección</div>
-                      <input name="direccion_texto" value="{_val(last_rev.direccion_texto)}"/>
+                      <input name="direccion_texto" value="{_esc_val(last_rev.direccion_texto)}"/>
                     </div>
                     <div>
                       <div class="label">Link Maps</div>
-                      <input name="link_maps" value="{_val(last_rev.link_maps)}"/>
+                      <input name="link_maps" value="{_esc_val(last_rev.link_maps)}"/>
                     </div>
                   </div>
                 </div>
@@ -5991,7 +6056,7 @@ def render_edit_latest_revision_form(
                     </div>
                     <div>
                       <div class="label">Notas turno</div>
-                      <textarea name="turno_notas">{_val(last_rev.turno_notas)}</textarea>
+                      <textarea name="turno_notas">{_esc_val(last_rev.turno_notas)}</textarea>
                     </div>
                   </div>
                   {_render_revision_approval_ui(last_rev, include_actions=True, lead_id=lead_id)}
@@ -6011,13 +6076,13 @@ def render_edit_latest_revision_form(
                     </div>
                     <div>
                       <div class="label">Resultado</div>
-                      <input name="resultado" value="{_val(last_rev.resultado)}"/>
+                      <input name="resultado" value="{_esc_val(last_rev.resultado)}"/>
                     </div>
                   </div>
                   <div class="grid-1" style="margin-top:8px;">
                     <div>
                       <div class="label">Motivo rechazo</div>
-                      <input name="motivo_rechazo" value="{_val(last_rev.motivo_rechazo)}"/>
+                      <input name="motivo_rechazo" value="{_esc_val(last_rev.motivo_rechazo)}"/>
                     </div>
                   </div>
                 </div>
@@ -6805,19 +6870,19 @@ def render_agencias_page(
                 <input type="hidden" name="agencia_id" value="{a.id}"/>
                 <div class="agModalBody">
                   <div class="grid">
-                    <div><div class="label">Nombre agencia</div><input name="nombre_agencia" value="{_val(a.nombre_agencia)}" required/></div>
-                    <div><div class="label">Dirección</div><input name="direccion" value="{_val(a.direccion)}"/></div>
+                    <div><div class="label">Nombre agencia</div><input name="nombre_agencia" value="{_esc_val(a.nombre_agencia)}" required/></div>
+                    <div><div class="label">Dirección</div><input name="direccion" value="{_esc_val(a.direccion)}"/></div>
                   </div>
                   <div class="grid" style="margin-top:8px;">
-                    <div><div class="label">GMaps</div><input name="gmaps" value="{_val(a.gmaps)}"/></div>
-                    <div><div class="label">Mail</div><input name="mail" value="{_val(a.mail)}"/></div>
+                    <div><div class="label">GMaps</div><input name="gmaps" value="{_esc_val(a.gmaps)}"/></div>
+                    <div><div class="label">Mail</div><input name="mail" value="{_esc_val(a.mail)}"/></div>
                   </div>
                   <div class="grid" style="margin-top:8px;">
                     <div><div class="label">Vendedor</div><select name="vendedor_id"><option value="">-</option>{''.join([f'<option value="{v.id}" {"selected" if a.vendedor_id==v.id else ""}>{_txt(v.nombre)}</option>' for v in vendedores])}</select></div>
                     <div><div class="label">+ Nuevo vendedor (opcional)</div><input name="vendedor_nuevo"/></div>
                   </div>
                   <div class="grid" style="margin-top:8px;">
-                    <div><div class="label">Teléfono</div><input name="telefono" value="{_val(a.telefono)}"/></div>
+                    <div><div class="label">Teléfono</div><input name="telefono" value="{_esc_val(a.telefono)}"/></div>
                     <div><div class="label">Archivo XLS</div><input name="file" type="file" accept=".xls,.xlsx"/></div>
                   </div>
                 </div>

@@ -85,6 +85,8 @@ _DESTINATION = re.compile(r"[1-9][0-9]{7,14}")
 #: international digits only, never `+` (W1F-OPERATOR-WA-ME-LINK-CONTRACT-CORRECTION).
 _WA_ME_DIGITS = re.compile(r"[1-9][0-9]{7,14}")
 CUSTOMER_WA_ID_MALFORMED = "CUSTOMER_WA_ID_MALFORMED"
+#: The booking no longer occupies the agenda (cancelled or moved off it): never announced.
+BOOKING_NOT_OCCUPYING = "BOOKING_NOT_OCCUPYING"
 _TEMPLATE_NAME = re.compile(r"[a-z0-9_]{1,128}")
 _LANGUAGE = re.compile(r"[a-z]{2,3}(_[A-Z]{2})?")
 _PARAM_MAX = 120
@@ -231,8 +233,16 @@ def build_summary(db: Session, ledger) -> Optional[BookingSummary]:
     wa_me = customer_wa_me_parameter(wa_id)
     values = (EVENT_LABEL, name, wa_me, vehicle, place, when,
               professional, status, ids, crm)
+    # PRELAUNCH-MINIMUM-LAUNCH (C): "Nueva reserva confirmada" is only true of a booking that
+    # still occupies the agenda. A booking cancelled (or moved off the agenda) after it was
+    # enqueued — the cancelled-Wild HELD row is exactly this — is never announced, whatever
+    # path later reaches the sender: the notice is HELD with a typed reason instead.
+    from .booking_representation import is_occupying
+    problem = None if wa_me is not None else CUSTOMER_WA_ID_MALFORMED
+    if not is_occupying(rev.turno_fecha, rev.turno_hora, rev.estado_revision):
+        problem = BOOKING_NOT_OCCUPYING
     return BookingSummary(parameters=tuple(_param(v) for v in values), customer_wa_id=wa_id,
-                          problem=None if wa_me is not None else CUSTOMER_WA_ID_MALFORMED)
+                          problem=problem)
 
 
 # ── enqueue: committed ledger rows → one notice row each ─────────────────────
@@ -428,7 +438,8 @@ def send_claimed(db: Session, claim: Claim, config: Optional[OperatorConfig]) ->
         if summary is None:
             return Outcome(False, False, "SUMMARY_UNAVAILABLE")
         if summary.problem is not None:
-            # a malformed customer number must never reach the operator as a wa.me link
+            # a malformed customer number must never reach the operator as a wa.me link, and
+            # a booking that no longer occupies the agenda is never announced as confirmed
             return Outcome(False, False, summary.problem)
         if config.destination in (summary.customer_wa_id, summary.parameters[2]):
             return Outcome(False, False, "DESTINATION_IS_CUSTOMER")

@@ -1976,6 +1976,10 @@ _FAQ_TOPIC_CONTRADICT_FN = {"payment": _payment_contradicts_policy,
 #: Topics whose "already stated correctly" test needs VALUES, not a pattern.
 #: A predicate here takes precedence over `_FAQ_TOPIC_SATISFIED`.
 _FAQ_TOPIC_SATISFIED_FN = {"business_hours": _hours_prose_satisfies}
+#: PRELAUNCH-MINIMUM-LAUNCH (F): topics whose CROSS-turn "already answered" test also accepts
+#: the order-insensitive intra-turn pattern. Payment only — the one topic the Wild measured
+#: being repeated; every other topic keeps the verbatim-slice rule unchanged.
+_CROSS_TURN_PATTERN_TOPICS = frozenset({"payment"})
 
 # F3 duplicate-answer probes — key phrases checked in normalized primary reply.
 # If found, the corresponding FAQ was already answered; no supplement appended.
@@ -7640,6 +7644,17 @@ class ConversationEngine:
                     # A distinctive slice of the canonical answer, not one common word.
                     if canonical and canonical[:40] in body:
                         answered.add(topic)
+                    # PRELAUNCH-MINIMUM-LAUNCH (F, NP-04): the verbatim slice is defeated by
+                    # word order — the Wild's first reply said "transferencia bancaria,
+                    # Mercado Pago y efectivo", the slice wants "efectivo, transferencia…",
+                    # and the payment fact was repeated unprompted. For PAYMENT only, the
+                    # same order-insensitive test the intra-turn check already uses
+                    # (`_FAQ_TOPIC_SATISFIED`) also counts — and never a body that
+                    # contradicts the policy.
+                    elif (topic in _CROSS_TURN_PATTERN_TOPICS
+                          and self._satisfies_canonical(topic, body)
+                          and not self._contradicts_canonical(topic, body)):
+                        answered.add(topic)
         except Exception as exc:
             logger.warning("L4.7W3-F1 recent FAQ context unavailable: %s", exc)
         return answered
@@ -12851,7 +12866,15 @@ class ConversationEngine:
             lead.nombre = first
             state.customer_name = form_data["customer_name"]
         if form_data.get("phone") and not lead.telefono:
-            lead.telefono = form_data["phone"]
+            # PRELAUNCH-MINIMUM-LAUNCH-R1 (review F-11): one lead per canonical phone identity.
+            # A phone another lead already holds is NOT assigned (the turn continues, nothing
+            # is merged); a concurrent creator is arbitrated by the unique index, never by an
+            # IntegrityError that would fail this turn.
+            from .lead_identity import assign_phone_if_free
+            outcome = assign_phone_if_free(self.db, lead, form_data["phone"])
+            if outcome != "ASSIGNED" and outcome != "NO_IDENTITY":
+                logger.warning("M18 website_form phone not assigned thread_id=%s lead_id=%s "
+                               "outcome=%s", ctx.thread.id, lead.id, outcome)
 
         # ── Resolve vehicle from catalog first, fall back to form tipo ────
         vehicle_text = form_data.get("vehicle_text", "")

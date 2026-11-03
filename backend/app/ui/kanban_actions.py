@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 
 from fastapi import Depends, HTTPException, Form, Body, UploadFile, File, Request
-from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func, or_, select, update
 
@@ -181,9 +181,48 @@ def ui_lead_create(
     if _has(lead, "necesita_humano") and getattr(lead, "necesita_humano", None) is None:
         lead.necesita_humano = False
 
-    db.add(lead)
-    db.commit()
+    # PRELAUNCH-MINIMUM-LAUNCH (D) + R1 (review F-11): one lead per canonical phone identity.
+    # A phone that already belongs to a lead creates nothing, and the operator is TOLD so —
+    # an explicit existing-lead answer that names the lead and echoes what was typed (escaped)
+    # — instead of a silent redirect that discarded the form, or a 500 from the unique index.
+    from sqlalchemy.exc import IntegrityError
+    from ..services.lead_identity import identity_holder
+    holder = identity_holder(db, telefono_val)
+    if holder is None:
+        db.add(lead)
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()                      # a concurrent create won the identity
+            holder = identity_holder(db, telefono_val)
+            if holder is None:
+                raise
+    if holder is not None:
+        db.rollback()
+        return _identity_conflict_page(holder, creating=True, typed={
+            "Nombre": nombre, "Apellido": apellido, "Teléfono": telefono_val,
+            "Email": email, "Canal": canal})
     return RedirectResponse(url="/kanban", status_code=303)
+
+
+def _identity_conflict_page(holder_id: int, *, creating: bool, typed: dict) -> HTMLResponse:
+    """R1 (F-11): the typed, operator-visible LEAD_PHONE_IDENTITY_CONFLICT answer (HTTP 409).
+    Nothing was created or changed. Every echoed value is HTML-escaped."""
+    import html as _html
+    action = "No se creó un lead nuevo" if creating else "No se guardaron los cambios"
+    rows = "".join(f"<li>{_html.escape(k)}: {_html.escape(str(v))}</li>"
+                   for k, v in typed.items() if v not in (None, ""))
+    body = (
+        "<!doctype html><html lang='es'><head><meta charset='utf-8'>"
+        "<title>Teléfono ya registrado</title></head><body>"
+        "<h1>Teléfono ya registrado</h1>"
+        f"<p data-code='LEAD_PHONE_IDENTITY_CONFLICT'>{action}: ese teléfono ya pertenece al "
+        f"lead #{int(holder_id)}.</p>"
+        f"<p><a href='/kanban#lead-{int(holder_id)}'>Abrir el lead #{int(holder_id)}</a> · "
+        "<a href='/kanban'>Volver al tablero</a></p>"
+        + (f"<p>Datos ingresados (no guardados):</p><ul>{rows}</ul>" if rows else "")
+        + "</body></html>")
+    return HTMLResponse(body, status_code=409)
 
 
 def ui_lead_update(
@@ -234,7 +273,23 @@ def ui_lead_update(
         if s in ESTADOS_VALIDOS:
             set_lead_estado(db, lead, s)
 
-    db.commit()
+    # PRELAUNCH-MINIMUM-LAUNCH-R1 (review F-11): changing the phone to one another lead holds
+    # is a typed, operator-visible conflict (409, nothing changed) — never a 500 from the
+    # unique index. A concurrent writer is caught at commit the same way.
+    from sqlalchemy.exc import IntegrityError
+    from ..services.lead_identity import identity_holder
+    holder = identity_holder(db, telefono_val, exclude_lead_id=lead_id) if telefono_val else None
+    if holder is None:
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            holder = identity_holder(db, telefono_val, exclude_lead_id=lead_id)
+            if holder is None:
+                raise
+    if holder is not None:
+        db.rollback()
+        return _identity_conflict_page(holder, creating=False, typed={"Teléfono": telefono_val})
     return RedirectResponse(url=f"/kanban#lead-{lead_id}", status_code=303)
 
 

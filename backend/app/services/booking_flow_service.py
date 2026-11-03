@@ -684,8 +684,20 @@ class BookingFlowService:
                                  verified name, and nothing is invented.
         """
         wa_id = "".join(ch for ch in (ctx.contact.wa_id or "") if ch.isdigit())
+        name = _lead_display_name(ctx.lead)
+        if not name:
+            # PRELAUNCH-MINIMUM-LAUNCH (B/A): the name this customer typed on DETAILS in an
+            # earlier Flow of this thread (e.g. the one that lost a slot race), so a fresh Flow
+            # does not ask a person for what they already gave. Their own submission, read
+            # from this thread only; never a WhatsApp profile label.
+            try:
+                from .booking_flow_details import live_details
+                name = (live_details(self.db, [ctx.thread.id]).get(int(ctx.thread.id), {})
+                        .get("FLOW_CUSTOMER_NAME") or "")
+            except Exception:
+                name = ""
         return {
-            "customer_name": _lead_display_name(ctx.lead),
+            "customer_name": name,
             "contact_phone": wa_id,
             "contact_phone_display": _mask_phone(wa_id),
         }
@@ -792,6 +804,13 @@ class BookingFlowService:
                        extra={"date": date_str, "time": time_str},
         )
 
+        # PRELAUNCH-MINIMUM-LAUNCH (B): the first server-side sighting of these values is
+        # also the last chance to keep them if the confirmation later fails. Persisted as
+        # draft provenance, bound to this thread / cycle / offer-bound candidate, in its own
+        # short K1-first session; no booking, revision, offer or message is touched, and a
+        # failure here never changes the SUMMARY the customer is shown.
+        self._persist_details(ctx, booking_token, data, date_str=date_str, time_str=time_str)
+
         return {
             "version": FLOW_VERSION,
             "screen": "SUMMARY",
@@ -800,6 +819,24 @@ class BookingFlowService:
                 inspection_address, seller_name, seller_phone, listing_url,
             ),
         }
+
+    def _persist_details(self, ctx, booking_token: str, data: dict, *, date_str: str,
+                         time_str: str) -> None:
+        """B — see `booking_flow_details`. Only for a token that resolved AND names an offer
+        row of this thread; never raises."""
+        from .booking_flow_details import persist_flow_details, submitted_values
+        from .offer_lifecycle import OfferLifecycle
+        try:
+            adm = OfferLifecycle(self.db).admit(thread_id=int(ctx.thread.id), token=booking_token)
+            if adm.offer_id is None:
+                return
+            persist_flow_details(
+                self.db, thread_id=int(ctx.thread.id), offer_id=int(adm.offer_id),
+                candidate_id=getattr(ctx.candidate, "id", None),
+                values=submitted_values(data, date_str=date_str, time_str=time_str))
+        except Exception as exc:
+            logger.error("BOOKING_FLOW_DETAILS skipped thread_id=%s: %s", ctx.thread.id,
+                         type(exc).__name__)
 
     def handle_confirm_booking(self, booking_token: str, data: dict, *,
                                attempt_ref: Optional[str] = None) -> dict:
@@ -883,6 +920,15 @@ class BookingFlowService:
         # ── 3. context and admission, as READS ───────────────────────────────────
         try:
             ctx = self.resolve_context(token)
+        except BookingTokenError:
+            # PRELAUNCH-MINIMUM-LAUNCH (A): the slot-conflict recovery supersedes the losing
+            # offer, so a Meta RETRY of the very delivery that was refused no longer resolves.
+            # That delivery is owed the same answer it got (Phase 4-R1: one delivery, one
+            # answer) — and nothing more: no evidence, no recovery, no message.
+            replay = self._replayed_slot_refusal(token, key, attempt, data)
+            if replay is not None:
+                raise replay
+            raise
         except BookingAlreadyCompletedError:
             # The offer table says ACCEPTED and names a booking, but the ledger missed above.
             # The offer projection is never a replay authority (design §8): re-read the
@@ -916,7 +962,24 @@ class BookingFlowService:
         email = str(data.get("email", "")).strip()
         inspection_address = str(data.get("inspection_address", "")).strip()
         seller_name = str(data.get("seller_name", "")).strip()
+        seller_phone = str(data.get("seller_phone", "")).strip()
         listing_url = str(data.get("listing_url", "")).strip()
+
+        # PRELAUNCH-MINIMUM-LAUNCH-R1 (C-3 / F-03): the submitted details are persisted AGAIN
+        # here, through the same canonical function and the same thread / offer / candidate
+        # binding as prepare_summary, BEFORE the authority is invoked — so neither the winner's
+        # nor the loser's details depend on that one earlier request. A replay writes nothing
+        # (identity = value + predecessor); a corrected value supersedes. K1 is only TRIED
+        # here (a short wait): a contended confirmation reaches the authority and its typed
+        # retry answer exactly as before and writes nothing. A write that could not happen is
+        # SETTLED once the outcome is known — retried under the K1 the slot-recovery
+        # admission holds, or after the commit — and only then, if it still fails, becomes a
+        # typed DETAILS_NOT_PERSISTED condition that flags the thread and lead (listed on
+        # /api/ops/booking-attention); never silent. The booking itself may still complete:
+        # its own transaction writes the canonical copy (thread_revisions, incl. seller_phone).
+        pending_details = self._persist_confirm_details(ctx, adm.offer_id, data,
+                                                        date_str=date_str, time_str=time_str,
+                                                        attempt=attempt)
 
         # The offer-bound candidate (G3-7R/S3) and ITS canonical location, as resolved.
         candidate = ctx.candidate
@@ -960,6 +1023,7 @@ class BookingFlowService:
                 thread_id=int(ctx.thread.id), candidate_id=int(candidate.id),
                 buyer_name=name or None, buyer_phone=phone or None, buyer_email=email or None,
                 seller_type=None, seller_name=seller_name or None,
+                seller_phone=seller_phone or None,
                 address=inspection_address or None,
                 tipo_vehiculo=candidate.tipo_vehiculo, marca=candidate.marca,
                 modelo=candidate.modelo, anio=candidate.anio,
@@ -1042,6 +1106,14 @@ class BookingFlowService:
                                        outcome=outcome_for(result.outcome))
             if result.outcome is BookingOutcome.OFFER_REFUSED:
                 raise BookingTokenError(f"offer not acceptable: {result.reason}")
+            if result.outcome is BookingOutcome.SLOT_CONFLICT:
+                # PRELAUNCH-MINIMUM-LAUNCH (A): the refusal screen below is NOT the recovery —
+                # the handset cannot render it after a terminal SUMMARY (F3a). The customer is
+                # told in the conversation, once per losing offer, and offered a fresh Flow.
+                # Strictly after the durable refusal above and the ledger re-read that missed;
+                # it books nothing and accepts nothing.
+                self._recover_slot_conflict(ctx, token, adm.offer_id, attempt,
+                                            details=pending_details)
             message = _FLOW_REFUSAL_MESSAGES.get(result.outcome, BOOKING_HANDOFF_TEXT)
             if message == BOOKING_HANDOFF_TEXT:
                 # the screen promises an advisor, so a person is handed the thread
@@ -1061,6 +1133,10 @@ class BookingFlowService:
         if result.identity_outcome == "CONFLICT":
             _booking_event(ctx.thread.id, "BOOKING_IDENTITY_CONFLICT", booking_token=token,
                            extra={"crm_rev_id": result.revision_id, "lead_id": ctx.lead.id})
+        # R1 (C-3): a details write that could not happen before the authority is retried now
+        # (K1 is free after the commit) and, failing again, recorded — the booking's own
+        # canonical copy already exists.
+        self._settle_confirm_details(ctx, pending_details)
         # ── 6. after the commit: the one acknowledgement, through the ledger's claim ──
         self._acknowledge(key, result, wa_id=ctx.contact.wa_id, thread_id=int(ctx.thread.id))
         return self._success_response(token)
@@ -1160,6 +1236,129 @@ class BookingFlowService:
             # The booking is committed; nothing here may undo it. The ledger still says the
             # acknowledgement is owed, so a replay or /control recovers it.
             logger.error("BOOKING_ACK failed thread_id=%s: %s", thread_id, type(exc).__name__)
+
+    def _replayed_slot_refusal(self, token: str, key: str, attempt: str, data: dict):
+        """The BookingSlotConflictError owed to a REPLAY of a delivery already refused for
+        its slot whose offer the recovery then superseded — or None for anything else.
+
+        Recognised only by durable facts, never by timing: the token's offer is SUPERSEDED,
+        and the slot-recovery JOB of that offer (R1: the admission authority, not the forensic
+        `booking_attempt_events`) records THIS delivery as the one that lost
+        (`origin_delivery_hash`). Any other delivery on a superseded offer fails closed. The
+        screen is rebuilt from the same rows the first answer was built from (thread, contact,
+        lead, state, the offer's candidate and zone)."""
+        from ..models import SlotRecoveryJob as J, WhatsAppBookingOffer as O
+        from .booking_slot_recovery import origin_delivery_hash, recovery_identity
+        from .offer_lifecycle import token_fingerprint
+        try:
+            fp = token_fingerprint(token)
+            offer = self.db.execute(select(O).where(O.token_fingerprint == fp)).scalars().first() \
+                if fp else None
+            if offer is None or offer.status != "SUPERSEDED":
+                return None
+            origin = origin_delivery_hash(attempt)
+            job = self.db.execute(select(J.origin_delivery_hash, J.thread_id).where(
+                J.recovery_identity == recovery_identity(int(offer.id)))).first()
+            if (job is None or origin is None or job.origin_delivery_hash != origin
+                    or int(job.thread_id) != int(offer.thread_id)):
+                return None
+            thread = self.db.get(WhatsAppThread, offer.thread_id)
+            contact = self.db.get(WhatsAppContact, thread.contact_id) if thread else None
+            lead = self.db.get(Lead, thread.lead_id) if thread and thread.lead_id else None
+            state = self.db.execute(select(WhatsAppThreadState).where(
+                WhatsAppThreadState.thread_id == offer.thread_id)).scalar_one_or_none()
+            if thread is None or contact is None or lead is None or state is None:
+                return None
+            candidate = (self.db.get(WhatsAppThreadCandidate, offer.candidate_id)
+                         if offer.candidate_id is not None else None)
+            ctx = BookingContext(
+                thread=thread, contact=contact, lead=lead, state=state, candidate=candidate,
+                vehicle_summary=self._vehicle_summary(candidate),
+                location_summary=self._location_summary(offer.zone_group, offer.zone_detail,
+                                                        candidate),
+                zone_group=offer.zone_group, zone_detail=offer.zone_detail,
+                booking_token=token)
+            logger.info("BOOKING_FLOW_SLOT_REFUSAL_REPLAY thread_id=%s offer_id=%s — the same "
+                        "answer, nothing recorded or sent", thread.id, offer.id)
+            return BookingSlotConflictError(self._refusal_screen(
+                ctx, str((data or {}).get("date", "")).strip(),
+                _FLOW_REFUSAL_MESSAGES[BookingOutcome.SLOT_CONFLICT]))
+        except Exception as exc:
+            logger.error("BOOKING_FLOW slot-refusal replay check failed: %s", type(exc).__name__)
+            return None
+
+    def _recover_slot_conflict(self, ctx, token: str, offer_id, attempt, *,
+                               details=None) -> None:
+        """A + R1 — ADMIT the recovery (`booking_slot_recovery.admit_recovery`): one durable
+        job per losing offer, in the same transaction as the human flags. NO provider call
+        happens here: the text and the fresh Flow are the background worker's. A details
+        write that could not happen before the authority is retried inside the admission
+        transaction (K1 held, in a savepoint); still failing, it is recorded as a typed
+        condition. Never raises."""
+        from .booking_slot_recovery import admit_recovery
+        try:
+            self.db.rollback()                        # the request session only ever read
+            out = admit_recovery(self.db, ctx, losing_offer_id=offer_id, attempt_ref=attempt,
+                                 details=details)
+            logger.info("SLOT_RECOVERY thread_id=%s admission=%s job_id=%s", ctx.thread.id,
+                        out.reason, out.job_id)
+            if details is not None and not out.details_persisted:
+                self._settle_confirm_details(ctx, details, retry=False)
+        except Exception as exc:
+            logger.error("SLOT_RECOVERY admission raised thread_id=%s: %s", ctx.thread.id,
+                         type(exc).__name__)
+            if details is not None:
+                self._settle_confirm_details(ctx, details, retry=False)
+
+    def _persist_confirm_details(self, ctx, offer_id, data: dict, *, date_str: str,
+                                 time_str: str, attempt):
+        """R1 (C-3): the confirm-time write, K1 only TRIED (`CONFIRM_LOCK_TIMEOUT_MS`).
+        Returns None when persisted (or nothing to persist), else the PENDING write for
+        `_settle_confirm_details` / the recovery admission. Writes nothing else. Never raises."""
+        from .booking_flow_details import (CONFIRM_LOCK_TIMEOUT_MS, persist_flow_details,
+                                           submitted_values)
+        values: dict = {}
+        try:
+            values = submitted_values(data, date_str=date_str, time_str=time_str)
+            if not values:
+                return None
+            result = persist_flow_details(
+                self.db, thread_id=int(ctx.thread.id),
+                offer_id=int(offer_id) if offer_id is not None else None,
+                candidate_id=getattr(ctx.candidate, "id", None), values=values,
+                producer_version="confirm_booking/1", lock_timeout_ms=CONFIRM_LOCK_TIMEOUT_MS)
+            if result.persisted:
+                return None
+            why = result.reason
+        except Exception as exc:
+            why = type(exc).__name__
+        return {"thread_id": int(ctx.thread.id), "offer_id": offer_id,
+                "candidate_id": getattr(ctx.candidate, "id", None), "values": values,
+                "attempt": attempt, "why": (why or "FAILED")[:48]}
+
+    def _settle_confirm_details(self, ctx, pending, *, retry: bool = True) -> None:
+        """R1 (C-3): the pending confirm-time write, settled once the outcome is known: retried
+        once with the normal bounded K1 wait (`retry`), and if it still fails a typed
+        DETAILS_NOT_PERSISTED condition (thread + lead flagged, listed). Never raises."""
+        if not pending:
+            return
+        from .booking_flow_details import persist_flow_details, record_details_condition
+        why = pending.get("why")
+        try:
+            if retry and pending.get("values"):
+                result = persist_flow_details(
+                    self.db, thread_id=pending["thread_id"], offer_id=pending["offer_id"],
+                    candidate_id=pending["candidate_id"], values=pending["values"],
+                    producer_version="confirm_booking/1")
+                if result.persisted:
+                    return
+                why = result.reason or why
+        except Exception as exc:
+            why = type(exc).__name__
+        record_details_condition(
+            self.db, thread_id=pending["thread_id"], lead_id=getattr(ctx.lead, "id", None),
+            offer_id=pending["offer_id"], attempt_ref=pending.get("attempt"),
+            reason=f"CONFIRM_{why or 'FAILED'}")
 
     def _refusal_screen(self, ctx, date_str: str, message: str) -> dict:
         """The APPOINTMENT screen with what is free now and the reason nothing was booked."""

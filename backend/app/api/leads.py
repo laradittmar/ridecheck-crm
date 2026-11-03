@@ -12,7 +12,7 @@ from ..schemas.revisions import RevisionSummaryOut
 from ..schemas.whatsapp_api import WhatsAppThreadOut
 from ..services.db_errors import commit_or_400
 from ..services.lead_lifecycle import set_lead_estado
-from ..services.phone_utils import normalize_phone_or_422, normalized_phone_sql
+from ..services.phone_utils import normalize_phone_or_422
 from ..services.whatsapp_threads import load_thread_payload
 
 router = APIRouter(prefix="/leads", tags=["leads"])
@@ -39,19 +39,25 @@ MOTIVOS_PERDIDA_VALIDOS = {"PRECIO", "DISPONIBILIDAD", "OTRO"}
 
 @router.post("", response_model=LeadOut)
 def create_lead(payload: LeadCreate, db: Session = Depends(get_db)):
-    lead = Lead(
-        estado="CONSULTA_NUEVA",
-        telefono=normalize_phone_or_422(payload.telefono),
-        nombre=payload.nombre,
-        apellido=payload.apellido,
-        email=payload.email,
-        canal=payload.canal,
-        compro_el_auto=payload.compro_el_auto,
-        necesita_humano=False,
-    )
-    db.add(lead)
-    commit_or_400(db, detail="No se pudo crear el lead: revisá longitudes y valores permitidos")
-    db.refresh(lead)
+    """Create a lead — idempotently per canonical phone identity (PRELAUNCH-MINIMUM-LAUNCH D).
+
+    This is n8n's "Create Lead" node. Two concurrent executions for one customer's opening
+    burst used to create two leads; now the database's unique identity index arbitrates and
+    both receive the SAME lead, so both thread links agree. An existing lead is returned
+    unchanged — a create request never overwrites one."""
+    from sqlalchemy.exc import IntegrityError
+    from ..services.lead_identity import find_or_create_lead
+    values = dict(estado="CONSULTA_NUEVA", nombre=payload.nombre, apellido=payload.apellido,
+                  email=payload.email, canal=payload.canal,
+                  compro_el_auto=payload.compro_el_auto, necesita_humano=False)
+    try:
+        lead, _created = find_or_create_lead(
+            db, telefono=normalize_phone_or_422(payload.telefono), values=values)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400,
+                            detail="No se pudo crear el lead: revisá longitudes y valores "
+                                   "permitidos")
     return lead
 
 
@@ -61,7 +67,12 @@ def list_leads(telefono: str | None = Query(default=None), db: Session = Depends
     if telefono is not None:
         normalized = normalize_phone_or_422(telefono)
         if normalized is not None:
-            stmt = stmt.where(normalized_phone_sql(Lead.telefono) == normalized)
+            # D: the lookup compares the canonical identity, so "+549…" finds "549…" — the
+            # same rule the unique index enforces. Never a pattern on the display form.
+            # Ordering is unchanged (newest first) so a caller that reads the first element
+            # behaves as before on a database that still holds a legacy duplicate.
+            from ..services.lead_identity import phone_identity_clause
+            stmt = stmt.where(phone_identity_clause(db, normalized))
     return db.execute(stmt.order_by(Lead.created_at.desc())).scalars().all()
 
 

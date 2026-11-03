@@ -49,6 +49,8 @@ from .services.outbound_path_registry import AUTHORIZED_PATHS, get_deployment_id
 from .services.quote_followup import quote_followup_loop
 from .services.unanswered_alert import unanswered_alert_loop
 from .services.operator_notification import operator_notification_loop
+from .services.booking_slot_recovery import start_worker as start_slot_recovery_worker
+from .services.booking_slot_recovery import stop_worker as stop_slot_recovery_worker
 from .settings import get_settings
 from .ui.kanban import router as ui_router
 from .ui.whatsapp_ui import router as whatsapp_ui_router
@@ -654,6 +656,22 @@ async def _start_followup_tasks() -> None:
 async def _start_operator_notification_task() -> None:
     # W1-F2: inert until configured — committed bookings are then recorded HELD and listed.
     _keep(asyncio.create_task(operator_notification_loop(), name="operator_notification"))
+
+
+@app.on_event("startup")
+def _start_slot_recovery_worker() -> None:
+    # PRELAUNCH-MINIMUM-LAUNCH-R1 (C-2): the slot-conflict recovery's text → Flow runs HERE,
+    # on its own worker thread with deadline-bounded transport — never inside the Data
+    # Exchange request and never on the event loop. Inert while no job is due.
+    # R2 (R1-02): one application-owned DAEMON thread; starting twice starts one.
+    start_slot_recovery_worker()
+
+
+@app.on_event("shutdown")
+def _stop_slot_recovery_worker() -> None:
+    # R2 (R1-02): the stop signal is set FIRST — no claim and no provider call begins after
+    # it — then a bounded join. A provider call already in flight is abandoned, not cancelled.
+    stop_slot_recovery_worker()
 
 
 @app.on_event("startup")

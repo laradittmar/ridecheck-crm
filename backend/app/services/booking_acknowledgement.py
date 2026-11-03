@@ -110,8 +110,18 @@ def _send_ledger_acknowledgement(
     correlation_id: Optional[str] = None,
     causal_inbound_wa_message_id: Optional[str] = None,
     delivery_fingerprint: Optional[str] = None,
+    text: str = BOOKING_FLOW_RECEIPT_TEXT,
+    transport=None,
 ) -> "ReceiptOutcome":
     """Send the single canonical booking acknowledgement.
+
+    PRELAUNCH-MINIMUM-LAUNCH (A): `text` exists so the slot-conflict recovery
+    (`booking_slot_recovery`) reuses THIS transport classification — gate, typed receipt,
+    the definite/ambiguous boundary — for its own fixed copy, instead of a second sender.
+    Every booking-acknowledgement caller passes nothing and sends the owner-approved receipt.
+    R1: `transport` (same signature as `_send_whatsapp_cloud_text`) lets the recovery WORKER
+    wrap the provider call in its bounded-deadline executor; None = the plain sender, exactly
+    as before for every existing caller.
 
     Exactly-once comes from the booking ledger, not from a flag: a Meta retry or a
     duplicate confirm_booking replays the committed result (it no longer reaches
@@ -145,7 +155,7 @@ def _send_ledger_acknowledgement(
     from .outbound_path_registry import OutboundPathId, get_deployment_id
     from .outbound_safety_gate import GateOutcome, OutboundSafetyGate
 
-    text = BOOKING_FLOW_RECEIPT_TEXT          # owner-approved copy (SB2A-R3)
+    # owner-approved copy (SB2A-R3) unless the slot-conflict recovery passes its own
     # Phase 3-R1: where the attempt stands relative to the irreversible transport boundary.
     # "before" — nothing can have left; "entered" — the sender was called and has not proven a
     # rejection, so ANY failure from here on is UNCERTAIN; "settled" — classified below.
@@ -182,7 +192,7 @@ def _send_ledger_acknowledgement(
             return ReceiptOutcome(False, None, f"GATE_{result.outcome.value}"[:64])
         try:
             boundary = "entered"
-            wa_message_id, _ = _send_whatsapp_cloud_text(
+            wa_message_id, _ = (transport or _send_whatsapp_cloud_text)(
                 to_wa_id=ctx.contact.wa_id, text=text)
         except OutboundBlockedError:
             # raised by enforce_outbound_enabled, the transport's FIRST statement: nothing

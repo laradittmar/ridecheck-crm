@@ -33,6 +33,19 @@ from .services.booking_representation import (
 
 class Lead(Base):
     __tablename__ = "leads"
+    # PRELAUNCH-MINIMUM-LAUNCH (D): one lead per canonical (digits-only) phone identity,
+    # enforced by the database. PostgreSQL only — the index is an expression over
+    # `regexp_replace`, which SQLite does not have; on PostgreSQL `create_all` builds exactly
+    # what migration `20261102_lead_phone_identity` creates (a test pins the two together).
+    # R1 (F-11): the predicate is the IDENTITY being non-empty, not the raw column — a
+    # digit-free value ("-", "s/n") has no identity and behaves like NULL for uniqueness.
+    __table_args__ = (
+        Index("uq_leads_phone_identity",
+              text("regexp_replace(telefono, '[^0-9]', '', 'g')"),
+              unique=True,
+              postgresql_where=text("regexp_replace(telefono, '[^0-9]', '', 'g') <> ''"),
+              ).ddl_if(dialect="postgresql"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
@@ -744,6 +757,11 @@ class ThreadRevision(Base):
     modelo: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     anio: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     publication_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    #: PRELAUNCH-MINIMUM-LAUNCH-R1 (C-3 / F-03): the seller phone the customer typed in the
+    #: Booking Flow, written by the booking's OWN transaction (migration
+    #: `20261103_slot_recovery_job`). Before R1 it had no booking-associated copy at all: the
+    #: draft evidence row was its only home, and a failed draft write lost it silently.
+    seller_phone: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
     appointment_approval_status: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     appointment_approval_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, unique=True)
     appointment_approval_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -816,6 +834,138 @@ class BookingAttemptEvent(Base):
     hist_offer_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     hist_revision_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     hist_thread_revision_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+#: PRELAUNCH-MINIMUM-LAUNCH-R1 — the slot-recovery job's state machine (C-1/C-2/C-7).
+SLOT_RECOVERY_STATES = ("PENDING", "SENDING_TEXT", "TEXT_SENT", "SENDING_FLOW",
+                        "RECOVERED", "HANDOFF", "FAILED")
+SLOT_RECOVERY_TERMINAL = ("RECOVERED", "HANDOFF", "FAILED")
+#: Claims a job may consume before it is FAILED (ATTEMPTS_EXHAUSTED); a CHECK bounds it.
+SLOT_RECOVERY_MAX_CLAIMS = 6
+
+
+class SlotRecoveryJob(Base):
+    """PRELAUNCH-MINIMUM-LAUNCH-R1 — the durable recovery owed to the customer who lost a slot
+    race: one explanation text, then one fresh Booking Flow (`services/booking_slot_recovery`).
+
+    The ADMISSION authority. One row per LOSING OFFER (`UNIQUE (recovery_identity)`), created
+    by the Data Exchange request in the same transaction that hands the thread to a person
+    (stage SCHEDULING + the human flags), and executed later by the background worker — never
+    inside the Data Exchange request. `booking_attempt_events` is forensic only and is not
+    read by any recovery decision.
+
+    State machine (CHECKed vocabulary):
+
+        PENDING → SENDING_TEXT → TEXT_SENT → SENDING_FLOW → RECOVERED
+        and the terminal degraded outcomes HANDOFF (a classified stop: a person continues)
+        and FAILED (an unexpected stop: internal error, lock contention or claims exhausted).
+
+    SENDING_* means a transport may be in flight; a claim on it whose lease EXPIRED is
+    resumed only when the gate proves nothing crossed for that step's delivery identity, and
+    is otherwise HANDOFF (uncertain) — never re-sent.
+
+    The ids are scalar HISTORY, deliberately without foreign keys (the `operator_notifications`
+    rule): a tester reset must never be blocked by, or cascade into, this record. No customer
+    PII is stored: identities are hex digests, WAMIDs are provider ids, reasons are typed codes.
+    """
+    __tablename__ = "slot_recovery_jobs"
+    __table_args__ = (
+        UniqueConstraint("recovery_identity", name="uq_slot_recovery_jobs_identity"),
+        CheckConstraint("state IN ('PENDING', 'SENDING_TEXT', 'TEXT_SENT', 'SENDING_FLOW', "
+                        "'RECOVERED', 'HANDOFF', 'FAILED')",
+                        name="ck_slot_recovery_jobs_state"),
+        CheckConstraint("attempts >= 0 AND attempts <= 6", name="ck_slot_recovery_jobs_attempts"),
+        CheckConstraint("text_attempts >= 0 AND text_attempts <= 2",
+                        name="ck_slot_recovery_jobs_text_attempts"),
+        CheckConstraint("flow_attempts >= 0 AND flow_attempts <= 1",
+                        name="ck_slot_recovery_jobs_flow_attempts"),
+        CheckConstraint("(state IN ('RECOVERED', 'HANDOFF', 'FAILED')) = "
+                        "(outcome IS NOT NULL AND completed_at IS NOT NULL)",
+                        name="ck_slot_recovery_jobs_terminal"),
+        Index("ix_slot_recovery_jobs_state", "state"),
+        Index("ix_slot_recovery_jobs_thread", "thread_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True)
+    #: sha256("slot-conflict-recovery|v1|offer:<losing offer id>") — one job per losing offer.
+    recovery_identity: Mapped[str] = mapped_column(String(64), nullable=False)
+    thread_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    lead_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    contact_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    candidate_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    losing_offer_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    new_offer_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    #: 16-hex digest of the Data Exchange delivery (envelope) that lost — the original Flow
+    #: delivery identity, never the IV or ciphertext.
+    origin_delivery_hash: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    state: Mapped[str] = mapped_column(String(16), nullable=False)
+    #: Typed terminal outcome (RECOVERED, or the HANDOFF / FAILED reason); NULL until terminal.
+    outcome: Mapped[Optional[str]] = mapped_column(String(48), nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0,
+                                          server_default=text("0"))
+    text_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0,
+                                               server_default=text("0"))
+    flow_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0,
+                                               server_default=text("0"))
+    claim_token: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True),
+                                                                 nullable=True)
+    next_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True),
+                                                                nullable=True)
+    last_error: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    #: The gate delivery identity of the text attempt in flight / last made, and of the Flow.
+    text_delivery_identity: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    flow_delivery_identity: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    text_provider_message_id: Mapped[Optional[str]] = mapped_column(String(191), nullable=True)
+    flow_provider_message_id: Mapped[Optional[str]] = mapped_column(String(191), nullable=True)
+    #: The human-attention flags this job raised (false → true) and therefore may clear.
+    attention_applied: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False,
+                                                    server_default=text("false"))
+    owns_state_flag: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False,
+                                                  server_default=text("false"))
+    owns_lead_flag: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False,
+                                                 server_default=text("false"))
+    #: 16-hex digest of the thread's last processed inbound when the flags were raised: a
+    #: turn processed since then may have asserted its own handoff, so the job never clears.
+    inbound_marker: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False,
+                                                 server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False,
+                                                 server_default=func.now())
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True),
+                                                             nullable=True)
+
+
+#: PRELAUNCH-MINIMUM-LAUNCH-R1 — the kinds of attention condition a booking writer records.
+BOOKING_ATTENTION_KINDS = ("DETAILS_NOT_PERSISTED",)
+
+
+class BookingAttentionCondition(Base):
+    """PRELAUNCH-MINIMUM-LAUNCH-R1 (C-3 / F-03) — a durable, typed reason a person must look at
+    a thread that no job owns: today, Booking Flow details that could not be persisted at
+    confirm_booking. Listed on `/api/ops/booking-attention`; it also keeps a slot-recovery job
+    from clearing the generic human flags (`booking_slot_recovery`). One row per (kind,
+    thread, delivery) — `UNIQUE (condition_uid)`, so a Meta retry records nothing twice.
+    Scalar ids, no foreign keys (history, like `operator_notifications.hist_*`); no PII."""
+    __tablename__ = "booking_attention_conditions"
+    __table_args__ = (
+        UniqueConstraint("condition_uid", name="uq_booking_attention_conditions_uid"),
+        CheckConstraint("kind IN ('DETAILS_NOT_PERSISTED')",
+                        name="ck_booking_attention_conditions_kind"),
+        Index("ix_booking_attention_conditions_thread", "thread_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True)
+    condition_uid: Mapped[str] = mapped_column(String(64), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason: Mapped[str] = mapped_column(String(64), nullable=False)
+    thread_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    lead_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    offer_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    flags_applied: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False,
+                                                server_default=text("false"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False,
+                                                 server_default=func.now())
+
 
 class WhatsAppMessage(Base):
     __tablename__ = "whatsapp_messages"

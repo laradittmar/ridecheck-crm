@@ -591,6 +591,10 @@ class SB2AAuthorityPostgres(unittest.TestCase):
             c.execute(text("DELETE FROM whatsapp_booking_offers WHERE thread_id IN (:a, :b)"), {"a": t1, "b": t2})
             c.execute(text("DELETE FROM whatsapp_thread_states WHERE thread_id IN (:a, :b)"), {"a": t1, "b": t2})
             c.execute(text("DELETE FROM whatsapp_thread_candidates WHERE thread_id IN (:a, :b)"), {"a": t1, "b": t2})
+            # PRELAUNCH-MINIMUM-LAUNCH-R1 (adaptation): confirm_booking now also persists the
+            # submitted Flow details (whatsapp_thread_evidence, FK to the thread), so they are
+            # removed before the threads, like the offers above. Nothing else changes.
+            c.execute(text("DELETE FROM whatsapp_thread_evidence WHERE thread_id IN (:a, :b)"), {"a": t1, "b": t2})
             c.execute(text("DELETE FROM whatsapp_threads WHERE id IN (:a, :b)"), {"a": t1, "b": t2})
             c.execute(text("DELETE FROM whatsapp_contacts WHERE display_name='Fixture'"))
 

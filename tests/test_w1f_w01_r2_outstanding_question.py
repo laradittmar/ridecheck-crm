@@ -2724,7 +2724,17 @@ class TestR2J_Structural(unittest.TestCase):
         cfg.set_main_option("script_location", str(BACKEND_DIR / "migrations"))
         self.assertEqual([EXPECTED_HEAD],
                          ScriptDirectory.from_config(cfg).get_heads())
-        self.assertEqual("20261027_w1f_conversation_memory", EXPECTED_HEAD)
+        # PRELAUNCH-MINIMUM-LAUNCH (D) adaptation: one additive revision now sits on this
+        # one. This revision must still be in the chain, directly below the new head, and its
+        # own source is still asserted additive below.
+        # R1: a second additive revision (20261103_slot_recovery_job) sits on that one; this
+        # revision must still be in the chain, directly below 20261102_lead_phone_identity.
+        self.assertEqual("20261103_slot_recovery_job", EXPECTED_HEAD)
+        script = ScriptDirectory.from_config(cfg)
+        self.assertEqual(script.get_revision(EXPECTED_HEAD).down_revision,
+                         "20261102_lead_phone_identity")
+        self.assertEqual(script.get_revision("20261102_lead_phone_identity").down_revision,
+                         "20261027_w1f_conversation_memory")
         source = (BACKEND_DIR / "migrations" / "versions"
                   / "20261027_w1f_conversation_memory.py").read_text(encoding="utf-8")
         for forbidden in ("DROP TABLE whatsapp_thread_states", "DELETE FROM", "TRUNCATE",
@@ -2950,6 +2960,14 @@ class TestR2K_Migration(unittest.TestCase):
     PARENT = "20261022_operator_notifications"
     HEAD = "20261027_w1f_conversation_memory"
     TABLES = ("whatsapp_thread_evidence", "whatsapp_outstanding_questions")
+    # PRELAUNCH-MINIMUM-LAUNCH (D) adaptation: an additive revision
+    # (`20261102_lead_phone_identity`, one index) now sits above HEAD, so the rehearsal
+    # database is at the TREE's head and a relative `downgrade -1` would exercise that
+    # revision instead of this one. The downgrades below therefore name this revision's
+    # parent explicitly — the path still runs THIS revision's downgrade — and the version
+    # assertions compare against the tree's head. Every assertion about this revision's own
+    # refusal, message and round trip is unchanged.
+    from app.services.schema_preflight import EXPECTED_HEAD as TREE_HEAD
 
     @classmethod
     def _engine(cls):
@@ -3027,7 +3045,7 @@ class TestR2K_Migration(unittest.TestCase):
                        self._sql("SELECT count(*) FROM whatsapp_outstanding_questions")[0][0])
         self.assertEqual((1, 1), rows_before, "the fixture did not seed one row per table")
         head_before = self._sql("SELECT version_num FROM alembic_version")[0][0]
-        self.assertEqual(self.HEAD, head_before)
+        self.assertEqual(self.TREE_HEAD, head_before)
 
         cfg = Config()
         cfg.set_main_option("script_location",
@@ -3036,7 +3054,7 @@ class TestR2K_Migration(unittest.TestCase):
         # so it is set for the duration of this call and nowhere else.
         with patch.dict(os.environ, {"DATABASE_URL": _R2_PG_URL}):
             with self.assertRaises(RuntimeError) as caught:
-                command.downgrade(cfg, "-1")
+                command.downgrade(cfg, self.PARENT)
         message = str(caught.exception)
 
         # 1 — it refused
@@ -3050,7 +3068,8 @@ class TestR2K_Migration(unittest.TestCase):
              self._sql("SELECT count(*) FROM whatsapp_outstanding_questions")[0][0]),
             "the refusal deleted evidence")
         # 3 — the head did not move
-        self.assertEqual(self.HEAD, self._sql("SELECT version_num FROM alembic_version")[0][0])
+        self.assertEqual(self.TREE_HEAD,
+                         self._sql("SELECT version_num FROM alembic_version")[0][0])
         self.assertEqual(2, self._tables_present(), "a refused downgrade dropped a table")
         # 4 — the message carries the schema-compatible fallback boundary
         for needle in ("NO EVIDENCE ROW WAS DELETED",
@@ -3107,7 +3126,7 @@ class TestR2K_Migration(unittest.TestCase):
         before = self._fingerprint()
         self.assertIsNotNone(before)
         with patch.dict(os.environ, {"DATABASE_URL": _R2_PG_URL}):
-            command.downgrade(cfg, "-1")
+            command.downgrade(cfg, self.PARENT)
         self.assertEqual(0, self._tables_present(), "the empty downgrade dropped nothing")
         self.assertEqual(self.PARENT,
                          self._sql("SELECT version_num FROM alembic_version")[0][0])
@@ -3122,7 +3141,7 @@ class TestR2K_Migration(unittest.TestCase):
         with patch.dict(os.environ, {"DATABASE_URL": _R2_PG_URL}):
             command.upgrade(cfg, "head")
         self.assertEqual(2, self._tables_present())
-        self.assertEqual(self.HEAD,
+        self.assertEqual(self.TREE_HEAD,
                          self._sql("SELECT version_num FROM alembic_version")[0][0])
         self.assertEqual(before, self._fingerprint(),
                          "re-upgrading produced a different schema")

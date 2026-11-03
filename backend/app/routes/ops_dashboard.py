@@ -1305,7 +1305,16 @@ def get_booking_attention(
     Pre-Wild PW1-B: `operational_conditions` lists lost booking evidence and booking I/O-guard
     trips on the e-mail path. Read-only, behind the same signed CRM session as `/control`."""
     rows = booking_attention(db)
+    # PRELAUNCH-MINIMUM-LAUNCH-R1 (C-1 / C-3): every slot-conflict recovery a customer is
+    # still owed (pending, in progress, lease expired, stale, internal error, lock contention)
+    # or that ended degraded (HANDOFF / FAILED), and every typed booking attention condition
+    # (DETAILS_NOT_PERSISTED). From the canonical backing service, durable fields only.
+    from ..services.booking_slot_recovery import condition_attention, recovery_attention
+    recoveries = recovery_attention(db)
+    conditions = condition_attention(db)
     return {"count": len(rows), "rows": rows,
+            "slot_recovery_count": len(recoveries), "slot_recoveries": recoveries,
+            "attention_condition_count": len(conditions), "attention_conditions": conditions,
             "operational_conditions": operational_conditions(db)}
 
 

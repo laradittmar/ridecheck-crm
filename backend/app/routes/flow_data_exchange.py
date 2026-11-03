@@ -20,6 +20,7 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
@@ -166,7 +167,15 @@ async def booking_flow_data_exchange(
     booking_token = str(data.get("booking_token") or flow_token or "").strip()
 
     # ── Route by action ───────────────────────────────────────────────────────
-    try:
+    # PRELAUNCH-MINIMUM-LAUNCH-R1 (review F-02 / C-2): the dispatch below is synchronous —
+    # database reads and the booking authority — and used to run directly on the single
+    # uvicorn event loop, so one slow request stalled every webhook and CRM page. It is
+    # unchanged, but it now runs on the threadpool (`run_in_threadpool`) and the event loop
+    # only awaits it; every exception it raises reaches the SAME handlers below. No provider
+    # call happens on this path any more: a slot conflict only ADMITS a recovery job, which
+    # the background worker executes.
+    def _dispatch() -> dict:
+        result: dict
         if action == "INIT":
             result = svc.handle_init(booking_token)
 
@@ -199,6 +208,10 @@ async def booking_flow_data_exchange(
             logger.warning("BOOKING_FLOW_VALIDATION_REFUSED kind=unknown_action "
                            "action=%r token_present=%s", action, bool(booking_token))
             raise HTTPException(status_code=422, detail=f"Unknown action: {action!r}")
+        return result
+
+    try:
+        result = await run_in_threadpool(_dispatch)
 
     except BookingAlreadyCompletedError as exc:
         # ── G3-7R/S6: a REPLAY, caught BEFORE BookingTokenError on purpose ───────

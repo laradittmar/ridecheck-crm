@@ -117,7 +117,17 @@ class P4R1_DeclaredSchema(unittest.TestCase):
         # 20261016_notification_sent_at). NEW: one additive revision,
         # 20261027_w1f_conversation_memory, sits on it; the whole chain below is asserted
         # unchanged, which is what this test is really for.
-        self.assertEqual(heads, ["20261027_w1f_conversation_memory"])
+        # PRELAUNCH-MINIMUM-LAUNCH (D) adaptation, same idiom. OLD: the single head was
+        # 20261027_w1f_conversation_memory. NEW: one additive revision,
+        # 20261102_lead_phone_identity (a unique index on the canonical phone identity),
+        # sits on it; the chain below is asserted unchanged.
+        # PRELAUNCH-MINIMUM-LAUNCH-R1 adaptation, same idiom. OLD: the single head was
+        # 20261102_lead_phone_identity. NEW: one additive revision, 20261103_slot_recovery_job
+        # (two new tables and one nullable column), sits on it; the chain below is unchanged.
+        self.assertEqual(heads, ["20261103_slot_recovery_job"])
+        self.assertEqual(revs["20261103_slot_recovery_job"], "20261102_lead_phone_identity")
+        self.assertEqual(revs["20261102_lead_phone_identity"],
+                         "20261027_w1f_conversation_memory")
         self.assertEqual(revs["20261027_w1f_conversation_memory"],
                          "20261022_operator_notifications")
         self.assertEqual(revs["20261022_operator_notifications"], "20261016_notification_sent_at")

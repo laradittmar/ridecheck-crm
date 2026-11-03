@@ -364,12 +364,21 @@ def kanban(
         select(Profesional).order_by(Profesional.nombre, Profesional.apellido)
     ).scalars().all()
     agencias = db.execute(select(Agencia).order_by(Agencia.nombre_agencia)).scalars().all()
+    # PRELAUNCH-MINIMUM-LAUNCH (B): the booking attempt behind each card, joined from the
+    # canonical rows at render time (read only). A failure here never breaks the board.
+    try:
+        from ..services.lead_booking_details import lead_booking_details
+        booking_details = lead_booking_details(db, [l.id for l in leads])
+    except Exception:
+        db.rollback()
+        booking_details = {}
     return HTMLResponse(
         render_page(
             leads,
             profesionales=profesionales,
             agencias=agencias,
             user_email=getattr(request.state, "user_email", ""),
+            booking_details=booking_details,
             **filters,
         ),
         media_type="text/html; charset=utf-8",

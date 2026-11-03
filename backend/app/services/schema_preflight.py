@@ -45,7 +45,11 @@ logger = logging.getLogger(__name__)
 #: migration DEPLOYMENT-ORDERED: an image carrying this code refuses to start until the
 #: migration has run, which is the ordering `docs/operations/RECOVERY_MANIFEST.md` §6
 #: already requires and the reason R1 shipped without a table.
-EXPECTED_HEAD = "20261027_w1f_conversation_memory"
+#: PRELAUNCH-MINIMUM-LAUNCH (D) added `20261102_lead_phone_identity` (one additive unique
+#: index on the canonical phone identity of `leads`), with the same deployment ordering.
+#: PRELAUNCH-MINIMUM-LAUNCH-R1 added `20261103_slot_recovery_job` (the recovery-job and
+#: attention-condition tables and `thread_revisions.seller_phone`), same ordering.
+EXPECTED_HEAD = "20261103_slot_recovery_job"
 
 
 class DeclaredSchemaMissing(RuntimeError):
