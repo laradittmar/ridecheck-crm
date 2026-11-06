@@ -4,6 +4,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from ..services.vehicle_identity import normalize_dominio, parse_kilometraje
+
 
 class RevisionCreate(BaseModel):
     # VEHICULO
@@ -11,6 +13,8 @@ class RevisionCreate(BaseModel):
     marca: str | None = Field(default=None, max_length=50)
     modelo: str | None = Field(default=None, max_length=50)
     anio: int | None = None
+    kilometraje: int | None = None
+    dominio: str | None = None
     link_compra: str | None = None
     presupuesto_compra: int | None = None
     vendedor_tipo: str | None = Field(default=None, max_length=20)
@@ -46,6 +50,16 @@ class RevisionCreate(BaseModel):
     estado_revision: str | None = Field(default=None, max_length=20)
     resultado: str | None = Field(default=None, max_length=20)
     motivo_rechazo: str | None = Field(default=None, max_length=80)
+
+    @field_validator("kilometraje", mode="before")
+    @classmethod
+    def validate_kilometraje(cls, value):
+        return parse_kilometraje(value)
+
+    @field_validator("dominio", mode="before")
+    @classmethod
+    def validate_dominio(cls, value):
+        return normalize_dominio(value)
 
     @field_validator("cobrado")
     @classmethod
@@ -106,6 +120,8 @@ class RevisionOut(BaseModel):
     marca: str | None = None
     modelo: str | None = None
     anio: int | None = None
+    kilometraje: int | None = None
+    dominio: str | None = None
     link_compra: str | None = None
     presupuesto_compra: int | None = None
     vendedor_tipo: str | None = None

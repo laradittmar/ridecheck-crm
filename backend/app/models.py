@@ -196,6 +196,13 @@ class Revision(Base):
     marca: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     modelo: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     anio: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    #: PRELAUNCH-MINIMUM-LAUNCH-VEHICLE-IDENTITY: the canonical home of both values once a
+    #: booking commits (migration `20261104_vehicle_identity`). Before that they exist only
+    #: as draft `whatsapp_thread_evidence` rows. Both optional; NULL is "not given", never 0.
+    #: `dominio` is the canonical form (`services/vehicle_identity`) and is deliberately NOT
+    #: unique: one vehicle can have many inspections.
+    kilometraje: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    dominio: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
 
     link_compra: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     presupuesto_compra: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)

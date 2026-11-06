@@ -18,13 +18,17 @@ status and supersession), not in a new table and not in a booking table:
   `BOOKING_FLOW_DETAILS`. No locality, vehicle or booking decision reads these rows: the
   locality binder reads `role='INSPECTION_LOCATION'` with `outcome='ACCEPT'` only, and these
   rows carry neither. The booking still writes its own canonical copy when it commits.
-* **Idempotent.** A row's identity is a hash of (thread, claim type, value, the row it
-  replaces). The same submission replayed derives the same identities and writes nothing; the
-  table's UNIQUE `(thread_id, claim_id)` is the arbiter if two replays race.
+* **Idempotent, within one attempt.** An attempt is one candidate in one cycle. A row's identity
+  is a hash of (thread, claim type, value, the row it replaces, candidate, cycle). The same
+  submission replayed derives the same identities and writes nothing; the table's UNIQUE
+  `(thread_id, claim_id)` is the arbiter if two replays race. The same VALUE in another attempt
+  is a new fact: a person's e-mail typed for a second car belongs to that attempt too, so it
+  gets its own row.
 * **Superseded, never duplicated.** A corrected value is a NEW row and the previous live row of
-  that claim type gets `superseded_by_id` — the old value stays readable as history. An
-  optional field submitted empty is "not given this time", not a correction: the previous
-  value stands.
+  that claim type IN THE SAME ATTEMPT gets `superseded_by_id` — the old value stays readable as
+  history. Another attempt's row is never touched: it stays live and bound to its own candidate
+  and cycle, so a thread can hold one live row of a claim type per attempt. An optional field
+  submitted empty is "not given this time", not a correction: the previous value stands.
 * **No side effect beyond the rows.** No booking, revision, offer, lead or message is written
   and nothing is sent. Serialised per thread by K1 (the thread-state row, bounded) — the same
   first lock every offer writer takes — in its own short session, never the request's.
@@ -38,6 +42,20 @@ the confirm-time write fails, `record_details_condition` records a typed
 DETAILS_NOT_PERSISTED condition (`booking_attention_conditions`) and raises the human flags,
 so the loss is never silent. A COMMITTED booking also carries its own canonical copy in
 `thread_revisions` (incl. `seller_phone`, written by the booking transaction).
+
+VEHICLE IDENTITY + RECOVERY PREFILL (milestone PRELAUNCH-MINIMUM-LAUNCH-VEHICLE-IDENTITY):
+`vehicle_mileage` and `vehicle_plate` are two more claims of the same draft, stored canonical
+(`services/vehicle_identity`); their committed home is `revisions.kilometraje` / `.dominio`.
+
+These rows are also what a refreshed Flow reads back (`prefill_details`), so a customer who lost
+a slot does not retype anything. The read is scoped, and that scope is the safety property:
+this thread, this offer's candidate, this cycle. A thread holds the rows of every attempt, so
+without it a second car on the same thread would be offered the first car's plate.
+
+Once prefill is on, a blank optional field can be a deliberate correction: the customer saw the
+value and removed it. Only then, and only over a value they could have seen, a blank is
+recorded as an empty row superseding the old one (`clear_blank`). With prefill off the rule
+above stands: blank is "not given this time".
 """
 from __future__ import annotations
 
@@ -68,10 +86,20 @@ CLAIM_TYPES = (
     ("seller_name", "FLOW_SELLER_NAME"),
     ("seller_phone", "FLOW_SELLER_PHONE"),
     ("listing_url", "FLOW_LISTING_URL"),
+    ("vehicle_mileage", "FLOW_VEHICLE_MILEAGE"),
+    ("vehicle_plate", "FLOW_VEHICLE_PLATE"),
     ("slot", "FLOW_REQUESTED_SLOT"),
 )
 CLAIM_TYPE_FOR = dict(CLAIM_TYPES)
 ALL_CLAIM_TYPES = tuple(ct for _, ct in CLAIM_TYPES)
+
+#: What a refreshed Flow may offer back: every detail the customer typed. The slot is excluded
+#: on purpose — it is what was refused, and it is chosen again from what is free now.
+PREFILL_KEY_FOR = {ct: key for key, ct in CLAIM_TYPES if key != "slot"}
+#: The Flow's optional inputs, the only ones a customer can empty. `name` and
+#: `inspection_address` are required by the screen.
+CLEARABLE_KEYS = frozenset({"email", "seller_name", "seller_phone", "listing_url",
+                            "vehicle_mileage", "vehicle_plate"})
 
 
 @dataclass(frozen=True)
@@ -86,35 +114,82 @@ def _clean(value) -> str:
     return " ".join(str(value if value is not None else "").split())[:VALUE_MAX]
 
 
-def submitted_values(data: dict, *, date_str: str, time_str: str) -> dict:
-    """The claim type → value map of one prepare_summary payload (empty values dropped)."""
+def details_prefill_enabled() -> bool:
+    """BOOKING_FLOW_DETAILS_PREFILL_ENABLED, with the exact `is True` test: anything else is
+    OFF. On only together with the Flow that declares `details_prefill`."""
+    from ..settings import get_settings
+    return getattr(get_settings(), "booking_flow_details_prefill_enabled", False) is True
+
+
+def prefill_contract_defaults() -> dict:
+    """The declared-but-empty prefill key for a screen with no context, on the same switch."""
+    return {"details_prefill": {}} if details_prefill_enabled() else {}
+
+
+def flow_vehicle_identity(data: dict) -> "tuple[Optional[int], Optional[str]]":
+    """(kilometraje, dominio) of a Flow payload. Raises `ValueError` on a malformed value;
+    absent or blank is None, which is all an older Flow can ever send."""
+    from .vehicle_identity import normalize_dominio, parse_kilometraje
+    data = data or {}
+    return (parse_kilometraje(data.get("vehicle_mileage")),
+            normalize_dominio(data.get("vehicle_plate")))
+
+
+def submitted_values(data: dict, *, date_str: str, time_str: str,
+                     clear_blank: bool = False) -> dict:
+    """The claim type → value map of one prepare_summary payload (empty values dropped).
+
+    `clear_blank`: an optional key that IS in the payload and is blank maps to "" — "the
+    customer emptied this" — which `write_detail_rows` applies only over a value they could
+    have seen. An absent key is never a clearing: an older Flow simply does not send it."""
+    data = data or {}
+    mileage, plate = flow_vehicle_identity(data)
     out = {}
     for key, claim_type in CLAIM_TYPES:
         if key == "slot":
             value = f"{date_str} {time_str}".strip() if date_str and time_str else ""
+        elif key == "vehicle_mileage":
+            value = "" if mileage is None else str(mileage)
+        elif key == "vehicle_plate":
+            value = plate or ""
         else:
-            value = _clean((data or {}).get(key, ""))
+            value = _clean(data.get(key, ""))
         if value:
             out[claim_type] = value
+        elif clear_blank and key in CLEARABLE_KEYS and key in data:
+            out[claim_type] = ""
     return out
 
 
-def _claim_id(thread_id: int, claim_type: str, value: str, predecessor_id) -> str:
-    raw = "|".join(("flow-details:v1", str(int(thread_id)), claim_type, value,
-                    str(predecessor_id or "-")))
+def _claim_id(thread_id: int, claim_type: str, value: str, predecessor_id,
+              candidate_id: Optional[int], cycle: int) -> str:
+    raw = "|".join(("flow-details:v2", str(int(thread_id)), claim_type, value,
+                    str(predecessor_id or "-"),
+                    str(candidate_id if candidate_id is not None else "-"), str(int(cycle))))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:64]
 
 
-def _live_rows(s, thread_id: int) -> dict:
+def _live_rows(s, thread_id: int, candidate_id: Optional[int], cycle: int) -> dict:
+    """The live rows of ONE attempt: what a submission for it can repeat or correct."""
     from ..models import WhatsAppThreadEvidence as E
+    bound = (E.bound_to_candidate_id.is_(None) if candidate_id is None
+             else E.bound_to_candidate_id == int(candidate_id))
     rows = s.execute(select(E).where(
         E.thread_id == int(thread_id), E.producer == PRODUCER,
-        E.claim_type.in_(ALL_CLAIM_TYPES), E.superseded_by_id.is_(None))
+        E.claim_type.in_(ALL_CLAIM_TYPES), E.superseded_by_id.is_(None),
+        bound, E.cycle_key == int(cycle))
         .order_by(E.id)).scalars().all()
     live = {}
     for row in rows:                          # newest wins should two ever be live
         live[row.claim_type] = row
     return live
+
+
+def _visible_to_customer(row, cycle: int, candidate_id: Optional[int]) -> bool:
+    """Would `prefill_details` have offered this row to this customer? The same scope, so a
+    blank can only clear what could actually have been on their screen."""
+    return (row is not None and bool(row.value) and candidate_id is not None
+            and row.bound_to_candidate_id == int(candidate_id) and row.cycle_key == int(cycle))
 
 
 #: confirm_booking's K1 wait for the details write (R1). Deliberately SHORT: a contended
@@ -135,16 +210,19 @@ def write_detail_rows(s, *, thread_id: int, offer_id: Optional[int],
     state = s.execute(select(WhatsAppThreadState).where(
         WhatsAppThreadState.thread_id == int(thread_id))).scalar_one_or_none()
     cycle = int(_cycle_key(state)) if state is not None else 0
-    live = _live_rows(s, thread_id)
+    live = _live_rows(s, thread_id, candidate_id, cycle)
     written = superseded = 0
     for claim_type in ALL_CLAIM_TYPES:
         value = values.get(claim_type)
-        if not value:
+        if value is None:
             continue
         previous = live.get(claim_type)
+        if value == "" and not _visible_to_customer(previous, cycle, candidate_id):
+            continue                                  # nothing they saw, so nothing cleared
         if previous is not None and previous.value == value:
             continue                                  # the same fact again: nothing new
-        claim_id = _claim_id(thread_id, claim_type, value, getattr(previous, "id", None))
+        claim_id = _claim_id(thread_id, claim_type, value, getattr(previous, "id", None),
+                             candidate_id, cycle)
         if s.execute(select(E.id).where(E.thread_id == int(thread_id),
                                         E.claim_id == claim_id)).first():
             continue                                  # a replay of this exact correction
@@ -252,7 +330,9 @@ def record_details_condition(db, *, thread_id: int, lead_id: Optional[int], offe
 
 
 def live_details(db, thread_ids) -> dict:
-    """{thread_id: {claim_type: value}} of the live (not superseded) rows. Read only."""
+    """{thread_id: {claim_type: value}} of the live (not superseded) rows, the newest attempt's
+    value per claim type. Thread-wide, so NOT scoped to a vehicle: see `attempt_details`. An
+    empty row is a value the customer removed, so it also hides an older attempt's. Read only."""
     from ..models import WhatsAppThreadEvidence as E
     ids = [int(t) for t in (thread_ids or []) if t is not None]
     if not ids:
@@ -262,5 +342,48 @@ def live_details(db, thread_ids) -> dict:
         E.superseded_by_id.is_(None)).order_by(E.id)).all()
     out: dict = {}
     for thread_id, claim_type, value in rows:
-        out.setdefault(int(thread_id), {})[claim_type] = value
+        claims = out.setdefault(int(thread_id), {})
+        if value:
+            claims[claim_type] = value
+        else:
+            claims.pop(claim_type, None)
+    return {thread_id: claims for thread_id, claims in out.items() if claims}
+
+
+def attempt_details(db, attempts: dict) -> dict:
+    """{thread_id: {claim_type: value}} of each thread's ONE attempt, given as
+    {thread_id: (candidate_id, cycle_key)}: the scope of `prefill_details`, for many threads.
+    An emptied value is present as "", which is how a reader tells it from one never given.
+    A thread not in `attempts` has no scope and gets nothing. Read only."""
+    from ..models import WhatsAppThreadEvidence as E
+    if not attempts:
+        return {}
+    rows = db.execute(select(E.thread_id, E.claim_type, E.value, E.bound_to_candidate_id,
+                             E.cycle_key).where(
+        E.thread_id.in_([int(t) for t in attempts]), E.producer == PRODUCER,
+        E.claim_type.in_(ALL_CLAIM_TYPES), E.superseded_by_id.is_(None))
+        .order_by(E.id)).all()
+    out: dict = {}
+    for thread_id, claim_type, value, candidate_id, cycle in rows:
+        if attempts[int(thread_id)] == (candidate_id, cycle):
+            out.setdefault(int(thread_id), {})[claim_type] = value
     return out
+
+
+def prefill_details(db, *, thread_id: int, candidate_id: Optional[int], cycle_key: int) -> dict:
+    """{Flow input name: value} a refreshed Flow may offer back, from the durable rows alone —
+    never request or process memory, so it is the same after a restart, a lease expiry or a
+    retried refusal. Blank values are left out: an input is never initialised with nothing.
+
+    Scoped to this thread, this offer's candidate and this cycle. A row outside that scope is
+    another conversation's fact, however recent. No candidate, nothing offered. Read only."""
+    from ..models import WhatsAppThreadEvidence as E
+    if candidate_id is None:
+        return {}
+    rows = db.execute(select(E.claim_type, E.value).where(
+        E.thread_id == int(thread_id), E.producer == PRODUCER,
+        E.claim_type.in_(tuple(PREFILL_KEY_FOR)), E.superseded_by_id.is_(None),
+        E.bound_to_candidate_id == int(candidate_id), E.cycle_key == int(cycle_key))
+        .order_by(E.id)).all()
+    latest = {claim_type: value for claim_type, value in rows}
+    return {PREFILL_KEY_FOR[claim_type]: value for claim_type, value in latest.items() if value}

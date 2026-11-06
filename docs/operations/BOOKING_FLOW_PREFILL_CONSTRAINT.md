@@ -6,6 +6,13 @@ cannot preselect or prefill anything. Changing that requires republishing the Fl
 Flow `28104222025943520` ("RideCheck Booking"), version 7.3, data_api_version 3.0, fetched
 read-only from the Meta Flows API on 2026-09-11.
 
+> **Correction, 2026-11-04.** This page is the 2026-09-11 reading and its "what remains open"
+> plan is wrong in one respect: it proposes `init-value` on inputs that sit inside a `Form`,
+> which Meta rejected on 2026-09-16 and which its component reference allows only OUTSIDE a
+> Form. Inside a Form the documented mechanism is the Form's own `init-values`, and the
+> unpublished candidate `meta/flows/booking/CANDIDATE_v7.8-vehicle-identity-prefill.json` uses
+> it. The Dropdown preselection below stays out of scope. Nothing published has changed.
+
 ## What the published definition actually contains
 
 ```

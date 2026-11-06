@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 
 from ..db import get_db
 from ..services.booking_attempt_events import dx_attempt_ref
+from ..services.booking_flow_details import prefill_contract_defaults
 from ..services.booking_flow_service import (
     FLOW_VERSION,
     BookingFlowService,
@@ -267,6 +268,7 @@ async def booking_flow_data_exchange(
             "data": appointment_payload(
                 error_message="Tu sesión de reserva expiró. Por favor, volvé a iniciar el proceso.",
                 has_error=True,
+                **prefill_contract_defaults(),
             ),
         }
         # WILD1-R3: FAIL-CLOSED, and classified separately from the slot conflict above.

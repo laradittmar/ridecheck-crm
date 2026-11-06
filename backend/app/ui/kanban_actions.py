@@ -18,6 +18,7 @@ from ..db import get_db
 from ..models import Agencia, Lead, Revision, Profesional, Vendedor
 from ..services.lead_lifecycle import set_lead_estado
 from ..services.booking_authority import BookingAuthority, BookingSource, command_for_edit
+from ..services.vehicle_identity import normalize_dominio, parse_kilometraje
 from .kanban_view import (
     ESTADOS_VALIDOS,
     MOTIVOS_PERDIDA_VALIDOS,
@@ -752,6 +753,11 @@ def ui_revision_latest_update(
     marca: str | None = Form(None),
     modelo: str | None = Form(None),
     anio: str | None = Form(None),
+    kilometraje: str | None = Form(None),
+    dominio: str | None = Form(None),
+    # Marks a form that renders both inputs. FastAPI gives a blank `Form` field its default, so
+    # None cannot tell "the operator cleared it" from "this form never had it" without this.
+    vehicle_identity_form: str | None = Form(None),
     link_compra: str | None = Form(None),
     presupuesto_compra: str | None = Form(None),
     compro: str | None = Form(None),
@@ -800,6 +806,17 @@ def ui_revision_latest_update(
 
     if not latest:
         raise HTTPException(status_code=404, detail="No revisions for this lead yet")
+
+    if vehicle_identity_form is not None:
+        # Before any field is touched: a refused value leaves the revision exactly as it was.
+        # A POST without the marker (a stale tab, another client) changes neither value.
+        try:
+            kilometraje_val = parse_kilometraje(kilometraje)
+            dominio_val = normalize_dominio(dominio)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        latest.kilometraje = kilometraje_val
+        latest.dominio = dominio_val
 
     latest.tipo_vehiculo = _clean_str(tipo_vehiculo)
     tipo_raw = _clean_str(tipo_vendedor) or _clean_str(vendedor_tipo)

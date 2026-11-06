@@ -15,6 +15,7 @@ from sqlalchemy import select
 
 from ..models import Agencia, Lead, Revision, ViaticosZone, Profesional, Vendedor
 from ..services.travel import ZoneTravelProvider
+from ..services.vehicle_identity import format_kilometraje
 from .components import render_sidebar_ai_block, render_sidebar_ai_script, render_sidebar_nav, render_whatsapp_icon_svg
 
 # Cache-buster for bg.png — recomputed on each server restart from file mtime
@@ -1106,11 +1107,11 @@ def _filters_form_html(
 
     if has_zones:
         zone_group_options = "".join(
-            f'<option value="{g}" {"selected" if g == zone_group_val else ""}>{g}</option>'
+            f'<option value="{html_lib.escape(g, quote=True)}" {"selected" if g == zone_group_val else ""}>{html_lib.escape(g, quote=True)}</option>'
             for g in zone_groups
         )
         zone_detail_options = "".join(
-            f'<option value="{d}" {"selected" if d == zone_detail_val else ""}>{d}</option>'
+            f'<option value="{html_lib.escape(d, quote=True)}" {"selected" if d == zone_detail_val else ""}>{html_lib.escape(d, quote=True)}</option>'
             for d in (zones_map.get(zone_group_val) or [])
         )
         zone_inputs_html = f"""
@@ -1222,7 +1223,7 @@ def _filters_form_html(
 
     back_link_html = ""
     if include_back_link:
-        back_link_html = f'<a class="backLink" href="{back_href}"><span class="arrow">{ICON_ARROW_LEFT}</span><span>CRM</span></a>'
+        back_link_html = f'<a class="backLink" href="{html_lib.escape(back_href, quote=True)}"><span class="arrow">{ICON_ARROW_LEFT}</span><span>CRM</span></a>'
 
     return f"""
       <form method="get" action="{action}" style="margin-top:10px;" data-filter-form="1">
@@ -1794,7 +1795,8 @@ def render_page(
     html.append('<div id="popover-root"></div>')
     html.append('<button id="mobile-add-lead-btn" onclick="window._mobileAddLead()" style="display:none;position:fixed;bottom:24px;right:24px;width:56px;height:56px;border-radius:50%;background:#111827;color:white;font-size:24px;line-height:1;display:flex;align-items:center;justify-content:center;border:none;z-index:1700;box-shadow:0 4px 12px rgba(0,0,0,.3);cursor:pointer;">+</button>')
     html.append('<div id="toast-root" class="toastWrap"></div>')
-    zones_json = json.dumps(zones_map or {}, ensure_ascii=False).replace("</", "<\\/")
+    # `<` as \u003c: neither `</script>` nor `<!--` can reach the HTML tokenizer; JSON.parse restores it.
+    zones_json = json.dumps(zones_map or {}, ensure_ascii=False).replace("<", "\\u003c")
 
     html.append(f"""
       <script type="application/json" id="zones-data">{zones_json}</script>
@@ -2683,6 +2685,10 @@ def render_page(
             setTimeout(function () { el.classList.remove("flash"); }, 2000);
           }
 
+          function waEsc(v) {
+            return String(v).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+              .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+          }
           function waNorm(v) {
             return (v || "").toString().normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
           }
@@ -2744,7 +2750,7 @@ def render_page(
                   return !q || waNorm(text).indexOf(q) !== -1;
                 }).slice(0, 40);
                 list.innerHTML = items.map(function(thread){
-                  return '<button type="button" data-thread-id="' + thread.thread_id + '" style="text-align:left;border:1px solid #e5e7eb;border-radius:12px;background:#fff;padding:10px 12px;cursor:pointer;"><div>' + (thread.display_name || thread.wa_id || "-") + '</div><div style="margin-top:4px;font-size:12px;color:#6b7280;">' + (thread.wa_id || "-") + '</div></button>';
+                  return '<button type="button" data-thread-id="' + thread.thread_id + '" style="text-align:left;border:1px solid #e5e7eb;border-radius:12px;background:#fff;padding:10px 12px;cursor:pointer;"><div>' + waEsc(thread.display_name || thread.wa_id || "-") + '</div><div style="margin-top:4px;font-size:12px;color:#6b7280;">' + waEsc(thread.wa_id || "-") + '</div></button>';
                 }).join("") || '<div style="font-size:12px;color:#6b7280;">Sin resultados.</div>';
                 list.querySelectorAll("[data-thread-id]").forEach(function(btn){
                   btn.addEventListener("click", function(){
@@ -2884,709 +2890,6 @@ def render_page(
     """)
 
     html.append("</main></div>")  # main + layout
-    return "\n".join(html)
-
-
-def render_table_page(
-    leads: list[Lead],
-    profesionales: list[Profesional] | None = None,
-    q: str = "",
-    estado: list[str] | None = None,
-    flag: list[str] | None = None,
-    profesional_id: str = "",
-    canal: str = "",
-    tipo_vehiculo: str = "",
-    marca: str = "",
-    modelo: str = "",
-    anio: str = "",
-    zone_group: str = "",
-    zone_detail: str = "",
-    estado_revision: str = "",
-    turno_fecha_from: str = "",
-    turno_fecha_to: str = "",
-    zones_map: dict[str, list[str]] | None = None,
-    open_filters: bool = False,
-) -> str:
-    table_css = """
-      .tableWrap { overflow-x: auto; max-width: 100%; background: rgba(255,255,255,.7); border: 1px solid var(--border); border-radius: 14px; box-shadow: var(--shadow); max-height: calc(100vh - 160px); }
-      table { width: 100%; border-collapse: collapse; min-width: max-content; }
-      th, td { padding: 8px 10px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
-      th { position: relative; }
-      thead th { font-size: 12px; color: #374151; background: #fff; position: sticky; top: 0; z-index: 5; box-shadow: 0 1px 0 rgba(0,0,0,.08); }
-      td { font-size: 13px; }
-      tr:hover td { background: #f3f4f6; }
-      .tableHeader { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; margin-bottom:12px; }
-      .tableTopTitle { display:flex; flex-direction:column; gap:2px; }
-      .tableSubtitle {
-        font-size: 14px;
-        font-weight: 700;
-        color: #ffffff;
-        text-shadow: 0 1px 2px rgba(0,0,0,.4);
-        background: rgba(0,0,0,.45);
-        backdrop-filter: blur(6px);
-        padding: 4px 10px;
-        border-radius: 999px;
-        display: inline-block;
-      }
-      .tableTopActions { display:flex; gap:8px; align-items:center; }
-      .iconActionBtn { border:1px solid var(--border); background:#fff; border-radius:10px; padding:6px 8px; cursor:pointer; display:inline-flex; align-items:center; }
-      .iconActionBtn:hover { background:#f9fafb; }
-      @media (max-width: 768px) {
-        .kanbanTopBar { display: flex !important; top: 52px; }
-        .kanbanTopBarTitle, .buildStamp { display: none !important; }
-        .main { padding: 0 12px; }
-      }
-      .colResizer { position:absolute; right:0; top:0; width:8px; height:100%; cursor:col-resize; }
-      body.colResizing { cursor: col-resize; user-select: none; }
-      .chips { display:flex; flex-wrap:wrap; gap:8px; margin: 8px 0 12px; }
-      .chip { display:inline-flex; align-items:center; gap:8px; padding:6px 10px; border-radius:999px; border:1px solid var(--border); background:#fff; font-size:12px; text-decoration:none; color:#111827; }
-      .chip .x { opacity:.6; }
-    """
-    css = _base_css(extra_css=table_css)
-
-    icon_search = globals().get("ICON_SEARCH")
-    icon_export = globals().get("ICON_EXPORT")
-    if not icon_search:
-        logger.warning("ICON_SEARCH not defined; using text fallback in table header")
-        icon_search = "Buscar"
-    if not icon_export:
-        logger.warning("ICON_EXPORT not defined; using text fallback in table header")
-        icon_export = "Exportar"
-    build_stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    search_val = html_lib.escape(_val(q), quote=True)
-
-    params = {
-        "q": q,
-        "estado": estado or [],
-        "flag": flag or [],
-        "profesional_id": profesional_id,
-        "canal": canal,
-        "tipo_vehiculo": tipo_vehiculo,
-        "marca": marca,
-        "modelo": modelo,
-        "anio": anio,
-        "zone_group": zone_group,
-        "zone_detail": zone_detail,
-        "estado_revision": estado_revision,
-        "turno_fecha_from": turno_fecha_from,
-        "turno_fecha_to": turno_fecha_to,
-    }
-    query = _build_query_string(params)
-    kanban_href = f"/kanban?{query}" if query else "/kanban"
-    filters_href = "/table"
-
-    def _canal_label(val: str) -> str:
-        mapping = {
-            "IG_DM": "Instagram DM",
-            "IG_WHATSAPP": "Instagram WhatsApp",
-            "FB_DM": "Facebook DM",
-            "FB_WHATSAPP": "Facebook WhatsApp",
-            "WEBSITE": "Website",
-            "GOOGLE": "Google",
-            "GMAPS": "Google Maps",
-            "OTROS": "Otros",
-        }
-        return mapping.get(val, val.replace("_", " ").title())
-
-    def _make_table_link(new_params: dict[str, Any]) -> str:
-        qstr = _build_query_string(new_params)
-        return f"/table?{qstr}" if qstr else "/table"
-
-    chips: list[str] = []
-    active_params = dict(params)
-    estado_list = list(active_params.get("estado") or [])
-    if estado_list:
-        for st in estado_list:
-            p = dict(active_params)
-            p["estado"] = [x for x in estado_list if x != st]
-            label = KANBAN_LABELS.get(st, st)
-            chips.append(f'<a class="chip" href="{_make_table_link(p)}">Estado: {label}<span class="x">-</span></a>')
-    flag_list = list(active_params.get("flag") or [])
-    if flag_list:
-        for fv in flag_list:
-            p = dict(active_params)
-            p["flag"] = [x for x in flag_list if x != fv]
-            label = FLAG_LABELS.get(fv, fv)
-            chips.append(f'<a class="chip" href="{_make_table_link(p)}">Flag: {label}<span class="x">-</span></a>')
-    if _val(profesional_id):
-        p = dict(active_params)
-        p["profesional_id"] = ""
-        label = "-"
-        try:
-            pid = int(_val(profesional_id))
-        except ValueError:
-            pid = None
-        if pid:
-            prof_lookup = {p.id: p for p in (profesionales or [])}
-            prof = prof_lookup.get(pid)
-            if prof:
-                label = _profesional_label(prof)
-        chips.append(f'<a class="chip" href="{_make_table_link(p)}">Profesional: {label}<span class="x">-</span></a>')
-    if _val(canal):
-        p = dict(active_params)
-        p["canal"] = ""
-        chips.append(f'<a class="chip" href="{_make_table_link(p)}">Canal: {_canal_label(_val(canal))}<span class="x">-</span></a>')
-    if _val(marca):
-        p = dict(active_params)
-        p["marca"] = ""
-        chips.append(f'<a class="chip" href="{_make_table_link(p)}">Marca: {_txt(marca)}<span class="x">-</span></a>')
-    if _val(modelo):
-        p = dict(active_params)
-        p["modelo"] = ""
-        chips.append(f'<a class="chip" href="{_make_table_link(p)}">Modelo: {_txt(modelo)}<span class="x">-</span></a>')
-    if _val(tipo_vehiculo):
-        p = dict(active_params)
-        p["tipo_vehiculo"] = ""
-        chips.append(f'<a class="chip" href="{_make_table_link(p)}">Tipo vehículo: {_txt(tipo_vehiculo)}<span class="x">-</span></a>')
-    if _val(anio):
-        p = dict(active_params)
-        p["anio"] = ""
-        chips.append(f'<a class="chip" href="{_make_table_link(p)}">Año: {_txt(anio)}<span class="x">-</span></a>')
-    if _val(zone_group):
-        p = dict(active_params)
-        p["zone_group"] = ""
-        chips.append(f'<a class="chip" href="{_make_table_link(p)}">Zona grupo: {_txt(zone_group)}<span class="x">-</span></a>')
-    if _val(zone_detail):
-        p = dict(active_params)
-        p["zone_detail"] = ""
-        chips.append(f'<a class="chip" href="{_make_table_link(p)}">Zona detalle: {_txt(zone_detail)}<span class="x">-</span></a>')
-    if _val(estado_revision):
-        p = dict(active_params)
-        p["estado_revision"] = ""
-        chips.append(f'<a class="chip" href="{_make_table_link(p)}">Estado revisión: {_txt(estado_revision)}<span class="x">-</span></a>')
-    if _val(turno_fecha_from) or _val(turno_fecha_to):
-        p = dict(active_params)
-        p["turno_fecha_from"] = ""
-        p["turno_fecha_to"] = ""
-        if _val(turno_fecha_from) and _val(turno_fecha_to):
-            label = f"Turno: {turno_fecha_from} ? {turno_fecha_to}"
-        elif _val(turno_fecha_from):
-            label = f"Turno desde: {turno_fecha_from}"
-        else:
-            label = f"Turno hasta: {turno_fecha_to}"
-        chips.append(f'<a class="chip" href="{_make_table_link(p)}">{label}<span class="x">-</span></a>')
-    if _val(q):
-        p = dict(active_params)
-        p["q"] = ""
-        chips.append(f'<a class="chip" href="{_make_table_link(p)}">Buscar: {_txt(q)}<span class="x">-</span></a>')
-    if chips:
-        chips.append(f'<a class="chip" href="/table">Limpiar todo<span class="x">-</span></a>')
-
-    filters_form_html = _filters_form_html(
-        q=q,
-        estado=estado,
-        flag=flag,
-        profesional_id=profesional_id,
-        profesionales=profesionales or [],
-        canal=canal,
-        tipo_vehiculo=tipo_vehiculo,
-        marca=marca,
-        modelo=modelo,
-        anio=anio,
-        zone_group=zone_group,
-        zone_detail=zone_detail,
-        estado_revision=estado_revision,
-        turno_fecha_from=turno_fecha_from,
-        turno_fecha_to=turno_fecha_to,
-        zones_map=zones_map,
-        action="/table",
-        include_back_link=True,
-        back_href=kanban_href,
-        include_open_filters=True,
-    )
-
-    total_precio = 0
-    for l in leads:
-        revs = list(getattr(l, "revisions", []) or [])
-        latest = _latest_revision(revs)
-        if latest and latest.precio_total is not None:
-            total_precio += latest.precio_total
-
-    html: list[str] = [css]
-    html.append('<div class="layout">')
-
-    icon_board = '<svg class="icon" viewBox="0 0 24 24"><rect x="3" y="4" width="7" height="7"/><rect x="14" y="4" width="7" height="7"/><rect x="3" y="15" width="7" height="7"/><rect x="14" y="15" width="7" height="7"/></svg>'
-    icon_calendar = '<svg class="icon" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M8 3v4M16 3v4M3 11h18"/></svg>'
-    icon_filter = '<svg class="icon" viewBox="0 0 24 24"><path d="M4 6h16l-6 7v5l-4 2v-7z"/></svg>'
-    icon_prof = '<svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="7" r="4"/><path d="M4 21c1.5-4 14.5-4 16 0"/></svg>'
-    icon_ag = '<svg class="icon" viewBox="0 0 24 24"><path d="M3 21h18"/><path d="M5 21V8l7-5 7 5v13"/><path d="M9 12h6"/></svg>'
-    icon_toggle = '<svg class="icon icon-only" viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg>'
-
-    html.append("""
-      <aside class="sidebar" id="sidebar">
-        <div class="brandRow">
-          <img class="brandLogo" src="/static/branding/ridecheck-logo.jpg" alt="RideCheck">
-          <button class="sidebarToggle" type="button" onclick="toggleSidebar()" title="Collapse sidebar">%s</button>
-        </div>
-        %s
-      </aside>
-    """ % (
-        icon_toggle,
-        render_sidebar_nav(
-            icon_board=icon_board,
-            icon_calendar=icon_calendar,
-            icon_filter=icon_filter,
-            icon_prof=icon_prof,
-            icon_ag=icon_ag,
-            icon_wa=ICON_WHATSAPP,
-            filters_href=filters_href,
-        ),
-    ))
-
-    html.append('<main class="main">')
-    html.append(f"""
-      <div class="kanbanTopBar">
-        <div class="kanbanTopBarTitle">Base de Datos</div>
-        <div class="kanbanTopBarRight">
-          <span class="buildStamp">build: {build_stamp}</span>
-          <div class="searchControl" id="table-search-control">
-            <button class="iconBtn" id="table-search-toggle" type="button" title="Buscar (Ctrl+F)" aria-expanded="false">{ICON_SEARCH}</button>
-            <div class="searchBoxWrap" id="table-search-wrap">
-              <input id="table-search-input" class="searchInput" type="text" placeholder="Buscar en resultados..." value="{search_val}"/>
-              <span id="table-search-count" class="searchCount">0 / 0</span>
-              <button class="iconBtn" id="table-search-close" type="button" title="Cerrar búsqueda">{ICON_CLOSE}</button>
-            </div>
-          </div>
-        </div>
-      </div>
-    """)
-    html.append("""
-      <div class="tableHeader">
-        <div class="tableTopTitle">
-          <div class="tableSubtitle">Resultados: %s | Total: %s</div>
-        </div>
-        <div class="tableTopActions">
-          <button class="iconActionBtn" type="button" onclick="openFilters()" title="Filtros" aria-label="Filtros">%s</button>
-          <button class="iconActionBtn" type="button" title="Exportar">%s</button>
-        </div>
-      </div>
-    """ % (len(leads), _fmt_money(total_precio), ICON_MENU_HAMBURGER, icon_export))
-
-    rows: list[str] = []
-    for l in leads:
-        revs = list(getattr(l, "revisions", []) or [])
-        latest = _latest_revision(revs)
-        flag_val = _lead_flag_value(l)
-        flag_label = FLAG_LABELS.get(flag_val, flag_val) if flag_val else None
-        flag_html = (
-            f'<span class="flagPill {_flag_class(flag_val)}">{html_lib.escape(str(flag_label), quote=True)}</span>' if flag_val else "-"
-        )
-        estado_val = _lead_operational_estado(_get(l, "estado"))
-        estado_label = KANBAN_LABELS.get(estado_val, estado_val)
-
-        if latest:
-            turno_txt = "-"
-            if latest.turno_fecha or latest.turno_hora:
-                tf = latest.turno_fecha.isoformat() if latest.turno_fecha else "-"
-                th = latest.turno_hora.strftime("%H:%M") if latest.turno_hora else "-"
-                turno_txt = f"{tf} {th}"
-            latest_tipo = _txt(latest.tipo_vehiculo)
-            latest_marca = _txt(latest.marca)
-            latest_modelo = _txt(latest.modelo)
-            latest_anio = _txt(latest.anio)
-            latest_zg = _txt(latest.zone_group)
-            latest_zd = _txt(latest.zone_detail)
-            latest_estado = _txt(latest.estado_revision)
-            latest_precio = _fmt_money(latest.precio_total)
-        else:
-            turno_txt = "-"
-            latest_tipo = latest_marca = latest_modelo = latest_anio = "-"
-            latest_zg = latest_zd = latest_estado = "-"
-            latest_precio = "-"
-
-        open_href = f"{kanban_href}#lead-{l.id}"
-        rows.append(f"""
-            <tr>
-              <td>{l.id}</td>
-              <td>{_txt(_get(l, "nombre"))}</td>
-              <td>{_txt(_get(l, "apellido"))}</td>
-              <td>{_txt(_get(l, "telefono"))}</td>
-              <td>{_txt(_get(l, "email"))}</td>
-              <td>{estado_label}</td>
-              <td>{flag_html}</td>
-              <td>{latest_tipo}</td>
-              <td>{latest_marca}</td>
-              <td>{latest_modelo}</td>
-              <td>{latest_anio}</td>
-              <td>{latest_zg}</td>
-              <td>{latest_zd}</td>
-              <td>{turno_txt}</td>
-              <td>{latest_estado}</td>
-              <td>{latest_precio}</td>
-              <td><a class="btn btn-sm" href="{open_href}">Abrir</a></td>
-            </tr>
-        """)
-
-    html.append("""
-      <div id="drawerOverlay" class="drawerOverlay%s" onclick="closeFilters()"></div>
-      <div id="filtersDrawer" class="drawer%s" role="dialog" aria-label="Filtros">
-        <div class="menuTitle">Filtros</div>
-        %s
-      </div>
-    """ % (" open" if open_filters else "", " open" if open_filters else "", filters_form_html))
-
-    if chips:
-        html.append('<div class="chips">%s</div>' % "".join(chips))
-
-    html.append("""
-      <div class="tableWrap" data-search-scope="table">
-        <table>
-          <thead>
-            <tr>
-              <th>Lead ID<span class="colResizer"></span></th>
-              <th>Nombre<span class="colResizer"></span></th>
-              <th>Apellido<span class="colResizer"></span></th>
-                <th>Tel<span class="colResizer"></span></th>
-                <th>Email<span class="colResizer"></span></th>
-                <th>Lead Estado<span class="colResizer"></span></th>
-                <th>Flag<span class="colResizer"></span></th>
-                <th>Tipo vehículo<span class="colResizer"></span></th>
-              <th>Marca<span class="colResizer"></span></th>
-              <th>Modelo<span class="colResizer"></span></th>
-              <th>Año<span class="colResizer"></span></th>
-              <th>Zona grupo<span class="colResizer"></span></th>
-              <th>Zona detalle<span class="colResizer"></span></th>
-              <th>Turno<span class="colResizer"></span></th>
-              <th>Estado revisión<span class="colResizer"></span></th>
-              <th>Precio total<span class="colResizer"></span></th>
-              <th><span class="colResizer"></span></th>
-            </tr>
-          </thead>
-          <tbody>
-            %s
-          </tbody>
-        </table>
-      </div>
-    """ % "\n".join(rows))
-
-    zones_json = json.dumps(zones_map or {}, ensure_ascii=False).replace("</", "<\\/")
-    html.append(f"""
-      <script type="application/json" id="zones-data">{zones_json}</script>
-    """)
-
-    html.append("""
-      <script>
-        (function () {
-          var zonesEl = document.getElementById("zones-data");
-          var zonesMap = {};
-          var searchControl = document.getElementById("table-search-control");
-          var searchInput = document.getElementById("table-search-input");
-          var searchToggleBtn = document.getElementById("table-search-toggle");
-          var searchCloseBtn = document.getElementById("table-search-close");
-          var searchCount = document.getElementById("table-search-count");
-          var searchScope = document.querySelector('[data-search-scope="table"]');
-          if (zonesEl && zonesEl.textContent) {
-            try {
-              zonesMap = JSON.parse(zonesEl.textContent);
-            } catch (e) {
-              zonesMap = {};
-            }
-          }
-          function normalizeSearchText(value) {
-            return (value || "")
-              .toString()
-              .normalize("NFD")
-              .replace(/[\\u0300-\\u036f]/g, "")
-              .toLowerCase()
-              .trim();
-          }
-          function applyTableSearch() {
-            if (!searchScope) return;
-            var q = normalizeSearchText(searchInput ? searchInput.value : "");
-            var dataTargets = searchScope.querySelectorAll("[data-search]");
-            var total = 0;
-            var visible = 0;
-            if (dataTargets.length) {
-              dataTargets.forEach(function (node) {
-                total += 1;
-                var haystack = normalizeSearchText(node.getAttribute("data-search") || "");
-                var show = !q || haystack.indexOf(q) !== -1;
-                node.classList.toggle("search-item-hidden", !show);
-                if (show) visible += 1;
-              });
-            } else {
-              var rows = searchScope.querySelectorAll("tbody tr");
-              rows.forEach(function (row) {
-                total += 1;
-                var haystack = normalizeSearchText(row.textContent || "");
-                var show = !q || haystack.indexOf(q) !== -1;
-                row.style.display = show ? "" : "none";
-                if (show) visible += 1;
-              });
-            }
-            if (searchCount) {
-              searchCount.textContent = q ? (visible + " / " + total) : (total + " / " + total);
-            }
-          }
-          function openTableSearch(focusInput) {
-            if (!searchControl || !searchToggleBtn) return;
-            searchControl.classList.add("open");
-            searchToggleBtn.setAttribute("aria-expanded", "true");
-            if (focusInput && searchInput) {
-              searchInput.focus();
-              searchInput.select();
-            }
-            applyTableSearch();
-          }
-          function closeTableSearch(clearValue) {
-            if (!searchControl || !searchToggleBtn) return;
-            if (clearValue && searchInput) searchInput.value = "";
-            searchControl.classList.remove("open");
-            searchToggleBtn.setAttribute("aria-expanded", "false");
-            applyTableSearch();
-          }
-          if (searchToggleBtn) {
-            searchToggleBtn.addEventListener("click", function () {
-              var isOpen = searchControl && searchControl.classList.contains("open");
-              if (isOpen) {
-                closeTableSearch(false);
-                return;
-              }
-              openTableSearch(true);
-            });
-          }
-          if (searchCloseBtn) {
-            searchCloseBtn.addEventListener("click", function () {
-              closeTableSearch(true);
-            });
-          }
-          if (searchInput) {
-            searchInput.addEventListener("input", applyTableSearch);
-          }
-          function refreshZoneDetails(scope) {
-            if (!zonesMap || Object.keys(zonesMap).length === 0) return;
-            var groupSel = scope.querySelector('select[data-zone-group]');
-            var detailSel = scope.querySelector('select[data-zone-detail]');
-            if (!groupSel || !detailSel) return;
-            var groupVal = groupSel.value || "";
-            var options = zonesMap[groupVal] || [];
-            var current = detailSel.value || "";
-            detailSel.innerHTML = '<option value="">-</option>';
-            options.forEach(function (d) {
-              var opt = document.createElement("option");
-              opt.value = d;
-              opt.textContent = d;
-              if (d === current) opt.selected = true;
-              detailSel.appendChild(opt);
-            });
-          }
-
-          document.addEventListener("change", function (e) {
-            var el = e.target;
-            if (el && el.matches('select[data-zone-group]')) {
-              var form = el.closest("form") || document;
-              refreshZoneDetails(form);
-            }
-          });
-
-          window.addEventListener("DOMContentLoaded", function () {
-            if (!zonesMap || Object.keys(zonesMap).length === 0) return;
-            document.querySelectorAll("form").forEach(function (f) {
-              refreshZoneDetails(f);
-            });
-          });
-
-          var FILTERS_STORAGE_KEY = "crm_filters";
-
-          function getFilterForm() {
-            return document.querySelector('form[data-filter-form="1"]');
-          }
-
-          function readFilters() {
-            try {
-              var raw = localStorage.getItem(FILTERS_STORAGE_KEY);
-              if (!raw) return null;
-              var parsed = JSON.parse(raw);
-              return parsed && typeof parsed === "object" ? parsed : null;
-            } catch (e) {
-              return null;
-            }
-          }
-
-          function writeFilters(form) {
-            if (!form) return;
-            var data = {};
-            var fd = new FormData(form);
-            fd.forEach(function (value, key) {
-              if (key === "estado") {
-                if (!data.estado) data.estado = [];
-                data.estado.push(String(value));
-              } else {
-                data[key] = String(value);
-              }
-            });
-            try {
-              localStorage.setItem(FILTERS_STORAGE_KEY, JSON.stringify(data));
-            } catch (e) {
-              // ignore storage errors
-            }
-          }
-
-          function restoreFilters(form) {
-            if (!form) return;
-            var saved = readFilters();
-            if (!saved) return;
-            var params = new URLSearchParams(window.location.search || "");
-            Object.keys(saved).forEach(function (key) {
-              if (key === "estado") {
-                if (params.has("estado")) return;
-                var list = Array.isArray(saved.estado) ? saved.estado : [];
-                var set = {};
-                list.forEach(function (v) { set[v] = true; });
-                form.querySelectorAll('input[name="estado"]').forEach(function (cb) {
-                  cb.checked = !!set[cb.value];
-                });
-                return;
-              }
-              if (params.has(key)) return;
-              var field = form.querySelector('[name="' + key + '"]');
-              if (!field) return;
-              field.value = saved[key];
-            });
-            refreshZoneDetails(form);
-          }
-
-          function clearSavedFilters(form) {
-            try {
-              localStorage.removeItem(FILTERS_STORAGE_KEY);
-            } catch (e) {
-              // ignore storage errors
-            }
-            if (form) form.reset();
-          }
-
-          function initColumnResizers() {
-            var minWidth = 120;
-            var activeTh = null;
-            var startX = 0;
-            var startWidth = 0;
-
-            function onMove(e) {
-              if (!activeTh) return;
-              var dx = e.clientX - startX;
-              var width = Math.max(minWidth, startWidth + dx);
-              activeTh.style.width = width + "px";
-            }
-
-            function onUp() {
-              if (!activeTh) return;
-              document.removeEventListener("mousemove", onMove);
-              document.removeEventListener("mouseup", onUp);
-              document.body.classList.remove("colResizing");
-              activeTh = null;
-            }
-
-            document.querySelectorAll("th .colResizer").forEach(function (handle) {
-              handle.addEventListener("mousedown", function (e) {
-                e.preventDefault();
-                e.stopPropagation();
-                var th = handle.closest("th");
-                if (!th) return;
-                activeTh = th;
-                startX = e.clientX;
-                startWidth = th.offsetWidth;
-                document.addEventListener("mousemove", onMove);
-                document.addEventListener("mouseup", onUp);
-                document.body.classList.add("colResizing");
-              });
-            });
-          }
-
-          window.openFilters = function () {
-            var drawer = document.getElementById("filtersDrawer");
-            var overlay = document.getElementById("drawerOverlay");
-            if (!drawer || !overlay) return;
-            if (!drawer.classList.contains("open")) {
-              drawer.classList.add("open");
-              overlay.classList.add("open");
-              restoreFilters(getFilterForm());
-            }
-          };
-
-          window.closeFilters = function () {
-            var drawer = document.getElementById("filtersDrawer");
-            var overlay = document.getElementById("drawerOverlay");
-            if (!drawer || !overlay) return;
-            drawer.classList.remove("open");
-            overlay.classList.remove("open");
-          };
-
-          window.toggleSidebar = function () {
-            var sidebar = document.getElementById("sidebar");
-            if (!sidebar) return;
-            var collapsed = !sidebar.classList.contains("collapsed");
-            sidebar.classList.toggle("collapsed", collapsed);
-            localStorage.setItem("sidebar_collapsed", collapsed ? "1" : "0");
-          };
-
-          window.addEventListener("DOMContentLoaded", function () {
-            var sb = document.getElementById("sidebar");
-            if (sb && localStorage.getItem("sidebar_collapsed") === "1") {
-              sb.classList.add("collapsed");
-            }
-          });
-
-          document.addEventListener("click", function (e) {
-            document.querySelectorAll("details.multiSelect[open]").forEach(function (d) {
-              if (!d.contains(e.target)) d.removeAttribute("open");
-            });
-          });
-          document.addEventListener("keydown", function (e) {
-            if (!(e.ctrlKey || e.metaKey)) return;
-            if ((e.key || "").toLowerCase() !== "f") return;
-            e.preventDefault();
-            openTableSearch(true);
-          }, true);
-
-          window.addEventListener("DOMContentLoaded", function () {
-            initColumnResizers();
-          });
-
-          window.addEventListener("DOMContentLoaded", function () {
-            var form = getFilterForm();
-            if (!form) return;
-
-            var drawer = document.getElementById("filtersDrawer");
-            if (drawer && drawer.classList.contains("open")) {
-              restoreFilters(form);
-            }
-
-            form.addEventListener("submit", function () {
-              writeFilters(form);
-            });
-
-            var saveBtn = form.querySelector("[data-filter-save]");
-            if (saveBtn) {
-              saveBtn.addEventListener("click", function () {
-                writeFilters(form);
-              });
-            }
-
-            var restoreBtn = form.querySelector("[data-filter-restore]");
-            if (restoreBtn) {
-              restoreBtn.addEventListener("click", function () {
-                restoreFilters(form);
-              });
-            }
-
-            var clearBtn = form.querySelector("[data-filter-clear]");
-            if (clearBtn) {
-              clearBtn.addEventListener("click", function () {
-                clearSavedFilters(form);
-                var href = clearBtn.getAttribute("data-clear-href");
-                if (href) window.location.href = href;
-              });
-            }
-            applyTableSearch();
-            if (searchInput && (searchInput.value || "").trim()) {
-              openTableSearch(false);
-            }
-          });
-        })();
-      </script>
-    """)
-
-    html.append("</main></div>")
     return "\n".join(html)
 
 
@@ -4145,12 +3448,18 @@ def render_calendar_page(
         _ev = (rev_obj.estado_revision or "").strip().upper()
         return "past" if _past else ("confirmed" if _ev == "CONFIRMADO" else "pending")
 
+    # Escaping contract of the Agenda: `_aname`, `_aveh` and `_aprof` return PLAIN text, because
+    # `data-search` and the day card escape them at their own sink; escaping here too would show
+    # `&amp;` to the operator. Every sink escapes exactly once. `_aaddr` and `_ameta_row` are the
+    # exception: they return finished HTML, so nothing may escape their result again.
     def _ahref(l, r): return f"/kanban?open_lead={l.id}&open_rev={r.id}"
     def _aname(l): return (f"{(_get(l,'nombre') or '').strip()} {(_get(l,'apellido') or '').strip()}").strip() or "-"
     def _aveh(r):
         tipo = _friendly_tipo_vehiculo(_val(r.tipo_vehiculo))
-        return " / ".join([x for x in [tipo, _val(r.marca), _val(r.modelo), str(r.anio) if r.anio else ""] if x])
-    def _aaddr(r): return _url_link(r.link_maps) if _safe_url(r.link_maps) else _txt(r.direccion_texto)
+        return " / ".join([x for x in [tipo, _val(r.marca), _val(r.modelo), str(r.anio) if r.anio else "",
+                                       _val(getattr(r, "dominio", None)),
+                                       format_kilometraje(getattr(r, "kilometraje", None))] if x])
+    def _aaddr(r): return _url_link(r.link_maps) if _safe_url(r.link_maps) else _esc_txt(r.direccion_texto)
     def _aprof(r):
         pid = getattr(r, "profesional_id", None)
         p = prof_by_id.get(pid) if pid else None
@@ -4159,6 +3468,9 @@ def render_calendar_page(
         """Join non-empty parts with · — skips blank and '-' values."""
         kept = [str(p) for p in parts if p and str(p).strip() not in ("", "-")]
         return " &nbsp;&middot;&nbsp; ".join(kept)
+    def _ameta_row(r) -> str:
+        """The address / professional line, as finished HTML."""
+        return _ameta(_aaddr(r), html_lib.escape(_aprof(r), quote=True))
 
     _travel_provider = ZoneTravelProvider()
 
@@ -4243,7 +3555,7 @@ def render_calendar_page(
             f'<div class="agendaStartInfo">'
             f'<div class="agendaStartLabel">INICIO</div>'
             f'<div class="agendaStartDetail">{html_lib.escape(zero_detail)}</div>'
-            f'<div class="agendaStartTime">{start_str}</div>'
+            f'<div class="agendaStartTime">{html_lib.escape(start_str)}</div>'
             f'</div></div>'
         )
 
@@ -4479,15 +3791,15 @@ def render_calendar_page(
                     cls = _acls(r); href = _ahref(l, r)
                     tstr = r.turno_hora.strftime("%H:%M") if r.turno_hora else f"{h:02d}:00"
                     scls = "confirmed" if cls == "confirmed" else ("past" if cls == "past" else "")
-                    _meta_row = _ameta(_aaddr(r), _aprof(r))
+                    _meta_row = _ameta_row(r)
                     parts.append(
                         f'<div class="calDaySlotCard has-appt {cls}-appt">'
                         f'<div class="calDaySlotTime">{tstr}</div>'
                         f'<a class="calDaySlotBody" href="{href}">'
-                        f'<div class="calApptName">{_txt(_aname(l))}</div>'
-                        f'<div class="calApptMeta">{_txt(_aveh(r))}</div>'
+                        f'<div class="calApptName">{_esc_txt(_aname(l))}</div>'
+                        f'<div class="calApptMeta">{_esc_txt(_aveh(r))}</div>'
                         + (f'<div class="calApptMeta">{_meta_row}</div>' if _meta_row else '')
-                        + f'<span class="calApptStatus {scls}">{_txt(r.estado_revision)}</span>'
+                        + f'<span class="calApptStatus {scls}">{_esc_txt(r.estado_revision)}</span>'
                         '</a></div>'
                     )
             else:
@@ -4500,15 +3812,15 @@ def render_calendar_page(
             l, r = it["lead"], it["rev"]
             cls = _acls(r); href = _ahref(l, r)
             scls = "confirmed" if cls == "confirmed" else ("past" if cls == "past" else "")
-            _meta_row_nr = _ameta(_aaddr(r), _aprof(r))
+            _meta_row_nr = _ameta_row(r)
             parts.append(
                 f'<div class="calDaySlotCard has-appt {cls}-appt">'
                 '<div class="calDaySlotTime">--</div>'
                 f'<a class="calDaySlotBody" href="{href}">'
-                f'<div class="calApptName">{_txt(_aname(l))}</div>'
-                f'<div class="calApptMeta">{_txt(_aveh(r))}</div>'
+                f'<div class="calApptName">{_esc_txt(_aname(l))}</div>'
+                f'<div class="calApptMeta">{_esc_txt(_aveh(r))}</div>'
                 + (f'<div class="calApptMeta">{_meta_row_nr}</div>' if _meta_row_nr else '')
-                + f'<span class="calApptStatus {scls}">{_txt(r.estado_revision)}</span>'
+                + f'<span class="calApptStatus {scls}">{_esc_txt(r.estado_revision)}</span>'
                 '</a></div>'
             )
         parts.append('</div>')
@@ -4520,13 +3832,13 @@ def render_calendar_page(
         tstr = r.turno_hora.strftime("%H:%M") if r.turno_hora else "-"
         hl_id = ' id="cal-highlight-appt"' if (highlight_lead_id and _get(l,"id") == highlight_lead_id) else ""
         hl_cls = " calAppt-highlight" if hl_id else ""
-        _meta_mc = _ameta(_aaddr(r), _aprof(r))
+        _meta_mc = _ameta_row(r)
         return (
             f'<a class="calMonthApptCard {cls}{hl_cls}" href="{href}"{hl_id}>'
-            f'<div class="calMonthApptName">{_txt(_aname(l))} <span style="font-weight:400;color:#9ca3af;font-size:12px;">{tstr}</span></div>'
-            f'<div class="calMonthApptMeta">{_txt(_aveh(r))}</div>'
+            f'<div class="calMonthApptName">{_esc_txt(_aname(l))} <span style="font-weight:400;color:#9ca3af;font-size:12px;">{tstr}</span></div>'
+            f'<div class="calMonthApptMeta">{_esc_txt(_aveh(r))}</div>'
             + (f'<div class="calMonthApptMeta">{_meta_mc}</div>' if _meta_mc else '')
-            + f'<div class="calMonthApptMeta">{_txt(r.estado_revision)}</div>'
+            + f'<div class="calMonthApptMeta">{_esc_txt(r.estado_revision)}</div>'
             '</a>'
         )
 
@@ -4600,15 +3912,15 @@ def render_calendar_page(
                           '<span class="calStatusRibbonWord">ESPERANDO</span><span class="calStatusRibbonWord">APROBACIÓN</span>'
                           '</div></div><div class="calApptBody">')
                 body_close = "</div></div>"
-            _meta_wk = _ameta(_aaddr(r), _aprof(r))
+            _meta_wk = _ameta_row(r)
             html.append(
                 f'<a class="calWeekApptRow{hl_cls}" href="{href}" data-search="{search_text}"{hl_id}>'
                 + ribbon
                 + f'<span class="calWeekApptTime">{tstr}</span>'
-                + f'<div class="calWeekApptInfo"><div class="calWeekApptName">{_txt(_aname(l))}</div>'
-                + f'<div class="calWeekApptMeta">{_txt(_aveh(r))}</div>'
+                + f'<div class="calWeekApptInfo"><div class="calWeekApptName">{_esc_txt(_aname(l))}</div>'
+                + f'<div class="calWeekApptMeta">{_esc_txt(_aveh(r))}</div>'
                 + (f'<div class="calWeekApptMeta">{_meta_wk}</div>' if _meta_wk else '')
-                + f'<div class="calWeekApptMeta">{_txt(r.estado_revision)}</div>'
+                + f'<div class="calWeekApptMeta">{_esc_txt(r.estado_revision)}</div>'
                 + approval_ui + body_close
                 + '</div></a>'
             )
@@ -4999,11 +4311,11 @@ def render_profesionales_page(profesionales: list[Profesional], user_email: str 
         created_txt = p.created_at.strftime("%d/%m %H:%M") if p.created_at else "-"
         rows.append(f"""
           <tr>
-            <td>{_txt(p.nombre)}</td>
-            <td>{_txt(p.apellido)}</td>
-            <td>{_txt(p.email)}</td>
-            <td>{_txt(getattr(p, "telefono", None))}</td>
-            <td>{_txt(p.cargo)}</td>
+            <td>{_esc_txt(p.nombre)}</td>
+            <td>{_esc_txt(p.apellido)}</td>
+            <td>{_esc_txt(p.email)}</td>
+            <td>{_esc_txt(getattr(p, "telefono", None))}</td>
+            <td>{_esc_txt(p.cargo)}</td>
             <td>{created_txt}</td>
           </tr>
         """)
@@ -5141,6 +4453,22 @@ def render_profesionales_page(profesionales: list[Profesional], user_email: str 
     return "\n".join(html)
 
 
+def _vehicle_identity(r) -> tuple:
+    return getattr(r, "kilometraje", None), getattr(r, "dominio", None)
+
+
+def _vehicle_identity_line(r) -> str:
+    """`Kilometraje` and `Dominio / patente` of a revision, or nothing at all: a revision
+    without them renders exactly as it always did, with no `0 km`, `None` or empty label."""
+    kilometraje, dominio = _vehicle_identity(r)
+    parts = []
+    if kilometraje is not None:
+        parts.append(f"Kilometraje: {_esc_txt(format_kilometraje(kilometraje))}")
+    if dominio:
+        parts.append(f"Dominio / patente: {_esc_txt(dominio)}")
+    return f'<div class="muted small">{" | ".join(parts)}</div>' if parts else ""
+
+
 def render_booking_details_block(details) -> str:
     """PRELAUNCH-MINIMUM-LAUNCH (B): the booking attempt as the canonical rows record it —
     the current-focus candidate and the live Booking Flow details — for a lead whose booking
@@ -5149,7 +4477,9 @@ def render_booking_details_block(details) -> str:
         return ""
     rows = (
         ("Nombre (Flow)", details.customer_name), ("Email (Flow)", details.email),
-        ("Vehículo", details.vehicle), ("Zona", details.locality),
+        ("Vehículo", details.vehicle),
+        ("Kilometraje", format_kilometraje(details.kilometraje)),
+        ("Dominio / patente", details.dominio), ("Zona", details.locality),
         ("Dirección de inspección", details.inspection_address),
         ("Turno solicitado", details.requested_slot),
         ("Vendedor", details.seller_name), ("Tel. vendedor", details.seller_phone),
@@ -5411,6 +4741,11 @@ def render_lead_card(
         ] if x])
         if veh_line:
             rev_lines.append(f"Vehículo: {_t(veh_line)}")
+        last_km, last_dominio = _vehicle_identity(last_rev)
+        if last_km is not None:
+            rev_lines.append(f"Kilometraje: {_t(format_kilometraje(last_km))}")
+        if last_dominio:
+            rev_lines.append(f"Dominio / patente: {_t(last_dominio)}")
 
         if last_rev.precio_total is not None or last_rev.precio_base is not None or last_rev.viaticos is not None:
             rev_lines.append(
@@ -5675,6 +5010,7 @@ def render_revisions_block(
                 <div class="box">
                   <div class="small"><b>Vehículo</b></div>
                   <div class="muted small">Tipo: {_esc_txt(r.tipo_vehiculo)} | Marca: {_esc_txt(r.marca)} | Modelo: {_esc_txt(r.modelo)} | Año: {str(r.anio) if r.anio else "-"}</div>
+                  {_vehicle_identity_line(r)}
                   <div class="muted small">Compra: {_url_link(r.link_compra)} | Presu compra: {_fmt_money(r.presupuesto_compra)} | Tipo vendedor: {tipo_vendedor_txt} | Agencia: {agencia_txt}</div>
                   <div class="muted small">Compró: {_esc_txt(getattr(r, "compro", None))} | Comisión: {_fmt_money(getattr(r, "comision", None))} | Cobrado: {_esc_txt(getattr(r, "cobrado", None))} | Fecha cobro: {_esc_txt(getattr(r, "fecha_cobro", None))}</div>
                 </div>
@@ -5786,11 +5122,11 @@ def render_edit_latest_revision_form(
 
     if has_zones:
         zone_group_options = "".join(
-            f'<option value="{g}" {"selected" if g == zone_group_val else ""}>{g}</option>'
+            f'<option value="{html_lib.escape(g, quote=True)}" {"selected" if g == zone_group_val else ""}>{html_lib.escape(g, quote=True)}</option>'
             for g in zone_groups
         )
         zone_detail_options = "".join(
-            f'<option value="{d}" {"selected" if d == zone_detail_val else ""}>{d}</option>'
+            f'<option value="{html_lib.escape(d, quote=True)}" {"selected" if d == zone_detail_val else ""}>{html_lib.escape(d, quote=True)}</option>'
             for d in (zones_map.get(zone_group_val) or [])
         )
         zone_inputs_html = f"""
@@ -5887,6 +5223,18 @@ def render_edit_latest_revision_form(
                     <div>
                       <div class="label">Presupuesto compra</div>
                       <input name="presupuesto_compra" type="number" value="{last_rev.presupuesto_compra or ''}"/>
+                    </div>
+                  </div>
+
+                  <input type="hidden" name="vehicle_identity_form" value="1"/>
+                  <div class="grid" style="margin-top:8px;">
+                    <div>
+                      <div class="label">Kilometraje</div>
+                      <input name="kilometraje" type="text" inputmode="decimal" autocomplete="off" value="{'' if _vehicle_identity(last_rev)[0] is None else _esc_val(_vehicle_identity(last_rev)[0])}"/>
+                    </div>
+                    <div>
+                      <div class="label">Dominio / patente</div>
+                      <input name="dominio" value="{_esc_val(_vehicle_identity(last_rev)[1])}"/>
                     </div>
                   </div>
 
@@ -6420,8 +5768,9 @@ def render_revisions_table_page(
         return mapping.get(val, val.replace("_", " ").title())
 
     def _make_table_link(new_params: dict[str, Any]) -> str:
+        # urlencode for the query, then HTML-escape once for the href attribute it is written to.
         qstr = _build_query_string(new_params)
-        return f"/table?{qstr}" if qstr else "/table"
+        return html_lib.escape(f"/table?{qstr}" if qstr else "/table", quote=True)
 
     chips: list[str] = []
     active_params = dict(params)
@@ -6430,13 +5779,13 @@ def render_revisions_table_page(
         for st in estado_list:
             p = dict(active_params)
             p["estado"] = [x for x in estado_list if x != st]
-            chips.append(f'<a class="chip" href="{_make_table_link(p)}">Estado: {KANBAN_LABELS.get(st, st)}<span class="x">-</span></a>')
+            chips.append(f'<a class="chip" href="{_make_table_link(p)}">Estado: {html_lib.escape(KANBAN_LABELS.get(st, st), quote=True)}<span class="x">-</span></a>')
     flag_list = list(active_params.get("flag") or [])
     if flag_list:
         for fv in flag_list:
             p = dict(active_params)
             p["flag"] = [x for x in flag_list if x != fv]
-            chips.append(f'<a class="chip" href="{_make_table_link(p)}">Flag: {FLAG_LABELS.get(fv, fv)}<span class="x">-</span></a>')
+            chips.append(f'<a class="chip" href="{_make_table_link(p)}">Flag: {html_lib.escape(FLAG_LABELS.get(fv, fv), quote=True)}<span class="x">-</span></a>')
     if _val(profesional_id):
         p = dict(active_params)
         p["profesional_id"] = ""
@@ -6450,39 +5799,39 @@ def render_revisions_table_page(
             prof = prof_lookup.get(pid)
             if prof:
                 label = _profesional_label(prof)
-        chips.append(f'<a class="chip" href="{_make_table_link(p)}">Profesional: {label}<span class="x">-</span></a>')
+        chips.append(f'<a class="chip" href="{_make_table_link(p)}">Profesional: {html_lib.escape(label, quote=True)}<span class="x">-</span></a>')
     if _val(canal):
         p = dict(active_params)
         p["canal"] = ""
-        chips.append(f'<a class="chip" href="{_make_table_link(p)}">Canal: {_canal_label(_val(canal))}<span class="x">-</span></a>')
+        chips.append(f'<a class="chip" href="{_make_table_link(p)}">Canal: {html_lib.escape(_canal_label(_val(canal)), quote=True)}<span class="x">-</span></a>')
     if _val(marca):
         p = dict(active_params)
         p["marca"] = ""
-        chips.append(f'<a class="chip" href="{_make_table_link(p)}">Marca: {_txt(marca)}<span class="x">-</span></a>')
+        chips.append(f'<a class="chip" href="{_make_table_link(p)}">Marca: {_esc_txt(marca)}<span class="x">-</span></a>')
     if _val(modelo):
         p = dict(active_params)
         p["modelo"] = ""
-        chips.append(f'<a class="chip" href="{_make_table_link(p)}">Modelo: {_txt(modelo)}<span class="x">-</span></a>')
+        chips.append(f'<a class="chip" href="{_make_table_link(p)}">Modelo: {_esc_txt(modelo)}<span class="x">-</span></a>')
     if _val(tipo_vehiculo):
         p = dict(active_params)
         p["tipo_vehiculo"] = ""
-        chips.append(f'<a class="chip" href="{_make_table_link(p)}">Tipo vehículo: {_txt(tipo_vehiculo)}<span class="x">-</span></a>')
+        chips.append(f'<a class="chip" href="{_make_table_link(p)}">Tipo vehículo: {_esc_txt(tipo_vehiculo)}<span class="x">-</span></a>')
     if _val(anio):
         p = dict(active_params)
         p["anio"] = ""
-        chips.append(f'<a class="chip" href="{_make_table_link(p)}">Año: {_txt(anio)}<span class="x">-</span></a>')
+        chips.append(f'<a class="chip" href="{_make_table_link(p)}">Año: {_esc_txt(anio)}<span class="x">-</span></a>')
     if _val(zone_group):
         p = dict(active_params)
         p["zone_group"] = ""
-        chips.append(f'<a class="chip" href="{_make_table_link(p)}">Zona grupo: {_txt(zone_group)}<span class="x">-</span></a>')
+        chips.append(f'<a class="chip" href="{_make_table_link(p)}">Zona grupo: {_esc_txt(zone_group)}<span class="x">-</span></a>')
     if _val(zone_detail):
         p = dict(active_params)
         p["zone_detail"] = ""
-        chips.append(f'<a class="chip" href="{_make_table_link(p)}">Zona detalle: {_txt(zone_detail)}<span class="x">-</span></a>')
+        chips.append(f'<a class="chip" href="{_make_table_link(p)}">Zona detalle: {_esc_txt(zone_detail)}<span class="x">-</span></a>')
     if _val(estado_revision):
         p = dict(active_params)
         p["estado_revision"] = ""
-        chips.append(f'<a class="chip" href="{_make_table_link(p)}">Estado revisión: {_txt(estado_revision)}<span class="x">-</span></a>')
+        chips.append(f'<a class="chip" href="{_make_table_link(p)}">Estado revisión: {_esc_txt(estado_revision)}<span class="x">-</span></a>')
     if _val(from_date) or _val(to_date):
         p = dict(active_params)
         p["from_date"] = ""
@@ -6494,11 +5843,11 @@ def render_revisions_table_page(
             label = f"{field_label} desde: {from_date}"
         else:
             label = f"{field_label} hasta: {to_date}"
-        chips.append(f'<a class="chip" href="{_make_table_link(p)}">{label}<span class="x">-</span></a>')
+        chips.append(f'<a class="chip" href="{_make_table_link(p)}">{html_lib.escape(label, quote=True)}<span class="x">-</span></a>')
     if _val(q):
         p = dict(active_params)
         p["q"] = ""
-        chips.append(f'<a class="chip" href="{_make_table_link(p)}">Buscar: {_txt(q)}<span class="x">-</span></a>')
+        chips.append(f'<a class="chip" href="{_make_table_link(p)}">Buscar: {_esc_txt(q)}<span class="x">-</span></a>')
     if chips:
         chips.append('<a class="chip" href="/table">Limpiar todo<span class="x">-</span></a>')
 
@@ -6573,21 +5922,21 @@ def render_revisions_table_page(
             <td>{r.id}</td>
             <td>{r.created_at.strftime("%Y-%m-%d %H:%M") if r.created_at else "-"}</td>
             <td>{l.id}</td>
-            <td>{_txt(l.nombre)} {_txt(l.apellido)}</td>
-            <td>{_txt(l.telefono)}</td>
-            <td>{_txt(l.email)}</td>
-            <td>{_txt(_lead_operational_estado(_get(l, "estado")))}</td>
-            <td>{_txt(flag_label)}</td>
-            <td>{_txt(r.tipo_vehiculo)}</td>
-            <td>{_txt(r.marca)}</td>
-            <td>{_txt(r.modelo)}</td>
-            <td>{_txt(r.anio)}</td>
-            <td>{_txt(r.zone_group)}</td>
-            <td>{_txt(r.zone_detail)}</td>
+            <td>{_esc_txt(l.nombre)} {_esc_txt(l.apellido)}</td>
+            <td>{_esc_txt(l.telefono)}</td>
+            <td>{_esc_txt(l.email)}</td>
+            <td>{_esc_txt(_lead_operational_estado(_get(l, "estado")))}</td>
+            <td>{_esc_txt(flag_label)}</td>
+            <td>{_esc_txt(r.tipo_vehiculo)}</td>
+            <td>{_esc_txt(r.marca)}</td>
+            <td>{_esc_txt(r.modelo)}</td>
+            <td>{_esc_txt(r.anio)}</td>
+            <td>{_esc_txt(r.zone_group)}</td>
+            <td>{_esc_txt(r.zone_detail)}</td>
             <td>{turno_txt}</td>
-            <td>{_txt(r.estado_revision)}</td>
+            <td>{_esc_txt(r.estado_revision)}</td>
             <td>{_fmt_money(r.precio_total)}</td>
-            <td><a class="btn btn-sm" href="{kanban_href}#lead-{l.id}">Abrir</a></td>
+            <td><a class="btn btn-sm" href="{html_lib.escape(kanban_href, quote=True)}#lead-{l.id}">Abrir</a></td>
           </tr>
         """)
 
@@ -6657,7 +6006,8 @@ def render_revisions_table_page(
         </table>
       </div>
     """ % "\n".join(rows))
-    zones_json = json.dumps(zones_map or {}, ensure_ascii=False).replace("</", "<\\/")
+    # `<` as \u003c: neither `</script>` nor `<!--` can reach the HTML tokenizer; JSON.parse restores it.
+    zones_json = json.dumps(zones_map or {}, ensure_ascii=False).replace("<", "\\u003c")
     html.append(f'<script type="application/json" id="zones-data">{zones_json}</script>')
     html.append("""
       <script>
@@ -6826,7 +6176,7 @@ def render_agencias_page(
     """
     css = _base_css(extra_css=table_css)
     build_stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    vend_opts = "".join([f'<option value="{v.id}">{_txt(v.nombre)}</option>' for v in vendedores])
+    vend_opts = "".join([f'<option value="{v.id}">{_esc_txt(v.nombre)}</option>' for v in vendedores])
     icon_board = '<svg class="icon" viewBox="0 0 24 24"><rect x="3" y="4" width="7" height="7"/><rect x="14" y="4" width="7" height="7"/><rect x="3" y="15" width="7" height="7"/><rect x="14" y="15" width="7" height="7"/></svg>'
     icon_calendar = '<svg class="icon" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M8 3v4M16 3v4M3 11h18"/></svg>'
     icon_filter = '<svg class="icon" viewBox="0 0 24 24"><path d="M4 6h16l-6 7v5l-4 2v-7z"/></svg>'
@@ -6838,8 +6188,7 @@ def render_agencias_page(
     modals: list[str] = []
     for a in agencias:
         vend_name = _txt(a.vendedor.nombre if a.vendedor else None)
-        file_name = _txt(a.file_name)
-        file_cell = f'<a href="/ui/agencia_file/{a.id}">{file_name}</a>' if a.file_path else "-"
+        file_cell = f'<a href="/ui/agencia_file/{a.id}">{_esc_txt(a.file_name)}</a>' if a.file_path else "-"
         search_text = html_lib.escape(
             " ".join([
                 _val(a.nombre_agencia),
@@ -6853,8 +6202,8 @@ def render_agencias_page(
         )
         rows.append(f"""
           <tr data-search="{search_text}">
-            <td>{a.id}</td><td>{_txt(a.nombre_agencia)}</td><td>{_txt(a.direccion)}</td><td>{_url_link(a.gmaps, "Maps")}</td><td>{_txt(a.mail)}</td>
-            <td>{vend_name}</td><td>{_txt(a.telefono)}</td><td>{file_cell}</td><td>{a.fecha_subido.strftime("%Y-%m-%d %H:%M") if a.fecha_subido else "-"}</td>
+            <td>{a.id}</td><td>{_esc_txt(a.nombre_agencia)}</td><td>{_esc_txt(a.direccion)}</td><td>{_url_link(a.gmaps, "Maps")}</td><td>{_esc_txt(a.mail)}</td>
+            <td>{html_lib.escape(vend_name, quote=True)}</td><td>{_esc_txt(a.telefono)}</td><td>{file_cell}</td><td>{a.fecha_subido.strftime("%Y-%m-%d %H:%M") if a.fecha_subido else "-"}</td>
             <td><button class="btn btn-sm" type="button" onclick="openAgenciaEdit({a.id})">Editar</button></td>
           </tr>
         """)
@@ -6878,7 +6227,7 @@ def render_agencias_page(
                     <div><div class="label">Mail</div><input name="mail" value="{_esc_val(a.mail)}"/></div>
                   </div>
                   <div class="grid" style="margin-top:8px;">
-                    <div><div class="label">Vendedor</div><select name="vendedor_id"><option value="">-</option>{''.join([f'<option value="{v.id}" {"selected" if a.vendedor_id==v.id else ""}>{_txt(v.nombre)}</option>' for v in vendedores])}</select></div>
+                    <div><div class="label">Vendedor</div><select name="vendedor_id"><option value="">-</option>{''.join([f'<option value="{v.id}" {"selected" if a.vendedor_id==v.id else ""}>{_esc_txt(v.nombre)}</option>' for v in vendedores])}</select></div>
                     <div><div class="label">+ Nuevo vendedor (opcional)</div><input name="vendedor_nuevo"/></div>
                   </div>
                   <div class="grid" style="margin-top:8px;">

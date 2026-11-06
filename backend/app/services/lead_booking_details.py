@@ -16,15 +16,24 @@ truth to drift when the customer changes vehicle or corrects an address.
 The same view serves the winner (whose booking also has its own revision) and the loser
 (who has none). Seller data is a third party's and is shown only when the customer supplied it.
 
-R1 (review F-03): for a COMMITTED booking the card no longer depends on the draft evidence
-rows. Any field they do not provide is taken from the thread's latest committed booking
-`thread_revisions` row (status booked/completed — written by the booking's own transaction,
-including `seller_phone`). Evidence first (it is the customer's latest submission, and the
-loser's only record), the committed booking second. Still read only.
+Two kinds of fact, and they follow different rules:
 
-Accepted debt (review F-14, unchanged): the live Flow details are per THREAD, not per
-conversation cycle, so a later conversation on the same thread shows the earlier details
-until the customer submits new ones.
+PERSON (`PERSON_CLAIMS`: name, e-mail). They belong to the customer, so they follow the thread:
+the displayed attempt's own value, else the thread's most recent, else the committed booking's
+(review F-03, F-14). Only what is listed there is treated this way.
+
+CAR, everything else: plate, mileage, listing URL, seller, inspection address, requested slot.
+They describe one vehicle and one inspection, and an operator acts on them, so they appear only
+beside that vehicle and never fall back to the thread:
+* A COMMITTED card (the displayed candidate has a booking; or, with no candidate to display, the
+  thread's latest booking) takes them from that booking alone: `thread_revisions`, written by the
+  booking's own transaction, and `revisions` for `kilometraje` / `dominio`, which the operator
+  edits and the card's revision lines show. A blank there stays blank. No draft fills it, so an
+  old draft cannot contradict a correction.
+* An UNCOMMITTED card takes them from the attempt it displays, the focus candidate in the current
+  cycle (`attempt_details`, the scope `prefill_details` uses).
+* Otherwise they are not shown. An unknown is better than another car's seller.
+Vehicle and locality are read from the displayed candidate itself.
 """
 from __future__ import annotations
 
@@ -46,11 +55,19 @@ class LeadBookingDetails:
     seller_name: Optional[str] = None
     seller_phone: Optional[str] = None
     listing_url: Optional[str] = None
+    #: Digits as stored; `vehicle_identity.format_kilometraje` is what displays it.
+    kilometraje: Optional[str] = None
+    dominio: Optional[str] = None
 
     def has_content(self) -> bool:
         return any((self.customer_name, self.email, self.vehicle, self.locality,
                     self.inspection_address, self.requested_slot, self.seller_name,
-                    self.seller_phone, self.listing_url))
+                    self.seller_phone, self.listing_url, self.kilometraje, self.dominio))
+
+
+#: Facts about the customer. Every other claim is about one car, including any added later:
+#: being scoped is the default, and following the thread has to be asked for here.
+PERSON_CLAIMS = frozenset({"FLOW_CUSTOMER_NAME", "FLOW_CUSTOMER_EMAIL"})
 
 
 def _vehicle(c) -> Optional[str]:
@@ -71,7 +88,8 @@ def _locality(c) -> Optional[str]:
 def lead_booking_details(db, lead_ids) -> dict:
     """{lead_id: LeadBookingDetails} for the leads that have a WhatsApp thread. Read only."""
     from ..models import WhatsAppThread, WhatsAppThreadCandidate, WhatsAppThreadState
-    from .booking_flow_details import live_details
+    from .booking_flow_details import attempt_details, live_details
+    from .clarification_attempt import cycle_key
     ids = sorted({int(x) for x in (lead_ids or []) if x is not None})
     if not ids:
         return {}
@@ -86,9 +104,11 @@ def lead_booking_details(db, lead_ids) -> dict:
     if not thread_for:
         return {}
     tids = list(thread_for.values())
-    focus = dict(db.execute(select(WhatsAppThreadState.thread_id,
-                                   WhatsAppThreadState.current_focus_candidate_id)
-                            .where(WhatsAppThreadState.thread_id.in_(tids))).all())
+    states = {int(row.thread_id): row for row in db.execute(
+        select(WhatsAppThreadState.thread_id, WhatsAppThreadState.current_focus_candidate_id,
+               WhatsAppThreadState.current_cycle_start_message_db_id)
+        .where(WhatsAppThreadState.thread_id.in_(tids))).all()}
+    focus = {t: row.current_focus_candidate_id for t, row in states.items()}
     cand_ids = [int(c) for c in focus.values() if c is not None]
     candidates = {}
     if cand_ids:
@@ -96,38 +116,59 @@ def lead_booking_details(db, lead_ids) -> dict:
                 WhatsAppThreadCandidate.id.in_(cand_ids))).scalars().all():
             candidates[int(c.id)] = c
     details = live_details(db, tids)
-    # R1: the committed booking's own copy, per thread (latest booked/completed row).
+    # The attempt each card displays: only a focus candidate of that very thread has one.
+    attempts = {t: (int(focus[t]), cycle_key(states[t])) for t in tids
+                if focus.get(t) is not None and int(focus[t]) in candidates
+                and int(candidates[int(focus[t])].thread_id) == t}
+    displayed = attempt_details(db, attempts)
+    # R1: the committed booking's own copy (latest booked/completed row), per thread for the
+    # person and per candidate for the car: a thread can hold bookings of two cars.
     from ..models import ThreadRevision as TR
     booked: dict = {}
+    booked_car: dict = {}
     for tr in db.execute(select(TR).where(TR.thread_id.in_(tids),
                                           TR.status.in_(("booked", "completed")))
                          .order_by(TR.thread_id, TR.id)).scalars().all():
         booked[int(tr.thread_id)] = tr
+        booked_car[(int(tr.thread_id), tr.candidate_id)] = tr
     out = {}
     for lead_id, thread_id in thread_for.items():
         cid = focus.get(thread_id)
         c = candidates.get(int(cid)) if cid is not None else None
         if c is not None and int(c.thread_id) != int(thread_id):
             c = None                            # never another thread's vehicle
-        d = dict(details.get(thread_id, {}))
+        own = displayed.get(thread_id, {})
+        d = {k: v for k, v in details.get(thread_id, {}).items() if k in PERSON_CLAIMS}
+        for claim_type in PERSON_CLAIMS & set(own):
+            if own[claim_type]:
+                d[claim_type] = own[claim_type]
+            else:
+                d.pop(claim_type, None)           # this attempt emptied it
         tr = booked.get(thread_id)
         if tr is not None:
-            slot = (f"{tr.scheduled_date.isoformat()} {tr.scheduled_time.strftime('%H:%M')}"
-                    if tr.scheduled_date is not None and tr.scheduled_time is not None else None)
             for claim_type, value in (("FLOW_CUSTOMER_NAME", tr.buyer_name),
-                                      ("FLOW_CUSTOMER_EMAIL", tr.buyer_email),
-                                      ("FLOW_INSPECTION_ADDRESS", tr.address),
-                                      ("FLOW_SELLER_NAME", tr.seller_name),
-                                      ("FLOW_SELLER_PHONE", getattr(tr, "seller_phone", None)),
-                                      ("FLOW_LISTING_URL", tr.publication_url),
-                                      ("FLOW_REQUESTED_SLOT", slot)):
+                                      ("FLOW_CUSTOMER_EMAIL", tr.buyer_email)):
                 if not d.get(claim_type) and value:
                     d[claim_type] = value
+        committed = tr if c is None else booked_car.get((thread_id, int(c.id)))
+        if committed is not None:
+            slot = (f"{committed.scheduled_date.isoformat()} "
+                    f"{committed.scheduled_time.strftime('%H:%M')}"
+                    if committed.scheduled_date is not None
+                    and committed.scheduled_time is not None else None)
+            d.update({"FLOW_INSPECTION_ADDRESS": committed.address,
+                      "FLOW_SELLER_NAME": committed.seller_name,
+                      "FLOW_SELLER_PHONE": getattr(committed, "seller_phone", None),
+                      "FLOW_LISTING_URL": committed.publication_url,
+                      "FLOW_REQUESTED_SLOT": slot})
+        else:
+            d.update({k: v for k, v in own.items() if k not in PERSON_CLAIMS and v})
         out[lead_id] = LeadBookingDetails(
             thread_id=thread_id, customer_name=d.get("FLOW_CUSTOMER_NAME"),
             email=d.get("FLOW_CUSTOMER_EMAIL"), vehicle=_vehicle(c), locality=_locality(c),
             inspection_address=d.get("FLOW_INSPECTION_ADDRESS"),
             requested_slot=d.get("FLOW_REQUESTED_SLOT"),
             seller_name=d.get("FLOW_SELLER_NAME"), seller_phone=d.get("FLOW_SELLER_PHONE"),
-            listing_url=d.get("FLOW_LISTING_URL"))
+            listing_url=d.get("FLOW_LISTING_URL"),
+            kilometraje=d.get("FLOW_VEHICLE_MILEAGE"), dominio=d.get("FLOW_VEHICLE_PLATE"))
     return out

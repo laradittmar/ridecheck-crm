@@ -414,6 +414,28 @@ APPOINTMENT_DEFAULTS = {
     "contact_phone_display": "",
 }
 
+# ── The v7.8 candidate: NOT published, and nothing above changes ───────────────────────
+#
+# PRELAUNCH-MINIMUM-LAUNCH-VEHICLE-IDENTITY. Everything above is still the contract of the
+# PUBLISHED Flow (v7.7). The candidate adds exactly the keys below, and the backend sends them
+# only behind `details_prefill_enabled()`, which is turned on together with its publication.
+CANDIDATE_FLOW_PATH = "meta/flows/booking/CANDIDATE_v7.8-vehicle-identity-prefill.json"
+CANDIDATE_FLOW_SHA256 = "2102a8ec5f01be41c6671a1d9a3c59cf1f79fbad55354bf623f1db1cd3348354"
+CANDIDATE_FLOW_CANONICAL_SHA256 = "3b8dc55eef53e260680c0efa4c894fc37bf22cbe0532dceee40a56d5d0370292"
+
+#: One object, carried APPOINTMENT -> DETAILS on the navigate payload and bound whole to the
+#: DETAILS Form's `init-values`. Meta's component reference: `init-value` exists only on a
+#: component OUTSIDE a Form (which is why it was rejected on 2026-09-16), and a Form initialises
+#: its inputs with `init-values`, static or dynamic as `"${data.init_values}"`.
+DETAILS_PREFILL_KEY = "details_prefill"
+#: The two values the candidate adds to the SUMMARY `data`, for confirm_booking to read back.
+VEHICLE_IDENTITY_KEYS = frozenset({"vehicle_mileage", "vehicle_plate"})
+CANDIDATE_SCREEN_KEYS = {
+    "APPOINTMENT": APPOINTMENT_KEYS | {DETAILS_PREFILL_KEY},
+    "DETAILS": DETAILS_KEYS | {DETAILS_PREFILL_KEY},
+    "SUMMARY": SUMMARY_KEYS | VEHICLE_IDENTITY_KEYS,
+}
+
 #: Envelope keys that belong to the Data API protocol, not to a screen's `data`.
 PROTOCOL_KEYS = frozenset({"version", "screen", "data"})
 
@@ -431,16 +453,18 @@ def appointment_payload(**values) -> dict:
     it is not true of every Flow version, and a key the Flow ignores is a key the backend
     believes it delivered.
     """
-    unknown = set(values) - APPOINTMENT_KEYS
+    unknown = set(values) - CANDIDATE_SCREEN_KEYS["APPOINTMENT"]
     if unknown:
         raise ValueError("not declared by %s on APPOINTMENT: %s"
                          % (TARGET_FLOW_PATH, ", ".join(sorted(unknown))))
     out = dict(APPOINTMENT_DEFAULTS)
     out.update(values)
-    return {k: out[k] for k in sorted(APPOINTMENT_KEYS)}
+    # `details_prefill` leaves only when a caller supplied it, i.e. only behind the switch.
+    keys = APPOINTMENT_KEYS | ({DETAILS_PREFILL_KEY} & set(values))
+    return {k: out[k] for k in sorted(keys)}
 
 
-def validate_screen_payload(screen: str, payload: dict) -> None:
+def validate_screen_payload(screen: str, payload: dict, *, candidate: bool = False) -> None:
     """Both directions, for any screen. Raises `ValueError` naming what is wrong.
 
     This lives beside the contract rather than in a test so that the comparison cannot be
@@ -449,7 +473,7 @@ def validate_screen_payload(screen: str, payload: dict) -> None:
     """
     if screen not in SCREEN_KEYS:
         raise ValueError("unknown screen %r" % screen)
-    declared = set(SCREEN_KEYS[screen])
+    declared = set((CANDIDATE_SCREEN_KEYS if candidate else SCREEN_KEYS)[screen])
     supplied = set(payload) - PROTOCOL_KEYS
     undeclared = supplied - declared
     missing = declared - supplied

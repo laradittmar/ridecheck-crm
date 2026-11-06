@@ -1023,7 +1023,8 @@ def render_control_page(user_email: str) -> str:
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;');
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
     }}
 
     function fmtAge(seconds) {{
@@ -1496,7 +1497,7 @@ def render_control_page(user_email: str) -> str:
                          String(r.path_id).toLowerCase().indexOf('legacy') >= 0;
           var rowCls = isLegacy ? 'rowCritical' : '';
           return '<tr class="' + rowCls + '">'
-            + '<td><a href="#panel-msgs" onclick="filterTraceByPath(' + "'" + esc(r.path_id || r.path) + "'" + ');return false;"><strong>'
+            + '<td><a href="#panel-msgs" data-path="' + esc(r.path_id || r.path) + '" onclick="filterTraceByPath(this.dataset.path);return false;"><strong>'
                  + esc(r.path_id || r.path) + '</strong></a></td>'
             + '<td>' + (r.total !== null && r.total !== undefined ? r.total
                           : (r.count !== null && r.count !== undefined ? r.count : '—')) + '</td>'

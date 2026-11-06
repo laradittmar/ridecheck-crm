@@ -143,6 +143,10 @@ class Settings:
     # everywhere: with it off CE-W1/CE-W2 keep their legacy behaviour exactly, and nothing
     # writes a booking ledger row from CE. Read with `is True`, never truthiness.
     smart_booking_ce_enabled: bool = False
+    # PRELAUNCH-MINIMUM-LAUNCH-VEHICLE-IDENTITY. Default OFF: the Data Exchange payloads are
+    # byte-for-byte what the published Flow (v7.7) declares. Turned on only together with the
+    # publication of the v7.8 candidate, which is the Flow that declares `details_prefill`.
+    booking_flow_details_prefill_enabled: bool = False
     # W1-F2 — the operator's WhatsApp notice of a committed customer booking. OFF unless
     # OPERATOR_WHATSAPP_NOTIFY_ENABLED is exactly "true" AND the destination and the approved
     # Meta template are configured and well formed (`operator_notification.operator_config`);
@@ -262,6 +266,8 @@ def get_settings() -> Settings:
         hybrid_trace_enabled=(_getenv("HYBRID_TRACE_ENABLED", "false").lower() == "true"),
         smart_booking_ce_enabled=(
             _getenv("SMART_BOOKING_CE_ENABLED", "false").lower() == "true"),
+        booking_flow_details_prefill_enabled=(
+            _getenv("BOOKING_FLOW_DETAILS_PREFILL_ENABLED", "false").lower() == "true"),
         operator_whatsapp_notify_enabled=(
             _getenv("OPERATOR_WHATSAPP_NOTIFY_ENABLED", "false").lower() == "true"),
         operator_whatsapp_to=_getenv("OPERATOR_WHATSAPP_TO"),

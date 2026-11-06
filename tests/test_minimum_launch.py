@@ -435,7 +435,9 @@ class B_Details(unittest.TestCase):
     def test_b01_prepare_summary_persists_every_value_bound_and_draft(self):
         w = H.seed(self.engine)
         with Meta() as m:
-            self.assertEqual(prepare(self.engine, w)["screen"], "SUMMARY")
+            # VEHICLE-IDENTITY adaptation: "every value" now includes the two optional ones.
+            self.assertEqual(prepare(self.engine, w, vehicle_mileage="85000",
+                                     vehicle_plate="ABC123")["screen"], "SUMMARY")
         rows = self.rows(w.thread_id)
         self.assertEqual(sorted(r.claim_type for r in rows), sorted(ALL_CLAIM_TYPES))
         for r in rows:

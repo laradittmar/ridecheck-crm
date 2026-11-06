@@ -44,7 +44,10 @@ from .booking_authority import BookingOutcome
 
 logger = logging.getLogger(__name__)
 
-from .flow_contract import appointment_payload  # WILD1-F3
+from .booking_flow_details import (details_prefill_enabled, flow_vehicle_identity,
+                                   prefill_contract_defaults)
+from .flow_contract import VEHICLE_IDENTITY_KEYS, appointment_payload  # WILD1-F3
+from .vehicle_identity import format_kilometraje
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 BOOKING_HORIZON_DAYS = 14
@@ -696,11 +699,37 @@ class BookingFlowService:
                         .get("FLOW_CUSTOMER_NAME") or "")
             except Exception:
                 name = ""
-        return {
+        fields = {
             "customer_name": name,
             "contact_phone": wa_id,
             "contact_phone_display": _mask_phone(wa_id),
         }
+        fields.update(self._details_prefill(ctx, name))
+        return fields
+
+    def _details_prefill(self, ctx, customer_name: str) -> dict:
+        """The v7.8 candidate's `details_prefill`, or nothing while the published Flow (which
+        does not declare it) is what customers open. Built here because every APPOINTMENT
+        payload already passes through `_identity_fields`: INIT, date_selected and a refusal.
+
+        Read from the durable rows at the moment the Flow asks, so what a recovered customer
+        sees depends on no job, worker, request or process state. It is their own data under
+        their own token; a failure to read offers an empty form, it never blocks the Flow."""
+        from .booking_flow_details import details_prefill_enabled, prefill_details
+        from .clarification_attempt import cycle_key as _cycle_key
+        if not details_prefill_enabled():
+            return {}
+        prefill: dict = {}
+        try:
+            prefill = prefill_details(self.db, thread_id=int(ctx.thread.id),
+                                      candidate_id=getattr(ctx.candidate, "id", None),
+                                      cycle_key=int(_cycle_key(ctx.state)))
+        except Exception as exc:
+            logger.error("BOOKING_FLOW_PREFILL not read thread_id=%s: %s", ctx.thread.id,
+                         type(exc).__name__)
+        if customer_name and not prefill.get("name"):
+            prefill["name"] = customer_name
+        return {"details_prefill": prefill}
 
     def _summary_screen_data(
         self,
@@ -714,6 +743,7 @@ class BookingFlowService:
         seller_name: str,
         seller_phone: str,
         listing_url: str,
+        vehicle_identity: Optional[tuple] = None,
     ) -> dict:
         try:
             d = date.fromisoformat(date_str)
@@ -723,7 +753,23 @@ class BookingFlowService:
             appointment_summary = f"{date_str} {time_str}".strip()
 
         customer_summary = _format_customer_summary(name, phone)
+        vehicle_keys: dict = {}
+        if vehicle_identity is not None:
+            # Declared by the candidate's SUMMARY and read back by its confirm_booking, so with
+            # the switch on both always leave, empty when not given: Meta may omit a blank
+            # optional input. With it off the published v7.7 declares neither, and only a
+            # session that sent them gets them back.
+            mileage, plate = vehicle_identity
+            vehicle_keys = {"vehicle_mileage": "" if mileage is None else str(mileage),
+                            "vehicle_plate": plate or ""}
+            lines = [customer_summary] if customer_summary else []
+            if mileage is not None:
+                lines.append(f"Kilometraje: {format_kilometraje(mileage)}")
+            if plate:
+                lines.append(f"Dominio / patente: {plate}")
+            customer_summary = " · ".join(lines)
         return {
+            **vehicle_keys,
             "booking_token": ctx.booking_token,
             "appointment_summary": appointment_summary,
             "customer_summary": customer_summary,
@@ -798,6 +844,9 @@ class BookingFlowService:
         seller_name = str(data.get("seller_name", "")).strip()
         seller_phone = str(data.get("seller_phone", "")).strip()
         listing_url = str(data.get("listing_url", "")).strip()
+        # Refused here, before anything is kept: the screen's own `pattern` stops a malformed
+        # value on the handset, so this is the server's rule for any other client.
+        vehicle_identity = flow_vehicle_identity(data)
 
         _booking_event(ctx.thread.id, "BOOKING_FLOW_SUMMARY_PREPARED",
                        booking_token=booking_token,
@@ -817,6 +866,8 @@ class BookingFlowService:
             "data": self._summary_screen_data(
                 ctx, date_str, time_str, name, phone, email,
                 inspection_address, seller_name, seller_phone, listing_url,
+                vehicle_identity=(vehicle_identity if details_prefill_enabled()
+                                  or VEHICLE_IDENTITY_KEYS & set(data or {}) else None),
             ),
         }
 
@@ -824,7 +875,8 @@ class BookingFlowService:
                          time_str: str) -> None:
         """B — see `booking_flow_details`. Only for a token that resolved AND names an offer
         row of this thread; never raises."""
-        from .booking_flow_details import persist_flow_details, submitted_values
+        from .booking_flow_details import (details_prefill_enabled, persist_flow_details,
+                                           submitted_values)
         from .offer_lifecycle import OfferLifecycle
         try:
             adm = OfferLifecycle(self.db).admit(thread_id=int(ctx.thread.id), token=booking_token)
@@ -833,7 +885,8 @@ class BookingFlowService:
             persist_flow_details(
                 self.db, thread_id=int(ctx.thread.id), offer_id=int(adm.offer_id),
                 candidate_id=getattr(ctx.candidate, "id", None),
-                values=submitted_values(data, date_str=date_str, time_str=time_str))
+                values=submitted_values(data, date_str=date_str, time_str=time_str,
+                                        clear_blank=details_prefill_enabled()))
         except Exception as exc:
             logger.error("BOOKING_FLOW_DETAILS skipped thread_id=%s: %s", ctx.thread.id,
                          type(exc).__name__)
@@ -964,6 +1017,10 @@ class BookingFlowService:
         seller_name = str(data.get("seller_name", "")).strip()
         seller_phone = str(data.get("seller_phone", "")).strip()
         listing_url = str(data.get("listing_url", "")).strip()
+        # This submission's own values, refused before anything is written. They reach the
+        # Revision through the booking's transaction; the idempotency key is the token alone,
+        # so neither value can make a retry a second booking.
+        kilometraje, dominio = flow_vehicle_identity(data)
 
         # PRELAUNCH-MINIMUM-LAUNCH-R1 (C-3 / F-03): the submitted details are persisted AGAIN
         # here, through the same canonical function and the same thread / offer / candidate
@@ -1054,6 +1111,10 @@ class BookingFlowService:
                 "zone_group": zone_group, "zone_detail": zone_detail,
                 "direccion_texto": inspection_address or candidate.direccion_texto,
                 "vendedor_tipo": None, "tipo_vendedor": None,
+                # Only when given: a submission without them keeps the request fingerprint
+                # it had before these columns existed.
+                **({"kilometraje": kilometraje} if kilometraje is not None else {}),
+                **({"dominio": dominio} if dominio else {}),
             })
         # Revalidation is the AUTHORITY's, under its own locks (B-7).
         availability = AvailabilityRevalidation(
@@ -1315,11 +1376,12 @@ class BookingFlowService:
         """R1 (C-3): the confirm-time write, K1 only TRIED (`CONFIRM_LOCK_TIMEOUT_MS`).
         Returns None when persisted (or nothing to persist), else the PENDING write for
         `_settle_confirm_details` / the recovery admission. Writes nothing else. Never raises."""
-        from .booking_flow_details import (CONFIRM_LOCK_TIMEOUT_MS, persist_flow_details,
-                                           submitted_values)
+        from .booking_flow_details import (CONFIRM_LOCK_TIMEOUT_MS, details_prefill_enabled,
+                                           persist_flow_details, submitted_values)
         values: dict = {}
         try:
-            values = submitted_values(data, date_str=date_str, time_str=time_str)
+            values = submitted_values(data, date_str=date_str, time_str=time_str,
+                                      clear_blank=details_prefill_enabled())
             if not values:
                 return None
             result = persist_flow_details(
@@ -1368,7 +1430,8 @@ class BookingFlowService:
             # or already-completed context takes — the least-exercised one of all.
             return {"version": FLOW_VERSION, "screen": "APPOINTMENT",
                     "data": appointment_payload(slot_conflict_message=message,
-                                                has_refusal=True)}
+                                                has_refusal=True,
+                                                **prefill_contract_defaults())}
         data = dict(self._appointment_screen_data(ctx, selected_date_str=date_str))
         data["slot_conflict_message"] = message
         data["has_refusal"] = True

@@ -2729,9 +2729,12 @@ class TestR2J_Structural(unittest.TestCase):
         # own source is still asserted additive below.
         # R1: a second additive revision (20261103_slot_recovery_job) sits on that one; this
         # revision must still be in the chain, directly below 20261102_lead_phone_identity.
-        self.assertEqual("20261103_slot_recovery_job", EXPECTED_HEAD)
+        # VEHICLE-IDENTITY adaptation: a third (two nullable columns) sits on that one.
+        self.assertEqual("20261104_vehicle_identity", EXPECTED_HEAD)
         script = ScriptDirectory.from_config(cfg)
         self.assertEqual(script.get_revision(EXPECTED_HEAD).down_revision,
+                         "20261103_slot_recovery_job")
+        self.assertEqual(script.get_revision("20261103_slot_recovery_job").down_revision,
                          "20261102_lead_phone_identity")
         self.assertEqual(script.get_revision("20261102_lead_phone_identity").down_revision,
                          "20261027_w1f_conversation_memory")

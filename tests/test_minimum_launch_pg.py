@@ -61,7 +61,11 @@ BACKEND = pathlib.Path(__file__).resolve().parents[1] / "backend"
 REV = "20261102_lead_phone_identity"
 PARENT = "20261027_w1f_conversation_memory"
 #: R1: the tree's head now sits one additive revision above REV.
-HEAD = "20261103_slot_recovery_job"
+#: VEHICLE-IDENTITY adaptation: and a second one above that. `R1_REV` is the revision the R1
+#: rehearsal below is ABOUT; `HEAD` stays what the database is at. Downgrades name their target,
+#: so each still runs the revision under test, through the (empty) new columns' downgrade.
+R1_REV = "20261103_slot_recovery_job"
+HEAD = "20261104_vehicle_identity"
 INDEX = "uq_leads_phone_identity"
 
 
@@ -800,7 +804,7 @@ class PG_R2_DispatchOff(unittest.TestCase):
 def _r1_migration():
     import importlib.util
     spec = importlib.util.spec_from_file_location(
-        "m_srj", BACKEND / "migrations" / "versions" / f"{HEAD}.py")
+        "m_srj", BACKEND / "migrations" / "versions" / f"{R1_REV}.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -887,7 +891,7 @@ class PG_R1_Migration(unittest.TestCase):
         # re-upgrade
         rc, out = _alembic(R1_MIG_URL, "upgrade", "head")
         self.assertEqual(rc, 0, out)
-        self.assertIn(f"{HEAD}: CREATED", out)
+        self.assertIn(f"{R1_REV}: CREATED", out)
         self.assertEqual((self.version(), self.shape()), (HEAD, (True, True, True)))
         # adoption: the version rewound over the upgraded schema (empty) → adopted
         self.assertEqual(_alembic(R1_MIG_URL, "stamp", REV)[0], 0)

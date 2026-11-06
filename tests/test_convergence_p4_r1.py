@@ -124,7 +124,9 @@ class P4R1_DeclaredSchema(unittest.TestCase):
         # PRELAUNCH-MINIMUM-LAUNCH-R1 adaptation, same idiom. OLD: the single head was
         # 20261102_lead_phone_identity. NEW: one additive revision, 20261103_slot_recovery_job
         # (two new tables and one nullable column), sits on it; the chain below is unchanged.
-        self.assertEqual(heads, ["20261103_slot_recovery_job"])
+        # VEHICLE-IDENTITY adaptation: one more additive revision (two nullable columns).
+        self.assertEqual(heads, ["20261104_vehicle_identity"])
+        self.assertEqual(revs["20261104_vehicle_identity"], "20261103_slot_recovery_job")
         self.assertEqual(revs["20261103_slot_recovery_job"], "20261102_lead_phone_identity")
         self.assertEqual(revs["20261102_lead_phone_identity"],
                          "20261027_w1f_conversation_memory")

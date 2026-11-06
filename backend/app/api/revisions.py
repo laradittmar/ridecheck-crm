@@ -61,6 +61,12 @@ def create_revision(lead_id: int, payload: RevisionCreate, db: Session = Depends
 
     fields = payload.model_dump()
     fields["tipo_vendedor"] = payload.tipo_vendedor or payload.vendedor_tipo
+    # Optional and absent: left out, so a request that never mentions them keeps the booking
+    # command's `request_fingerprint` it had before these columns existed (an idempotent
+    # retry spanning a deployment must still match its own key).
+    for optional in ("kilometraje", "dominio"):
+        if fields.get(optional) is None:
+            fields.pop(optional, None)
     requested_status = fields.pop("estado_revision") or "PENDIENTE"
     turno_fecha = fields.pop("turno_fecha")
     turno_hora = fields.pop("turno_hora")

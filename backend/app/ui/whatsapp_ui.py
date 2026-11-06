@@ -1294,6 +1294,10 @@ def _render_whatsapp_shell(user_email: str, title: str, body_html: str) -> str:
         if (scrollWrap) scrollWrap.addEventListener("scroll", closeMenu, { passive: true });
         window.addEventListener("resize", closeMenu, { passive: true });
       }
+      function waEsc(v){
+        return String(v).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+      }
       function waNorm(v){
         return (v || "").toString().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim();
       }
@@ -1411,7 +1415,7 @@ def _render_whatsapp_shell(user_email: str, title: str, body_html: str) -> str:
               return !q || waNorm(text).indexOf(q) !== -1;
             }).slice(0, 40);
             list.innerHTML = items.map(function(lead){
-              return '<button type="button" class="wa-utility-item" data-lead-id="' + lead.id + '"><div>#' + lead.id + ' · ' + (lead.nombre || '-') + ' ' + (lead.apellido || '') + '</div><div class="wa-utility-meta">' + (lead.telefono || '-') + '</div></button>';
+              return '<button type="button" class="wa-utility-item" data-lead-id="' + lead.id + '"><div>#' + lead.id + ' · ' + waEsc(lead.nombre || '-') + ' ' + waEsc(lead.apellido || '') + '</div><div class="wa-utility-meta">' + waEsc(lead.telefono || '-') + '</div></button>';
             }).join("") || '<div class="wa-utility-meta">Sin resultados.</div>';
             list.querySelectorAll("[data-lead-id]").forEach(function(btn){
               btn.addEventListener("click", function(){
@@ -1645,7 +1649,7 @@ def _render_whatsapp_shell(user_email: str, title: str, body_html: str) -> str:
           });
           list.innerHTML = items.map(function(row){
             var threadId = row.getAttribute("data-thread-id");
-            return '<button type="button" class="wa-utility-item' + (selected[threadId] ? ' wa-selected' : '') + '" data-thread-id="' + threadId + '"><div>' + (row.getAttribute("data-display-name") || "-") + '</div><div class="wa-utility-meta">' + (row.getAttribute("data-wa-id") || "-") + '</div></button>';
+            return '<button type="button" class="wa-utility-item' + (selected[threadId] ? ' wa-selected' : '') + '" data-thread-id="' + threadId + '"><div>' + waEsc(row.getAttribute("data-display-name") || "-") + '</div><div class="wa-utility-meta">' + waEsc(row.getAttribute("data-wa-id") || "-") + '</div></button>';
           }).join("") || '<div class="wa-utility-meta">Sin resultados.</div>';
           list.querySelectorAll("[data-thread-id]").forEach(function(btn){
             btn.addEventListener("click", function(){
