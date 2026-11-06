@@ -439,6 +439,23 @@ class N_Notice(unittest.TestCase):
         self.assertEqual(row["notification_state"], "DELIVERY_FAILED")
         self.assertIn("OPERATOR_NOTIFICATION_REQUIRED", row["reasons"])
 
+    def test_n04b_a_retry_is_never_redirected_by_a_changed_destination(self):
+        """PRELAUNCH-P1: the first attempt's destination is the notice's recipient decision."""
+        other = "5491100990002"
+        book(self.engine)
+        now = datetime.now(timezone.utc)
+        with notifier(template=Template("4xx")) as first:
+            run(self.engine, now)
+        recorded = notices(self.engine)[0].destination_hash
+        with notifier(op_settings(operator_whatsapp_to=other)) as moved:
+            run(self.engine, now + timedelta(seconds=ON.RETRY_AFTER_SECONDS + 1))
+        self.assertEqual([s["to"] for s in first.sent], [DEST])
+        self.assertEqual(moved.sent, [])
+        n = notices(self.engine)[0]
+        self.assertEqual((n.status, n.attempts, n.last_error),
+                         ("HELD", 2, ON.RETRY_DESTINATION_CHANGED))
+        self.assertEqual(n.destination_hash, recorded)
+
     def test_n04_first_failure_one_bounded_retry_then_sent(self):
         w = book(self.engine)
         t0 = datetime.now(timezone.utc)

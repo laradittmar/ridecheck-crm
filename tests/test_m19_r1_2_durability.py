@@ -50,6 +50,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
 from app.models import WhatsAppMessage
+from app.services.outbound_path_registry import OutboundPathId
 from app.services.outbound_safety_gate import (
     FLOOD_MAX_MESSAGES,
     FLOOD_WINDOW_SECONDS,
@@ -57,6 +58,9 @@ from app.services.outbound_safety_gate import (
     OutboundSafetyGate,
 )
 
+# Every gate attempt names its authorized path (M21.3): without one the gate refuses at step
+# -1, before the recipient lock, and these suites would prove nothing about the lock.
+_PATH = OutboundPathId.CE_TEXT.value
 _DB_URL = os.environ.get("DATABASE_URL", "")
 _POSTGRES = "postgresql" in _DB_URL
 
@@ -237,6 +241,7 @@ class TestDuplicateBlockDurability(_DurabilityBase):
             wa_id=self.wa_id, thread_id=self.thread_id,
             text="D1 durability duplicate text",
             message_type="text", now=_NOW,
+            path_id=_PATH,
         )
         self.assertEqual(r1.outcome, GateOutcome.ALLOWED,
                          "First send must be ALLOWED to seed dedup entry")
@@ -246,6 +251,7 @@ class TestDuplicateBlockDurability(_DurabilityBase):
             wa_id=self.wa_id, thread_id=self.thread_id,
             text="D1 durability duplicate text",
             message_type="text", now=_NOW + timedelta(seconds=30),
+            path_id=_PATH,
         )
         self.assertEqual(r2.outcome, GateOutcome.BLOCKED_DUPLICATE)
         blocked_id = r2.message_id
@@ -276,6 +282,7 @@ class TestDuplicateBlockDurability(_DurabilityBase):
             wa_id=self.wa_id, thread_id=self.thread_id,
             text="D1b pending survival text",
             message_type="text", now=_NOW,
+            path_id=_PATH,
         )
         self.assertEqual(r1.outcome, GateOutcome.ALLOWED)
         pending_id = r1.message_id
@@ -309,6 +316,7 @@ class TestFloodBlockDurability(_DurabilityBase):
                 wa_id=self.wa_id, thread_id=self.thread_id,
                 text=f"D2 flood filler message #{i}",
                 message_type="text", now=_NOW + timedelta(seconds=i),
+                path_id=_PATH,
             )
             self.assertEqual(
                 r.outcome, GateOutcome.ALLOWED,
@@ -320,6 +328,7 @@ class TestFloodBlockDurability(_DurabilityBase):
             wa_id=self.wa_id, thread_id=self.thread_id,
             text="D2 flood trigger",
             message_type="text", now=_NOW + timedelta(seconds=FLOOD_MAX_MESSAGES),
+            path_id=_PATH,
         )
         self.assertEqual(r_flood.outcome, GateOutcome.BLOCKED_FLOOD)
         flood_blocked_id = r_flood.message_id
@@ -389,6 +398,7 @@ class TestAllowedCallerIsolation(_DurabilityBase):
         result = OutboundSafetyGate(self.caller_db).attempt(
             wa_id=self.wa_id, thread_id=self.thread_id,
             text=gate_text, message_type="text", now=_NOW,
+            path_id=_PATH,
         )
         self.assertEqual(result.outcome, GateOutcome.ALLOWED,
                          "Gate must ALLOW a fresh text")
@@ -443,6 +453,7 @@ class TestAllowedCallerIsolation(_DurabilityBase):
             wa_id=self.wa_id, thread_id=self.thread_id,
             text="D3b pre-meta pending text",
             message_type="text", now=_NOW,
+            path_id=_PATH,
         )
         self.assertEqual(result.outcome, GateOutcome.ALLOWED)
 
@@ -468,6 +479,7 @@ class TestAllowedSuccessLifecycle(_DurabilityBase):
         result = gate.attempt(
             wa_id=self.wa_id, thread_id=self.thread_id,
             text="D4 lifecycle sent text", message_type="text", now=_NOW,
+            path_id=_PATH,
         )
         self.assertEqual(result.outcome, GateOutcome.ALLOWED)
 
@@ -492,6 +504,7 @@ class TestAllowedSuccessLifecycle(_DurabilityBase):
         r1 = gate.attempt(
             wa_id=self.wa_id, thread_id=self.thread_id,
             text=text_msg, message_type="text", now=_NOW,
+            path_id=_PATH,
         )
         self.assertEqual(r1.outcome, GateOutcome.ALLOWED)
         gate.mark_sent(r1.message_id, wa_message_id="wamid.d4b.xyz")
@@ -501,6 +514,7 @@ class TestAllowedSuccessLifecycle(_DurabilityBase):
             wa_id=self.wa_id, thread_id=self.thread_id,
             text=text_msg, message_type="text",
             now=_NOW + timedelta(minutes=5),
+            path_id=_PATH,
         )
         self.assertEqual(
             r2.outcome, GateOutcome.BLOCKED_DUPLICATE,
@@ -515,6 +529,7 @@ class TestAllowedSuccessLifecycle(_DurabilityBase):
         result = gate.attempt(
             wa_id=self.wa_id, thread_id=self.thread_id,
             text="D4c mark failed text", message_type="text", now=_NOW,
+            path_id=_PATH,
         )
         self.assertEqual(result.outcome, GateOutcome.ALLOWED)
 
@@ -545,6 +560,7 @@ class TestExactlyOneAuditRow(_DurabilityBase):
         OutboundSafetyGate(self.caller_db).attempt(
             wa_id=self.wa_id, thread_id=self.thread_id,
             text="D5 duplicate one audit text", message_type="text", now=_NOW,
+            path_id=_PATH,
         )
 
         # Second send — BLOCKED_DUPLICATE
@@ -552,6 +568,7 @@ class TestExactlyOneAuditRow(_DurabilityBase):
             wa_id=self.wa_id, thread_id=self.thread_id,
             text="D5 duplicate one audit text", message_type="text",
             now=_NOW + timedelta(minutes=1),
+            path_id=_PATH,
         )
         self.assertEqual(r2.outcome, GateOutcome.BLOCKED_DUPLICATE)
 
@@ -583,12 +600,14 @@ class TestExactlyOneAuditRow(_DurabilityBase):
                 wa_id=self.wa_id, thread_id=self.thread_id,
                 text=f"D5b flood filler {i}", message_type="text",
                 now=_NOW + timedelta(seconds=i),
+                path_id=_PATH,
             )
 
         r_flood = OutboundSafetyGate(self.caller_db).attempt(
             wa_id=self.wa_id, thread_id=self.thread_id,
             text="D5b flood trigger", message_type="text",
             now=_NOW + timedelta(seconds=FLOOD_MAX_MESSAGES),
+            path_id=_PATH,
         )
         self.assertEqual(r_flood.outcome, GateOutcome.BLOCKED_FLOOD)
 

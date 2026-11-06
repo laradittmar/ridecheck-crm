@@ -1240,6 +1240,59 @@ Turn a certified crm_test release into a controlled production launch.
 13. Rollback plan documented.
 14. Launch smoke test performed.
 
+### P-1 — HARD PREREQUISITE before OUTBOUND_ENABLED for customers (owner decision, 2026-11-06)
+
+**P-1 is a hard prerequisite before `OUTBOUND_ENABLED` is enabled for customers.** It was
+raised as finding P-1 of the controlled-merge independent review (2026-11-06), which left it as
+an owner call; the owner has made it a hard gate. It is no longer acceptable as launch debt.
+
+- **What it concerns:** the operator-notification recipient lock — the PostgreSQL recipient
+  lock (`whatsapp_recipient_locks`, taken in `OutboundSafetyGate.attempt()`) that the operator
+  notification crosses on the `OPERATOR_NOTIFICATION` path, together with the notification's own
+  recipient decision.
+- **Why it was open:** at base `163b37e` the inherited M19 PostgreSQL tests fail earlier,
+  because their fixture lacks `path_id`: the gate refuses at step -1, before the lock, so they
+  prove nothing about it.
+- **Allowed before P-1:** commit and push. Deployment preparation.
+- **Not allowed before P-1:** customer outbound enablement.
+  Customer outbound enablement may not occur until P-1 is reviewed, committed and included in the deployed image.
+- **Scope of the gate:** `OUTBOUND_ENABLED` for customers only. This entry changes no other
+  launch decision.
+
+Milestone: `PRELAUNCH-P1-OPERATOR-NOTIFICATION-RECIPIENT-LOCK` (closeout in `docs/Launch/`). It
+corrects product code as well as the fixture, so P-1 is passed only when that closeout is
+accepted by independent review AND the corrected code is committed AND it is in the image that
+enables outbound.
+
+#### P-1 — safe flag order for enablement and disablement
+
+This records the required order only. It changes no flag.
+
+**Preconditions**
+
+- The deployed image contains the reviewed and committed P-1 correction.
+- The operator template, token, destination and notification floor are all valid.
+- Settings are cached, so any configuration change requires a container recreate.
+
+**Enablement**
+
+- `OUTBOUND_ENABLED` and `OPERATOR_WHATSAPP_NOTIFY_ENABLED` must be enabled in the same
+  controlled container recreate.
+- `OPERATOR_WHATSAPP_NOTIFY_ENABLED` must never be true while `OUTBOUND_ENABLED` is false.
+- If a two-step enablement is unavoidable, `OUTBOUND_ENABLED` must be enabled first, and every
+  booking in the gap requires manual notification follow-up.
+
+**Normal disablement**
+
+1. Set `OPERATOR_WHATSAPP_NOTIFY_ENABLED=false`.
+2. Then set `OUTBOUND_ENABLED=false`.
+
+**Emergency OFF**
+
+- Emergency OFF remains authorised immediately.
+- Pending notices may become `FAILED` and visible.
+- Those notices require manual follow-up and must not be assumed to resend automatically.
+
 ### Launch strategy
 Do not activate every acquisition source at once.
 
@@ -1259,6 +1312,7 @@ Public launch requires:
 - L4 PASS
 - App Secret/security resolved
 - production migration/runtime gate PASS
+- P-1 PASS (hard prerequisite of `OUTBOUND_ENABLED` for customers)
 
 Only then:
 
@@ -1493,6 +1547,7 @@ L4.2 closeout: `2026-09-01_RIDECHECK_CRM_L4.2-CLEAN-SLATE-TESTER_CLOSEOUT_PREPAR
 | L3 Dirty-History Certification | **FROZEN — PASS (2026-09-01)** | YES |
 | L4 Runtime + Wild Certification | **FAIL — Wild A (scheduling) and Wild B (evidence capture) failed and were remediated (L4.3, L4.6); response validator added (L4.7D); tester zero state prepared (L4.4); runtime proof still pending; 0/3 clean sessions** | AFTER L4.7E AND A CONTROLLED WILD C |
 | L5 Production Launch Gate | PENDING | NO |
+| P-1 Operator-notification recipient lock | **HARD PREREQUISITE — NOT PASSED** (owner decision 2026-11-06) | Blocks `OUTBOUND_ENABLED` for customers only; commit, push and deployment preparation may proceed |
 | Meta App Secret | EXTERNAL BLOCKER | Does not block L4 tester-only Wild |
 
 # 12. Definition of launch-ready

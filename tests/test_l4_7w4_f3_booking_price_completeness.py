@@ -374,7 +374,8 @@ class TestTraceability(unittest.TestCase):
             and any(k.arg == "status" and getattr(k.value, "value", None) == "blocked"
                     for k in n.keywords)
         ]
-        self.assertEqual(len(blocked_writers), 4, "expected 4 blocked-row writers")
+        # 5th: PRELAUNCH-P1's BLOCKED_RECIPIENT_LOCK audit, held to the same attribution below.
+        self.assertEqual(len(blocked_writers), 5, "expected 5 blocked-row writers")
         for call in blocked_writers:
             kwargs = {k.arg for k in call.keywords}
             self.assertIn("path_id", kwargs,

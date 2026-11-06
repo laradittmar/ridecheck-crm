@@ -46,6 +46,7 @@ from app.models import (
     WhatsAppThread,
     WhatsAppThreadState,
 )
+from app.services.outbound_path_registry import OutboundPathId
 from app.services.outbound_safety_gate import (
     DEDUP_WINDOW_MINUTES,
     FLOOD_MAX_MESSAGES,
@@ -54,6 +55,9 @@ from app.services.outbound_safety_gate import (
     OutboundSafetyGate,
 )
 
+# Every gate attempt names its authorized path (M21.3): without one the gate refuses at step
+# -1, before the recipient lock, and these suites would prove nothing about the lock.
+_PATH = OutboundPathId.CE_TEXT.value
 _DB_URL = os.environ.get("DATABASE_URL", "")
 _POSTGRES = "postgresql" in _DB_URL
 
@@ -240,14 +244,24 @@ class TestPgSchema(unittest.TestCase):
                         "ix_dedup_wa_kind_fp_created index must exist on whatsapp_outbound_dedup")
 
     def test_b1_alembic_head_is_rolling_window(self):
+        """The database is at the repository's single head, and that head descends from the
+        recipient-lock revision. (Pinned literally to 20260629 until PRELAUNCH-P1, which every
+        later head failed; the revision is an ancestor, so the guarantee is the same.)"""
+        from alembic.config import Config
+        from alembic.script import ScriptDirectory
+        cfg = Config()
+        cfg.set_main_option("script_location", str(ROOT_DIR / "backend" / "migrations"))
+        scripts = ScriptDirectory.from_config(cfg)
         with self._engine.connect() as conn:
             row = conn.execute(
                 text("SELECT version_num FROM alembic_version")
             ).fetchone()
         self.assertIsNotNone(row, "alembic_version table must have a row")
-        self.assertEqual(
-            row[0], "20260629_recipient_lock_rolling_window",
-            f"crm_test must be at revision 20260629_recipient_lock_rolling_window, got: {row[0]}",
+        self.assertEqual(row[0], scripts.get_current_head())
+        self.assertIn(
+            "20260629_recipient_lock_rolling_window",
+            [r.revision for r in scripts.walk_revisions(base="base", head=row[0])],
+            f"the database at {row[0]} must descend from the recipient-lock revision",
         )
 
 
@@ -274,7 +288,7 @@ class TestPgGateLogic(unittest.TestCase):
     def test_b2_allowed_sends_create_pending_dedup_lock_rows(self):
         wa_id, thread_id, _ = _make_recipient(self.session, "B2_ALLOW")
         gate = OutboundSafetyGate(self.session)
-        r = gate.attempt(wa_id=wa_id, thread_id=thread_id, text="Hola desde test B.2.", now=_NOW)
+        r = gate.attempt(wa_id=wa_id, thread_id=thread_id, text="Hola desde test B.2.", now=_NOW, path_id=_PATH)
         self.assertEqual(r.outcome, GateOutcome.ALLOWED)
 
         # pending message must exist
@@ -299,12 +313,12 @@ class TestPgGateLogic(unittest.TestCase):
         text_msg = "Cotización: $130.000 para revisión integral."
         pfx = id(self)
 
-        r1 = gate.attempt(wa_id=wa_id, thread_id=thread_id, text=text_msg, now=_NOW)
+        r1 = gate.attempt(wa_id=wa_id, thread_id=thread_id, text=text_msg, now=_NOW, path_id=_PATH)
         self.assertEqual(r1.outcome, GateOutcome.ALLOWED)
         gate.mark_sent(r1.message_id, f"wamid_b2_dedup_{pfx}")
 
         r2 = gate.attempt(wa_id=wa_id, thread_id=thread_id, text=text_msg,
-                          now=_NOW + timedelta(minutes=5))
+                          now=_NOW + timedelta(minutes=5), path_id=_PATH)
         self.assertEqual(r2.outcome, GateOutcome.BLOCKED_DUPLICATE,
                          "Same text within rolling 10-min window must be blocked on Postgres")
 
@@ -316,12 +330,12 @@ class TestPgGateLogic(unittest.TestCase):
         T = _NOW
         T_plus_10 = T + timedelta(minutes=DEDUP_WINDOW_MINUTES)
 
-        r1 = gate.attempt(wa_id=wa_id, thread_id=thread_id, text=text_msg, now=T)
+        r1 = gate.attempt(wa_id=wa_id, thread_id=thread_id, text=text_msg, now=T, path_id=_PATH)
         self.assertEqual(r1.outcome, GateOutcome.ALLOWED)
         gate.mark_sent(r1.message_id, f"wamid_b2_bound_{pfx}")
 
         # At T+10min: cutoff = T, row.created_at = T → T > T → False → ALLOWED
-        r2 = gate.attempt(wa_id=wa_id, thread_id=thread_id, text=text_msg, now=T_plus_10)
+        r2 = gate.attempt(wa_id=wa_id, thread_id=thread_id, text=text_msg, now=T_plus_10, path_id=_PATH)
         self.assertEqual(r2.outcome, GateOutcome.ALLOWED,
                          "At exactly T+10min the dedup row is at the boundary (strict >) → ALLOWED")
         gate.mark_sent(r2.message_id, f"wamid_b2_bound2_{pfx}")
@@ -334,7 +348,7 @@ class TestPgGateLogic(unittest.TestCase):
         for i in range(4):
             r = gate.attempt(wa_id=wa_id, thread_id=thread_id,
                              text=f"Flood message {pfx}_{i}",
-                             now=_NOW + timedelta(seconds=i * 5))
+                             now=_NOW + timedelta(seconds=i * 5), path_id=_PATH)
             outcomes.append(r.outcome)
             if r.outcome == GateOutcome.ALLOWED:
                 gate.mark_sent(r.message_id, f"wamid_b2_flood_{pfx}_{i}")
@@ -353,7 +367,7 @@ class TestPgGateLogic(unittest.TestCase):
         wa_id, thread_id, _ = _make_recipient(self.session, "B2_FAIL")
         gate = OutboundSafetyGate(self.session)
         r = gate.attempt(wa_id=wa_id, thread_id=thread_id,
-                         text="Auto-retry test message.", now=_NOW)
+                         text="Auto-retry test message.", now=_NOW, path_id=_PATH)
         self.assertEqual(r.outcome, GateOutcome.ALLOWED)
         gate.mark_failed(r.message_id)
 
@@ -361,7 +375,7 @@ class TestPgGateLogic(unittest.TestCase):
         self.assertEqual(msg.status, "failed")
 
         r2 = gate.attempt(wa_id=wa_id, thread_id=thread_id,
-                          text="Auto-retry test message.", now=_NOW)
+                          text="Auto-retry test message.", now=_NOW, path_id=_PATH)
         self.assertEqual(r2.outcome, GateOutcome.BLOCKED_DUPLICATE,
                          "Auto-retry within window must be BLOCKED_DUPLICATE on Postgres")
 
@@ -371,13 +385,13 @@ class TestPgGateLogic(unittest.TestCase):
         gate = OutboundSafetyGate(self.session)
         pfx = id(self)
 
-        r1 = gate.attempt(wa_id=wa_id, thread_id=thread_id, text=f"Lock test 1 {pfx}", now=_NOW)
+        r1 = gate.attempt(wa_id=wa_id, thread_id=thread_id, text=f"Lock test 1 {pfx}", now=_NOW, path_id=_PATH)
         self.assertEqual(r1.outcome, GateOutcome.ALLOWED)
         gate.mark_sent(r1.message_id, f"wamid_b2_lock1_{pfx}")
 
         # A second attempt on the same wa_id should reuse the lock row silently.
         r2 = gate.attempt(wa_id=wa_id, thread_id=thread_id, text=f"Lock test 2 {pfx}",
-                          now=_NOW + timedelta(seconds=5))
+                          now=_NOW + timedelta(seconds=5), path_id=_PATH)
         self.assertIn(r2.outcome, (GateOutcome.ALLOWED, GateOutcome.BLOCKED_FLOOD,
                                     GateOutcome.BLOCKED_DUPLICATE),
                       "Second attempt must not crash due to lock row collision")
@@ -390,13 +404,13 @@ class TestPgGateLogic(unittest.TestCase):
         pfx = id(self)
 
         r_text = gate.attempt(wa_id=wa_id, thread_id=thread_id,
-                              text=body, message_type="text", now=_NOW)
+                              text=body, message_type="text", now=_NOW, path_id=_PATH)
         self.assertEqual(r_text.outcome, GateOutcome.ALLOWED)
         gate.mark_sent(r_text.message_id, f"wamid_b2_kind_text_{pfx}")
 
         r_flow = gate.attempt(wa_id=wa_id, thread_id=thread_id,
                               text=body, message_type="flow",
-                              now=_NOW + timedelta(seconds=3))
+                              now=_NOW + timedelta(seconds=3), path_id=_PATH)
         self.assertEqual(r_flow.outcome, GateOutcome.ALLOWED,
                          "Flow message with same body as earlier text must not be deduped (different message_kind)")
         gate.mark_sent(r_flow.message_id, f"wamid_b2_kind_flow_{pfx}")
@@ -426,7 +440,7 @@ class TestPgKillSwitch(unittest.TestCase):
         wa_id, thread_id, _ = _make_recipient(self.session, "B3_KS")
         gate = OutboundSafetyGate(self.session)
         r = gate.attempt(wa_id=wa_id, thread_id=thread_id,
-                         text="Kill switch test.", now=_NOW)
+                         text="Kill switch test.", now=_NOW, path_id=_PATH)
         self.assertEqual(r.outcome, GateOutcome.BLOCKED_KILL_SWITCH)
         self.assertIsNotNone(r.message_id)
 

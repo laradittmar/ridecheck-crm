@@ -44,6 +44,11 @@ For every gate outcome:
       are all committed in a dedicated gate session BEFORE Meta is called.
     → caller session receives no commit from the gate.
 
+  BLOCKED_RECIPIENT_LOCK
+    → the recipient lock could not be held within its bound (see below).
+    → the transaction holding it is rolled back: no dedup claim, no pending row.
+    → blocked audit committed in a fresh gate session; nothing was sent.
+
   mark_sent / mark_failed
     → update the pending row in their own dedicated gate sessions.
     → caller session untouched.
@@ -64,6 +69,12 @@ Before flood/dedup checks, a per-recipient advisory lock is acquired via
 INSERT-OR-IGNORE + SELECT FOR UPDATE on whatsapp_recipient_locks.  These run
 inside the gate's dedicated session, serialising concurrent automated sends at
 the DB level.  On SQLite the FOR UPDATE clause is skipped via SAVEPOINT/rollback.
+
+PRELAUNCH-P1: on PostgreSQL the lock is never assumed. Every wait of the locked
+transaction is bounded by `SET LOCAL lock_timeout` / `statement_timeout`, and a lock
+that was not obtained — timed out, cancelled, deadlock victim, or a row removed under
+the gate — ends the attempt as BLOCKED_RECIPIENT_LOCK. The gate never goes on without
+it, because the flood and dedup checks are only true of a recipient it holds.
 """
 from __future__ import annotations
 
@@ -77,6 +88,7 @@ from enum import Enum
 from typing import Optional
 
 from sqlalchemy import func as sqlfunc, select, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
 from ..models import (
@@ -93,6 +105,14 @@ logger = logging.getLogger(__name__)
 DEDUP_WINDOW_MINUTES: int = 10
 FLOOD_WINDOW_SECONDS: int = 60
 FLOOD_MAX_MESSAGES: int = 3
+#: The longest the gate waits for any one lock, and for any one statement (the lock bound plus
+#: a margin, so a lock wait fails as the typed `55P03` first). The same bounds as
+#: `booking_authority`: a gate holds the recipient for milliseconds and calls nothing external,
+#: so reaching this means a stuck holder, never ordinary contention.
+GATE_LOCK_TIMEOUT_MS: int = 4000
+GATE_STATEMENT_TIMEOUT_MARGIN_MS: int = 6000
+#: lock_not_available, deadlock_detected, serialization_failure, query_canceled.
+_LOCK_FAILURE_SQLSTATES = frozenset({"55P03", "40P01", "40001", "57014"})
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -112,6 +132,23 @@ def _is_configured_operator(wa_id: str) -> bool:
     return config is not None and type(wa_id) is str and wa_id == config.destination
 
 
+class _RecipientLockNotHeld(Exception):
+    """FOR UPDATE matched no row: it succeeded and locked nothing."""
+
+
+@contextlib.contextmanager
+def _recipient_lock_failure_caught():
+    """Ends the enclosed block silently when the recipient lock, or a bounded wait under it,
+    failed. Every other exception — a lost connection, a bug — propagates unchanged."""
+    try:
+        yield
+    except _RecipientLockNotHeld:
+        pass
+    except DBAPIError as exc:
+        if getattr(exc.orig, "sqlstate", None) not in _LOCK_FAILURE_SQLSTATES:
+            raise
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 class GateOutcome(str, Enum):
@@ -120,6 +157,7 @@ class GateOutcome(str, Enum):
     BLOCKED_FLOOD = "blocked_flood"
     BLOCKED_KILL_SWITCH = "blocked_kill_switch"
     BLOCKED_UNAUTHORIZED_PATH = "blocked_unauthorized_path"
+    BLOCKED_RECIPIENT_LOCK = "blocked_recipient_lock"
 
 
 @dataclass
@@ -204,6 +242,7 @@ class OutboundSafetyGate:
           GateOutcome.BLOCKED_DUPLICATE → do NOT call Meta; durable audit written
           GateOutcome.BLOCKED_FLOOD     → do NOT call Meta; durable audit + needs_human written
           GateOutcome.BLOCKED_KILL_SWITCH → same; audit in separate session
+          GateOutcome.BLOCKED_RECIPIENT_LOCK → do NOT call Meta; nothing claimed, audit written
         """
         # SB2A-R2: nothing may leave the process from inside a booking callback, before the
         # booking transaction has committed. Outside a callback this is a no-op.
@@ -245,7 +284,9 @@ class OutboundSafetyGate:
             return kill_result
 
         # ── 1-4. Remaining ops share ONE dedicated session (holds FOR UPDATE) ─
-        with self._gate_db() as gate_db:
+        # Every path through this block returns; only a lock failure gets past it, with the
+        # gate session already rolled back and closed.
+        with _recipient_lock_failure_caught(), self._gate_db() as gate_db:
 
             # 1. Acquire recipient lock
             self._acquire_recipient_lock(gate_db, wa_id=wa_id, now=now)
@@ -305,6 +346,11 @@ class OutboundSafetyGate:
             )
             return GateResult(outcome=GateOutcome.ALLOWED, message_id=pending_id)
 
+        return self._refuse_without_lock(
+            wa_id=wa_id, thread_id=thread_id, text=text, fp=fp, message_type=message_type,
+            now=now, path_id=path_id, deployment_id=deployment_id,
+        )
+
     # ── Post-send status updates ──────────────────────────────────────────────
 
     def mark_sent(self, message_id: int, wa_message_id: Optional[str] = None) -> None:
@@ -362,11 +408,15 @@ class OutboundSafetyGate:
 
         Postgres: acquires a row-level lock that serialises concurrent automated
         sends.  The lock is held until db.commit() is called (end of the main
-        gate attempt transaction).
+        gate attempt transaction).  Every wait is bounded and any failure to hold
+        the lock raises: see the module docstring.
 
         SQLite: FOR UPDATE is not supported; the SAVEPOINT is rolled back silently
         so single-threaded offline tests continue without modification.
         """
+        postgres = db.get_bind().dialect.name == "postgresql"
+        if postgres:
+            self._bound_lock_waits(db)
         try:
             db.execute(
                 text(
@@ -376,17 +426,77 @@ class OutboundSafetyGate:
                 {"wa_id": wa_id, "now": now},
             )
         except Exception:
+            if postgres:
+                raise
             return  # table not available (migration not applied)
 
         nested = db.begin_nested()
         try:
-            db.execute(
+            held = db.execute(
                 text("SELECT id FROM whatsapp_recipient_locks WHERE wa_id = :wa_id FOR UPDATE"),
                 {"wa_id": wa_id},
-            )
+            ).first()
             nested.commit()
         except Exception:
             nested.rollback()  # SQLite: FOR UPDATE not supported — graceful no-op
+            if postgres:
+                raise
+            return
+        if postgres and held is None:
+            raise _RecipientLockNotHeld(wa_id)
+
+    @staticmethod
+    def _bound_lock_waits(db: Session) -> None:
+        """`SET LOCAL`: for this gate transaction only, never a caller or a pooled connection."""
+        db.execute(text(f"SET LOCAL lock_timeout = {int(GATE_LOCK_TIMEOUT_MS)}"))
+        db.execute(text("SET LOCAL statement_timeout = "
+                        f"{int(GATE_LOCK_TIMEOUT_MS + GATE_STATEMENT_TIMEOUT_MARGIN_MS)}"))
+
+    def _refuse_without_lock(
+        self,
+        wa_id: str,
+        thread_id: int,
+        text: str,
+        fp: str,
+        message_type: str,
+        now: datetime,
+        path_id: Optional[str],
+        deployment_id: Optional[str],
+    ) -> GateResult:
+        """The attempt ends here: nothing claimed, nothing sent. The audit row is best effort
+        under the same bound, because the refusal must never become another unbounded wait."""
+        reason = (f"RECIPIENT_LOCK: not held within {GATE_LOCK_TIMEOUT_MS}ms for "
+                  f"wa_id='...{wa_id[-4:]}' (thread_id={thread_id})")
+        blocked_id: Optional[int] = None
+        with _recipient_lock_failure_caught(), self._gate_db() as _audit:
+            self._bound_lock_waits(_audit)
+            _blocked = WhatsAppMessage(
+                thread_id=thread_id,
+                direction="out",
+                status="blocked",
+                timestamp=now,
+                created_at=now,
+                message_type=message_type,
+                text=text,
+                automated=True,
+                content_fingerprint=fp,
+                blocked_reason=reason,
+                path_id=path_id,
+                deployment_id=deployment_id,
+            )
+            _audit.add(_blocked)
+            _audit.flush()
+            blocked_id = _blocked.id
+            _audit.commit()
+        logger.warning(
+            "OUTBOUND_GATE_RECIPIENT_LOCK wa_id=...%s thread_id=%s fp=%.8s blocked_id=%s",
+            wa_id[-4:], thread_id, fp, blocked_id,
+        )
+        return GateResult(
+            outcome=GateOutcome.BLOCKED_RECIPIENT_LOCK,
+            message_id=blocked_id,
+            blocked_reason=reason,
+        )
 
     def _check_authorized_path(
         self,

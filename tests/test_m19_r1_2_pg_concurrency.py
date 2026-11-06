@@ -49,12 +49,16 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
 from app.models import WhatsAppMessage, WhatsAppOutboundDedup
+from app.services.outbound_path_registry import OutboundPathId
 from app.services.outbound_safety_gate import (
     FLOOD_MAX_MESSAGES,
     GateOutcome,
     OutboundSafetyGate,
 )
 
+# Every gate attempt names its authorized path (M21.3): without one the gate refuses at step
+# -1, before the recipient lock, and these suites would prove nothing about the lock.
+_PATH = OutboundPathId.CE_TEXT.value
 _DB_URL = os.environ.get("DATABASE_URL", "")
 _POSTGRES = "postgresql" in _DB_URL
 
@@ -150,6 +154,7 @@ def _gate_worker(wa_id, thread_id, text_msg, message_type, db_url, barrier, resu
         result = gate.attempt(
             wa_id=wa_id, thread_id=thread_id, text=text_msg,
             message_type=message_type, now=_NOW,
+            path_id=_PATH,
         )
         result_queue.put({
             "outcome": result.outcome.value,
@@ -454,6 +459,7 @@ class TestPgConcurrencyDistinctBurst(unittest.TestCase):
                 thread_id=self.thread_id,
                 text="Un quinto mensaje diferente que no debería pasar.",
                 now=_NOW,
+                path_id=_PATH,
             )
             self.assertEqual(
                 fifth.outcome, GateOutcome.BLOCKED_FLOOD,

@@ -24,6 +24,9 @@ How each guarantee is made:
   or Meta's documented rejection — `meta_rejection_is_definite`). Anything uncertain — a
   timeout, a 5xx, a success without id, a sender that died holding its lease — is HELD and
   never repeated automatically, so the operator is never told twice.
+* **A retry keeps its recipient.** The first attempt's destination is the notice's recipient
+  decision (`destination_hash`). A retry to any other number — the configuration changed while
+  it waited — is HELD (`RETRY_DESTINATION_CHANGED`), and the recorded decision is kept.
 * **Visible when it cannot be sent.** FAILED (two definite failures) and HELD (not
   configured, no summary, destination refused, uncertain) are terminal and are listed as
   `OPERATOR_NOTIFICATION_REQUIRED` on `/api/ops/booking-attention`.
@@ -87,6 +90,8 @@ _WA_ME_DIGITS = re.compile(r"[1-9][0-9]{7,14}")
 CUSTOMER_WA_ID_MALFORMED = "CUSTOMER_WA_ID_MALFORMED"
 #: The booking no longer occupies the agenda (cancelled or moved off it): never announced.
 BOOKING_NOT_OCCUPYING = "BOOKING_NOT_OCCUPYING"
+#: A retry would reach a different number than its first attempt: never sent, never redirected.
+RETRY_DESTINATION_CHANGED = "RETRY_DESTINATION_CHANGED"
 _TEMPLATE_NAME = re.compile(r"[a-z0-9_]{1,128}")
 _LANGUAGE = re.compile(r"[a-z]{2,3}(_[A-Z]{2})?")
 _PARAM_MAX = 120
@@ -320,6 +325,8 @@ class Claim:
     attempt: int
     identity: str
     booking_command_id: int
+    #: The recipient decision of an earlier attempt, if there was one.
+    destination_hash: Optional[str] = None
 
 
 def claim_next(db: Session, *, now: Optional[datetime] = None) -> Optional[Claim]:
@@ -341,11 +348,12 @@ def claim_next(db: Session, *, now: Optional[datetime] = None) -> Optional[Claim
                         updated_at=now))
         if res.rowcount != 1:
             continue                                 # another sender took it
-        row = db.execute(select(N.attempts, N.identity, N.booking_command_id)
+        row = db.execute(select(N.attempts, N.identity, N.booking_command_id, N.destination_hash)
                          .where(N.id == nid)).one()
         db.rollback()
         return Claim(notification_id=int(nid), token=token, attempt=int(row.attempts),
-                     identity=row.identity, booking_command_id=int(row.booking_command_id))
+                     identity=row.identity, booking_command_id=int(row.booking_command_id),
+                     destination_hash=row.destination_hash)
     return None
 
 
@@ -378,7 +386,7 @@ def record(db: Session, claim: Claim, outcome: Outcome, config: Optional[Operato
         values = dict(status="FAILED", last_error=outcome.error, next_attempt_at=None)
     else:
         values = dict(status="HELD", last_error=outcome.error, next_attempt_at=None)
-    if config is not None:
+    if config is not None and outcome.error != RETRY_DESTINATION_CHANGED:
         values.update(destination_hash=_hash16(config.destination),
                       template_name=config.template_name, template_language=config.language)
     if outcome.outbound_message_id is not None:
@@ -429,6 +437,8 @@ def send_claimed(db: Session, claim: Claim, config: Optional[OperatorConfig]) ->
 
     if config is None:
         return Outcome(False, False, config_problem() or "NOT_CONFIGURED")
+    if claim.attempt > 1 and claim.destination_hash != _hash16(config.destination):
+        return Outcome(False, False, RETRY_DESTINATION_CHANGED)
     boundary = "before"
     gate = result = None
     try:
