@@ -49,7 +49,11 @@ logger = logging.getLogger(__name__)
 #: index on the canonical phone identity of `leads`), with the same deployment ordering.
 #: PRELAUNCH-MINIMUM-LAUNCH-R1 added `20261103_slot_recovery_job` (the recovery-job and
 #: attention-condition tables and `thread_revisions.seller_phone`), same ordering.
-EXPECTED_HEAD = "20261103_slot_recovery_job"
+#: ROLLBACK-COMPATIBILITY build (parent 198ed4d + this patch only): accepts the schema of the
+#: minimum-launch final candidate's head, so the 198ed4d application can run on it for rollback
+#: without a downgrade. It neither reads nor writes `revisions.kilometraje` / `.dominio`, which
+#: are additive, nullable and without default. Not the launch candidate. No other change.
+EXPECTED_HEAD = "20261104_vehicle_identity"
 
 
 class DeclaredSchemaMissing(RuntimeError):
