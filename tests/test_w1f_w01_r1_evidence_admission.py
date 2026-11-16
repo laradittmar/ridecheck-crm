@@ -1029,14 +1029,18 @@ class TestR1G_Placement(unittest.TestCase):
         In both the reply is byte-identical to the committed one."""
         text = "¿de qué consta la revisión? en flores"
         off, on = _both(text)
-        self.assertEqual(on.turn.sent, off.turn.sent)
+        # R6-C4B-R1: the reply is the canonical message, so it follows canonical state — with
+        # the locality admitted it no longer asks for the zone (it used to be the model's
+        # text, identical either way)
+        self.assertIn("zona", " ".join(off.turn.sent))
+        self.assertNotIn("zona", " ".join(on.turn.sent))
         self.assertTrue(on.turn.sent, "Layer D must still answer the FAQ")
         self.assertEqual(off.turn.thread_zone, (None, None))
         self.assertEqual(on.turn.thread_zone, ("CABA", "Flores"))
         self.assertEqual(on.records, (), "no interpretation was offered on this turn")
 
         off2, on2 = _both(text, evidence=_evidence(_loc("Flores")))
-        self.assertEqual(on2.turn.sent, off2.turn.sent)
+        self.assertNotIn("zona", " ".join(on2.turn.sent))     # R6-C4B-R1 (see above)
         self.assertEqual(on2.turn.thread_zone, ("CABA", "Flores"))
         record = on2.record_for()
         self.assertEqual(record.outcome, ReconciliationOutcome.ACCEPT.value)

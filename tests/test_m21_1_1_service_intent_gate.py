@@ -1342,8 +1342,9 @@ class TestFAQMutationGuard(unittest.TestCase):
         )
         _assert_handled(self, result, "replied")
 
-        # Only the reply is sent
-        self.assertIn("una hora", eng._send_text_to_wa.call_args[0][1])
+        # R6-C4B-R1: an interpreter-invented FAQ fact (a duration RideCheck has no canonical
+        # answer for) is never delivered; only canonical text is sent
+        self.assertNotIn("una hora", str(eng._send_text_to_wa.call_args[0][1]))
 
         # Mutations are ignored
         self.assertEqual(eng._apply_candidate.call_count, 0)

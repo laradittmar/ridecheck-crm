@@ -92,7 +92,28 @@ from ..services.vehicle_catalog import (
     VehicleMatch, lookup_vehicle, fuzzy_lookup_vehicle, FuzzyLookupResult,
     _contextual_numeric_model_lookup, extract_model_del_year,
 )
-from ..services.response_validator import CanonicalFacts, validate_response
+from ..services.response_validator import business_today as _rv_business_today
+from ..services.response_validator import canonical_date as _rv_canonical_date
+from ..services.response_validator import stated_day_is as _rv_stated_day_is
+from ..services.response_validator import stated_times_of as _rv_stated_times_of
+from ..services.response_validator import safe_failure_text as _rv_safe_failure_text
+from ..services.transactional_boundary import (AI_SCHEDULE_FIELDS as _TB_AI_SCHEDULE_FIELDS,
+                                               TransactionalRoute,
+                                               classify_route as _tb_classify_route,
+                                               normalized as _tb_normalized)
+from ..services.response_validator import select_validation_fallback as _rv_select_fallback
+from ..services import verified_generation as _vg
+from ..services.verified_generation import (GenerationContext as _VgContext,
+                                            is_verified as _vg_is_verified)
+from ..services.response_validator import (ApprovedTemplateId, ApprovedTemplateText,
+                                            CanonicalFacts, ComposedText, DomainClaim,
+                                            QuestionIntent, ResponseProvenance,
+                                            StructuredClaim, composed_text,
+                                            approved_text_if_exact, safe_failure_text,
+                                            template_tag_of,
+                                            validate_envelope, validate_response)
+from ..services.reply_claim_shape import (classify_vehicle_mention,
+                                          outbound_vehicle_claim)
 from ..services.field_evidence import (
     resolve_field_evidence,
     INSP_ASSEMBLED_ACCESSIBLE,
@@ -126,6 +147,10 @@ STAGE_QUOTED = "QUOTED"
 STAGE_SCHEDULING = "SCHEDULING"
 STAGE_FLOW_SENT = "FLOW_SENT"
 STAGE_BOOKED = "BOOKED"
+#: R6-C2. ThreadRevision statuses that are a COMMITTED appointment, READ by
+#: `_committed_booking_slot` (the only day/time a confirmed booking may restate). A reader's
+#: constant, kept at module level: no function body here names a booked status it could write.
+_COMMITTED_REVISION_STATUSES = frozenset({"booked", "completed"})
 STAGE_HUMAN = "HUMAN_REQUIRED"
 
 # L4.7W5-F7B: the canonical set lives in claim_projection, with the acceptance producer
@@ -253,7 +278,13 @@ _FALLBACK_WARM_HANDOFF = (
 # form completion.  Distinct from _FALLBACK_WARM_HANDOFF which follows an
 # actual Flow submission.  Used as fallback when WHATSAPP_FLOW_ID (CLIENT DATA
 # FLOW) is not configured.
-_MOTORCYCLE_HANDOFF_REPLY = (
+#
+# R5-F1: an approved template with a validation contract (`response_validator.
+# _APPROVED_TEMPLATE_CONTRACTS`). The text must stay equal to the contract's; changing the
+# copy means changing the contract too, or the exemption is refused and the reply is
+# validated as if it were composed prose.
+_MOTORCYCLE_HANDOFF_REPLY = ApprovedTemplateText(
+    ApprovedTemplateId.MOTORCYCLE_HANDOFF_REPLY,
     "Las motos las revisamos de forma manual. "
     "Un asesor de Ridecheck se va a contactar con vos para continuar."
 )
@@ -265,7 +296,12 @@ _MOTORCYCLE_CONTACT_INTRO = (
 )
 
 # M21.2 Motorcycle contact-data Flow — reply after successful Flow submission.
-_MOTORCYCLE_ADVISOR_REPLY = (
+# R5-F1: "uno de nuestros asesores" was read as Fiat Uno by the reply vehicle resolver and
+# the handoff was replaced with the vehicle/zone question. The template now declares, by
+# contract, that it asserts no vehicle (`TemplateValidationPolicy.NO_VEHICLE_CLAIM`); every
+# other claim check still runs on it.
+_MOTORCYCLE_ADVISOR_REPLY = ApprovedTemplateText(
+    ApprovedTemplateId.MOTORCYCLE_ADVISOR_REPLY,
     "A la brevedad uno de nuestros asesores se estará contactando con vos."
 )
 
@@ -721,6 +757,18 @@ _GENERIC_HANDOFF_REPLY = (
 # ordinary car (review finding R2R-02). They are enumerated so a reason can never be
 # borrowed from an unrelated product area again.
 _HANDOFF_CATEGORY_UNRESOLVED = "vehicle_category_unresolved"
+_HANDOFF_POST_BOOKING_MESSAGE = "post_booking_message"            # R6-C4A
+_HANDOFF_TRANSACTIONAL_FACTS_INCOMPLETE = "transactional_facts_incomplete"  # R6-C4A
+#: R6-C4A deterministic transactional copy (no date, time, slot or price stated)
+_TX_SCHEDULING_ASK_TEXT = "¿Qué día y horario te viene mejor para la revisión?"
+#: R6-C4B-R1 canonical next action after shown availability: the Meta Booking Flow owns
+#: choosing, confirming and booking (it is dispatched by its own reviewed path)
+_TX_FLOW_CTA_TEXT = ("Decime cuál te queda mejor y te envío el formulario de reserva para "
+                     "elegirlo y confirmar el turno.")
+#: the engine's own bounded line when the reply model failed or its result was refused
+_DELAY_LINE = "Disculpá la demora, ya te ayudamos."
+_TX_FLOW_PENDING_TEXT = ("Te envié el formulario para confirmar el turno. "
+                         "Completalo con tus datos y terminamos la reserva.")
 _HANDOFF_CORRECTION_UNRESOLVED = "correction_unresolved_after_flow"
 _HANDOFF_RESPONSE_COMPOSITION_FAILED = "response_composition_failed"
 _HANDOFF_VEHICLE_FLOW_UNAVAILABLE = "vehicle_clarification_flow_unavailable"
@@ -2074,6 +2122,10 @@ _LOCATION_ASK_PROBES: frozenset[str] = frozenset({
 
 # Canonical location question appended by the deterministic finalizer.
 _CANONICAL_LOCATION_ASK = "\n\n¿En qué localidad o barrio está el auto?"
+#: R6-C4B-R1B: the deferred-interest copy when canonical state already holds a focus vehicle
+#: (the no-focus copy is `narrative_schema.DEFERRED_RESPONSE_ES`). No vehicle text is inserted.
+_DEFERRED_RESPONSE_FOCUS_ES = (
+    "Perfecto, pensalo tranquilo. Cuando quieras retomar la revisión de ese auto, escribinos.")
 
 
 def _reply_already_asks_location(reply: str) -> bool:
@@ -3353,6 +3405,13 @@ class ConversationEngine:
         self._burst_message_count = 1
         self._burst_earliest_inbound_db_id = None
         self._turn_faq_burst = None
+        self._turn_route = None                     # R6-C4A: this turn's transactional route
+        self._discarded_ai_reply = None             # R6-C4A: the discarded model body
+        self._vg_outcome = None                     # R6-C4B-R1: this turn's bridge outcome
+        self._vg_precheck_findings = []             # R6-C4B-R1: defence-in-depth refusals
+        self._vg_rejected_texts = []                # R6-C4B-R1: rejected bridges
+        self._turn_bridge = None                    # R6-C4B-R1: approved bridge, consumed once
+        self._turn_bridge_sent = None               # R6-C4B-R1: the bridge this turn delivered
         self._availability_authority_cache = None   # G3-4: one decision per turn
         self._canonical_turn_burst = None           # G3-5A: one burst per turn
         self._availability_authority_phases = {}    # G3-5B: one decision per phase
@@ -3427,6 +3486,9 @@ class ConversationEngine:
         self._turn_clarification_prevented_second = False
         self._turn_clarification_store_fault = None
         self._turn_clarification_burst = None
+        # R6-C4B-R1B: this turn is a terminal deferred-interest turn (set only by
+        # `_handle_deferred_interest`); reset every turn so it cannot leak.
+        self._turn_deferred_terminal = False
         self._turn_clar_semantic = None
         self._turn_clar_deterministic = None
         self._turn_clar_identity = None
@@ -4873,7 +4935,304 @@ class ConversationEngine:
         sent_id = self._send_text_to_wa(ctx, msg)
         return _out("replied", wa_message_id=sent_id)
 
+    # ── R6-C4A: the transactional renderers ──────────────────────────────
+
+    def _refuse_discarded_model_body(self, ctx, text):
+        """R6-C4A. The send-side tripwire behind `_apply_transactional_boundary`.
+
+        Declared deterministic values (`ComposedText`, `ApprovedTemplateText`) are the
+        engine's own words and pass. Any other value that contains the model body discarded
+        this turn is refused and replaced by the safe no-question line. Containment of the
+        discarded bytes (whitespace/case folded) — no phrase is recognised."""
+        # R6-C4B: a VerifiedGeneratedText passes by its exact type; every rejected generated
+        # message of this turn is covered exactly like the discarded interpreter body.
+        if type(text) in (ComposedText, ApprovedTemplateText) or _vg_is_verified(text):
+            return text
+        model_texts = [getattr(self, "_discarded_ai_reply", None)]
+        model_texts += list(getattr(self, "_vg_rejected_texts", None) or [])
+        folded = _tb_normalized(text)
+        for discarded in model_texts:
+            if not discarded:
+                continue
+            body = _tb_normalized(discarded)
+            if len(body) >= 12 and body in folded:
+                logger.error("R6-C4A DISCARDED MODEL BODY REACHED THE SEND BOUNDARY "
+                             "thread_id=%s route=%s — refused",
+                             getattr(getattr(ctx, "thread", None), "id", None),
+                             getattr(getattr(self, "_turn_route", None), "name", None))
+                return _rv_safe_failure_text()
+        return text
+
+    def _missing_quote_facts_reply(self, ctx, state) -> "ComposedText":
+        """The deterministic request for the fact that would unlock PricingService."""
+        focus_c = self._focus_candidate(ctx)
+        if state.home_zone_group and not state.home_zone_detail:
+            return composed_text(
+                f"¿En qué barrio de {state.home_zone_group} está el auto? "
+                "Así te paso el valor exacto.",
+                questions=(QuestionIntent.INSPECTION_LOCATION,))
+        if not (focus_c and focus_c.tipo_vehiculo):
+            return composed_text(
+                "Para avanzar necesito saber qué tipo de vehículo es. "
+                "¿Es un auto, SUV u otro tipo?",
+                questions=(QuestionIntent.VEHICLE_IDENTITY,))
+        if not (state.home_zone_group or state.home_zone_detail):
+            return composed_text(
+                "Para avanzar necesito saber en qué zona está el auto. "
+                "¿Me podés indicar el barrio?",
+                questions=(QuestionIntent.INSPECTION_LOCATION,))
+        return composed_text("Antes de avanzar necesito confirmar el precio. "
+                             "Falta información de la zona o el vehículo.")
+
+    def _render_transactional_reply(self, ctx, state, route, real_price_quote):
+        """R6-C4A. The canonical deterministic response for a transactional route.
+
+        Returns `(value, handoff_reason)`. Every value is a declared `ComposedText` built
+        from canonical facts only, and each fact it states is a StructuredClaim validated
+        against CanonicalFacts before sending:
+
+        * BOOKED — the committed revision's own date and start time (BOOKING claim), and a
+          person takes the thread over (a post-booking message is never answered by the
+          model; the handoff's own approved line follows in the same message). No
+          committed slot → handoff with the neutral line only.
+        * FLOW_PENDING — the outstanding Booking Flow, no date or time restated.
+        * QUOTATION — PricingService's quote (PRICE / VEHICLE / LOCATION claims), or the
+          request for the missing fact.
+        * SCHEDULING — before a quote, the missing-fact request (or the quote); after it,
+          the day/time question. No date, time or slot is stated: offering one is
+          ScheduleService's handlers' job, on the customer's own words.
+        """
+        if route is TransactionalRoute.BOOKED:
+            booked_date, booked_times = self._committed_booking_slot(state)
+            if booked_date is None or not booked_times:
+                return None, _HANDOFF_TRANSACTIONAL_FACTS_INCOMPLETE
+            human = _format_date_human(booked_date.isoformat(), date.today())
+            return composed_text(
+                f"Tu turno está confirmado para el {human} a las {booked_times[0]}.",
+                claims=[StructuredClaim(DomainClaim.BOOKING,
+                                        (booked_date.isoformat(), booked_times[0]))],
+            ), _HANDOFF_POST_BOOKING_MESSAGE
+        if route is TransactionalRoute.FLOW_PENDING:
+            return composed_text(_TX_FLOW_PENDING_TEXT), None
+        quote_ready = real_price_quote is not None and not state.needs_human
+        if state.last_stage == STAGE_SCHEDULING:
+            # The canonical stage already moved on THIS turn (a deterministic acceptance
+            # advanced QUOTED → SCHEDULING after the route was classified): the next step is
+            # the day/time question, not the quote or a missing-fact request.
+            return self._scheduling_next_step(ctx, state), None
+        if route is TransactionalRoute.QUOTATION or (
+                route is TransactionalRoute.SCHEDULING
+                and state.last_stage in (STAGE_QUALIFYING, None)):
+            if quote_ready:
+                _q_focus = self._focus_candidate(ctx)
+                _, _q_det = self._get_active_inspection_location(ctx, state)
+                self._answer_source = "PRICING_SERVICE"
+                return self._composed_quote_reply(
+                    (_q_focus.marca or "").strip() or None if _q_focus else None,
+                    (_q_focus.modelo or "").strip() or None if _q_focus else None,
+                    _q_det, real_price_quote.precio_total,
+                    _q_focus.anio if _q_focus else None), None
+            return self._missing_quote_facts_reply(ctx, state), None
+        return self._scheduling_next_step(ctx, state), None
+
+    def _scheduling_next_step(self, ctx, state) -> "ComposedText":
+        """R6-C4B-R1. The canonical SCHEDULING fact block + next action.
+
+        With a CURRENT ScheduleService evaluation (its exact date and slots, R6-C2 binding)
+        and no committed booking: that availability — stated as availability, never as a
+        reservation — and the Meta Booking Flow as the way to choose and confirm. Otherwise
+        the day/time question. The Booking Flow itself is dispatched only by its existing
+        reviewed path (`_dispatch_booking_flow_for_day` / `_send_booking_flow`), never here;
+        nothing here writes state, issues an offer or books."""
+        try:
+            facts = self._build_canonical_facts(ctx, state, compute_quote=False)
+        except Exception:
+            facts = None
+        day = getattr(facts, "availability_date", None)
+        slots = tuple(dict.fromkeys(str(x)[:5] for x in (getattr(facts, "offered_slots", ())
+                                                          or ())))
+        if (facts is None or day is None or not slots or getattr(facts, "booked_date", None)
+                or getattr(state, "flow_booking_token", None)):
+            return composed_text(_TX_SCHEDULING_ASK_TEXT)
+        human = _format_date_human(day.isoformat(), _rv_business_today())
+        shown = slots[0] if len(slots) == 1 else ", ".join(slots[:-1]) + f" y {slots[-1]}"
+        return self._composed_slot_offer(
+            f"Para el {human} hay disponibilidad a las {shown}. {_TX_FLOW_CTA_TEXT}",
+            day.isoformat(), slots)
+
+    def _send_transactional_reply(self, ctx, state, route, real_price_quote, *,
+                                  bridge_label=None):
+        """Render (and hand off, when the route needs it) and send ONE message.
+
+        R6-C4B-R1: with `bridge_label`, a claim-free natural bridge may precede the rendered
+        canonical value — never on a handoff, a booked or a Flow-pending render."""
+        self._answer_source = "TRANSACTIONAL_RENDERER"
+        value, handoff = self._render_transactional_reply(ctx, state, route, real_price_quote)
+        logger.info("R6-C4A transactional render route=%s handoff=%s thread_id=%s",
+                    route.name, handoff, getattr(getattr(ctx, "thread", None), "id", None))
+        if value is None:
+            return self._generic_human_handoff(ctx, state, reason=handoff)
+        if handoff is not None:
+            self._generic_human_handoff(ctx, state, reason=handoff, announce=False)
+        elif (bridge_label is not None
+              and route in (TransactionalRoute.QUOTATION, TransactionalRoute.SCHEDULING)):
+            return self._send_with_bridge(ctx, state, bridge_label, value)
+        sent_id = self._send_text_to_wa(ctx, value)
+        return _out("replied", wa_message_id=sent_id)
+
+    # ── R6-C4B-R1: claim-free natural bridge + canonical fact blocks ──────
+    #
+    # Owner decision: a customer message is (1) an AI-generated natural bridge, (2) the
+    # deterministic canonical fact block, (3) the deterministic canonical next action / Meta
+    # Booking Flow CTA. Segments 2 and 3 are the engine's existing renderers, unchanged in
+    # authority; segment 1 carries no operational claim and is optional — every failure sends
+    # the canonical message without it.
+
+    #: routes that may carry a bridge (BOOKED, FLOW_PENDING and needs_human never do)
+    _VG_ROUTES = ("QUALIFYING", "GENERAL_INFORMATION", "QUOTATION", "SCHEDULING")
+
+    @staticmethod
+    def _vg_route_label(route, role):
+        """The bridge route for this decision, or None for a deterministic-only route."""
+        if route is TransactionalRoute.NON_TRANSACTIONAL:
+            return ("GENERAL_INFORMATION"
+                    if getattr(role, "value", role) == ReplyRole.GENERAL_INFORMATION
+                    else "QUALIFYING")
+        if route in (TransactionalRoute.QUOTATION, TransactionalRoute.SCHEDULING):
+            return route.value
+        return None
+
+    @staticmethod
+    def _bridge_segment_for(value) -> str:
+        """The KIND of canonical segment a bridge introduces — read from the value's own
+        declaration, never from its words. Only the kind reaches the generator."""
+        decl = getattr(value, "declaration", None) or getattr(value, "_declaration", None)
+        kinds = {getattr(c, "kind", None) for c in (getattr(decl, "claims", None) or ())}
+        if DomainClaim.PRICE in kinds:
+            return "QUOTE"
+        if DomainClaim.AVAILABILITY in kinds:
+            return "AVAILABILITY"
+        if getattr(decl, "question_intents", None):
+            return "MISSING_DATA_QUESTION"
+        if str(value) == _TX_SCHEDULING_ASK_TEXT:
+            return "SCHEDULING_QUESTION"
+        return "GENERAL"
+
+    def _vg_context(self, ctx, label, segment):
+        turn = tuple(str(t) for t in (getattr(self, "_turn_burst_texts", None) or ()) if t)
+        history = []
+        for m in list(getattr(ctx, "db_messages", None) or [])[-6:]:
+            text = getattr(m, "text", None)
+            if text and getattr(m, "direction", None) != "out":
+                history.append(str(text))
+        return _VgContext(route=label, segment=segment,
+                          customer_messages=tuple(history) + turn,
+                          business_date=_rv_business_today())
+
+    def _approved_bridge(self, ctx, state, label, segment):
+        """R6-C4B-R1. Run the bridge pipeline; return an `ApprovedBridgeText` or None.
+
+        None — never an exception — whenever the route may not carry a bridge, generation or
+        verification failed, the verifier found any operational content or uncertainty
+        (twice), the bridge carries this turn's discarded interpreter body, or the unchanged
+        R6-C4 defence in depth refuses or edits the bridge on its own."""
+        thread_id = getattr(getattr(ctx, "thread", None), "id", None)
+        if label not in self._VG_ROUTES or state is None or getattr(state, "needs_human", False):
+            return None
+        try:
+            outcome = _vg.run_bridge_generation(
+                context=self._vg_context(ctx, label, segment),
+                generate=self._call_generator, verify=self._call_verifier,
+                budget=_vg.DEFAULT_BUDGET)
+        except Exception as exc:   # the pipeline is total; this is belt and braces
+            logger.warning("R6-C4B-R1 bridge pipeline error thread_id=%s: %s", thread_id,
+                           type(exc).__name__)
+            return None
+        self._vg_outcome = outcome
+        self._vg_rejected_texts = list(getattr(self, "_vg_rejected_texts", None) or []) + list(
+            outcome.rejected_bridges)
+        bridge = outcome.value
+        if bridge is not None:
+            discarded = getattr(self, "_discarded_ai_reply", None)
+            body = _tb_normalized(discarded) if discarded else ""
+            if len(body) >= 12 and body in _tb_normalized(bridge):
+                outcome.fallback_reason = _vg.FallbackReason.DISCARDED_BODY
+                bridge = None
+        if bridge is not None:
+            # Defence in depth (R6-C4, unchanged) on the bridge ALONE: it can only refuse.
+            try:
+                env = validate_envelope(
+                    bridge, self._build_canonical_facts(ctx, state, compute_quote=False),
+                    vehicle_resolver=self._reply_vehicle_claim_resolver,
+                    location_question=_reply_already_asks_location)
+                refused = env.fell_back or (" ".join(str(env.text).split())
+                                            != " ".join(str(bridge).split()))
+                self._vg_precheck_findings = [f for f in env.findings if not f.allowed]
+            except Exception:
+                refused = True
+            if refused:
+                outcome.fallback_reason = _vg.FallbackReason.DEFENCE_IN_DEPTH_REFUSED
+                self._vg_rejected_texts.append(str(bridge))
+                bridge = None
+        if bridge is None:
+            outcome.value = None
+        logger.info("R6-C4B-R1 bridge thread_id=%s %s", thread_id,
+                    json.dumps(outcome.summary(), sort_keys=True))
+        return bridge
+
+    def _canonical_qualification_value(self, ctx, state) -> "ComposedText":
+        """R6-C4B-R1. The deterministic canonical segment of a QUALIFYING / GENERAL_INFORMATION
+        turn: the request for exactly the facts canonical state lacks (the validation
+        fallback contract's own words and question intents), declared as composed text.
+        A canonical FAQ answer, when the burst asked one, is added by the plan's FAQ
+        producer — never by a model."""
+        facts = self._build_canonical_facts(ctx, state, compute_quote=False)
+        contract = _rv_select_fallback(facts)
+        return composed_text(contract.text,
+                             questions=tuple(getattr(contract, "question_intents", ()) or ()))
+
+    def _send_with_bridge(self, ctx, state, label, value, **out_kwargs):
+        """Send the canonical `value`, preceded by an approved bridge when one is obtained.
+        The bridge is attached at the send boundary AFTER the canonical text was validated
+        and composed (`_send_text_to_wa`), and is consumed by that one send only."""
+        self._turn_bridge = self._approved_bridge(ctx, state, label,
+                                                  self._bridge_segment_for(value))
+        try:
+            sent_id = self._send_text_to_wa(ctx, value)
+        finally:
+            self._turn_bridge = None
+        return _out("replied", wa_message_id=sent_id, **out_kwargs)
+
+    def _send_declared(self, ctx, value, **out_kwargs):
+        sent_id = self._send_text_to_wa(ctx, value)
+        return _out("replied", wa_message_id=sent_id, **out_kwargs)
+
     # ── Qualification fallback Flows ─────────────────────────────────────
+
+    def _composed_quote_reply(self, marca, modelo, location, precio_total, anio=None):
+        """R6. The approved quote copy, DECLARED by the code that read the canonical values.
+
+        The composer states what its words claim — the PricingService amount, the focus
+        vehicle and the inspection zone it was given — and `validate_envelope` checks each
+        against canonical state before the rendered text is even read.
+        """
+        text = self._build_quote_reply(marca, modelo, location, precio_total, anio)
+        claims = [StructuredClaim(DomainClaim.PRICE, (int(precio_total),))]
+        if marca and modelo:
+            claims.append(StructuredClaim(DomainClaim.VEHICLE, (marca, str(modelo))))
+        if location:
+            claims.append(StructuredClaim(DomainClaim.LOCATION, (location,)))
+        return composed_text(text, claims=claims)
+
+    @staticmethod
+    def _composed_slot_offer(text: str, day_iso, slots) -> "ComposedText":
+        """R6-C3 (R6C2RV-S01). A deterministic slot offer, DECLARED by the code that holds
+        ScheduleService's answer: one AVAILABILITY claim carrying the exact ISO date and the
+        exact "HH:MM" slots the words name. `validate_envelope` checks the declaration
+        directly against CanonicalFacts (evaluated date, evaluated slots); the rendered
+        Spanish is not the truth source, and it still passes the temporal analysis."""
+        value = (str(day_iso), *(str(x) for x in slots))
+        return composed_text(text, claims=[StructuredClaim(DomainClaim.AVAILABILITY, value)])
 
     @staticmethod
     def _build_quote_reply(
@@ -8339,7 +8698,7 @@ class ConversationEngine:
             self._answer_source = "PRICING_SERVICE"
             focus = self._focus_candidate(ctx)
             _, _disp_det = self._get_active_inspection_location(ctx, state)
-            reply = self._build_quote_reply(
+            reply = self._composed_quote_reply(
                 (focus.marca or "").strip() or None if focus else None,
                 (focus.modelo or "").strip() or None if focus else None,
                 _disp_det,
@@ -8818,7 +9177,7 @@ class ConversationEngine:
             if _requery_quote is not None:
                 _rq_focus = self._focus_candidate(ctx)
                 _, _rq_det = self._get_active_inspection_location(ctx, state)
-                _requery_reply = self._build_quote_reply(
+                _requery_reply = self._composed_quote_reply(
                     (_rq_focus.marca or "").strip() or None if _rq_focus else None,
                     (_rq_focus.modelo or "").strip() or None if _rq_focus else None,
                     _rq_det,
@@ -9535,7 +9894,7 @@ class ConversationEngine:
             logger.warning("M18 AI call failed thread_id=%s: %s", ctx.thread.id, exc)
             decision = {
                 "intent": "OTHER",
-                "reply": "Disculpá la demora, ya te ayudamos.",
+                "reply": composed_text(_DELAY_LINE),   # R6-C4B: engine words, declared
                 "needs_human": True,
                 "lead_flag": None,
                 "extracted": {},
@@ -9545,7 +9904,7 @@ class ConversationEngine:
         # M21.1.6 deferred-interest intercept (NU-6, NU-7): must run before any
         # commercial mutation. Only fires when no active vehicle overrides deferred signal.
         if _narr is not None and _narr.is_effectively_deferred():
-            return self._handle_deferred_interest(ctx, state), True
+            return self._handle_deferred_interest(ctx, state)
 
         # ── G3-7: where the mutation proposals come from ─────────────────────────
         # Demoted: typed evidence the reconciler admitted. Legacy: the reply model, exactly
@@ -9984,25 +10343,24 @@ class ConversationEngine:
                 # Price unavailable — prompt for the missing data that would unlock pricing.
                 focus_c = self._focus_candidate(ctx)
                 if state.home_zone_group and not state.home_zone_detail:
-                    decision["reply"] = (
+                    decision["reply"] = composed_text(
                         f"¿En qué barrio de {state.home_zone_group} está el auto? "
-                        "Así te paso el valor exacto."
-                    )
+                        "Así te paso el valor exacto.",
+                        questions=(QuestionIntent.INSPECTION_LOCATION,))
                 elif not (focus_c and focus_c.tipo_vehiculo):
-                    decision["reply"] = (
+                    decision["reply"] = composed_text(
                         "Para avanzar necesito saber qué tipo de vehículo es. "
-                        "¿Es un auto, SUV u otro tipo?"
-                    )
+                        "¿Es un auto, SUV u otro tipo?",
+                        questions=(QuestionIntent.VEHICLE_IDENTITY,))
                 elif not (state.home_zone_group or state.home_zone_detail):
-                    decision["reply"] = (
+                    decision["reply"] = composed_text(
                         "Para avanzar necesito saber en qué zona está el auto. "
-                        "¿Me podés indicar el barrio?"
-                    )
+                        "¿Me podés indicar el barrio?",
+                        questions=(QuestionIntent.INSPECTION_LOCATION,))
                 else:
-                    decision["reply"] = (
+                    decision["reply"] = composed_text(
                         "Antes de avanzar necesito confirmar el precio. "
-                        "Falta información de la zona o el vehículo."
-                    )
+                        "Falta información de la zona o el vehículo.")
             # When real_price_quote is not None: deterministic override below sends the
             # quote and commits PRESUPUESTO_ENVIADO / QUOTED. No reply set here.
 
@@ -10013,7 +10371,7 @@ class ConversationEngine:
                 if real_price_quote is not None and not state.needs_human:
                     _q_focus = self._focus_candidate(ctx)
                     _, _q_det = self._get_active_inspection_location(ctx, state)
-                    decision["reply"] = self._build_quote_reply(
+                    decision["reply"] = self._composed_quote_reply(
                         (_q_focus.marca or "").strip() or None if _q_focus else None,
                         (_q_focus.modelo or "").strip() or None if _q_focus else None,
                         _q_det,
@@ -10049,7 +10407,7 @@ class ConversationEngine:
             state.last_stage = STAGE_QUOTED
             _q_focus = self._focus_candidate(ctx)
             _, _q_det = self._get_active_inspection_location(ctx, state)
-            decision["reply"] = self._build_quote_reply(
+            decision["reply"] = self._composed_quote_reply(
                 (_q_focus.marca or "").strip() or None if _q_focus else None,
                 (_q_focus.modelo or "").strip() or None if _q_focus else None,
                 _q_det,
@@ -10084,24 +10442,39 @@ class ConversationEngine:
                 )
                 return self._handle_day_only_request(ctx, state, pday)
 
-        # If the AI proposed a time in its reply (e.g., "¿Te parece bien las 11:30?"),
-        # store it in state.preferred_time so the next "Sí" triggers block 4b.
-        if stage == STAGE_SCHEDULING and not state.needs_human and not state.flow_booking_token:
-            ai_reply_text = decision.get("reply") or ""
-            if ai_reply_text and state.active_requested_date and not state.preferred_time:
-                _, ai_proposed_time = _parse_scheduling_text([ai_reply_text], _business_today())
-                if ai_proposed_time:
-                    state.preferred_time = ai_proposed_time
-                    logger.info(
-                        "M20 stored AI-proposed time=%s in preferred_time thread_id=%s",
-                        ai_proposed_time, ctx.thread.id,
-                    )
+        # R6-C4A: the model may no longer propose a time into state. The block that stored
+        # an AI-proposed time (R6 / R6-C2 / R6-C4 gated it on parsing the model's own
+        # prose) is removed: on this SCHEDULING route the body is discarded at
+        # `_apply_transactional_boundary`, and no state is derived from it.
 
-        reply = str(decision.get("reply") or "")
-        # BUG-2 guard: if AI invented a price and we have no deterministic quote, scrub it.
-        reply = self._scrub_invented_price(reply, real_price_quote)
-        # Scrub AI-hallucinated booking confirmations in SCHEDULING/QUOTED stages.
-        reply = _scrub_scheduling_confirmation(reply, stage)
+        _raw_reply = decision.get("reply")
+        _route = getattr(self, "_turn_route", None)
+        if type(_raw_reply) is ComposedText:
+            # A declared deterministic value of the engine's own (the quote override, a
+            # missing-data question, the bounded delay line) keeps its declaration.
+            reply = _raw_reply
+            if (any(c.kind is DomainClaim.PRICE for c in _raw_reply.declaration.claims)
+                    and not state.needs_human):
+                # R6-C4B-R1: the first quote IS the canonical fact block (PricingService's
+                # composed quote, unchanged); the model may only add a claim-free bridge.
+                return self._send_with_bridge(ctx, state, "QUOTATION", _raw_reply)
+        elif not isinstance(_route, TransactionalRoute):
+            # Not a reply-model decision of this turn (no route was classified): nothing
+            # model-written exists to send.
+            reply = ""
+        else:
+            # R6-C4B-R1: the interpreter's body was discarded at the boundary on every route.
+            # The facts and the next action are canonical (the R6-C4A renderer, or the
+            # qualification request); the model may only add a claim-free bridge before them.
+            _label = self._vg_route_label(_route, ReplyRole.COMMERCIAL_TURN)
+            if _label is None or state.needs_human:
+                # BOOKED / FLOW_PENDING / handoff (owner decision): deterministic, no bridge.
+                return self._send_transactional_reply(ctx, state, _route, real_price_quote)
+            if _route.transactional:
+                return self._send_transactional_reply(ctx, state, _route, real_price_quote,
+                                                      bridge_label=_label)
+            return self._send_with_bridge(ctx, state, _label,
+                                          self._canonical_qualification_value(ctx, state))
         if not reply:
             # L4.7W5-NO-REPLY-ALERT-INTEGRITY. Nothing usable came back and nothing is
             # handed to the outbound path, so this is NOT a reply. Returning `replied`
@@ -12027,14 +12400,17 @@ class ConversationEngine:
         return self._zone_names_cache
 
     def _build_canonical_facts(
-        self, ctx: "_Context", state: "WhatsAppThreadState | None"
+        self, ctx: "_Context", state: "WhatsAppThreadState | None", *, compute_quote=True
     ) -> "CanonicalFacts":
-        """Snapshot of everything the outbound text is allowed to assert as fact."""
+        """Snapshot of everything the outbound text is allowed to assert as fact.
+
+        `compute_quote=False` (R6-C4B, a route that may not state a price) reads only a quote
+        already computed this turn and never calls PricingService."""
         focus = self._focus_candidate(ctx)
         zone_group, zone_detail = self._get_active_inspection_location(ctx, state)
 
         quote = getattr(self, "_turn_price_quote", None)
-        if quote is None and state is not None:
+        if quote is None and state is not None and compute_quote:
             try:
                 quote = self._compute_price_quote(ctx, state)
             except Exception:
@@ -12053,6 +12429,8 @@ class ConversationEngine:
                         offered = tuple(str(x) for x in parsed)
                         availability_checked = True
                         break
+        today = _rv_business_today()
+        availability_date = self._canonical_availability_date(state, offered, today)
 
         booking_confirmed = bool(
             state is not None
@@ -12061,6 +12439,8 @@ class ConversationEngine:
                 or state.last_stage == STAGE_BOOKED
             )
         )
+        booked_date, booked_times = (self._committed_booking_slot(state)
+                                     if booking_confirmed else (None, ()))
         acceptance_confirmed = bool(
             (ctx.lead is not None and getattr(ctx.lead, "flag", None) == "ACEPTADO")
             or (state is not None and state.last_stage in (
@@ -12105,9 +12485,89 @@ class ConversationEngine:
             previously_quoted=tuple(prior_amounts),
             availability_checked=availability_checked,
             offered_slots=offered,
+            availability_date=availability_date,
+            business_today=today,
             booking_confirmed=booking_confirmed,
+            booked_date=booked_date,
+            booked_times=booked_times,
             acceptance_confirmed=acceptance_confirmed,
         )
+
+    @staticmethod
+    def _canonical_availability_date(state, offered: "tuple[str, ...]",
+                                     today: "date") -> "date | None":
+        """R6-C2 (R6C1RV-S01). The calendar date the canonical slot set was evaluated for.
+
+        Every ScheduleService evaluation writes `active_requested_date` TOGETHER with
+        `last_offered_slots` (the full evaluated day); `last_visible_slots` is always a
+        subset of that same evaluation. So the date belongs to the slot set exactly when:
+
+        * `active_requested_date` is a strict ISO `YYYY-MM-DD` calendar date;
+        * `last_offered_slots` is a JSON list of that evaluation; and
+        * every canonical slot is in it (a visible list from another evaluation is not);
+        * the date is not before today on the business calendar (a past evaluation is stale).
+
+        Anything else — no date, no slots, a malformed or stale date, slots that are not that
+        evaluation's — returns None, and the validator then refuses any reply that names a
+        day for those slots. Assistant prose is never read here.
+        """
+        if state is None or not offered:
+            return None
+        evaluated = _rv_canonical_date(getattr(state, "active_requested_date", None))
+        if evaluated is None or evaluated < today:
+            return None
+        try:
+            evaluation = json.loads(getattr(state, "last_offered_slots", None) or "null")
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(evaluation, list):
+            return None
+        if not set(offered) <= {str(x) for x in evaluation}:
+            return None
+        return evaluated
+
+    @classmethod
+    def _ai_time_day_is_evaluated(cls, state, reply_text: str, evaluated,
+                                  proposed_time=None) -> bool:
+        """R6-C2 (R6C1RV-S01). May an AI-proposed time (already one of the `evaluated` slot
+        times) be held as `preferred_time`? Only when the reply names no day, or every day it
+        names is the canonical evaluated date of those slots (business timezone). A time the
+        model put on another day is not that slot, and a named day with no canonical date is
+        not supported.
+
+        R6-C4 (R6C3RV-P01): both answers come from the validator's ONE temporal analysis of
+        the complete reply — the same one that rules the outbound text — so every form it
+        cannot read is False here; and the time CE's own parser extracted must be one the
+        analysis reads ("diez y veinte" is 10:20, never a held 10:00)."""
+        today = _rv_business_today()
+        evaluated_date = cls._canonical_availability_date(state, tuple(evaluated), today)
+        if not _rv_stated_day_is(reply_text, evaluated_date, today):
+            return False
+        if proposed_time is None:
+            return True
+        return str(proposed_time) in _rv_stated_times_of(reply_text, today)
+
+    def _committed_booking_slot(self, state) -> "tuple[date | None, tuple[str, ...]]":
+        """R6-C2. The committed booking's OWN service date and start/end times, read from
+        the booked ThreadRevision (`current_revision_id`) — never `active_requested_date`
+        or the last requested time. `(None, ())` when there is no booked revision with a
+        date and time; a confirmed booking may then restate no day and no time."""
+        rev_id = getattr(state, "current_revision_id", None) if state is not None else None
+        if rev_id is None:
+            return (None, ())
+        try:
+            rev = self.db.get(ThreadRevision, int(rev_id))
+        except Exception:
+            return (None, ())
+        if rev is None or getattr(rev, "status", None) not in _COMMITTED_REVISION_STATUSES:
+            return (None, ())
+        sched_date, sched_time = rev.scheduled_date, rev.scheduled_time
+        if type(sched_date) is not date or not isinstance(sched_time, time):
+            return (None, ())
+        from .schedule import SERVICE_MINUTES
+        start = datetime.combine(sched_date, sched_time)
+        end = start + timedelta(minutes=SERVICE_MINUTES)
+        return (sched_date, (start.strftime("%H:%M"), end.strftime("%H:%M")))
 
     def _reply_vehicle_resolver(self, fragment: str):
         """Deterministic vehicle resolution used to read claims out of composed text."""
@@ -12119,34 +12579,57 @@ class ConversationEngine:
             return mdy[0]
         return _contextual_numeric_model_lookup(fragment)
 
+    def _reply_vehicle_claim_resolver(self, fragment: str):
+        """R6 (R5F1RV-01). The resolver the outbound validator uses: the same catalogue
+        chain, plus the construction verdict — a catalogue token is a vehicle CLAIM only in
+        a vehicle-identity construction (`reply_claim_shape`). A bare mention comes back
+        with `claim_shaped=False` and the validator records it as a diagnostic."""
+        return outbound_vehicle_claim(fragment, self._reply_vehicle_resolver)
+
     def _validate_outbound_text(
         self, text: str, ctx: "_Context", state: "WhatsAppThreadState | None"
     ) -> str:
         """COMPOSE → **VALIDATE** → OutboundSafetyGate → SEND.
 
-        A composed reply may assert only what canonical state proves.  Unsupported
-        sentences are rewritten or dropped; questions, FAQ answers and the required next
-        question always survive.  Never raises: a validator failure must not break a turn.
+        R6 (R5F1RV-01): the value is validated as a structured response contract
+        (`validate_envelope`): its provenance comes from its exact type, its declared claims
+        are checked against canonical state, and the rendered text passes the claim-shaped
+        defence in depth. The validated envelope is kept on `_last_outbound_envelope` so the
+        delivery side (`_record_delivered_questions`) acts on DECLARED question intent, never
+        on what the words happen to contain.
+
+        Never raises, and never fails OPEN: a validator failure sends a safe deterministic
+        line that asks nothing — the unvalidated value is never delivered (R6, the
+        exception-driven raw-text path is closed). The only exception is an exact approved
+        template equal to its registered text, which is owner-approved words by definition.
         """
+        self._last_outbound_envelope = None
         try:
             facts = self._build_canonical_facts(ctx, state)
-            result = validate_response(
-                text, facts, vehicle_resolver=self._reply_vehicle_resolver
-            )
-            for finding in result.findings:
+            env = validate_envelope(
+                text, facts, vehicle_resolver=self._reply_vehicle_claim_resolver,
+                location_question=_reply_already_asks_location)
+            for finding in env.findings:
                 logger.info(
                     "CE_RESPONSE_VALIDATION thread_id=%s claim=%s allowed=%s proof=%r "
                     "action=%s detail=%r",
                     getattr(ctx.thread, "id", None), finding.claim, finding.allowed,
                     finding.proof, finding.action, finding.detail,
                 )
-            return result.text
+            logger.info(
+                "CE_RESPONSE_CONTRACT thread_id=%s provenance=%s fallback=%s intents=%s",
+                getattr(ctx.thread, "id", None), env.provenance.name,
+                getattr(env.fallback_id, "name", None),
+                sorted(i.name for i in env.question_intents))
+            self._last_outbound_envelope = env
+            return env.text
         except Exception as exc:
             logger.warning(
-                "L4.7D response validation error thread_id=%s: %s",
-                getattr(ctx.thread, "id", None), exc,
+                "L4.7D response validation error thread_id=%s: %s — safe line sent",
+                getattr(ctx.thread, "id", None), type(exc).__name__,
             )
-            return text
+            approved = approved_text_if_exact(text)
+            return approved if approved is not None else safe_failure_text()
 
     # ── L4.6 Phase E — buffered inspection location ──────────────────────────
 
@@ -12739,9 +13222,31 @@ class ConversationEngine:
             logger.warning(
                 "M21.1.1 FAQ AI call failed thread_id=%s: %s", ctx.thread.id, exc
             )
-            decision = {"reply": "Disculpá la demora, ya te ayudamos."}
+            decision = {"reply": composed_text(_DELAY_LINE)}   # R6-C4B: engine words
 
-        reply = decision.get("reply") or ""
+        _route = getattr(self, "_turn_route", None)
+        _raw = decision.get("reply")
+        if type(_raw) is not ComposedText and isinstance(_route, TransactionalRoute):
+            # R6-C4B-R1: the interpreter's body was discarded at the boundary. A price or
+            # scheduling request is QUOTATION / SCHEDULING (the R6-C4A renderer), ordinary
+            # FAQ is GENERAL_INFORMATION (the qualification request, with the plan's
+            # canonical FAQ answer); booked or Flow-pending threads stay deterministic. The
+            # model may only add a claim-free bridge.
+            _label = self._vg_route_label(_route, ReplyRole.GENERAL_INFORMATION)
+            try:
+                _quote = (self._compute_price_quote(ctx, ctx.state) if _route.transactional
+                          else None)
+                if _route.transactional or _label is None:
+                    return self._send_transactional_reply(ctx, ctx.state, _route, _quote,
+                                                          bridge_label=_label)
+                return self._send_with_bridge(
+                    ctx, ctx.state, _label, self._canonical_qualification_value(ctx, ctx.state),
+                    answer_source="FAQ_RULE")
+            except OutboundBlockedError:
+                self.db.commit()
+                return _out("service_gate_blocked", detail="faq_kill_switch",
+                            answer_source="FAQ_RULE")
+        reply = _raw or ""
         if reply:
             try:
                 sent_id = self._send_text_to_wa(ctx, reply)
@@ -13072,7 +13577,7 @@ class ConversationEngine:
                 flow_id = (self.settings.whatsapp_flow_id or "").strip()
                 if not flow_id:
                     logger.error("M18 WHATSAPP_FLOW_ID not set — sending text fallback")
-                    fallback = ai_reply or "Perfecto, tenemos disponibilidad. ¡Ya te confirmo!"
+                    fallback = "Perfecto, tenemos disponibilidad. ¡Ya te confirmo!"  # R6-C4A: never model words
                     sent_id = self._send_text_to_wa(ctx, fallback)
                     return _out("replied", wa_message_id=sent_id)
 
@@ -13186,6 +13691,7 @@ class ConversationEngine:
                     f"no tenemos disponibilidad{reason_suffix}. "
                     f"Horarios disponibles: {slot_list}. ¿Alguno te viene bien?"
                 )
+                offer_claim = (preferred_day_iso, shown)
             else:
                 state.last_visible_slots = None
                 reasons = reason_phrase or (
@@ -13195,8 +13701,11 @@ class ConversationEngine:
                     f"Para {date_human} no hay horarios disponibles "
                     f"({reasons}). ¿Tenés otro día preferido?"
                 )
+                offer_claim = None
             if body_prefix:
                 msg = f"{body_prefix} {msg}"
+            if offer_claim is not None:
+                msg = self._composed_slot_offer(msg, *offer_claim)
             sent_id = self._send_text_to_wa(ctx, msg)
             return _out("replied", wa_message_id=sent_id)
 
@@ -13458,6 +13967,7 @@ class ConversationEngine:
 
         fallback_human = _format_date_human(fallback.day_iso, today)
         fallback_slots = fallback_eval["slots"]
+        offer_claim = None
         if fallback_slots:
             shown = fallback_slots[:12]
             if len(shown) >= 2:
@@ -13470,6 +13980,7 @@ class ConversationEngine:
             state.last_requested_time = fallback.time_str
             state.last_offered_slots = json.dumps(fallback_slots)
             state.last_visible_slots = json.dumps(shown)
+            offer_claim = (fallback.day_iso, shown)
         else:
             reason = fallback_eval["reason"]
             reason_suffix = f" ({reason})" if reason else ""
@@ -13486,7 +13997,10 @@ class ConversationEngine:
         state.preferred_day = None
         state.preferred_time = None
 
-        sent_id = self._send_text_to_wa(ctx, f"{primary_msg} {fallback_msg}")
+        reply = f"{primary_msg} {fallback_msg}"
+        if offer_claim is not None:
+            reply = self._composed_slot_offer(reply, *offer_claim)
+        sent_id = self._send_text_to_wa(ctx, reply)
         return _out("replied", wa_message_id=sent_id)
 
     # ── Period-based scheduling: "por la tarde" ───────────────────────────
@@ -13528,7 +14042,9 @@ class ConversationEngine:
                 slot_list = ", ".join(shown[:-1]) + f" o {shown[-1]}"
             else:
                 slot_list = shown[0]
-            msg = f"Sí, para {date_human} por la {period_label} tengo: {slot_list}. ¿Cuál te sirve?"
+            msg = self._composed_slot_offer(
+                f"Sí, para {date_human} por la {period_label} tengo: {slot_list}. ¿Cuál te sirve?",
+                str(state.active_requested_date), shown)
         else:
             state.last_visible_slots = None
             msg = (
@@ -13785,8 +14301,12 @@ class ConversationEngine:
             return flow_out
 
         # Flow could not open — fall back to naming the slots rather than going silent.
-        shown = ", ".join(found.slots[:5])
-        msg = f"{prefix} Tengo estos horarios: {shown}. ¿Cuál te sirve?"
+        # R6-C3: what the customer is shown is the visible subset of this evaluation.
+        shown_slots = list(found.slots[:5])
+        state.last_visible_slots = json.dumps(shown_slots)
+        shown = ", ".join(shown_slots)
+        msg = self._composed_slot_offer(f"{prefix} Tengo estos horarios: {shown}. ¿Cuál te sirve?",
+                                        found.day.isoformat(), shown_slots)
         sent_id = self._send_text_to_wa(ctx, msg)
         return _out("replied", wa_message_id=sent_id)
 
@@ -13866,15 +14386,15 @@ class ConversationEngine:
                 msg = f"Para {date_human} por la {period_label} tengo: {slot_list}. ¿A qué hora te viene bien?"
             else:
                 msg = f"Para {date_human} tengo disponible: {slot_list}. ¿A qué hora te viene bien?"
+            msg = self._composed_slot_offer(msg, day_iso, shown)
         elif period_label and all_slots:
             # Requested period has no slots — offer the other period.
             shown_all = all_slots[:12]
             state.last_visible_slots = json.dumps(shown_all)
             sl = ", ".join(shown_all[:-1]) + f" o {shown_all[-1]}" if len(shown_all) >= 2 else shown_all[0]
-            msg = (
+            msg = self._composed_slot_offer(
                 f"Para {date_human} no hay horarios por la {period_label}. "
-                f"Tengo disponible: {sl}. ¿Alguno te sirve?"
-            )
+                f"Tengo disponible: {sl}. ¿Alguno te sirve?", day_iso, shown_all)
         elif is_closed:
             state.last_visible_slots = None
             msg = (
@@ -14142,7 +14662,74 @@ class ConversationEngine:
             self._reply_contract = ReplyContract.RENDERER_ONLY
         else:
             self._reply_contract = ReplyContract.LEGACY_WITH_MUTATIONS
-        return decision, admission
+        return self._apply_transactional_boundary(decision, role=role, ctx=ctx), admission
+
+    def _transactional_route_for(self, role, ctx) -> "TransactionalRoute":
+        """R6-C4A. This decision's route, from its role and canonical state — never from
+        the model's words. Fail-closed: an error classifies the turn as SCHEDULING."""
+        try:
+            state = getattr(ctx, "state", None)
+            texts = list(getattr(self, "_turn_burst_texts", None) or [])
+            norm = self._norm_text(" ".join(texts)) if texts else ""
+            price_signal = bool(norm) and (self._detect_price_question(norm)
+                                           or bool(re.search(r"\bcostos?\b", norm)))
+            scheduling_signal = False
+            if texts:
+                _d, _t = _parse_scheduling_text(texts, _business_today())
+                scheduling_signal = bool(_d or _t or _detect_time_period(texts))
+                # A question about the business's OWN operating days ("¿trabajan los
+                # sábados?") is general-hours information, answered from
+                # `business_hours_for_weekday` by the existing hours authority — unless it
+                # also names a time. The existing STRONG partition decides; nothing is added.
+                if (scheduling_signal and not _t
+                        and getattr(role, "value", role) == ReplyRole.GENERAL_INFORMATION
+                        and any(m in norm for m in _HOURS_STRONG_MARKERS)):
+                    scheduling_signal = False
+            return _tb_classify_route(
+                role,
+                stage=getattr(state, "last_stage", None),
+                has_flow_token=bool(getattr(state, "flow_booking_token", None)),
+                has_committed_revision=getattr(state, "current_revision_id", None) is not None,
+                price_signal=price_signal, scheduling_signal=scheduling_signal)
+        except Exception as exc:
+            logger.warning("R6-C4A route classification failed thread_id=%s: %s — "
+                           "treated as transactional",
+                           getattr(getattr(ctx, "thread", None), "id", None),
+                           type(exc).__name__)
+            return TransactionalRoute.SCHEDULING
+
+    def _apply_transactional_boundary(self, decision: dict, *, role, ctx) -> dict:
+        """R6-C4A — the transactional provenance boundary, at the ONE route every reply
+        decision crosses.
+
+        1. Model-extracted scheduling fields are removed on every route: a day or time the
+           model read is never scheduling state (the deterministic reading of the customer's
+           words and ScheduleService are the only sources).
+        2. On a transactional route the model's customer-visible body is DISCARDED here,
+           before any consumer can read it. However it is worded — whether or not the
+           temporal analyser would accept it — it cannot reach the customer, be stored, or be
+           re-read: the engine renders the canonical deterministic response instead
+           (`_render_transactional_reply`). The discarded body is kept only for the
+           send-side tripwire in `_send_text_to_wa`.
+        """
+        extracted = decision.get("extracted")
+        if isinstance(extracted, dict):
+            for field in _TB_AI_SCHEDULE_FIELDS:
+                extracted.pop(field, None)
+        route = self._transactional_route_for(role, ctx)
+        self._turn_route = route
+        # R6-C4B: the interpreter's body is discarded on EVERY route, not only on the
+        # transactional ones. Customer-facing words come only from the verified-generation
+        # bridge pipeline (`_approved_bridge`, tone only), declared deterministic values, or
+        # a fallback.
+        body = decision.get("reply")
+        self._discarded_ai_reply = body if isinstance(body, str) and body.strip() else None
+        decision["reply"] = None
+        logger.info("R6-C4B interpreter body discarded route=%s role=%s thread_id=%s "
+                    "(%d chars)", route.name, role,
+                    getattr(getattr(ctx, "thread", None), "id", None),
+                    len(self._discarded_ai_reply or ""))
+        return decision
 
     def _reply_admission(self) -> str:
         """May this turn's reply-model output be consumed? Typed, and fail-closed.
@@ -14192,7 +14779,7 @@ class ConversationEngine:
                 str(getattr(self, "_reply_burst", None) or "absent")[:12])
         except Exception:
             pass
-        return {"intent": "OTHER", "reply": "Disculpá la demora, ya te ayudamos.",
+        return {"intent": "OTHER", "reply": composed_text(_DELAY_LINE),
                 "deferred_interest": False, "candidate": {"action": "none"},
                 "extracted": {}, "lead_flag": None, "needs_human": False}
 
@@ -14452,6 +15039,47 @@ Respondé SOLO con JSON válido:
 
         payload = json.loads(response_body)
         return payload["choices"][0]["message"]["content"]
+
+    # ── R6-C4B-R1: the bridge generator and the independent bridge verifier ──
+    #
+    # Two narrowly separated provider calls, each with its own prompt (built by
+    # `verified_generation`), its own counter and an explicit timeout. Neither feeds the
+    # reply-admission accounting of `_call_openai`, and neither result is ever state.
+
+    def _call_generator(self, messages: list[dict], *, timeout: float) -> str:
+        # `_ai_invoked` is already True: the generator only runs after the interpreter call
+        # (`_call_openai`, the one place that records it).
+        self._generator_calls = getattr(self, "_generator_calls", 0) + 1
+        return self._call_provider_json(messages, timeout=timeout, temperature=0.5,
+                                        max_tokens=80)
+
+    def _call_verifier(self, messages: list[dict], *, timeout: float) -> str:
+        self._verifier_calls = getattr(self, "_verifier_calls", 0) + 1
+        return self._call_provider_json(messages, timeout=timeout, temperature=0.0,
+                                        max_tokens=300)
+
+    def _call_provider_json(self, messages: list[dict], *, timeout: float, temperature: float,
+                            max_tokens: int) -> str:
+        # Both calls use the configured chat model (the verifier is context-independent of
+        # the generator, not model-independent — R6-C4B review N-1, disclosed).
+        api_key = (self.settings.openai_api_key or "").strip()
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY not configured")
+        model = self.settings.openai_chat_model or "gpt-4o-mini"
+        body = json.dumps({
+            "model": str(model).strip(), "messages": messages,
+            "response_format": {"type": "json_object"},
+            "temperature": temperature, "max_tokens": int(max_tokens),
+        }).encode("utf-8")
+        req = urlrequest.Request(
+            "https://api.openai.com/v1/chat/completions", data=body, method="POST",
+            headers={"Authorization": f"Bearer {api_key}",
+                     "Content-Type": "application/json"})
+        from .booking_authority import forbid_external_io
+        forbid_external_io("openai")
+        with urlrequest.urlopen(req, timeout=float(timeout)) as resp:
+            response_body = resp.read().decode("utf-8", errors="replace")
+        return json.loads(response_body)["choices"][0]["message"]["content"]
 
     # ── Context helpers ───────────────────────────────────────────────────
 
@@ -14879,8 +15507,18 @@ Respondé SOLO con JSON válido:
     def _handle_deferred_interest(
         self, ctx: "_Context", state: "WhatsAppThreadState"
     ) -> "ConversationHandleOut":
-        """NU-6: send approved deferred-interest copy; no commercial mutation."""
-        return self._send_service_boundary(ctx, DEFERRED_RESPONSE_ES)
+        """NU-6: send approved deferred-interest copy; no commercial mutation.
+
+        R6-C4B-R1B: a terminal turn. The copy depends on whether canonical state already
+        holds a focus vehicle (read-only lookup, never the customer's prose); nothing else
+        joins the message, and the turn is attributed to the deterministic rule it is.
+        """
+        self._turn_deferred_terminal = True
+        self._turn_renderer_source = RendererSource.DETERMINISTIC_TEMPLATE
+        self._turn_decision_authority = DecisionAuthority.DETERMINISTIC_RULE
+        has_focus = self._focus_candidate(ctx, repair=False) is not None
+        return self._send_service_boundary(
+            ctx, _DEFERRED_RESPONSE_FOCUS_ES if has_focus else DEFERRED_RESPONSE_ES)
 
     def _apply_narrative_interpretation(
         self,
@@ -15629,9 +16267,39 @@ Respondé SOLO con JSON válido:
         self._turn_answered_questions = tuple(closed)
         return closed
 
+    @staticmethod
+    def _evaluated_slot_times(state) -> set:
+        """R6. The slot times ScheduleService evaluated and the customer was shown — the ONLY
+        times an AI-proposed time may be held against (`last_visible_slots`/`last_offered_slots`)."""
+        out: set = set()
+        for src in (getattr(state, "last_visible_slots", None),
+                    getattr(state, "last_offered_slots", None)):
+            try:
+                parsed = json.loads(src) if src else []
+            except (json.JSONDecodeError, TypeError):
+                parsed = []
+            if isinstance(parsed, list):
+                out.update(str(x) for x in parsed)
+        return out
+
+    @staticmethod
+    def _primary_declares(plan, envelope, intent) -> bool:
+        """R6. Did the validated contract of the DELIVERED primary declare `intent`?
+
+        Structural only: the envelope's declared intents plus the plan's own inclusion
+        record (a primary suppressed by P2, or withheld for conflict, declared nothing that
+        was delivered). No text is read here."""
+        if envelope is None or not hasattr(envelope, "may_record"):
+            return False
+        if not envelope.may_record(intent):
+            return False
+        if plan is not None and not plan.included(PropositionId.PRIMARY_REPLY):
+            return False
+        return True
+
     def _record_delivered_questions(self, ctx: "_Context", *, text: str,
                                     outbound_message_id=None,
-                                    wa_message_id=None) -> tuple:
+                                    wa_message_id=None, envelope=None) -> tuple:
         """Record the question(s) the DELIVERED message actually asked. Returns the rows.
 
         Two provenances, because the system asks in two voices and the review's §8.1
@@ -15666,8 +16334,20 @@ Respondé SOLO con JSON válido:
         if plan is not None and plan.included(
                 PropositionId.clarification("inspection_location")):
             asked_by = OQ.OQ_ASKED_BY_DETERMINISTIC_TEMPLATE
+        elif self._primary_declares(plan, envelope, QuestionIntent.INSPECTION_LOCATION):
+            # R6 (R5F1RV-01, item E). The primary value's VALIDATED contract declares the
+            # question: a composer or fallback declared it, or the reply model's own
+            # surviving question asked it while canonical state genuinely lacks the place.
+            # Words alone — in particular a generic fallback that happens to contain a
+            # question — no longer change what the customer's next message is taken to be.
+            asked_by = (OQ.OQ_ASKED_BY_REPLY_MODEL
+                        if envelope.provenance in (ResponseProvenance.AI_COMPOSED,
+                                                   ResponseProvenance.VERIFIED_GENERATED)
+                        else OQ.OQ_ASKED_BY_DETERMINISTIC_TEMPLATE)
         elif _reply_already_asks_location(text or ""):
-            asked_by = OQ.OQ_ASKED_BY_REPLY_MODEL
+            self._decision_log(ctx, "outstanding_question_not_declared",
+                               provenance=getattr(getattr(envelope, "provenance", None),
+                                                  "name", None))
         if asked_by is None:
             return ()
         focus = self._focus_candidate(ctx)
@@ -16296,6 +16976,10 @@ Respondé SOLO con JSON válido:
         plan = getattr(self, "_live_plan", None)
         if plan is None:
             return
+        if getattr(self, "_turn_deferred_terminal", False):
+            # R6-C4B-R1B: the customer is postponing. The deferred copy is the whole turn —
+            # no clarification, missing-data, price, FAQ or vehicle proposition joins it.
+            return
         for name, method, required in self._RESPONSE_PRODUCERS:
             try:
                 getattr(self, method)(ctx, text)
@@ -16647,12 +17331,20 @@ Respondé SOLO con JSON válido:
     # ── 3. canonical vehicle ─────────────────────────────────────────────────────
 
     def _register_canonical_vehicle_proposition(self, ctx, text: str) -> None:
-        """Reconcile a vehicle the reply speaks of that canonical state does not hold.
+        """Reconcile a vehicle the CUSTOMER named that canonical state does not hold.
 
-        Replaces `_enforce_canonical_vehicle_claim`. The detection and the canonical
-        decision are unchanged, including arming `pending_fuzzy_catalog_key` — that is a
+        Replaces `_enforce_canonical_vehicle_claim`. Arming `pending_fuzzy_catalog_key` is a
         PRODUCER's decision about canonical state and it stays here, where it can be seen,
         rather than inside a renderer, which §14 requires to be pure.
+
+        R6 (R5F1RV-01, item D). The vehicle is taken from CUSTOMER EVIDENCE — this turn's
+        inbound text, read by the same deterministic catalogue chain — and never from the
+        assistant's rendered reply. The reply is consulted only as a trigger: the
+        reconciliation is said out loud when the delivered reply CLAIMS (a claim-shaped
+        construction, `reply_claim_shape`) that same vehicle. Prose that merely contains a
+        catalogue token ("¿Te parece buena idea…?", "uno de los dos autos") can neither arm
+        pending state nor append "¿Es un …?", and a vehicle only the reply names — one the
+        customer never gave — arms nothing.
         """
         state = getattr(ctx, "state", None)
         if state is None or getattr(state, "needs_human", False):
@@ -16663,15 +17355,25 @@ Respondé SOLO con JSON válido:
             return                                   # P6: canonical state holds it
         if not text:
             return
-        hit = lookup_vehicle(text)
+        inbound = getattr(self, "_turn_text", None) or ""
+        if not inbound:
+            return                                   # no customer evidence this turn
+        hit = lookup_vehicle(inbound)
         if hit is None:
-            _mdy = extract_model_del_year(text)
+            _mdy = extract_model_del_year(inbound)
             if _mdy is not None:
                 hit = _mdy[0]
         if hit is None:
-            hit = _contextual_numeric_model_lookup(text)
+            hit = _contextual_numeric_model_lookup(inbound)
         if hit is None:
-            return                                   # names no specific vehicle
+            return                                   # the customer named no vehicle
+        mention = self._reply_vehicle_claim_resolver(text)
+        claimed = bool(
+            mention is not None and mention.claim_shaped
+            and (_norm_lower(mention.marca), _norm_lower(str(mention.modelo)))
+            == (_norm_lower(hit.marca), _norm_lower(str(hit.modelo))))
+        if not claimed:
+            return                                   # the reply claims no such vehicle
         question = _FUZZY_CONFIRMATION_TEMPLATE.format(marca=hit.marca, modelo=hit.modelo)
         # The customer-facing wording is unchanged from the finalizer this replaces: the
         # reconciliation says out loud that the vehicle is not confirmed, then asks.
@@ -16713,9 +17415,18 @@ Respondé SOLO con JSON válido:
                 to_wa_id=ctx.contact.wa_id, thread_id=ctx.thread.id, text=text,
                 gate_outcome="BLOCKED_SINGLE_MESSAGE_POLICY",
             )
+        # R6-C4A tripwire: a model body discarded on a transactional route can never be
+        # carried out by an undeclared value. Exact text containment, not language: the
+        # check reads the discarded bytes, never Spanish.
+        text = self._refuse_discarded_model_body(ctx, text)
+        _primary_declared = type(text) in (ComposedText, ApprovedTemplateText)
         # L4.7D: canonical response validation — the last check on the handler's own prose,
         # before it is offered to the plan as a proposition.
         text = self._validate_outbound_text(text, ctx, ctx.state)
+        # R6: the validated contract of the PRIMARY value. Question recording reads its
+        # declared intents; `None` (no envelope) declares nothing.
+        envelope = getattr(self, "_last_outbound_envelope", None)
+        self._turn_outbound_envelope = envelope
 
         # ── G3-6: producers register, THEN the plan composes ─────────────────────────
         #
@@ -16725,6 +17436,17 @@ Respondé SOLO con JSON válido:
         # every claim in the final message is counted, attributed, deduplicated by identity
         # and suppressible by policy — and nothing appends a fact after composition.
         self._turn_clarification_burst = getattr(self, "_turn_faq_burst", None)
+        # R6-C4B-R1: segment 1. An approved claim-free bridge (consumed by this one send)
+        # joins the PRIMARY value only after that value was validated as canonical text,
+        # and BEFORE the plan composes — so nothing is added after composition (G3-6 /
+        # G3-7). Only a declared deterministic primary carries one; if the plan degrades or
+        # suppresses the primary, the bridge goes with it.
+        _bridge = getattr(self, "_turn_bridge", None)
+        self._turn_bridge = None
+        _bridged = None
+        if _bridge is not None and _primary_declared and (text or "").strip():
+            _bridged = _vg.compose_bridged(_bridge, text)
+            text = _bridged
         if plan is not None:
             plan.degraded_fallback = _DEGRADED_RESPONSE_FALLBACK
             self._register_response_propositions(ctx, text)
@@ -16747,6 +17469,11 @@ Respondé SOLO con JSON válido:
                 self._turn_dispatch_path = DispatchPath.TEXT
                 self._turn_dispatch_result = DispatchResult.NOT_ATTEMPTED
                 return None
+
+        if (type(_bridged) is _vg.ComposedBridgedMessage and (text or "").startswith(
+                _bridged.bridge + _vg.BRIDGE_SEPARATOR)):
+            self._turn_bridge_sent = _bridged.bridge
+            self._turn_renderer_source = RendererSource.COMPOSED_MIXED
 
         if not (text or "").strip():
             # G3-7F-R2. A producer-only turn passes an EMPTY primary and lets the plan supply
@@ -16808,7 +17535,7 @@ Respondé SOLO con JSON válido:
             self._record_delivered_questions(
                 ctx, text=text,
                 outbound_message_id=getattr(result, "message_id", None),
-                wa_message_id=wa_message_id)
+                wa_message_id=wa_message_id, envelope=envelope)
         except MetaSendError as exc:
             self._turn_dispatch_result = DispatchResult.FAILED
             logger.error("M18 send_text MetaSendError thread_id=%s: %s", ctx.thread.id, exc)

@@ -62,3 +62,20 @@ def pytest_collection_modifyitems(
         module_name = item.module.__name__ if hasattr(item, "module") else ""
         if any(m in module_name for m in _infra_modules):
             item.add_marker(marker)
+
+
+# ── R6-C4B: the shared generator/verifier adapter for historical model fakes ─────────────
+# Installed after collection — every test module has imported the engine with its own
+# stubbing by then — so this conftest never imports application code itself. See
+# `tests/_c4b_model_fakes.py`.
+def pytest_collection_finish(session) -> None:
+    import _c4b_model_fakes
+    _c4b_model_fakes.install()
+
+
+@pytest.fixture(autouse=True)
+def _c4b_replay_installed():
+    """Re-install after any test that imported the engine late (idempotent, no import)."""
+    import _c4b_model_fakes
+    _c4b_model_fakes.install()
+    yield

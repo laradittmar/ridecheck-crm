@@ -222,7 +222,10 @@ class P2_StoppedButBounded(unittest.TestCase):
                          ("legacy", self._LegacySettings())):
             with self.subTest(posture=name):
                 _eng, d = self._decide(st)
-                self.assertEqual(d.get("reply"), "texto para el cliente")
+                # R6-C4B: the presentation content survives the boundary in both postures as
+                # the interpreter body the tripwire holds; it is never customer text itself
+                self.assertIsNone(d.get("reply"))
+                self.assertEqual(_eng._discarded_ai_reply, "texto para el cliente")
 
     def test_g37h_p2_06_canonical_writers_never_call_the_reply_boundary(self):
         """The writers take input handed to them; they never fetch prose themselves."""

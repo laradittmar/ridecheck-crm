@@ -334,7 +334,10 @@ class B_BindingEnforcement(unittest.TestCase):
         e._call_openai = lambda messages, role=None: '{"reply": "x"}'
         decision, admission = e._reply_decision([], role="COMMERCIAL_TURN", ctx=None)
         self.assertEqual(admission, ReplyAdmission.NOT_DISPATCHED)
-        self.assertEqual(decision["reply"], "x")
+        # R6-C4B: the interpreter body is discarded on every route; it is held only for
+        # the send-side tripwire and never reaches a consumer.
+        self.assertIsNone(decision["reply"])
+        self.assertEqual(e._discarded_ai_reply, "x")
         self.assertEqual(e._reply_admission_state, ReplyAdmission.NOT_DISPATCHED)
 
     def test_g35e2_14_the_binding_is_taken_at_the_provider_boundary(self):

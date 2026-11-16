@@ -398,6 +398,10 @@ class F_PoliciesLive(unittest.TestCase):
             self.assertIn(PropositionId.clarification("inspection_location"), registered)
             for p in registered.values():
                 with self.subTest(item=p.proposition_id):
+                    if (p.proposition_id == PropositionId.clarification("inspection_location")
+                            and "¿En qué localidad" in t.sent[0]):
+                        # R6-C4B-R1: the canonical primary already asks it — exactly once
+                        continue
                     self.assertTrue(p.included)
             self.assertEqual(len(t.sent), 1, "P1 produced more than one message")
             self.assertIn(business_hours_summary_es(), t.sent[0])
@@ -474,10 +478,10 @@ class G_MultiProposition(unittest.TestCase):
     """Nine required cases. Each reports registered, included, suppressed and the text."""
 
     def run_case(self, primary, *, topics, slots=None, candidates=(), zone=(None, None),
-                 vehicle_known=True):
+                 vehicle_known=True, turn_text="burst"):
         e, ctx = producer_engine(topics=set(topics), slots=slots)
         ctx.candidates = list(candidates)
-        e._turn_text = "burst"
+        e._turn_text = turn_text
         e._decision_log = lambda *a, **k: None
         e._focus_candidate = lambda c: (SimpleNamespace(id=1, tipo_vehiculo="AUTO")
                                         if vehicle_known else None)
@@ -514,12 +518,22 @@ class G_MultiProposition(unittest.TestCase):
         self.assertNotIn(PropositionId.CANONICAL_VEHICLE, r.registered)
 
     def test_g36_41_case4_vehicle_correction_plus_safe_faq(self):
+        # R6 (R5F1RV-01, item D — owner decision): the vehicle the reconciliation arms comes
+        # from CUSTOMER evidence, so the customer's burst names it here. Until R6 the burst
+        # was a placeholder and the reply alone armed Peugeot 2008 — prose-derived state.
         r = self.run_case("Hacemos la revisión para un 2008 del 2014.",
-                          topics=("report",), zone=("CABA", "Palermo"))
+                          topics=("report",), zone=("CABA", "Palermo"),
+                          turn_text="Hola, para revisar un 2008 del 2014")
         self.assertIn(PropositionId.CANONICAL_VEHICLE, r.included)
         self.assertIn(PropositionId.faq("report"), r.included)
         self.assertIn("¿Es un Peugeot 2008?", r.text)
         self.assertIn("informe", r.text.lower())
+
+    def test_g36_41b_r6_a_vehicle_only_the_reply_names_arms_nothing(self):
+        r = self.run_case("Hacemos la revisión para un 2008 del 2014.",
+                          topics=("report",), zone=("CABA", "Palermo"))
+        self.assertNotIn(PropositionId.CANONICAL_VEHICLE, r.registered)
+        self.assertNotIn("¿Es un Peugeot 2008?", r.text)
 
     def test_g36_42_case5_wrong_hours_plus_a_legitimate_price(self):
         r = self.run_case("La revisión sale $85.000. Trabajamos sábados de 9 a 13 hs.",

@@ -552,19 +552,42 @@ class TestOutObservabilityFields(unittest.TestCase):
 
         _, thread, lead = _seed_contact_thread_lead(self.db)
         _add_state(self.db, thread.id)
-        _add_inbound_message(self.db, thread.id, "ai-source-msg", "¿Cuánto sale revisar un auto?")
+        # R6-C4A: a price question is a QUOTATION route (rendered by the transactional
+        # renderer, see OBS-04b); a non-transactional AI turn keeps the CE_AI default.
+        _add_inbound_message(self.db, thread.id, "ai-source-msg", "Hola, quiero revisar un auto")
 
         eng = _make_engine(self.db)
         with patch.object(eng, "_send_text_to_wa", return_value="out-ce-ai"):
-            result = eng.handle(_event(thread.id, "ai-source-msg", "¿Cuánto sale revisar un auto?"))
+            result = eng.handle(_event(thread.id, "ai-source-msg", "Hola, quiero revisar un auto"))
 
         self.assertTrue(result.ai_invoked, "OBS-04: ai_invoked must be True")
         # When AI is called and no explicit answer_source tag is set, CE_AI is the default
-        if result.answer_source is not None:
-            self.assertEqual(
-                result.answer_source, "CE_AI",
-                "OBS-04: AI-invoked reply without explicit tag must default to 'CE_AI'",
-            )
+        # R6-C4B: the interpreter body is discarded; the customer receives the generated
+        # reply only after the verifier + comparator authorised it, and the source says so.
+        self.assertEqual(result.answer_source, "VERIFIED_GENERATED",
+                         "OBS-04: an AI turn's reply is VERIFIED_GENERATED")
+
+    @patch("urllib.request.urlopen")
+    def test_obs_04b_price_question_is_rendered_by_the_transactional_renderer(self, mock_urlopen):
+        """OBS-04b (R6-C4A): a price question discards the AI body; the source says so."""
+        mock_urlopen.return_value.__enter__ = lambda s: s
+        mock_urlopen.return_value.__exit__ = MagicMock()
+        mock_urlopen.return_value.read = lambda: json.dumps({
+            "choices": [{"message": {"content": _AI_REPLY_QUALIFYING}}]
+        }).encode()
+
+        _, thread, lead = _seed_contact_thread_lead(self.db)
+        _add_state(self.db, thread.id)
+        _add_inbound_message(self.db, thread.id, "ai-price-msg", "¿Cuánto sale revisar un auto?")
+
+        eng = _make_engine(self.db)
+        with patch.object(eng, "_send_text_to_wa", return_value="out-tx"):
+            result = eng.handle(_event(thread.id, "ai-price-msg", "¿Cuánto sale revisar un auto?"))
+
+        self.assertTrue(result.ai_invoked, "OBS-04b: ai_invoked must be True")
+        # R6-C4B: a QUOTATION turn is generated and verified (no price is stated here, so
+        # nothing is required); TRANSACTIONAL_RENDERER is now only the fallback source.
+        self.assertEqual(result.answer_source, "VERIFIED_GENERATED")
 
     def test_error_01_internal_error_sets_reply_required_and_alert_eligible(self):
         """ERROR-01: _out('error', detail='internal_error') → reply_required=True, alert_eligible=True."""

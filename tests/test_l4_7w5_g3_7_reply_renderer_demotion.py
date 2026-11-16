@@ -411,7 +411,10 @@ class D_BoundaryContract(unittest.TestCase):
         for field in ConversationEngine._REPLY_MUTATION_FIELDS:
             with self.subTest(field=field):
                 self.assertNotIn(field, decision)
-        self.assertEqual(decision["reply"], "prosa")
+        # R6-C4B: the interpreter's body never leaves the boundary either — it is kept only
+        # for the send-side tripwire; the customer's words come from verified generation
+        self.assertIsNone(decision["reply"])
+        self.assertEqual(e._discarded_ai_reply, "prosa")
         self.assertEqual(e._reply_contract, ReplyContract.RENDERER_ONLY)
 
     def test_g37_30_legacy_keeps_them_and_says_so(self):

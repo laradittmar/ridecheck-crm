@@ -190,11 +190,22 @@ class TestPriceClaim(unittest.TestCase):
 class TestAvailabilityClaim(unittest.TestCase):
 
     def test_val_avail_01_offered_slot_allowed(self):
-        facts = _facts(availability_checked=True, offered_slots=("13:00",))
+        # R6-C2 (R6C1RV-S01): the slot is ScheduleService's answer for ONE evaluated date
+        # (Thursday 2026-09-03); the stated "jueves 03/09" is that date. Before R6-C2 this
+        # test had no canonical date at all and so pinned day-blind acceptance.
+        import datetime as _dt
+        facts = _facts(availability_checked=True, offered_slots=("13:00",),
+                       availability_date=_dt.date(2026, 9, 3),
+                       business_today=_dt.date(2026, 9, 1))
         text = "Para jueves 03/09 tengo 13:00."
         out = validate_response(text, facts, vehicle_resolver=_resolver)
         self.assertEqual(out.text, text)
         self.assertTrue(_claims(out, CLAIM_AVAILABILITY)[0].allowed)
+        # the same time on another day is not that slot
+        out = validate_response("Para viernes 04/09 tengo 13:00.", facts,
+                                vehicle_resolver=_resolver)
+        self.assertNotIn("13:00", out.text)
+        self.assertFalse(_claims(out, CLAIM_AVAILABILITY)[0].allowed)
 
     def test_val_avail_02_unevaluated_availability_blocked(self):
         facts = _facts()
@@ -415,10 +426,19 @@ class TestValidatorOnEverySendPath(unittest.TestCase):
         self.assertTrue(facts.booking_confirmed)
 
     def test_validation_failure_never_breaks_a_turn(self):
+        """A validator failure must not break the turn — and, since R6, must not deliver the
+        UNVALIDATED words either. FINAL-CANDIDATE-CONVERGENCE-R6 (owner decision) closes the
+        exception-driven raw-text path: the turn still completes, with the safe line that
+        asks nothing. (Until R6 this asserted the raw text was returned.)"""
+        from app.services.response_validator import safe_failure_text
         eng = _ce_engine()
         eng._build_canonical_facts = MagicMock(side_effect=RuntimeError("boom"))
         ctx = _ce_ctx(_ce_state())
-        self.assertEqual(eng._validate_outbound_text("hola", ctx, ctx.state), "hola")
+        out = eng._validate_outbound_text("Es un Fiat Uno y tu turno está confirmado.",
+                                          ctx, ctx.state)
+        self.assertEqual(out, safe_failure_text())
+        self.assertIs(type(out), str)
+        self.assertNotIn("?", out, "a failure must not ask the customer anything")
 
     def test_ce_response_validation_logging(self):
         eng = _ce_engine()

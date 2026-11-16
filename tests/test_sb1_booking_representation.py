@@ -336,9 +336,30 @@ _FROZEN_AT_PARENT = {
     "backend/app/services/scheduling_reconciler.py": "cb102122e1dab93ff1d182b32d35f031dc7d0040",
     "backend/app/services/field_reconciler.py": "5af92de42901e130c8f9e9b59d63082a14eda594",
     "backend/app/services/shadow_reconciler.py": "2024d335a0383054f3a0d3796ac1109101de3289",
-    "backend/app/services/claim_projection.py": "e61cd7ef60a422017e56e91a4028b7e7a7af9317",
+    # R6-C1 (R6IRV-H01, owner ruling 7): re-recorded — W1F-W-01 R2 outstanding question contract
+    # (e0e83c3, 2026-10-28) is the milestone authorized to change it; reviewed and merged before f16b1f3.
+    "backend/app/services/claim_projection.py": "a420ef32fc3d0f401e671ca8392401bfe000e507",
     "backend/app/services/response_composition.py": "aa60cbc06578efcbc69aa8d046374690674c0789",
-    "backend/app/services/response_validator.py": "7085211b96771b802c177789e8c4460e4525dfad",
+    # R6-C1 (R6IRV-H01, owner ruling 7): re-recorded — FINAL-CANDIDATE-CONVERGENCE-R6 (the structured
+    # response contract, R5F1RV-01..04) and its correction R6-C1 (R6IRV-S01 / S02 / P01 / T01) are the
+    # milestones authorized to change it; the base f16b1f3 blob was 7085211b96771b802c177789e8c4460e4525dfad.
+    # R6-C2 (R6C1RV-S01): re-recorded again — PRELAUNCH-MINIMUM-LAUNCH-FINAL-CANDIDATE-CONVERGENCE-R6-C2
+    # (the stated day/date bound to the canonical evaluated date) is the milestone authorized to change
+    # it; the R6-C1 blob was 5e5690eecc40954d98d08e360160b75c16230b0a.
+    # R6-C3 (R6C2RV-S01): re-recorded again — PRELAUNCH-MINIMUM-LAUNCH-FINAL-CANDIDATE-CONVERGENCE-R6-C3
+    # (one temporal analysis of the complete reply; structured ISO-date availability claims) is the
+    # milestone authorized to change it; the R6-C2 blob was 7f3c2a2821f956ec0f446aa547d7f58d0fd00505.
+    # R6-C4 (R6C3RV-S01 / S02 / P01): re-recorded again — PRELAUNCH-MINIMUM-LAUNCH-FINAL-CANDIDATE-
+    # CONVERGENCE-R6-C4 (default-deny temporal validation; negative scope; compositional Spanish
+    # times) is the milestone authorized to change it; the R6-C3 blob was
+    # e43ff98209e3e9c8a9b280949b36ab8d629c2258.
+    # R6-C4A (transactional provenance boundary): re-recorded again — the BOOKING claim now
+    # validates a declared date/time against the committed revision (R6-C4 blob 683c033e…).
+    # R6-C4B (verified generative output): re-recorded again — the VERIFIED_GENERATED provenance
+    # and the verification-fallback value type (R6-C4A blob 24843e33…).
+    # R6-C4B-R1 (claim-free bridge): re-recorded again — VERIFIED_GENERATED now labels an
+    # approved bridge, and the verification-fallback value type is removed (C4B blob d4421ab2…).
+    "backend/app/services/response_validator.py": "a1e40945b0c2c3633cf90054af32b2fe5cc2911d",
     "backend/app/services/pricing.py": "9aed0358cfba7b08a4082bd7b1ecebcc778e5b5a",
     "backend/app/services/schedule.py": "00487c9a46ee168ae12dc76667863f0fbb5f71ad",
     "backend/app/services/travel.py": "fc95b0550e486b55ddf2cbb2af19e6c6d104d11d",
@@ -347,8 +368,13 @@ _FROZEN_AT_PARENT = {
     "backend/app/services/outbound_guard.py": "db2e3766d540e1b858ddb31cdd68c031ed2c830b",
     "backend/app/services/scheduling_lexicon.py": "0df23923081484e221441a36ac36afde4a6bcfb3",
     "backend/app/services/acceptance_lexicon.py": "153e39d3975ad2bcdd29c06c43ff5fde9d3ddb7a",
-    "backend/app/routes/flow_data_exchange.py": "559871881a5ee5090fce8387a31bbb134baa941d",
-    "backend/app/routes/whatsapp.py": "b2913d5584db84b6e0f1c8613d3ff968e15449be",
+    # R6-C1 (R6IRV-H01, owner ruling 7): re-recorded — changed by the authorized booking/launch
+    # milestones G3-7R (9181966), Phase 4-R1 (70fbbc4), WILD1 / WILD1-R2 / WILD1-R3 (c26f980, b31020a,
+    # 6f20587), the Smart Booking recovery fix (198ed4d) and the launch merge (163b37e, 2026-11-06).
+    "backend/app/routes/flow_data_exchange.py": "4a2310c55aaed4fd10c572c99ac7b0d99e0d2188",
+    # R6-C1 (R6IRV-H01, owner ruling 7): re-recorded — changed by booking Phase 4 (06250ed,
+    # 2026-10-15) and W1F-W-01 R2 outstanding question contract (e0e83c3, 2026-10-28).
+    "backend/app/routes/whatsapp.py": "4e979d370c91e7bff945727c1e970b335f6234a4",
     "meta/flows/booking/PUBLISHED_28104222025943520_v7.3.json":
         "6981647ac8f14b32de85401191ae0b12a7a6f991",
 }

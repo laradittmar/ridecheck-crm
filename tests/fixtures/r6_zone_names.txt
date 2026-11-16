@@ -1,0 +1,212 @@
+# R6 test fixture: zone_group|zone_detail place names (public geography; no amounts).
+Sur|Coronel Brandsen
+Sur|La Plata
+Sur|Berisso
+Sur|Ensenada
+Oeste|Cañuelas
+Oeste|General Las Heras
+Oeste|Luján
+Oeste|Exaltación de la Cruz
+Norte|Zárate
+Norte|Campana
+Oeste|General Rodriguez
+Oeste|Marcos Paz
+Oeste|Merlo
+Sur|La Matanza Este
+Sur|Ezeiza
+Sur|Esteban Echeverría
+Sur|Presidente Perón
+Sur|Florencio Varela
+Sur|Berazategui
+Norte|Escobar
+Norte|Pilar
+Oeste|Moreno
+Sur|Lomas de Zamora
+Sur|Almirante Brown
+Sur|Quilmes
+Norte|Malvinas Argentinas
+Oeste|Hurlingham
+Oeste|Ituzaingó
+Oeste|Morón
+Oeste|La Matanza Oeste
+Sur|Lanús
+Sur|Avellaneda
+Norte|Tigre
+Oeste|San Martin
+Oeste|3 de Febrero
+Norte|San Fernando
+Norte|San Isidro
+Norte|Beccar
+Norte|Vicente Lopez
+CABA|Agronomía
+CABA|Almagro
+CABA|Balvanera
+CABA|Barracas
+CABA|Belgrano
+CABA|Boedo
+CABA|Caballito
+CABA|Chacarita
+CABA|Coghlan
+CABA|Colegiales
+CABA|Constitución
+CABA|Flores
+CABA|Floresta
+CABA|La Boca
+CABA|La Paternal
+CABA|Liniers
+CABA|Mataderos
+CABA|Monte Castro
+CABA|Monserrat
+CABA|Nueva Pompeya
+CABA|Núñez
+CABA|Palermo
+CABA|Parque Avellaneda
+CABA|Parque Chacabuco
+CABA|Parque Chas
+CABA|Parque Patricios
+CABA|Puerto Madero
+CABA|Recoleta
+CABA|Retiro
+CABA|Saavedra
+CABA|San Cristóbal
+CABA|San Nicolás
+CABA|San Telmo
+CABA|Vélez Sarsfield
+CABA|Versalles
+CABA|Villa Crespo
+CABA|Villa del Parque
+CABA|Villa Devoto
+CABA|Villa General Mitre
+CABA|Villa Lugano
+CABA|Villa Luro
+CABA|Villa Ortúzar
+CABA|Villa Pueyrredón
+CABA|Villa Real
+CABA|Villa Riachuelo
+CABA|Villa Santa Rita
+CABA|Villa Soldati
+CABA|Villa Urquiza
+Oeste|Lomas del Mirador
+Oeste|San Justo
+Oeste|Ramos Mejía
+Oeste|Villa Luzuriaga
+Oeste|Ciudad Evita
+Oeste|Tapiales
+Oeste|La Tablada
+Oeste|Isidro Casanova
+Oeste|Rafael Castillo
+Oeste|González Catán
+CABA|CABA
+Sur|Dock Sud
+Norte|Benavídez
+CABA|
+Norte|
+Oeste|
+Sur|
+CABA|Capital Federal
+CABA|Capital
+Norte|Acassuso
+Norte|Belén de Escobar
+Norte|Boulogne
+Norte|Boulogne Sur Mer
+Norte|Carapachay
+Norte|Del Viso
+Norte|Don Torcuato
+Norte|El Talar
+Norte|Florida
+Norte|Garín
+Norte|General Pacheco
+Norte|Ingeniero Maschwitz
+Norte|La Lucila
+Norte|Manuel Alberti
+Norte|Maquinista Savio
+Norte|Martínez
+Norte|Munro
+Norte|Nordelta
+Norte|Olivos
+Norte|Pacheco
+Norte|Presidente Derqui
+Norte|Ricardo Rojas
+Norte|Rincón de Milberg
+Norte|Santa Catalina
+Norte|Tortuguitas
+Norte|Victoria
+Norte|Villa Adelina
+Norte|Villa Martelli
+Norte|Villa Rosa
+Norte|Virreyes
+Oeste|Bella Vista
+Oeste|Caseros
+Oeste|Castelar
+Oeste|Ciudad Jardín
+Oeste|Ciudadela
+Oeste|Cuartel V
+Oeste|El Palomar
+Oeste|Francisco Álvarez
+Oeste|Grand Bourg
+Oeste|Gregorio de Laferrère
+Oeste|Haedo
+Oeste|José C. Paz
+Oeste|José León Suárez
+Oeste|La Reja
+Oeste|Libertad
+Oeste|Los Polvorines
+Oeste|Mariano Acosta
+Oeste|Martín Coronado
+Oeste|Muñiz
+Oeste|Pablo Nogués
+Oeste|Padua
+Oeste|Paso del Rey
+Oeste|Pontevedra
+Oeste|Sáenz Peña
+Oeste|San Andrés
+Oeste|San Antonio de Padua
+Oeste|San Miguel
+Oeste|Santos Lugares
+Oeste|Trujui
+Oeste|Villa Ballester
+Oeste|Villa Bosch
+Oeste|Villa Lynch
+Oeste|Villa Sarmiento
+Oeste|Villa Tesei
+Oeste|Villa Udaondo
+Oeste|William Morris
+Sur|Adrogué
+Sur|Banfield
+Sur|Bernal
+Sur|Bosques
+Sur|Burzaco
+Sur|Canning
+Sur|City Bell
+Sur|Claypole
+Sur|Don Bosco
+Sur|El Jagüel
+Sur|Ezpeleta
+Sur|Gerli
+Sur|Glew
+Sur|Gonnet
+Sur|Guernica
+Sur|Hudson
+Sur|José Mármol
+Sur|Llavallol
+Sur|Longchamps
+Sur|Los Hornos
+Sur|Luis Guillón
+Sur|Monte Chingolo
+Sur|Monte Grande
+Sur|Piñeyro
+Sur|Plátanos
+Sur|Rafael Calzada
+Sur|Ranelagh
+Sur|Remedios de Escalada
+Sur|Ringuelet
+Sur|San Francisco Solano
+Sur|Sarandí
+Sur|Temperley
+Sur|Tolosa
+Sur|Tristán Suárez
+Sur|Turdera
+Sur|Valentín Alsina
+Sur|Villa Dominico
+Sur|Villa Elisa
+Sur|Wilde

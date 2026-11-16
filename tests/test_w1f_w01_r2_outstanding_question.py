@@ -517,8 +517,10 @@ class TestR2B_Wild(unittest.TestCase):
         has no candidate at all — the location question is the model's own sentence."""
         r = self._run_wild(r1=True, r2=True)
         self.addCleanup(r["thread"].close)
-        self.assertIn("¿En qué zona está el auto?", " ".join(r["t1"].sent))
-        self.assertEqual([(OQ_KIND_INSPECTION_LOCATION, OQ_ASKED_BY_REPLY_MODEL,
+        # R6-C4B-R1: the model's sentence is no longer delivered; the location question is
+        # the canonical qualification request's own DECLARED intent
+        self.assertIn("en qué zona está", " ".join(r["t1"].sent))
+        self.assertEqual([(OQ_KIND_INSPECTION_LOCATION, OQ.OQ_ASKED_BY_DETERMINISTIC_TEMPLATE,
                            OQ_OUTSTANDING)], r["q_after_1"])
 
     def test_b02_turn_two_answers_it_and_the_greeting_is_not_sent(self):
@@ -674,7 +676,11 @@ class TestR2C_Delivery(unittest.TestCase):
         t = _Thread()
         self.addCleanup(t.close)
         t.turn("¿de qué consta la revisión?", payload=_NEUTRAL)
-        self.assertEqual([], t.questions())
+        # R6-C4B-R1: the canonical qualification request genuinely asks (vehicle and zone
+        # are missing) and records its DECLARED intent; nothing is ever recorded from model
+        # prose
+        for q in t.questions():
+            self.assertNotEqual(q.asked_by, OQ.OQ_ASKED_BY_REPLY_MODEL)
 
     def test_c04_the_deterministic_template_is_recorded_as_such(self):
         """`asked_by = DETERMINISTIC_TEMPLATE`, proved STRUCTURALLY from the plan's own

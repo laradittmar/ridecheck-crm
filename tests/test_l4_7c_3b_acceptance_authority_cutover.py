@@ -374,10 +374,21 @@ class TestJustificationAndValidator(unittest.TestCase):
         # …and once the state supports it, the same sentence passes. `acceptance_confirmed`
         # is derived from the canonical transition the authorizer now gates, so the
         # validator consumes authorized state rather than re-reading the conversation.
+        # R6-C2 (R6C1RV-S01): "el jueves" is a stated day, so the evaluation it rests on must be
+        # of a Thursday (2026-11-12, "today" Wednesday 2026-11-11). Before R6-C2 this assertion
+        # had no canonical date at all and so pinned day-blind acceptance.
+        import datetime as _dt
+        # R6-C3 (R6C2RV-S01): "a las 15" is now read as the time 15:00, so the evaluated slot
+        # is the normalised "15:00" ScheduleService writes (the former "jueves 15:00" was never
+        # a slot value and matched only because the hour was not read).
         accepted = CanonicalFacts(acceptance_confirmed=True, availability_checked=True,
-                                  offered_slots=("jueves 15:00",))
+                                  offered_slots=("15:00",),
+                                  availability_date=_dt.date(2026, 11, 12),
+                                  business_today=_dt.date(2026, 11, 11))
         self.assertEqual(validate_response("Tenemos disponibilidad el jueves a las 15.",
                                            accepted).blocked, [])
+        self.assertEqual([f.claim for f in validate_response(
+            "Tenemos disponibilidad el viernes a las 15.", accepted).blocked], ["AVAILABILITY"])
         self.assertIn("acceptance_confirmed", CE_SOURCE)
 
     def test_authorizer_still_writes_nothing(self):
