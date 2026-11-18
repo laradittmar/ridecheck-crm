@@ -242,7 +242,7 @@ class C_ModelCalls(unittest.TestCase):
     def test_g35e_18_the_semantic_attribution_is_unchanged(self):
         from app.services import semantic_interpreter as si
         from app.schemas import turn_evidence as te
-        self.assertEqual(si.PROMPT_VERSION, "understand/1.20")
+        self.assertEqual(si.PROMPT_VERSION, "understand/1.22")
         self.assertEqual(te.SCHEMA_VERSION, "turn-evidence/1.4")
 
     def test_g35e_19_a_reply_timeout_is_represented_truthfully(self):
@@ -315,8 +315,12 @@ class D_ResponsePlan(unittest.TestCase):
                                 evidence=None)
         try:
             kinds = [i.kind for i in plan.included_items]
-            self.assertEqual(kinds, [ResponseItemKind.TEXT, ResponseItemKind.FAQ_ANSWER],
-                             kinds)
+            # WILD1-C-R4 (R3RV-01): `evidence=None` makes the provider return ok=False — a
+            # FAILED reading — so the burst is retained as a pending question and its
+            # acknowledgement is one more canonical FAQ item, still in the ONE message.
+            self.assertEqual(kinds, [ResponseItemKind.TEXT, ResponseItemKind.FAQ_ANSWER,
+                                     ResponseItemKind.FAQ_ANSWER], kinds)
+            self.assertIn(ce._PENDING_QUESTION_ACK, t.sent[0])
             self.assertEqual(plan.transport_multiplicity,
                              TransportMultiplicity.SINGLE_MESSAGE)
             self.assertEqual(len(t.sent), 1, "two propositions became two messages")

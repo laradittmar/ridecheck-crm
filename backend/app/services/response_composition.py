@@ -394,7 +394,17 @@ class LiveResponsePlan:
         if not parts:
             return ""
         head, *rest = parts
-        return head if not rest else (head.rstrip() + "\n\n" + " ".join(rest))
+        # WILD1-C: a multi-line canonical block (the price breakdown) keeps its own lines;
+        # running the next answer onto its "Total:" line would misread as part of it. Only
+        # then are the secondary parts separated by a blank line — single-line compositions
+        # are byte-identical to before.
+        if not rest:
+            return head
+        if any("\n" in r.strip() for r in rest):
+            tail = "\n\n".join(r.strip() for r in rest)
+        else:
+            tail = " ".join(rest)
+        return head.rstrip() + "\n\n" + tail
 
     @property
     def mixed_renderers(self) -> bool:

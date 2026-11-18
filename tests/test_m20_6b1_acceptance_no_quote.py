@@ -353,7 +353,7 @@ class TestInitialQuoteUnchanged(unittest.TestCase):
 
     @patch("urllib.request.urlopen")
     def test_5_quote_reply_contains_price_and_stage_is_quoted(self, mock_urlopen):
-        """Initial quote: approved copy with $140.000, no viáticos breakdown; stage=QUOTED."""
+        """Initial quote: approved copy with the $140.000 breakdown (WILD1-C); stage=QUOTED."""
         mock_urlopen.return_value = _openai_quote_response()
 
         result = self.eng.handle(_make_event(
@@ -386,8 +386,11 @@ class TestInitialQuoteUnchanged(unittest.TestCase):
                       f"Expected price in blocked text, got: {text!r}")
         self.assertIn("Genial", text,
                       f"Expected approved opening in blocked text, got: {text!r}")
-        self.assertNotIn("viático", text.lower(),
-                         f"Must not expose viáticos breakdown in quote: {text!r}")
+        # WILD1-C (owner requirement, supersedes the M20.6B1 "no breakdown" rule): every
+        # quote shows Revisión / Viáticos / Total, viáticos included even when it is $0.
+        self.assertIn("Revisión: $", text, f"Expected the breakdown, got: {text!r}")
+        self.assertIn("Viáticos: $", text, f"Expected viáticos shown, got: {text!r}")
+        self.assertIn("Total: $", text, f"Expected the total, got: {text!r}")
 
 
 # ── Tests 6–7: Acceptance scenarios (core fix) ───────────────────────────────

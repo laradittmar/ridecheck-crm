@@ -586,7 +586,8 @@ class C4_07_Controls(_Assert):
         "Te enviamos el informe en 24 hs.",
         "Escribinos al 11 2345-6789 y te esperamos el lunes 16 a las 10:00.",
         "Escribinos al +54 9 11 2345-6789.",
-        "Para el lunes 16 tengo 3 horarios disponibles. Elegí el que te sirva y confirmá el turno acá:",
+        # WILD1-C-R2: the Flow-first copy as it is now sent
+        "Para el lunes 16 tengo 3 horarios disponibles. Elegí el horario que te sirva y completá tus datos para solicitar el turno.",
         "Tengo 10:00 y 11:00. ¿Cuál de las dos te sirve?",
         "Tengo 10:00 y 11:00, ¿te sirven las dos?",
         "Uno, dos y tres: revisamos todo.",

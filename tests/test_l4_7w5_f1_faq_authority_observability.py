@@ -233,8 +233,13 @@ class TestFaqDedup(unittest.TestCase):
         self.assertNotIn(_FAQ_SCOPE_ANSWER, out)
 
     def test_faq_dedup_02_report_already_answered_is_not_repeated(self):
+        # WILD1-C: a coverage-tracked topic (report) is answered only by its CANONICAL text.
+        # A paraphrase in the primary — which since R6-C4B can only be model prose, never
+        # sent — no longer counts as the answer; the canonical one goes out exactly once.
         out = _compose("Al finalizar te enviamos un informe detallado.", BURST_2)
-        self.assertEqual(out.count("informe detallado"), 1)
+        self.assertEqual(out.count(_FAQ_REPORT_ANSWER), 1)
+        out = _compose(_FAQ_REPORT_ANSWER, BURST_2)
+        self.assertEqual(out.count(_FAQ_REPORT_ANSWER), 1)
 
     def test_faq_dedup_03_a_missing_canonical_fact_is_still_appended(self):
         """FAQ-DEDUP-03 — dedup must not become silence."""

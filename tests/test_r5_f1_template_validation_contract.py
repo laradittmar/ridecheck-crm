@@ -469,6 +469,14 @@ CUSTOMER_FACING = {
     "_TX_SCHEDULING_ASK_TEXT": "FULL",     # R6-C4A transactional renderer copy
     "_TX_FLOW_CTA_TEXT": "FULL",           # R6-C4B-R1: canonical Meta Booking Flow CTA
     "_DEFERRED_RESPONSE_FOCUS_ES": "FULL", # R6-C4B-R1B: deferred copy, focus vehicle held
+    "_FAQ_SCOPE_LEAD": "FULL",             # WILD1-C: scope answer (published FAQ), lead sentence
+    "_COVERAGE_PRICE_LEAD": "FULL",        # WILD1-C: lead of the secondary price-breakdown block
+    "_QUOTE_DECLINE_ACK": "FULL",          # WILD1-C: explicit quote decline acknowledgement
+    "_PENDING_QUESTION_ACK": "FULL",       # WILD1-C-R3/R4: question received, reading pending
+    "_PRICE_CONCERN_LEAD": "FULL",         # WILD1-C-R4 (WC-09): price concern, neutral lead
+    "_PERDIDO_HOLD_REPLY": "FULL",         # WILD1-C-R4 (WC-08): operator-held PERDIDO hold
+    "_PERDIDO_FALLBACK_DATA_REPLY": "FULL",  # WILD1-C-R4-R1: fallback after an engine decline
+    "_GENERIC_NO_QUESTION_TEXT": "FULL",   # WILD1-C-R4: alias of the validator's own closing
     "_VEHICLE_CLARIFICATION_INTRO": "FULL",
 }
 NOT_CUSTOMER_FACING = {

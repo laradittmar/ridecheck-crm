@@ -66,7 +66,7 @@ from ..schemas.turn_evidence import (
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "understand/1.20"
+PROMPT_VERSION = "understand/1.22"   # WILD1-C: acceptance.decline_reason
 INTERPRETER_ID = "semantic:understand"
 
 # Controlled vocabularies. These are the *schema* the interpreter must speak — not phrase
@@ -87,6 +87,9 @@ SCHEDULING_INTENT_VALUES = ("AVAILABILITY_ENQUIRY",)
 
 ACCEPTANCE_VALUES = ("ACCEPT", "REJECT", "HESITATE", "FUTURE_INTENT", "QUESTION_ONLY",
                      "UNKNOWN")
+#: WILD1-C: why an explicit REJECT declined — mapped by the engine onto the CRM's existing
+#: `motivo_perdida` vocabulary (PRICE → PRECIO, anything else → OTRO).
+DECLINE_REASONS = ("PRICE", "AVAILABILITY", "OTHER")
 
 _SYSTEM_PROMPT = f"""Sos el intérprete semántico de RideCheck (revisión pre-compra de autos, Argentina).
 
@@ -166,7 +169,14 @@ Contraste:
 ═══ 2. POSTURA DEL CLIENTE (acceptance) — una sola por mensaje ═══
 acceptance.signal describe la postura frente a algo que YA le propusimos:
   ACCEPT        acepta AHORA y explícitamente avanzar.
-  REJECT        dice que no.
+  REJECT        DECIDE explícitamente no avanzar con lo que le propusimos ("no, gracias",
+                "lo dejo", "no voy a hacerla", "es caro, no la hago", "ya conseguí otro").
+                Una queja o una pregunta por el precio SIN decidir que no ("me parece
+                caro, ¿cuánto es el viático?", "¿por qué sale tanto?") NO es REJECT: es
+                HESITATE o QUESTION_ONLY.
+Si (y sólo si) signal es REJECT, completá acceptance.decline_reason con el motivo que el
+cliente dio: PRICE (el precio / es caro / no le cierra el costo), AVAILABILITY (los días u
+horarios), OTHER (otro motivo o ninguno dicho). En cualquier otra postura va null.
   HESITATE      duda sobre LA PROPUESTA: lo va a pensar, lo tiene que ver, le parece caro,
                 no decidió, "capaz", "no sé". Pensarlo o mirarlo es duda, no promesa.
   FUTURE_INTENT promete volver / avisar / escribir / consultar MÁS ADELANTE.
@@ -420,7 +430,7 @@ Forma de cada ítem cuando SÍ hay evidencia:
 - vehicles[]: {{"make", "model", "year", "category_suggestion", "catalog_candidate",
                "is_superseded", "status", "year_status", "alternatives", "reason"}}
 - locations[]: {{"locality", "role", "status", "reason"}}
-- acceptance: {{"signal", "status", "reason"}}
+- acceptance: {{"signal", "status", "reason", "decline_reason"}}
 - scheduling_requests[]: {{"priority", "day_expression", "time", "flexible_time", "rank",
                           "status"}}
 - scheduling_intents[]: {{"kind", "status", "reason"}}   ← sin día, sin fecha, sin hora
@@ -999,10 +1009,14 @@ class SemanticTurnInterpreter:
                 signal = AcceptanceSignal(str(raw_acc["signal"]))
             except ValueError:
                 signal = AcceptanceSignal.UNKNOWN
+            _decline = str(raw_acc.get("decline_reason") or "").strip().upper()
             acceptance = AcceptanceEvidence(
                 value={"ACCEPT": True, "REJECT": False, "HESITATE": False,
                        "FUTURE_INTENT": False}.get(signal.value),
                 signal=signal, status=_status(raw_acc.get("status")),
+                # WILD1-C: typed, closed vocabulary, and only beside REJECT.
+                decline_reason=(_decline if signal.value == "REJECT"
+                                and _decline in DECLINE_REASONS else None),
                 confidence=_confidence(raw_acc.get("confidence")),
                 reason=raw_acc.get("reason"), provenance=prov)
 

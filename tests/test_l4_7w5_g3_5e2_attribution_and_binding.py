@@ -737,7 +737,7 @@ class F_NonRegression(unittest.TestCase):
         from app.schemas import turn_evidence as te
         self.assertEqual(len(_HOURS_FAQ_DETECTION), 8)
         self.assertEqual(len(lex.OPERATION_PREDICATES), 9)
-        self.assertEqual(si.PROMPT_VERSION, "understand/1.20")
+        self.assertEqual(si.PROMPT_VERSION, "understand/1.22")
         self.assertEqual(te.SCHEMA_VERSION, "turn-evidence/1.4")
 
 

@@ -84,7 +84,9 @@ def bench(primary, *, topics=(), quote=85000, src="PRICING_SERVICE", zone=("CABA
     e._turn_clarification_burst = None
     e._turn_text = "t"
     e._live_plan = LiveResponsePlan(turn_id="t")
-    e._turn_price_quote = SimpleNamespace(precio_total=quote) if quote else None
+    # WILD1-C: PricingService's structured quote — a total alone is no longer a quote.
+    e._turn_price_quote = (SimpleNamespace(precio_base=quote - 15000, viaticos=15000,
+                                           precio_total=quote) if quote else None)
     e._answer_source_value = src
     e._turn_decision_authority = None
     e._faq_topics_for_burst = lambda t, ctx=None, st=None: set(topics)
@@ -116,7 +118,9 @@ def bench(primary, *, topics=(), quote=85000, src="PRICING_SERVICE", zone=("CABA
 class A_PriceDerivedRedundancy(unittest.TestCase):
 
     def test_g37_01_an_ordinary_quote_turn_says_the_price_once(self):
-        r = bench(f"Genial! La cotización es de {MONEY}.")
+        # WILD1-C: the ordinary quote primary is the canonical breakdown copy.
+        r = bench(ConversationEngine._build_quote_reply(None, None, None, SimpleNamespace(
+            precio_base=70000, viaticos=15000, precio_total=85000)))
         self.assertEqual(r.text.count(MONEY), 1)
         item = r.props[PropositionId.CANONICAL_PRICE]
         self.assertFalse(item.included)
@@ -178,8 +182,10 @@ class A_PriceDerivedRedundancy(unittest.TestCase):
     def test_g37_09_the_amount_token_is_the_engines_own_formatter(self):
         """One formatter, so the copy and the equality check cannot disagree."""
         self.assertEqual(_format_price_ars(85000), "$85.000")
+        # WILD1-C: the copy is built from the structured quote (revisión + viáticos = total).
         self.assertIn(_format_price_ars(85000),
-                      ConversationEngine._build_quote_reply(None, None, None, 85000))
+                      ConversationEngine._build_quote_reply(None, None, None, SimpleNamespace(
+                          precio_base=70000, viaticos=15000, precio_total=85000)))
 
 
 # ══ B — required and optional producers (BC36-A03) ═════════════════════════
@@ -503,7 +509,7 @@ class E_NothingElseMoved(unittest.TestCase):
         interp = (ROOT / "backend/app/services/semantic_interpreter.py").read_text(
             encoding="utf-8")
         self.assertIn('REPLY_PROMPT_VERSION = "reply/1.0"', engine_src)
-        self.assertIn('PROMPT_VERSION = "understand/1.20"', interp)
+        self.assertIn('PROMPT_VERSION = "understand/1.22"', interp)
         self.assertIn('or "gpt-4o-mini"', interp)
         self.assertEqual(te.SCHEMA_VERSION, "turn-evidence/1.4")
         self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.10")

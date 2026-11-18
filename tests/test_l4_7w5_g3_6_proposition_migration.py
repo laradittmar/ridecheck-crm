@@ -610,9 +610,14 @@ class H_PlanCountIsTruthful(unittest.TestCase):
         t = Turn(((("w0", "¿Cuál es el horario de atención?", 0),)), evidence=None).run()
         try:
             payload = t.engine._turn_response_plan.to_payload()
-            self.assertEqual(payload["item_count"], 2)
+            # WILD1-C-R4 (R3RV-01): `evidence=None` makes the provider return ok=False — a
+            # FAILED reading — so the burst is retained as pending and its acknowledgement is
+            # a third counted item, still in the ONE message (re-recorded by WILD1-C-R4-R2).
+            self.assertEqual(payload["item_count"], 3)
             self.assertEqual(payload["item_kinds"],
-                             [ResponseItemKind.TEXT, ResponseItemKind.FAQ_ANSWER])
+                             [ResponseItemKind.TEXT, ResponseItemKind.FAQ_ANSWER,
+                              ResponseItemKind.FAQ_ANSWER])
+            self.assertIn(ce._PENDING_QUESTION_ACK, t.sent[0])
             self.assertEqual(len(t.sent), 1)
             self.assertIn(business_hours_summary_es(), t.sent[0])
         finally:

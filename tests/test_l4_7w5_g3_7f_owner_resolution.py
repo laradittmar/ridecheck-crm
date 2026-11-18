@@ -773,13 +773,22 @@ class F_NoFalseMoto(unittest.TestCase):
         lines = ENGINE_SRC.splitlines()
         sites = [i for i, l in enumerate(lines)
                  if "_motorcycle_human_handoff(" in l and "def " not in l]
-        self.assertEqual(len(sites), 5, f"call sites changed: {len(sites)}")
+        # WILD1-C-R4-R1 (C): +1 — `_hold_perdido_fallback` hands a motorcycle vehicle-fallback
+        # form on a PERDIDO lead to the held handoff, gated on `tipo == "MOTO"` /
+        # `_is_motorcycle_enquiry` like every other site (re-recorded by WILD1-C-R4-R2).
+        # WILD1-C-R4-R3 (RV-F-01): +6 — the cross-turn gate (Layer A thread check) and the
+        # defence-in-depth gates (fallback forms, website form, acceptance, both offer
+        # issuers), each gated on `_thread_motorcycle_recorded`, which answers True only for
+        # a typed-MOTO candidate or an engine-minted `moto-handoff-` token (pinned by
+        # `test_wild1_c_r4_r3_motorcycle_cross_turn::test_the_predicate_reads_both_…`).
+        self.assertEqual(len(sites), 12, f"call sites changed: {len(sites)}")
         for i in sites:
             context = "\n".join(lines[max(0, i - 10):i + 1])
             with self.subTest(line=i + 1):
                 self.assertTrue(
                     ('== "MOTO"' in context or "_is_motorcycle_enquiry" in context
-                     or "_turn_correction_moto" in context),
+                     or "_turn_correction_moto" in context
+                     or "_thread_motorcycle_recorded(ctx, state)" in context),
                     f"ungated motorcycle handoff near line {i + 1}")
 
     def test_or_44_the_non_moto_reasons_are_their_own(self):

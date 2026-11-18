@@ -255,7 +255,9 @@ class TestFaqCutover(unittest.TestCase):
     def test_faq_answers_coexist_and_do_not_duplicate(self):
         """A topic already covered by the primary reply is not appended twice."""
         eng = engine(semantic_topics=("report", "presence"))
-        primary = "Al finalizar la revisión te enviamos un informe detallado."
+        # WILD1-C: "already covered" now means the CANONICAL answer is in the primary (the
+        # constant, not its pre-WILD1-C wording).
+        primary = _FAQ_REPORT_ANSWER
         out = _compose_via_plan(eng, primary, WILD_2)
         self.assertEqual(out.count("informe detallado"), 1, "no duplicate report answer")
         self.assertIn(_FAQ_PRESENCE_ANSWER, out, "the unanswered topic is still added")

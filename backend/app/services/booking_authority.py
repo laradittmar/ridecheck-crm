@@ -497,7 +497,8 @@ _REQUIRED_COLUMNS_LISTED = {
     "whatsapp_thread_states": ("thread_id", "current_revision_id", "last_stage", "needs_human",
                                "flow_booking_token"),
     "whatsapp_threads": ("id", "lead_id"),
-    "leads": ("id", "estado", "flag", "necesita_humano", "nombre", "apellido", "email", "canal"),
+    "leads": ("id", "estado", "flag", "necesita_humano", "nombre", "apellido", "email", "canal",
+              "motivo_perdida"),
 }
 
 
@@ -1889,6 +1890,12 @@ class BookingAuthority:
             for name in ("estado", "flag", "necesita_humano"):
                 if getattr(u, name) is not None:
                     setattr(lead, name, getattr(u, name))
+            if u.flag == "ACEPTADO":
+                # WILD1-C-R4-R2 (owner ruling 2026-11-17): a persisted booking wins over an
+                # earlier PERDIDO, and a loss reason never stays attached to an accepted lead.
+                # Written here — after the Revision and ThreadRevision writes, under K8, in the
+                # booking's own transaction — so it commits with the booking or not at all.
+                lead.motivo_perdida = None
             if u.canal_if_empty is not None and not lead.canal:
                 lead.canal = u.canal_if_empty
             if u.identity is not None:

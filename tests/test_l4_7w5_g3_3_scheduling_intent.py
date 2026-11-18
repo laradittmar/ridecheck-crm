@@ -186,7 +186,7 @@ class ProvenanceAndBurst(unittest.TestCase):
 
     def test_g33_13_provenance_names_the_interpreter_and_its_version(self):
         self.assertEqual(self.item.provenance.interpreter,
-                         "semantic:understand:understand/1.20")
+                         "semantic:understand:understand/1.22")
         self.assertEqual(self.item.provenance.source_kind.value, "SEMANTIC")
         self.assertEqual(self.item.provenance.model_version, "test-model")
 
@@ -228,7 +228,7 @@ class TraceAndInspector(unittest.TestCase):
         self.assertEqual(item["kind"], "AVAILABILITY_ENQUIRY")
         self.assertEqual(item["provenance"]["source_kind"], "SEMANTIC")
         self.assertEqual(item["provenance"]["interpreter"],
-                         "semantic:understand:understand/1.20")
+                         "semantic:understand:understand/1.22")
 
     def test_g33_18_the_inspector_displays_it_as_semantic_evidence(self):
         from app.ui.hybrid_trace_view import _semantic_card
@@ -343,7 +343,7 @@ class ContractVersioning(unittest.TestCase):
 
     def test_g33_25_the_schema_version_was_bumped(self):
         self.assertEqual(te.SCHEMA_VERSION, "turn-evidence/1.4")
-        self.assertEqual(si.PROMPT_VERSION, "understand/1.20")
+        self.assertEqual(si.PROMPT_VERSION, "understand/1.22")
 
     def test_g33_26_scheduling_request_evidence_is_unchanged(self):
         self.assertEqual(SchedulingRequestEvidence()._MEANINGFUL_FIELDS,

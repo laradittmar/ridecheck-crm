@@ -16,9 +16,24 @@ State machine rules (official):
   E. Flow submitted / revision      → estado=COORDINAR_DISPONIBILIDAD, flag=ACEPTADO, needs_human=True
   F. Human approves                 → estado=AGENDADO  (CRM only — never by this engine)
 
+  G. Client explicitly declines quote → flag=PERDIDO, motivo_perdida=PRECIO|OTRO, stage stays
+                                       QUOTED; append-only DECLINED row (WILD1-C, below)
+  H. Client explicitly reconsiders    → only an ENGINE-written PERDIDO: RECONSIDERED row,
+                                       flag back to the active path, then C / D as usual
+
 Forbidden engine writes:
   - estado: AGENDADO, REVISION_COMPLETA
-  - flag:   PERDIDO, BUSCANDO_AUTO, RECOMPRA
+  - flag:   BUSCANDO_AUTO, RECOMPRA
+  - flag:   PERDIDO — EXCEPT the one narrow WILD1-C transition (owner ruling 2026-11-16):
+            the customer semantically makes an explicit decision not to proceed with a
+            DELIVERED quote (interpreter acceptance=REJECT, resolved, no day request in the
+            burst). A price question, a breakdown request or a concern without a refusal is
+            never a decline. Each such write appends a `whatsapp_thread_evidence` row
+            (claim_type=quote_decision, value=DECLINED, producer=ENGINE). The engine may
+            reverse ONLY a PERDIDO whose newest decision row is its own DECLINED with the
+            same motivo; an operator-written PERDIDO is never overwritten or reactivated
+            (commercial progression on it is HELD). The decline is not a complaint:
+            needs_human is untouched and no operator notification is created.
 """
 from __future__ import annotations
 
@@ -28,6 +43,7 @@ from types import SimpleNamespace
 import os
 import re
 import secrets
+import threading
 import time as _time
 import unicodedata
 from dataclasses import dataclass
@@ -62,6 +78,7 @@ from ..schemas.hybrid_trace import DecisionSite
 # list and the three locality validators. A LEAF module (it imports nothing from this
 # package), so `field_evidence` binds the SAME objects instead of replicating them.
 from . import locality_text as _loc
+from . import claim_coverage as _cov
 from .response_composition import (LiveResponsePlan, Proposition, PropositionId,
                                    SuppressionReason, flow_completion_ack_authorized)
 from ..schemas.hybrid_trace import (CoexistencePolicy, FLOW_COMPLETION_ACK_CONDITIONS,
@@ -102,6 +119,11 @@ from ..services.transactional_boundary import (AI_SCHEDULE_FIELDS as _TB_AI_SCHE
                                                classify_route as _tb_classify_route,
                                                normalized as _tb_normalized)
 from ..services.response_validator import select_validation_fallback as _rv_select_fallback
+from ..services.response_validator import render_price_breakdown as _rv_render_price_breakdown
+from ..services.response_validator import _VALIDATION_FALLBACKS as _RV_FALLBACKS
+from ..services.response_validator import ValidationFallbackId as _RVFallbackId
+#: WILD1-C-R4: the validator's own no-question closing (one literal, owned there).
+_GENERIC_NO_QUESTION_TEXT = _RV_FALLBACKS[_RVFallbackId.NO_QUESTION].text
 from ..services import verified_generation as _vg
 from ..services.verified_generation import (GenerationContext as _VgContext,
                                             is_verified as _vg_is_verified)
@@ -502,10 +524,15 @@ _FAQ_PATTERNS = [
     r'\bpagar\s+(con|en)\s+(d[eé]bito|cr[eé]dito|efectivo|transferencia)\b',
     r'\bmercado\s+pago\b',
     # Greetings / opening queries
+    # (WILD1-C-R3: this one anchored greeting form is also `_GREETING_ONLY_RE`, the
+    # segment test of the semantic-wait boundary — one grammar, two readers.)
     r'^(hola|buenas?|buen\s+d[ií]a|buenos\s+d[ií]as|buenas\s+tardes|buenas\s+noches)[,\s!.]*$',
     r'^(hola[,\s]+)?quer[ií]a\s+(hacer|hacer\s+una)\s+consulta',
     r'\bconsulta\b',
 ]
+#: WILD1-C-R3: the anchored greeting entry of `_FAQ_PATTERNS`, by identity (not a copy).
+_GREETING_ONLY_RE = re.compile(next(p for p in _FAQ_PATTERNS if p.startswith("^(hola")),
+                               re.IGNORECASE)
 
 # M21.1.1-R1: Inspection request patterns for Layer F pass-through.
 # Applied to accent-normalized, lowercase text.
@@ -543,6 +570,10 @@ _PRICE_QUESTION_PATTERNS: tuple[re.Pattern, ...] = (
     re.compile(r'\bcotizaci[oó]n\b', re.IGNORECASE),
     re.compile(r'\bme\s+pas[aá]s?\s+(precio|cotizaci[oó]n|presupuesto)\b', re.IGNORECASE),
     re.compile(r'\bprecio\b', re.IGNORECASE),
+    # WILD1-C: viáticos is a component of the quote — a question about it is a money
+    # question ("¿cuánto hay de viático?", "¿y los viáticos?"). One domain noun, the same
+    # term the quote block prints; the semantic QUOTE_REQUEST covers every other phrasing.
+    re.compile(r'\bvi[aá]tic', re.IGNORECASE),
 )
 
 # M21.2: Layer F deferred-interest pass-through patterns (step 8.5).
@@ -763,11 +794,13 @@ _HANDOFF_TRANSACTIONAL_FACTS_INCOMPLETE = "transactional_facts_incomplete"  # R6
 _TX_SCHEDULING_ASK_TEXT = "¿Qué día y horario te viene mejor para la revisión?"
 #: R6-C4B-R1 canonical next action after shown availability: the Meta Booking Flow owns
 #: choosing, confirming and booking (it is dispatched by its own reviewed path)
+# WILD1-C-R2 (owner ruling): before persisted Flow success the copy describes choosing,
+# completing or REQUESTING a booking — never confirming it.
 _TX_FLOW_CTA_TEXT = ("Decime cuál te queda mejor y te envío el formulario de reserva para "
-                     "elegirlo y confirmar el turno.")
+                     "elegirlo y solicitar el turno.")
 #: the engine's own bounded line when the reply model failed or its result was refused
 _DELAY_LINE = "Disculpá la demora, ya te ayudamos."
-_TX_FLOW_PENDING_TEXT = ("Te envié el formulario para confirmar el turno. "
+_TX_FLOW_PENDING_TEXT = ("Te envié el formulario para solicitar el turno. "
                          "Completalo con tus datos y terminamos la reserva.")
 _HANDOFF_CORRECTION_UNRESOLVED = "correction_unresolved_after_flow"
 _HANDOFF_RESPONSE_COMPOSITION_FAILED = "response_composition_failed"
@@ -1141,6 +1174,76 @@ def _format_price_ars(total: int) -> str:
     canonical-value equality check, so the two can never disagree about what "the price"
     looks like in a message."""
     return f"${total:,.0f}".replace(",", ".")
+
+
+#: WILD1-C: the legacy (authority-off) paths have no authorizer decision; this stands in for
+#: ALLOW so `_apply_lost_lead_rule` can reactivate an engine-written decline there too.
+_LEGACY_ALLOW = SimpleNamespace(allows=True, blockers=())
+#: WILD1-C: "not read yet" for the coverage layer's one semantic read per turn.
+_COV_UNSET = object()
+
+
+def _booking_flow_body(*, time_verified: bool) -> str:
+    """WILD1-C. The Booking Flow body. "Ese horario está disponible" only after a specific
+    time was selected AND ScheduleService verified it; before that, the available options.
+
+    WILD1-C-R2: the body REQUESTS the booking ("para solicitar el turno"); it never says or
+    implies it is confirmed — confirmation exists only after persisted Flow success."""
+    if time_verified:
+        return "Ese horario está disponible 🎉 Completá tus datos para solicitar el turno."
+    return "Elegí el horario que te sirva y completá tus datos para solicitar el turno."
+
+
+#: Meta's limit for an interactive message body.
+_FLOW_BODY_MAX = 1024
+
+#: WILD1-C-R3: the engine's own rendering of a price breakdown (`render_price_breakdown`):
+#: three lines, "Revisión: $X" / "Viáticos: $Y" / "Total: $Z", newline-separated.
+_PRICE_BLOCK_RE = re.compile(
+    r"Revisión: \$[0-9.]+\nViáticos: \$[0-9.]+\nTotal: \$[0-9.]+")
+
+
+def _restore_price_blocks(composed, validated: str) -> "tuple[str, bool]":
+    """WILD1-C-R3 (validator, touched price path). Returns (text, corrupted).
+
+    When `validate_response` rewrites or drops an UNRELATED sentence it re-joins the
+    survivors with single spaces, which flattens the canonical three-line block onto one
+    line. Each canonical block of the composed message whose flattened form survived
+    validation VERBATIM is restored — whitespace only: every character of the validated text
+    is kept; only the separators inside and immediately around the block go back to the
+    composed layout. A block the validator did NOT keep whole (a line removed or changed —
+    e.g. a message-wide temporal finding dropping "Revisión: $X") is reported `corrupted`,
+    and the caller must not send a partial breakdown. Nothing validated is ever undone."""
+    try:
+        out = str(validated)
+        source = (str.__str__(composed) if isinstance(composed, str)
+                  else str(composed or ""))
+        corrupted = False
+        for block in _PRICE_BLOCK_RE.findall(source):
+            if block in out:
+                continue
+            flat = re.sub(r"\s+", " ", block)
+            if out.count(flat) != 1:
+                corrupted = True
+                continue
+            head, tail = out.split(flat, 1)
+            if head.endswith(" ") and f"\n\n{block}" in source:
+                head = head[:-1] + "\n\n"
+            if tail.startswith(" ") and f"{block}\n\n" in source:
+                tail = "\n\n" + tail[1:]
+            out = f"{head}{block}{tail}"
+        return out, corrupted
+    except Exception:
+        return validated, False
+
+
+def _quote_breakdown(quote) -> tuple:
+    """WILD1-C. `(precio_base, viaticos, precio_total)` read from the structured PricingService
+    result — never recomputed, never inferred. A bare number is refused: a total alone is not
+    a quote any more. The reconciliation itself is `render_price_breakdown`'s."""
+    if isinstance(quote, (int, float, str)) or quote is None:
+        raise TypeError("a quote is the structured PricingQuote, not a bare amount")
+    return (quote.precio_base, quote.viaticos, quote.precio_total)
 REPLY_PROMPT_ID = "conversation_engine._build_ai_messages"
 
 
@@ -1577,7 +1680,25 @@ _PAYMENT_FAQ_PATTERNS: tuple[str, ...] = (
 def _faq_hours_answer() -> str:
     from .schedule import business_hours_summary_es
     return business_hours_summary_es()
-_FAQ_REPORT_ANSWER = "Al finalizar la revisión te enviamos un informe detallado."
+# WILD1-C. The scope and report answers are RideCheck's own published FAQ, not new claims:
+# `/var/www/ridecheck/faq.html` — "¿Qué cubre una revisión de Ride Check?" (mechanical,
+# electrical, structure and solidity inspection; electronic scan; real-mileage verification),
+# "¿Hacen test drive?" (the road test is part of the inspection) and "¿Qué incluye el
+# informe PDF?" (vehicle data, findings by system — engine, electrical, safety —, photos of
+# points of interest, conclusions on the general condition, technical recommendations).
+# The H-1 customer asked "¿de qué consta?" three times and "¿qué informan?" once, and the
+# old two-line answer named none of it.
+# WILD1-C-R1 — OWNER RULING (2026-11-16): the detailed report is sent DURING THE SAME DAY as
+# the inspection; at the end of the on-site inspection the inspector explains the principal
+# findings. This ruling SUPERSEDES the public FAQ's "24 a 48 horas" PDF wording, which is a
+# recorded content inconsistency to be corrected on the website before launch (not edited
+# here). Neither "immediately at the end" nor "24–48 h" is promised.
+_FAQ_REPORT_ANSWER = (
+    "Al terminar la revisión, el inspector te comenta los principales hallazgos. "
+    "El informe detallado se envía durante el mismo día, con los datos del vehículo, "
+    "los hallazgos por sistema, fotos, una conclusión sobre el estado general y "
+    "recomendaciones técnicas."
+)
 _FAQ_PRESENCE_ANSWER = "No es necesario que estés presente durante la inspección."
 # L4.7W1-F4: the customer asked "¿Aceptan? ¿Debito?" and the old answer listed what we
 # take without answering what was actually asked. Business truth: transfer, Mercado Pago
@@ -1586,10 +1707,56 @@ _FAQ_PAYMENT_ANSWER = (
     "Aceptamos efectivo, transferencia bancaria y Mercado Pago. "
     "Con débito no estamos trabajando por el momento."
 )
-_FAQ_SCOPE_ANSWER = (
-    "Vamos hasta donde está el vehículo y hacemos la revisión pre-compra en el lugar. "
-    "Al terminar te enviamos el informe con todo lo que encontramos."
+_FAQ_SCOPE_LEAD = (
+    "Vamos hasta donde está el vehículo y hacemos la revisión pre-compra en el lugar: "
+    "inspección mecánica, eléctrica, de estructura y solidez, prueba de marcha, escaneo "
+    "electrónico profesional y verificación del kilometraje real."
 )
+_FAQ_SCOPE_ANSWER = f"{_FAQ_SCOPE_LEAD} {_FAQ_REPORT_ANSWER}"
+#: WILD1-C: the acknowledgement of an explicit quote decline. Pressure-free: no offer, no
+#: discount, no call to book — only that the door stays open. (Owner review item: new copy.)
+_QUOTE_DECLINE_ACK = (
+    "Entendido, gracias por avisarnos. Si más adelante querés retomar la revisión, "
+    "escribinos por acá."
+)
+#: WILD1-C: the price-breakdown lead when the block is a SECONDARY answer (the customer asked
+#: the viáticos on a turn whose primary is not the quote). No call to action, no pressure.
+_COVERAGE_PRICE_LEAD = "Te paso el detalle de la cotización:"
+#: WILD1-C-R3 (WC-01): the burst's semantic reading did not arrive within the turn's bounded
+#: wait. WILD1-C-R4 (owner-authorized copy, 2026-11-17): truthful about what happens next — the
+#: system sends nothing proactively; the retained question is resumed when the customer writes
+#: again. It never says the question was answered and promises no time. The burst is durably
+#: retained (`pending_question`) and resolved on the next eligible turn.
+_PENDING_QUESTION_ACK = ("Recibí tu consulta, pero no pude procesarla en este momento. "
+                         "Si me escribís nuevamente, la retomo y te respondo.")
+#: WILD1-C-R4 (R3RV-03): THE turn's total semantic wait, in seconds — one monotonic deadline
+#: per turn, shared by every semantic consumer (the current burst's reading, the re-reading of
+#: pending questions, Layer D, the QUOTED decline/FAQ consumers, admission, scheduling). Every
+#: consumer waits only for what is left of it. Effective value = min(this,
+#: SEMANTIC_SAME_TURN_TIMEOUT_SECONDS). Measured real-provider latency (review §6, n=72): p50
+#: 1.4 s, p90 2.1 s, p95 3.3 s, max 8.2 s — p95 lands inside the budget, and the tail is
+#: retained as a pending question instead of being dropped.
+_TURN_SEMANTIC_BUDGET_SECONDS = 4.5
+#: R3 name, kept as an alias: the general-information route no longer has a budget of its own.
+_LAYER_D_SEMANTIC_WAIT_SECONDS = _TURN_SEMANTIC_BUDGET_SECONDS
+#: WILD1-C-R4 (R3RV-03): bounds of ONE pending re-reading. Oldest rows first; rows beyond
+#: either bound stay PENDING (never deleted) and are re-read on a later turn. A single row is
+#: itself capped at 4000 characters when it is written, so the first row always fits.
+_PENDING_REREAD_MAX_ROWS = 3
+_PENDING_REREAD_MAX_CHARS = 4000
+#: WILD1-C-R4 (WC-09, owner-authorized copy): the lead of the price block on a turn where the
+#: customer voices a price CONCERN without refusing (semantic HESITATE). No "Genial!", no CTA.
+_PRICE_CONCERN_LEAD = "Entiendo. Te detallo cómo se compone la cotización:"
+#: WILD1-C-R4 (WC-08, owner-authorized copy): a lead an operator closed (or a closed lead's
+#: late fallback form) tries to continue. The lead stays PERDIDO; nothing is reactivated,
+#: issued or booked, and no operator notification is claimed.
+_PERDIDO_HOLD_REPLY = ("Gracias. Para retomar esta consulta, nuestro equipo tiene que "
+                       "revisarla manualmente.")
+#: WILD1-C-R4-R1 (owner-authorized copy): a vehicle/location fallback form submitted after the
+#: ENGINE recorded the customer's own decline. The lead stays PERDIDO; the form is not a
+#: reconsideration, and the customer is told how to resume — no manual-review claim.
+_PERDIDO_FALLBACK_DATA_REPLY = ("Recibí los datos. Si querés retomar la revisión, decime por "
+                                "acá y continuamos.")
 
 # ── L4.7W1-F4 — semantic topic → deterministic business answer ────────────────
 #
@@ -2757,7 +2924,7 @@ def _scrub_scheduling_confirmation(reply: str, stage: str) -> str:
             )
             return (
                 "Perfecto, recibí tu preferencia. "
-                "Para confirmar el turno necesitamos que completes el formulario con tus datos. "
+                "Para solicitar el turno necesitamos que completes el formulario con tus datos. "
                 "¿Hay algo más que quieras ajustar?"
             )
     return reply
@@ -3489,6 +3656,7 @@ class ConversationEngine:
         # R6-C4B-R1B: this turn is a terminal deferred-interest turn (set only by
         # `_handle_deferred_interest`); reset every turn so it cannot leak.
         self._turn_deferred_terminal = False
+        self._turn_perdido_hold = False          # WILD1-C-R4: this turn is a PERDIDO hold
         self._turn_clar_semantic = None
         self._turn_clar_deterministic = None
         self._turn_clar_identity = None
@@ -3515,6 +3683,35 @@ class ConversationEngine:
         # reached the send primitive first.
         self._live_plan = LiveResponsePlan(turn_id=self._correlation_id)
         self._turn_burst_texts = []
+        # WILD1-C: this turn's coverage verdict, what the Booking Flow carried on another
+        # channel, and the quote decision this turn recorded — never carried across turns.
+        self._turn_coverage = None
+        self._turn_coverage_routed = set()
+        self._turn_quote_decision = None
+        self._turn_decline_probe = None
+        self._turn_cov_evidence = _COV_UNSET
+        self._turn_coverage_may_wait = False
+        # WILD1-C-R3 (WC-01): this burst's question potential, whether its question is now
+        # pending semantic resolution (and why), and the resolution of questions earlier
+        # bursts left pending — all per turn.
+        self._turn_question_potential = None
+        self._turn_pending_reason = None
+        self._turn_continues = False
+        self._turn_pending_rows = ()
+        self._turn_pending_deferred = ()
+        self._turn_pending_provider = None
+        self._turn_pending_resolution = _COV_UNSET
+        # WILD1-C-R4: the turn's ONE semantic deadline (monotonic seconds), its typed semantic
+        # state, and whether this burst's pending row was durably written.
+        self._turn_semantic_deadline = None
+        self._turn_semantic_state_memo = None
+        self._turn_pending_persisted = False
+        # WILD1-C-R3 (WC-02): how a PERDIDO lead may leave PERDIDO this turn (only the lost-
+        # lead rule's reconsideration, or the operator-triggered cycle reset), and the flush
+        # guard that enforces it.
+        self._turn_perdido_left_by = None
+        # WILD1-C-R4 (R3RV-04): a reused engine instance never carries a listener over.
+        self._disarm_perdido_guard()
         self._turn_trace_ctx = None
         self._turn_trace_before = None
         self._turn_trace_rows = []
@@ -3523,100 +3720,112 @@ class ConversationEngine:
         _trace_started_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
         _ce_t0 = _time.perf_counter()
         try:
-            out = self._handle(event)
-        except OutboundBlockedError as exc:
-            outcome = getattr(exc, "gate_outcome", "BLOCKED_KILL_SWITCH")
-            detail = f"OUTBOUND_GATE_{outcome.upper()}"
-            logger.warning(
-                "M19 OUTBOUND_BLOCKED thread_id=%s outcome=%s wa=%s",
-                event.thread_id, outcome, event.wa_message_id,
-            )
-            if outcome.upper() == "BLOCKED_KILL_SWITCH":
-                # Kill switch: CE computed the full logical result before reaching
-                # the send. Commit CE session to persist conversation state.
-                # Blocked audit is already committed in the gate's dedicated session.
-                try:
-                    self.db.commit()
-                except Exception:
+            try:
+                out = self._handle(event)
+            except OutboundBlockedError as exc:
+                outcome = getattr(exc, "gate_outcome", "BLOCKED_KILL_SWITCH")
+                detail = f"OUTBOUND_GATE_{outcome.upper()}"
+                logger.warning(
+                    "M19 OUTBOUND_BLOCKED thread_id=%s outcome=%s wa=%s",
+                    event.thread_id, outcome, event.wa_message_id,
+                )
+                if outcome.upper() == "BLOCKED_KILL_SWITCH":
+                    # Kill switch: CE computed the full logical result before reaching
+                    # the send. Commit CE session to persist conversation state.
+                    # Blocked audit is already committed in the gate's dedicated session.
+                    try:
+                        self.db.commit()
+                    except Exception:
+                        try:
+                            self.db.rollback()
+                        except Exception:
+                            pass
+                    out = _out("blocked_dispatch", detail=detail)
+                else:
+                    # Duplicate / flood: CE may have partial state — do not commit.
                     try:
                         self.db.rollback()
                     except Exception:
                         pass
-                out = _out("blocked_dispatch", detail=detail)
-            else:
-                # Duplicate / flood: CE may have partial state — do not commit.
+                    out = _out("error", detail=detail)
+            except Exception:
+                logger.exception(
+                    "M18 engine unhandled error thread_id=%s wa=%s",
+                    event.thread_id, event.wa_message_id,
+                )
                 try:
                     self.db.rollback()
                 except Exception:
                     pass
-                out = _out("error", detail=detail)
-        except Exception:
-            logger.exception(
-                "M18 engine unhandled error thread_id=%s wa=%s",
-                event.thread_id, event.wa_message_id,
-            )
-            try:
-                self.db.rollback()
-            except Exception:
-                pass
-            out = _out("error", detail="internal_error")
-        # ── R3/D: one place decides whether the customer saw this turn's slots ───
-        # Every branch above converges here, including the kill switch (which refused the
-        # send) and the crash path (whose rollback cannot undo the slot list, because the
-        # day-slots path committed it BEFORE dispatching). The helper itself checks what
-        # the outbound gate allowed and whether this turn claimed anything, so it is a
-        # no-op on every turn that really did display its slots.
-        self._revoke_undelivered_slot_claim(event, out)
-        out.latency_ce_ms = int((_time.perf_counter() - _ce_t0) * 1000)
-        _ai_inv = getattr(self, "_ai_invoked", False)
-        out.ai_invoked = _ai_inv
-        # Apply answer_source — priority order:
-        # 1. Inline answer_source already set in _out() call site
-        # 2. Unambiguous action inference (one-to-one action→source mapping)
-        # 3. self._answer_source (set at handler method entry for "replied" paths)
-        # 4. CE_AI when OpenAI was invoked
-        # 5. None (untagged — should not occur for launch-reachable paths)
-        if out.answer_source is None:
-            if out.action in ("flow_button_sent", "booking_created"):
-                out.answer_source = "FLOW_RESPONSE"
-                self._turn_decision_authority = DecisionAuthority.FLOW_TRANSACTION
-                self._note_fact_source(FactSource.FLOW_TRANSACTION)
-            elif out.action == "skipped_human":
-                out.answer_source = "HUMAN"
-                # G3-5E2: this resolution is truthful — the human-ownership policy really
-                # did own the turn — so the typed attribution is recorded with it. The
-                # action-derived branches below are NOT adopted: `blocked_dispatch` naming
-                # DETERMINISTIC_RULE is the very conflation G5D-04 recorded, and an
-                # ERROR_FALLBACK is an outcome, not an authority.
-                self._turn_decision_authority = DecisionAuthority.HUMAN_HANDOFF_POLICY
-                self._note_fact_source(FactSource.CANONICAL_STATE)
-            elif out.action in self._DETERMINISTIC_SOURCE_ACTIONS:
-                out.answer_source = "DETERMINISTIC_RULE"
-            elif out.action in self._VEHICLE_RESOLVER_SOURCE_ACTIONS:
-                out.answer_source = "VEHICLE_RESOLVER"
-            elif out.action == "error":
-                out.answer_source = "ERROR_FALLBACK"
-            else:
-                _ans_src = getattr(self, "_answer_source", None)
-                if _ans_src is not None:
-                    out.answer_source = _ans_src
-                elif _ai_inv:
-                    out.answer_source = "CE_AI"
-        # Apply burst observability fields
-        out.burst_message_count = getattr(self, "_burst_message_count", 1)
-        out.burst_earliest_inbound_db_id = getattr(self, "_burst_earliest_inbound_db_id", None)
-        out.contributing_sources = getattr(self, "_contributing_sources", None)
-        # L4.7W5 Gate 1/2 — record how this decision was reached. Runs AFTER the answer is
-        # final and after every response-shaping branch above, so it can observe the real
-        # outcome; it writes in its own transaction and returns None on every failure, so a
-        # trace defect can never cost a customer turn.
-        # G3-5E: the shadow plan describes the turn whether or not tracing is armed, so
-        # "what this turn owed the customer" is observable on its own terms. It reads state
-        # the decision path already recorded; it calls nothing and changes nothing.
-        self._turn_response_plan = self._turn_plan(out)
-        self._write_hybrid_trace(event, out, _trace_started_at,
-                                 int((_time.perf_counter() - _ce_t0) * 1000))
-        return out
+                out = _out("error", detail="internal_error")
+            # ── R3/D: one place decides whether the customer saw this turn's slots ───
+            # Every branch above converges here, including the kill switch (which refused the
+            # send) and the crash path (whose rollback cannot undo the slot list, because the
+            # day-slots path committed it BEFORE dispatching). The helper itself checks what
+            # the outbound gate allowed and whether this turn claimed anything, so it is a
+            # no-op on every turn that really did display its slots.
+            self._revoke_undelivered_slot_claim(event, out)
+            # WILD1-C-R4 (R3RV-01): the turn boundary. A non-terminal, non-greeting burst whose
+            # reading never resolved is durably retained even when no send path recorded it.
+            self._finalize_question_retention(out)
+            out.latency_ce_ms = int((_time.perf_counter() - _ce_t0) * 1000)
+            _ai_inv = getattr(self, "_ai_invoked", False)
+            out.ai_invoked = _ai_inv
+            # Apply answer_source — priority order:
+            # 1. Inline answer_source already set in _out() call site
+            # 2. Unambiguous action inference (one-to-one action→source mapping)
+            # 3. self._answer_source (set at handler method entry for "replied" paths)
+            # 4. CE_AI when OpenAI was invoked
+            # 5. None (untagged — should not occur for launch-reachable paths)
+            if out.answer_source is None:
+                if out.action in ("flow_button_sent", "booking_created"):
+                    out.answer_source = "FLOW_RESPONSE"
+                    self._turn_decision_authority = DecisionAuthority.FLOW_TRANSACTION
+                    self._note_fact_source(FactSource.FLOW_TRANSACTION)
+                elif out.action == "skipped_human":
+                    out.answer_source = "HUMAN"
+                    # G3-5E2: this resolution is truthful — the human-ownership policy really
+                    # did own the turn — so the typed attribution is recorded with it. The
+                    # action-derived branches below are NOT adopted: `blocked_dispatch` naming
+                    # DETERMINISTIC_RULE is the very conflation G5D-04 recorded, and an
+                    # ERROR_FALLBACK is an outcome, not an authority.
+                    self._turn_decision_authority = DecisionAuthority.HUMAN_HANDOFF_POLICY
+                    self._note_fact_source(FactSource.CANONICAL_STATE)
+                elif out.action in self._DETERMINISTIC_SOURCE_ACTIONS:
+                    out.answer_source = "DETERMINISTIC_RULE"
+                elif out.action in self._VEHICLE_RESOLVER_SOURCE_ACTIONS:
+                    out.answer_source = "VEHICLE_RESOLVER"
+                elif out.action == "error":
+                    out.answer_source = "ERROR_FALLBACK"
+                else:
+                    _ans_src = getattr(self, "_answer_source", None)
+                    if _ans_src is not None:
+                        out.answer_source = _ans_src
+                    elif _ai_inv:
+                        out.answer_source = "CE_AI"
+            # Apply burst observability fields
+            out.burst_message_count = getattr(self, "_burst_message_count", 1)
+            out.burst_earliest_inbound_db_id = getattr(self, "_burst_earliest_inbound_db_id", None)
+            out.contributing_sources = getattr(self, "_contributing_sources", None)
+            # L4.7W5 Gate 1/2 — record how this decision was reached. Runs AFTER the answer is
+            # final and after every response-shaping branch above, so it can observe the real
+            # outcome; it writes in its own transaction and returns None on every failure, so a
+            # trace defect can never cost a customer turn.
+            # G3-5E: the shadow plan describes the turn whether or not tracing is armed, so
+            # "what this turn owed the customer" is observable on its own terms. It reads state
+            # the decision path already recorded; it calls nothing and changes nothing.
+            self._turn_response_plan = self._turn_plan(out)
+            self._write_hybrid_trace(event, out, _trace_started_at,
+                                     int((_time.perf_counter() - _ce_t0) * 1000))
+            # WILD1-C-R4 (R3RV-04): the guard is disarmed by `handle()`'s `finally`, after every
+            # commit of the turn — including the kill-switch branch's commit of CE state above.
+            return out
+        finally:
+            # WILD1-C-R4 (R3RV-04): the PERDIDO flush guard is removed on EVERY exit of the
+            # request lifecycle — normal return, the kill-switch commit, the crash rollback,
+            # and an exception raised by anything after `_handle` (slot-claim revocation, the
+            # plan, the hybrid trace). R3 disarmed only on the normal return.
+            self._disarm_perdido_guard()
 
     # ── Core dispatch ─────────────────────────────────────────────────────
 
@@ -3755,6 +3964,21 @@ class ConversationEngine:
         if not _booking_shaped:
             self._maybe_set_attribution(ctx, state)
 
+        # WILD1-C-R4-R3 (RV-F-01): a later text turn of a motorcycle handoff sets `needs_human`
+        # while the contact-data Flow is still pending. The customer's submission of THAT
+        # form (its token is the pending mirror) is still accepted so its contact data is
+        # stored; the handler keeps the thread human-owned and opens no commercial step. Any
+        # other delivery — including a replay after the token was consumed — stays
+        # `skipped_human` below.
+        if (state.needs_human and event.message_type == "flow_response"
+                and event.flow_response
+                and _flow_route.startswith(_MOTO_HANDOFF_TOKEN_PREFIX)
+                and _flow_route == (state.flow_booking_token or "")):
+            logger.info("WILD1-C-R4-R3 thread_id=%s pending motorcycle contact Flow accepted "
+                        "on a human-owned thread", event.thread_id)
+            self._arm_perdido_guard(ctx)
+            return self._process_motorcycle_contact_response(ctx, state, event.flow_response)
+
         # Human takeover check — AFTER cycle reset which clears needs_human
         if state.needs_human:
             logger.info("M18 thread_id=%s needs_human — AI suppressed", event.thread_id)
@@ -3781,6 +4005,17 @@ class ConversationEngine:
                 self._maybe_set_attribution(ctx, state)
             self.db.commit()
             return _out("skipped_human")
+
+        # ── WILD1-C-R4 (R3RV-02): PERDIDO is protected BEFORE dispatch by message type ──
+        # R3 armed the flush guard inside `_process_text` only, so a vehicle/location fallback
+        # Flow submission (`_process_flow_response`) wrote `flag=PRESUPUESTO_ENVIADO` over an
+        # operator's PERDIDO. Armed here, it covers the text path and every Flow-response
+        # handler. The ONE exclusion is a booking-shaped submission: its writer is
+        # `BookingAuthority` (its own connection, outside this guard's Session) and its
+        # persisted-booking behaviour is out of this milestone's scope (owner decision
+        # recorded in the WILD1-C-R4 closeout).
+        if not _booking_shaped:
+            self._arm_perdido_guard(ctx)
 
         # Route by message type
         if event.message_type == "flow_response" and event.flow_response:
@@ -3899,8 +4134,24 @@ class ConversationEngine:
         if routing_token.startswith(_MOTO_HANDOFF_TOKEN_PREFIX):
             return self._process_motorcycle_contact_response(ctx, state, flow_data)
 
+        # WILD1-C-R4-R3 (RV-F-01): a vehicle/location fallback form on a thread that already
+        # identified a motorcycle/quad/UTV cannot quote or advance it — the plain-text handoff
+        # owns it (no flag/motivo write, so a PERDIDO pair is untouched as well).
+        if (("tipo_vehiculo" in flow_data or "zona_general" in flow_data)
+                and self._thread_motorcycle_recorded(ctx, state)):
+            if "tipo_vehiculo" in flow_data:
+                state.vehicle_fallback_flow_sent = False
+            else:
+                state.location_fallback_flow_sent = False
+            return self._motorcycle_human_handoff(ctx, state, recorded=True)
+
         # Route to qualification fallback handlers BEFORE booking flow processing.
         # Detection is by distinctive payload keys, not by token.
+        # WILD1-C-R4 (R3RV-02): a fallback form on a PERDIDO lead is HELD before either
+        # handler can quote, dispatch a Flow, withdraw/issue an offer or write the flag.
+        if (("tipo_vehiculo" in flow_data or "zona_general" in flow_data)
+                and getattr(lead, "flag", None) == "PERDIDO"):
+            return self._hold_perdido_fallback(ctx, state, flow_data)
         if "tipo_vehiculo" in flow_data:
             return self._process_vehicle_fallback_response(ctx, state, flow_data)
         if "zona_general" in flow_data:
@@ -5030,7 +5281,7 @@ class ConversationEngine:
                 return self._composed_quote_reply(
                     (_q_focus.marca or "").strip() or None if _q_focus else None,
                     (_q_focus.modelo or "").strip() or None if _q_focus else None,
-                    _q_det, real_price_quote.precio_total,
+                    _q_det, real_price_quote,
                     _q_focus.anio if _q_focus else None), None
             return self._missing_quote_facts_reply(ctx, state), None
         return self._scheduling_next_step(ctx, state), None
@@ -5209,20 +5460,50 @@ class ConversationEngine:
 
     # ── Qualification fallback Flows ─────────────────────────────────────
 
-    def _composed_quote_reply(self, marca, modelo, location, precio_total, anio=None):
+    def _composed_quote_reply(self, marca, modelo, location, quote, anio=None):
         """R6. The approved quote copy, DECLARED by the code that read the canonical values.
 
         The composer states what its words claim — the PricingService amount, the focus
         vehicle and the inspection zone it was given — and `validate_envelope` checks each
         against canonical state before the rendered text is even read.
+
+        WILD1-C: `quote` is the structured `PricingQuote` itself, never a bare total. The
+        PRICE claim declares the full breakdown (revisión, viáticos, total), reconciled as
+        integers here and again by the validator, which also requires the canonical block
+        verbatim in the rendered text. No component is computed by this method or any model.
         """
-        text = self._build_quote_reply(marca, modelo, location, precio_total, anio)
-        claims = [StructuredClaim(DomainClaim.PRICE, (int(precio_total),))]
+        base, viaticos, total = _quote_breakdown(quote)
+        text = self._build_quote_reply(marca, modelo, location, quote, anio)
+        claims = [StructuredClaim(DomainClaim.PRICE, (base, viaticos, total))]
         if marca and modelo:
             claims.append(StructuredClaim(DomainClaim.VEHICLE, (marca, str(modelo))))
         if location:
             claims.append(StructuredClaim(DomainClaim.LOCATION, (location,)))
         return composed_text(text, claims=claims)
+
+    @staticmethod
+    def _composed_concern_quote_reply(quote) -> "ComposedText":
+        """WILD1-C-R4 (WC-09): the canonical breakdown under the neutral concern lead,
+        declared with the same 3-tuple PRICE claim as every quote. No call to action."""
+        base, viaticos, total = _quote_breakdown(quote)
+        block = _rv_render_price_breakdown(base, viaticos, total)
+        return composed_text(f"{_PRICE_CONCERN_LEAD}\n\n{block}",
+                             claims=[StructuredClaim(DomainClaim.PRICE, (base, viaticos, total))])
+
+    def _semantic_price_concern(self) -> bool:
+        """The interpreter's resolved HESITATE for THIS burst (a concern, not a refusal).
+        No reading → False: the absence of a reading never selects concern copy."""
+        try:
+            from ..schemas.turn_evidence import UNRESOLVED_STATUSES
+            # The turn's coverage read (memoised; bounded by the one turn deadline) — no
+            # new reader of the evidence accessor and no second wait.
+            acc = getattr(self._coverage_evidence(), "acceptance", None)
+            signal = getattr(getattr(acc, "signal", None), "value",
+                             getattr(acc, "signal", None))
+            return (signal == "HESITATE"
+                    and getattr(acc, "status", None) not in UNRESOLVED_STATUSES)
+        except Exception:
+            return False
 
     @staticmethod
     def _composed_slot_offer(text: str, day_iso, slots) -> "ComposedText":
@@ -5239,15 +5520,25 @@ class ConversationEngine:
         marca: "str | None",
         modelo: "str | None",
         location: "str | None",
-        precio_total: int,
+        quote,
         anio: "int | None" = None,
     ) -> str:
         """Return the approved customer-facing quote copy.
 
-        Genial! La cotización para la revisión del {vehicle} en {location}
-        es de ${price}. Si te parece bien, podemos avanzar.
+        WILD1-C. Every quote shows the three canonical values — never a total alone:
+
+            Genial! Te paso la cotización para la revisión del {vehicle} en {location}:
+
+            Revisión: $X
+            Viáticos: $Y
+            Total: $Z
+
+            Si te parece bien, podemos avanzar.
+
+        `quote` is the structured `PricingQuote`; the monetary block is
+        `render_price_breakdown`, which refuses components that do not reconcile.
         """
-        total = _format_price_ars(precio_total)
+        block = _rv_render_price_breakdown(*_quote_breakdown(quote))
         vehicle = " ".join(
             p for p in [
                 (marca or "").strip(),
@@ -5255,25 +5546,11 @@ class ConversationEngine:
                 str(anio) if anio else None,
             ] if p
         ).strip() or None
-        if vehicle and location:
-            return (
-                f"Genial! La cotización para la revisión del {vehicle} en {location} "
-                f"es de {total}. Si te parece bien, podemos avanzar."
-            )
-        if vehicle:
-            return (
-                f"Genial! La cotización para la revisión del {vehicle} "
-                f"es de {total}. Si te parece bien, podemos avanzar."
-            )
-        if location:
-            return (
-                f"Genial! La cotización para la revisión en {location} "
-                f"es de {total}. Si te parece bien, podemos avanzar."
-            )
-        return (
-            f"Genial! La cotización para la revisión es de {total}. "
-            "Si te parece bien, podemos avanzar."
-        )
+        subject = ("la revisión"
+                   + (f" del {vehicle}" if vehicle else "")
+                   + (f" en {location}" if location else ""))
+        return (f"Genial! Te paso la cotización para {subject}:\n\n{block}\n\n"
+                "Si te parece bien, podemos avanzar.")
 
     # ── G3-4: semantic availability enquiry — read, never re-derived ─────────
 
@@ -8349,6 +8626,51 @@ class ConversationEngine:
         self._decision_log(ctx, "booking_offer_withdrawn", reason=reason, offers=n)
         return n
 
+    def _hold_perdido_fallback(self, ctx: _Context, state: "WhatsAppThreadState",
+                               flow_data: dict) -> ConversationHandleOut:
+        """WILD1-C-R4 (R3RV-02): a vehicle/location fallback form submitted for a PERDIDO lead.
+
+        Whoever wrote the PERDIDO — an operator, an operator's re-confirmation, or the
+        engine's own decline — a form submission is not the customer's reconsideration of the
+        quote (that is the lost-lead rule, on the text path, and it is unchanged). So the
+        submission changes nothing commercial: no candidate or zone write, no quote, no CTA,
+        no Flow, no offer withdrawal or issue, no token, no booking, and `flag`/`motivo_perdida`
+        stay exactly as they are (the flush guard armed by `_handle` is the second line). The
+        only state touched is the fact that the proposal is no longer outstanding. The reply
+        is the owner-approved hold copy; it claims no notification and no booking."""
+        self._answer_source = "DETERMINISTIC_RULE"
+        family = "VEHICLE" if "tipo_vehiculo" in flow_data else "LOCATION"
+        if family == "VEHICLE":
+            state.vehicle_fallback_flow_sent = False
+        else:
+            state.location_fallback_flow_sent = False
+        if family == "VEHICLE":
+            # WILD1-C-R4-R1 (C): a motorcycle/quad/UTV revealed by the form keeps its
+            # classification and its human-handoff safety state — the generic hold must not
+            # erase it. Existing handoff, plain-text branch (no Flow); flag/motivo untouched.
+            tipo = (flow_data.get("tipo_vehiculo") or "").strip().upper()
+            marca = (flow_data.get("marca") or "").strip() or None
+            modelo = (flow_data.get("modelo") or "").strip() or None
+            if tipo == "MOTO" or self._is_motorcycle_enquiry(
+                    " ".join(x for x in (tipo, marca or "", modelo or "") if x)):
+                logger.warning("WILD1-C-R4-R1 PERDIDO_FALLBACK_MOTORCYCLE thread_id=%s — held "
+                               "human handoff", getattr(ctx.thread, "id", None))
+                return self._motorcycle_human_handoff(ctx, state, marca=marca, modelo=modelo,
+                                                      held=True)
+        engine_decline = self._engine_written_decline(ctx) is not None
+        self._decision_log(ctx, "perdido_fallback_held", family=family,
+                           engine_decline=engine_decline,
+                           motivo=getattr(ctx.lead, "motivo_perdida", None))
+        logger.warning("WILD1-C-R4 PERDIDO_FALLBACK_HELD thread_id=%s family=%s "
+                       "engine_decline=%s — the form changes nothing on a PERDIDO lead",
+                       getattr(ctx.thread, "id", None), family, engine_decline)
+        self._turn_perdido_hold = True
+        # WILD1-C-R4-R1 (R4-D2): an operator's PERDIDO needs a person; the engine's own
+        # decline is the customer's to reverse by saying so — the copy says exactly that.
+        reply = _PERDIDO_FALLBACK_DATA_REPLY if engine_decline else _PERDIDO_HOLD_REPLY
+        sent_id = self._send_text_to_wa(ctx, composed_text(reply))
+        return _out("replied", wa_message_id=sent_id)
+
     def _process_vehicle_fallback_response(
         self,
         ctx: _Context,
@@ -8508,13 +8830,14 @@ class ConversationEngine:
         real_price_quote = self._compute_price_quote(ctx, state)
         if real_price_quote:
             _, _disp_det = self._get_active_inspection_location(ctx, state)
-            reply = self._build_quote_reply(
+            reply = self._composed_quote_reply(
                 marca or None,
                 modelo or None,
                 _disp_det,
-                real_price_quote.precio_total,
+                real_price_quote,
             )
             lead.flag = "PRESUPUESTO_ENVIADO"
+            lead.motivo_perdida = None      # WILD1-C-R4: a loss reason never outlives PERDIDO
             state.last_stage = STAGE_QUOTED
             self.db.commit()
             sent_id = self._send_text_to_wa(ctx, reply)
@@ -8702,9 +9025,10 @@ class ConversationEngine:
                 (focus.marca or "").strip() or None if focus else None,
                 (focus.modelo or "").strip() or None if focus else None,
                 _disp_det,
-                real_price_quote.precio_total,
+                real_price_quote,
             )
             lead.flag = "PRESUPUESTO_ENVIADO"
+            lead.motivo_perdida = None      # WILD1-C-R4: a loss reason never outlives PERDIDO
             state.last_stage = STAGE_QUOTED
         else:
             # Zone known but vehicle still missing — or zone not in pricing DB.
@@ -8824,6 +9148,7 @@ class ConversationEngine:
         if not flow_id:
             return None
         self._answer_source = "VEHICLE_RESOLVER"
+        intro = self._with_pending_ack(ctx, intro)          # WILD1-C-R4 (R3RV-01)
         logger.info(
             "M20 vehicle_flow_direct thread_id=%s flow_id=%s", ctx.thread.id, flow_id
         )
@@ -8871,6 +9196,7 @@ class ConversationEngine:
         # a customer who mentions a concern is asked for the locality the same way as
         # anyone else, and the concern is addressed in the inspection itself.
         body = body or _LOCATION_CLARIFICATION_INTRO
+        body = self._with_pending_ack(ctx, body)            # WILD1-C-R4 (R3RV-01)
         logger.info(
             "M20 location_flow_direct thread_id=%s flow_id=%s concern=%s",
             ctx.thread.id, flow_id, concern,
@@ -8945,6 +9271,11 @@ class ConversationEngine:
             lead.flag = "PRESUPUESTANDO"
             state.last_stage = STAGE_QUALIFYING
             self.db.commit()
+        # WILD1-C-R3 (WC-02): from here on, a PERDIDO lead's flag and loss reason change only
+        # through the lost-lead rule (reconsideration of the engine's OWN decline). R4: armed
+        # by `_handle` before dispatch; armed here only for a direct caller.
+        if getattr(self, "_turn_perdido_guard", None) is None:
+            self._arm_perdido_guard(ctx)
 
         # ── M21.1.1: Current-turn evidence construction ───────────────────
         # Audio transcripts arrive as event.text (DB text=NULL); must be
@@ -9050,13 +9381,30 @@ class ConversationEngine:
         # G3-5B (audit G5A-01): the interpreter is dispatched from the CANONICAL burst, not
         # from the presentation subset. The producer that holds semantic primacy over every
         # deterministic signal now interprets the same turn the reconciler authorizes.
+        # WILD1-C-R4 (R3RV-03): the turn's one semantic deadline starts as its readings are
+        # dispatched; every later semantic consumer waits only for what is left of it.
+        self._start_semantic_deadline()
         self._run_shadow_understand(
             ctx, event, list(self._canonical_turn_burst.texts),
             burst=self._canonical_turn_burst)
+        # WILD1-C-R3 (WC-01): a question an earlier burst left PENDING (its reading timed out
+        # or failed) is re-read now, CONCURRENTLY with the current reading, so it can be
+        # answered on this turn. R4: both share the one deadline above.
+        self._dispatch_pending_resolution(ctx)
 
         # ── M21.1.1 Layer A: Motorcycle pre-gate (all stages) ─────────────
+        # WILD1-C-R4-R3 (RV-F-01): the THREAD is checked first. A motorcycle/quad/UTV this
+        # cycle already identified (MOTO candidate, or the contact Flow still pending) owns
+        # every later text turn — whatever it says — through the plain-text handoff; it is
+        # never re-offered the contact Flow and never reaches a quote, acceptance, offer or
+        # scheduling path below.
+        if self._thread_motorcycle_recorded(ctx, state):
+            return self._motorcycle_human_handoff(ctx, state, recorded=True)
         if self._is_motorcycle_enquiry(current_turn_text):
-            return self._motorcycle_human_handoff(ctx, state, source_text=current_turn_text)
+            # WILD1-C-R4-R1: on a PERDIDO lead the handoff is the plain-text branch (no Flow).
+            return self._motorcycle_human_handoff(
+                ctx, state, source_text=current_turn_text,
+                held=(getattr(lead, "flag", None) == "PERDIDO"))
 
         # ── M21.1.1 Layer B: Phone-call/human-request pre-gate (all stages)
         # Uses existing module-level _is_phone_call_request (line 307).
@@ -9069,6 +9417,18 @@ class ConversationEngine:
         _svc_out = self._handle_explicit_service_gate(ctx, current_turn_text)
         if _svc_out is not None:
             return _svc_out
+
+        # ── WILD1-C-R4-R1 (R4-D1): an OPERATOR-held PERDIDO holds BEFORE any commercial step ──
+        # R4 relied on the flush guard to keep the flag while the deterministic quote force
+        # and the transactional renderer still sent a quote + CTA and moved the stage. Here,
+        # past the three terminal pre-gates (motorcycle → human, phone → human, service
+        # boundary) and before admission, Layer D, the website form, every quote/re-quote,
+        # clarification, scheduling and progression renderer, the turn is held: exact owner
+        # copy, nothing else composed, no stage/flag/motivo/offer/token/booking change. An
+        # ENGINE-written decline is not held here: it stays reconsiderable by the customer's
+        # explicit text (`_apply_lost_lead_rule`).
+        if self._operator_lost_lead(ctx):
+            return self._handle_perdido_hold(ctx, state)
 
         # ── W1F-W-01 R1: ADMIT BEFORE ROUTE ───────────────────────────────
         # The review's one structural change. Authority in the inherited engine is
@@ -9124,6 +9484,21 @@ class ConversationEngine:
                      and _has_acceptance_word(ai_input_messages)
                      and (not self._acceptance_authority_on()
                           or self._authorize_acceptance(ctx, state, ai_input_messages).allows))
+            # WILD1-C: after a quote, a burst that also asks the price/viáticos, or that
+            # explicitly declines, belongs to the commercial path below — the FAQ it carries
+            # still travels with it (the plan's FAQ producer), but Layer D's early answer
+            # would drop the money question and the decline (H-1, "¿de qué consta?" +
+            # "me parece caro, ¿cuánto hay de viático?").
+            and not (state.last_stage in (STAGE_QUOTED, STAGE_SCHEDULING)
+                     and not state.needs_human
+                     and (self._detect_price_question(self._norm_text(current_turn_text))
+                          or (state.last_stage == STAGE_QUOTED
+                              and self._explicit_quote_decline(ctx, state) is not None)
+                          # WILD1-C-R4 (WC-09): a price CONCERN after a quote is answered
+                          # with the breakdown on the commercial path; the FAQ it carries
+                          # still travels with it (the plan's FAQ producer).
+                          or (state.last_stage == STAGE_QUOTED
+                              and self._semantic_price_concern())))
         ):
             # ── G3-7H P4: register-and-continue, or the inherited answer-and-return ──
             if self._layer_d_register_and_continue_on():
@@ -9159,6 +9534,40 @@ class ConversationEngine:
         # Motorcycle / phone / service / FAQ-bypass / inspectability / website-form
         # all returned above and will not trigger reconciliation.
         self._turn_faq_burst = current_turn_text
+        # WILD1-C: past every terminal pre-gate — coverage may now wait (bounded) on the
+        # interpreter, exactly as the FAQ and acceptance consumers below already do.
+        self._turn_coverage_may_wait = True
+        self._turn_continues = True                     # WILD1-C-R3: eligible turn
+
+        # ── WILD1-C: explicit quote decline (pre-AI) ──────────────────────
+        # The customer semantically DECIDES not to proceed with the delivered quote. A price
+        # question, a breakdown request or a concern without a refusal is not a decline —
+        # the interpreter reads those as QUESTION_ONLY / HESITATE, and they continue below.
+        if state.last_stage == STAGE_QUOTED and not state.needs_human:
+            _decline = self._explicit_quote_decline(ctx, state)
+            if _decline is not None:
+                return self._handle_quote_decline(ctx, state, _decline)
+
+        # ── WILD1-C-R4 (WC-09): a price CONCERN without a refusal ─────────────────
+        # The interpreter reads "me parece caro…" as HESITATE (never REJECT, so nothing is
+        # declined). The reply explains the canonical breakdown under the owner-approved
+        # neutral lead — no "Genial!", no call to action; the plan adds any other answer
+        # the burst is owed. A day request in the same burst is a scheduling request first.
+        # QUOTED only: the decline probe above has already read this burst's semantics, so
+        # this adds no wait (a SCHEDULING turn's deterministic floors never wait on it).
+        if (state.last_stage == STAGE_QUOTED
+                and not state.needs_human
+                and self._semantic_price_concern()
+                and not self._turn_has_scheduling_evidence(
+                    ai_input_messages, self._coverage_evidence())):
+            _concern_quote = self._compute_price_quote(ctx, state)
+            if _concern_quote is not None:
+                logger.info("WILD1-C-R4 price concern thread_id=%s stage=%s",
+                            ctx.thread.id, state.last_stage)
+                self._answer_source = "PRICING_SERVICE"
+                sent_id = self._send_text_to_wa(
+                    ctx, self._composed_concern_quote_reply(_concern_quote))
+                return _out("replied", wa_message_id=sent_id)
 
         # ── Deterministic price re-query (pre-AI) ────────────────────────
         # Customer asks the price again while already in QUOTED or SCHEDULING.
@@ -9172,6 +9581,14 @@ class ConversationEngine:
             and self._detect_price_question(
                 self._norm_text(" ".join(ai_input_messages))
             )
+            # WILD1-C: a burst that ALSO asks for a day ("están en precio, ¿para mañana
+            # tenés horarios?" + "¿cuánto es de viático?") is a scheduling request first.
+            # The scheduling path below answers the day; the price breakdown and every
+            # other owed answer still reach the customer — in the text plan or, when the
+            # Booking Flow opens, in its body (`_coverage_preamble`). H-1 answered the
+            # total here and dropped the day and the report question.
+            and not self._turn_has_scheduling_evidence(
+                ai_input_messages, self._coverage_evidence())
         ):
             _requery_quote = self._compute_price_quote(ctx, state)
             if _requery_quote is not None:
@@ -9181,7 +9598,7 @@ class ConversationEngine:
                     (_rq_focus.marca or "").strip() or None if _rq_focus else None,
                     (_rq_focus.modelo or "").strip() or None if _rq_focus else None,
                     _rq_det,
-                    _requery_quote.precio_total,
+                    _requery_quote,
                     _rq_focus.anio if _rq_focus else None,
                 )
                 logger.info(
@@ -9212,13 +9629,24 @@ class ConversationEngine:
             # With the flag ON the deterministic predicate decides; with it OFF this is the
             # legacy path, unchanged.
             if not self._acceptance_authority_on():
-                return self._handle_quoted_acceptance(ctx, state)
+                # WILD1-C: legacy path — an operator's PERDIDO is never overwritten.
+                if not self._operator_lost_lead(ctx):
+                    # WILD1-C-R4: the rule's verdict is honoured (a HOLD never accepts).
+                    if getattr(self._apply_lost_lead_rule(ctx, state, _LEGACY_ALLOW),
+                               "allows", False):
+                        return self._handle_quoted_acceptance(ctx, state)
+                # WILD1-C-R4 (WC-08): an operator-held PERDIDO is never re-quoted with a CTA.
+                return self._handle_perdido_hold(ctx, state)
             _auth = self._authorize_acceptance(ctx, state, ai_input_messages)
             if _auth.allows:
                 return self._handle_quoted_acceptance(ctx, state)
             logger.info(
                 "L4.7C.3B acceptance NOT authorized thread_id=%s result=%s reason=%s",
                 ctx.thread.id, _auth.result, _auth.reason)
+            if self._operator_lost_lead(ctx):
+                # WILD1-C-R4 (WC-08): the acceptance of an operator-held PERDIDO is held
+                # with the owner-approved copy — not the quote again with a CTA.
+                return self._handle_perdido_hold(ctx, state)
 
         # ── Deterministic QUOTED + date proposal (pre-AI) ────────────────
         # User proposes a day (with or without exact time) while still in QUOTED
@@ -9230,15 +9658,29 @@ class ConversationEngine:
             # clear the same deterministic prerequisites — delivered, current, same-cycle
             # quote. Scheduling INTERPRETATION is untouched (that is C4): only the
             # commercial progression is gated.
-            _sched_auth = (self._authorize_scheduling_progression(ctx, state)
-                           if self._acceptance_authority_on() else None)
-            _progression_allowed = (_sched_auth is None or _sched_auth.allows)
             sched_day_iso, sched_time_str = _parse_scheduling_text(ai_input_messages, _business_today())
             period = _detect_time_period(ai_input_messages)
             # L4.3: the customer may offer two days at once ("mñ 15hs? o el jueves").
             # Evaluate the explicit PRIMARY preference before the FALLBACK.
             sched_requests = self._reconciled_scheduling_requests(
                     ctx, state, ai_input_messages, date.today())
+            # WILD1-C-R4-R1 (R4-D2): the authorizer applies the lost-lead rule, whose ALLOW
+            # appends RECONSIDERED and restores the quote flag. It used to run on EVERY QUOTED
+            # turn before any day was parsed, so "perdón, en realidad es un Corolla 2018"
+            # reconsidered an engine decline. It now runs only when this burst actually
+            # carries a day/time request — the implicit acceptance it authorizes.
+            _sched_auth = (self._authorize_scheduling_progression(ctx, state)
+                           if self._acceptance_authority_on()
+                           and (sched_day_iso or sched_requests) else None)
+            _progression_allowed = (_sched_auth is None or _sched_auth.allows)
+            if _sched_auth is None and _progression_allowed:
+                # WILD1-C: legacy path — the same PERDIDO rule as the authorizer's.
+                _progression_allowed = not self._operator_lost_lead(ctx)
+            if (not _progression_allowed and (sched_day_iso or sched_requests)
+                    and self._operator_lost_lead(ctx)):
+                # WILD1-C-R4 (WC-08): a day proposal is an implicit acceptance; on an
+                # operator-held PERDIDO it is held with the same owner-approved copy.
+                return self._handle_perdido_hold(ctx, state)
             if len(sched_requests) >= 2 and _progression_allowed:
                 lead.flag = "ACEPTADO"
                 state.last_stage = STAGE_SCHEDULING
@@ -10283,6 +10725,20 @@ class ConversationEngine:
         # required nothing at all: membership of _ALLOWED_FLAGS was the whole check, so
         # a model that emitted lead_flag="ACEPTADO" advanced commercial state directly.
         # It now passes the same C3B authorizer as every other acceptance.
+        # WILD1-C-R3 (WC-02): a model proposal never moves a PERDIDO lead — except ACEPTADO
+        # through the lost-lead rule (the authorizer below with the authority on; the legacy
+        # rule here with it off): an engine decline is reconsidered, an operator's is held.
+        if flag_accepted and lead.flag == "PERDIDO" and new_flag != "PERDIDO":
+            if new_flag != "ACEPTADO":
+                flag_accepted = False
+            elif not self._acceptance_authority_on():
+                if self._operator_lost_lead(ctx):
+                    logger.info("WILD1-C-R3 AI ACEPTADO held thread_id=%s — lead PERDIDO by "
+                                "an operator", ctx.thread.id)
+                    flag_accepted = False
+                elif not getattr(self._apply_lost_lead_rule(ctx, state, _LEGACY_ALLOW),
+                                 "allows", False):
+                    flag_accepted = False        # WILD1-C-R4: a HOLD never accepts
         if flag_accepted and new_flag == "ACEPTADO" and lead.flag != "ACEPTADO":
             if self._acceptance_authority_on():
                 _ai_auth = self._authorize_acceptance(ctx, state, ai_input_messages)
@@ -10375,7 +10831,7 @@ class ConversationEngine:
                         (_q_focus.marca or "").strip() or None if _q_focus else None,
                         (_q_focus.modelo or "").strip() or None if _q_focus else None,
                         _q_det,
-                        real_price_quote.precio_total,
+                        real_price_quote,
                         _q_focus.anio if _q_focus else None,
                     )
                     self._answer_source = "PRICING_SERVICE"
@@ -10411,7 +10867,7 @@ class ConversationEngine:
                 (_q_focus.marca or "").strip() or None if _q_focus else None,
                 (_q_focus.modelo or "").strip() or None if _q_focus else None,
                 _q_det,
-                real_price_quote.precio_total,
+                real_price_quote,
                 _q_focus.anio if _q_focus else None,
             )
             self._answer_source = "PRICING_SERVICE"
@@ -10619,6 +11075,35 @@ class ConversationEngine:
             return True
         return False
 
+    def _thread_motorcycle_recorded(self, ctx: "_Context",
+                                    state: "WhatsAppThreadState | None") -> bool:
+        """Has this thread's CURRENT cycle already identified a motorcycle/quad/UTV?
+
+        WILD1-C-R4-R3 (review RV-F-01). Layer A read only the current turn, and the
+        contact-Flow branch of `_motorcycle_human_handoff` deliberately defers `needs_human`
+        until the form is submitted — so a later "está en Palermo, ¿cuánto sale?" reached the
+        ordinary quote path with the `mentioned` MOTO candidate as its focus, and "dale,
+        ¿mañana puede ser?" then dispatched the Booking Flow with an ISSUED offer.
+
+        The thread-level authority is what the first enquiry ALREADY persists, so no
+        migration and no new state: a MOTO-typed candidate in this cycle (`ctx.candidates`
+        is loaded under the cycle watermark; a cycle reset archives the prior focus), or the
+        pending `moto-handoff-` contact-Flow token on the thread-state mirror. Either one
+        means a person owns the vehicle; nothing here reads customer prose.
+        """
+        token = getattr(state, "flow_booking_token", None) if state is not None else None
+        if isinstance(token, str) and token.startswith(_MOTO_HANDOFF_TOKEN_PREFIX):
+            return True
+        candidates = getattr(ctx, "candidates", None)
+        if not isinstance(candidates, (list, tuple)):
+            return False
+        for c in candidates:
+            tipo = getattr(c, "tipo_vehiculo", None)
+            if (isinstance(tipo, str) and tipo.upper() in _MOTO_TIPO_VALUES
+                    and getattr(c, "status", None) != "archived"):
+                return True
+        return False
+
     def _motorcycle_human_handoff(
         self,
         ctx: "_Context",
@@ -10626,8 +11111,22 @@ class ConversationEngine:
         source_text: str = "",
         marca: "str | None" = None,
         modelo: "str | None" = None,
+        held: bool = False,
+        recorded: bool = False,
     ) -> "ConversationHandleOut":
         """Motorcycle/quad/UTV inquiry handler.
+
+        WILD1-C-R4-R3 (RV-F-01): `recorded=True` — passed by a caller that found the thread
+        already holding a MOTO candidate / a pending motorcycle contact-Flow token
+        (`_thread_motorcycle_recorded`) — is a LATER turn of an unresolved motorcycle handoff. It takes the plain-text branch
+        below (`needs_human`, the existing review notification, `_MOTORCYCLE_HANDOFF_REPLY`),
+        records no second candidate, sends no second Flow, and leaves a pending contact-Flow
+        token in place so the customer's form can still be stored (`_handle`).
+
+        WILD1-C-R4-R1: `held=True` (the lead is PERDIDO) always takes the plain-text branch
+        below — a person owns the thread (`needs_human`), the existing review notification
+        runs, no Flow and no token are issued — and still records the MOTO candidate, so the
+        classification survives the hold. Flag and motivo are never written here.
 
         When WHATSAPP_FLOW_ID (CLIENT DATA FLOW) is configured (preferred path):
           Turn 1: creates a MOTO candidate, stores a pending token, and dispatches
@@ -10639,8 +11138,26 @@ class ConversationEngine:
         """
         self._answer_source = "DETERMINISTIC_RULE"
         flow_id = (getattr(self.settings, "whatsapp_flow_id", "") or "").strip()
+        # `recorded` is decided by the CALLER (each one checks `_thread_motorcycle_recorded`
+        # before it records anything): a caller that has just written this turn's MOTO
+        # candidate — the G3-7F-R2 correction — is a FIRST identification and keeps the
+        # contact-data Flow.
+        if recorded:
+            logger.warning("WILD1-C-R4-R3 MOTORCYCLE_HANDOFF_RECORDED thread_id=%s — a later "
+                           "turn of an unresolved motorcycle handoff goes to a person",
+                           getattr(ctx.thread, "id", None))
 
-        if not flow_id:
+        if held and not recorded:
+            from app.models import WhatsAppThreadCandidate as _HeldMoto
+            if not marca and not modelo and source_text:
+                marca, modelo = self._extract_motorcycle_make_model(source_text)
+            self.db.add(_HeldMoto(
+                thread_id=ctx.thread.id, tipo_vehiculo="MOTO", marca=marca or None,
+                modelo=modelo or None, status="mentioned",
+                source_text=(source_text or f"moto:{marca or ''} {modelo or ''}").strip()))
+            self.db.flush()
+
+        if not flow_id or held or recorded:
             # ── Fallback: Flow not configured — immediate plain-text handoff ───
             state.needs_human = True
             if ctx.lead:
@@ -10814,15 +11331,20 @@ class ConversationEngine:
         )
 
         # Human handoff — set AFTER persisting all data
+        # WILD1-C-R4-R3: a later text turn may already have handed the thread to a person
+        # (and raised the review notification); the form then stores its data and the
+        # notification is not raised a second time for the same handoff.
+        _already_human = bool(state.needs_human)
         lead.necesita_humano = True
         state.needs_human = True
 
         self.db.commit()
 
         try:
-            self._send_fallback_human_review_notification(
-                ctx, state, reason="motorcycle_enquiry"
-            )
+            if not _already_human:
+                self._send_fallback_human_review_notification(
+                    ctx, state, reason="motorcycle_enquiry"
+                )
         except Exception as exc:
             logger.error(
                 "M21.2 motorcycle_contact_response notification failed thread_id=%s: %s",
@@ -11212,10 +11734,51 @@ class ConversationEngine:
         provider = getattr(self, "_turn_semantic", None)
         if provider is None:
             return None
-        result = provider.get(timeout=self._semantic_sync_timeout())
+        # WILD1-C-R4 (R3RV-03): every consumer waits only for what is left of the turn's ONE
+        # semantic deadline. A consumer arriving after the deadline reads a reading that has
+        # finished since, and never starts a wait of its own (R3's per-provider "never wait
+        # twice" let QUOTED reach 6.0 s and a pending re-read 8–9 s).
+        result = self._await_reading(provider)
         if result is None or not getattr(result, "ok", False):
             return None
         return getattr(result, "evidence", None)
+
+    # ── WILD1-C-R4 (R3RV-03): one monotonic semantic deadline per turn ──────────────
+
+    def _semantic_budget(self) -> float:
+        """The turn's total semantic wait: min(4.5 s, SEMANTIC_SAME_TURN_TIMEOUT_SECONDS)."""
+        return min(_TURN_SEMANTIC_BUDGET_SECONDS, self._semantic_sync_timeout())
+
+    def _start_semantic_deadline(self) -> float:
+        """Start the turn's deadline once (idempotent); returns it (monotonic seconds)."""
+        deadline = getattr(self, "_turn_semantic_deadline", None)
+        if deadline is None:
+            deadline = _time.monotonic() + self._semantic_budget()
+            self._turn_semantic_deadline = deadline
+        return deadline
+
+    def _semantic_remaining(self) -> float:
+        """Seconds left of the turn's semantic deadline (0 once it has passed)."""
+        return max(0.0, self._start_semantic_deadline() - _time.monotonic())
+
+    def _await_reading(self, provider):
+        """One semantic result, waited for within the REMAINING turn deadline. Never raises.
+
+        * a finished reading is read immediately;
+        * a reading whose dispatch was declined or whose thread never started is NOT run
+          inline on the request thread (that path was bounded only by the provider's 30 s
+          HTTP timeout): it is unavailable for this turn, and its burst is retained;
+        * otherwise wait at most the time left of the turn's one deadline."""
+        if provider is None:
+            return None
+        try:
+            if getattr(provider, "ready", False):
+                return provider.get(timeout=0)
+            if not getattr(provider, "dispatched", True):
+                return None
+            return provider.get(timeout=self._semantic_remaining())
+        except Exception:
+            return None
 
     # ── L4.7W2-F1 — bounded locality recovery from imperfect speech ──────────
 
@@ -12163,6 +12726,8 @@ class ConversationEngine:
             has_scheduling_evidence=self._turn_has_scheduling_evidence(texts, evidence))
 
         decision = authorize_quote_acceptance(claims, self._commercial_state(ctx, state))
+        # WILD1-C: a PERDIDO lead — reactivate the engine's own decline, hold an operator's.
+        decision = self._apply_lost_lead_rule(ctx, state, decision)
         self._record_authorization(ctx, decision, state)
         # ── G3-1: observational. The authorizer decided; this records what it saw. ──
         # No authority verdict is passed: `authorize_quote_acceptance` folds the claims
@@ -12215,6 +12780,7 @@ class ConversationEngine:
     def _authorize_scheduling_progression(self, ctx: "_Context", state):
         from .acceptance_authorizer import authorize_scheduling_progression
         decision = authorize_scheduling_progression(self._commercial_state(ctx, state))
+        decision = self._apply_lost_lead_rule(ctx, state, decision)    # WILD1-C
         self._record_authorization(ctx, decision, state)
         return decision
 
@@ -12621,8 +13187,16 @@ class ConversationEngine:
                 getattr(ctx.thread, "id", None), env.provenance.name,
                 getattr(env.fallback_id, "name", None),
                 sorted(i.name for i in env.question_intents))
+            restored, corrupted = _restore_price_blocks(text, env.text)
+            if corrupted:
+                # WILD1-C-R3: never a partial price breakdown. The safe line goes instead and
+                # the coverage check (on this validated text) keeps the price owed.
+                logger.warning(
+                    "WILD1-C-R3 PRICE_BLOCK_CORRUPTED_BY_VALIDATION thread_id=%s — safe line "
+                    "sent, breakdown withheld", getattr(ctx.thread, "id", None))
+                return safe_failure_text()
             self._last_outbound_envelope = env
-            return env.text
+            return restored
         except Exception as exc:
             logger.warning(
                 "L4.7D response validation error thread_id=%s: %s — safe line sent",
@@ -13204,6 +13778,38 @@ class ConversationEngine:
         if ctx.lead is None:
             return self._send_service_boundary(ctx, _UNCERTAIN_SERVICE_REPLY)
 
+        # WILD1-C (H-1 turn 1): since R6-C4B the model's body is discarded on this route
+        # and the canonical FAQ answers come ONLY from the plan's FAQ producer — which reads
+        # `_turn_faq_burst`. Layer D returns before the commercial path arms it, so "¿De qué
+        # consta el servicio? ¿Se puede pagar con efectivo o débito?" was answered with the
+        # vehicle question alone. Arm it here, with this route's own burst.
+        # Armed only when there is something to answer — an explicit (deterministic) FAQ
+        # question, or a semantic reading that has ALREADY finished — so a bare "buenas"
+        # never waits on the model (W1F-R2: nothing to admit, nothing to wait for). Coverage
+        # on this route reads only a finished reading (`_turn_coverage_may_wait` stays off).
+        #
+        # WILD1-C-R3 (WC-01) — corrected. "A reading that has ALREADY finished" was the
+        # defect: under the live async posture the reading is usually still in flight here,
+        # so "¿Qué revisan?" was treated exactly like "buenas" and the question vanished.
+        # The boundary is now TYPED (`claim_coverage.question_potential`), not lexical:
+        #   * GREETING_ONLY — the burst is the engine's greeting form and nothing is owed:
+        #     no wait at all (the W1F-R2 contract, unchanged);
+        #   * MAY_ASK — a question may be in it: wait for the reading within
+        #     `_LAYER_D_SEMANTIC_WAIT_SECONDS`; if it does not arrive, the burst is retained
+        #     as a PENDING question (acknowledged, persisted, resolved next turn) — never
+        #     silently answered with the qualification question alone.
+        _ld_burst = " ".join(t for t in (ai_input_messages or ()) if isinstance(t, str))
+        self._turn_continues = True                     # an eligible (non-terminal) turn
+        _potential = self._question_potential(ai_input_messages)
+        if _potential is _cov.QuestionPotential.MAY_ASK:
+            self._bounded_question_reading()        # memoised for every coverage reader
+        _ld_provider = getattr(self, "_turn_semantic", None)
+        if (getattr(self, "_turn_faq_burst", None) is None and _ld_burst
+                and (_potential is _cov.QuestionPotential.MAY_ASK
+                     or self._explicit_faq_topics(_ld_burst)
+                     or (_ld_provider is not None and getattr(_ld_provider, "ready", False)))):
+            self._turn_faq_burst = _ld_burst
+
         messages = self._build_ai_messages(ctx, event, ai_input_messages)
 
         try:
@@ -13256,6 +13862,259 @@ class ConversationEngine:
                 return _out("service_gate_blocked", detail="faq_kill_switch", answer_source="FAQ_RULE")
         return _out("skipped_dedup", detail="faq_no_reply")
 
+    # ── WILD1-C: explicit quote decline, reconsideration, operator lock ───────────
+    #
+    # Owner ruling (2026-11-16, WILD1-C): the engine MAY write `flag=PERDIDO` — a narrow
+    # relaxation of the module-level "forbidden engine writes" rule — ONLY when the customer
+    # semantically makes an explicit decision not to proceed with a delivered quote. A price
+    # question, a request for the breakdown, or a concern without a refusal ("me parece
+    # caro, ¿cuánto es el viático?") is NOT a decline. Each decision is an append-only
+    # `whatsapp_thread_evidence` row (claim_type=quote_decision, producer=ENGINE); an explicit
+    # later reconsideration may reactivate ONLY a PERDIDO the engine wrote itself, and the
+    # DECLINED row stays. An operator-written PERDIDO is never overwritten or reactivated.
+
+    _QUOTE_DECISION_CLAIM = "quote_decision"
+    _QUOTE_DECISION_PRODUCER = "ENGINE"
+    _QUOTE_DECISION_VERSION = "wild1-c/1"
+    #: the interpreter's typed decline category → the CRM's existing `motivo_perdida` values
+    _DECLINE_MOTIVO = {"PRICE": "PRECIO"}
+
+    def _explicit_quote_decline(self, ctx, state) -> "str | None":
+        """The `motivo_perdida` for an explicit decline of the delivered quote, or None.
+
+        Semantic and typed: the interpreter's acceptance signal REJECT (it reads "le parece
+        caro" / "no sé" as HESITATE and a bare question as QUESTION_ONLY), resolved rather
+        than ambiguous, with no scheduling request in the same burst (a refusal beside a day
+        request is contradictory, so nothing is recorded). The quote must have been
+        DELIVERED. No semantic evidence (provider off, failed or timed out) → no decline:
+        the absence of a reading never writes PERDIDO. Memoised per turn."""
+        memo = getattr(self, "_turn_decline_probe", None)
+        if isinstance(memo, tuple) and memo[0] == id(state):
+            return memo[1]
+        reason = None
+        try:
+            lead = getattr(ctx, "lead", None)
+            if (lead is not None and state is not None
+                    and state.last_stage == STAGE_QUOTED and not state.needs_human
+                    and getattr(lead, "flag", None) != "PERDIDO"):
+                evidence = self._semantic_turn_evidence()
+                acc = getattr(evidence, "acceptance", None)
+                signal = getattr(getattr(acc, "signal", None), "value",
+                                 getattr(acc, "signal", None))
+                from ..schemas.turn_evidence import UNRESOLVED_STATUSES
+                if (signal == "REJECT"
+                        and getattr(acc, "status", None) not in UNRESOLVED_STATUSES
+                        and not (getattr(evidence, "scheduling_requests", ()) or ())
+                        and self._commercial_state(ctx, state).quote_is_delivered()):
+                    category = str(getattr(acc, "decline_reason", None) or "").upper()
+                    reason = self._DECLINE_MOTIVO.get(category, "OTRO")
+        except Exception as exc:
+            logger.warning("WILD1-C decline probe failed thread_id=%s: %s",
+                           getattr(getattr(ctx, "thread", None), "id", None),
+                           type(exc).__name__)
+            reason = None
+        self._turn_decline_probe = (id(state), reason)
+        return reason
+
+    def _record_quote_decision(self, ctx, state, decision: str, motivo: "str | None"):
+        """Append one quote-decision history row. Idempotent per (decision, inbound)."""
+        import hashlib as _hashlib
+        from ..models import WhatsAppThreadEvidence as _TE
+        cycle = getattr(state, "current_cycle_start_message_db_id", None)
+        cycle_key = cycle if isinstance(cycle, int) else 0
+        inbound = str(getattr(ctx, "inbound_wa_message_id", None) or "")
+        claim_id = _hashlib.sha256("|".join((
+            "quote-decision:v1", str(ctx.thread.id), str(cycle_key), decision, inbound,
+        )).encode("utf-8")).hexdigest()[:64]
+        existing = self.db.execute(select(_TE).where(
+            _TE.thread_id == ctx.thread.id, _TE.claim_id == claim_id)).scalars().first()
+        if existing is not None:
+            return existing
+        row = _TE(
+            thread_id=ctx.thread.id, cycle_key=cycle_key,
+            turn_id=(str(getattr(self, "_correlation_id", "") or "")[:64] or None),
+            claim_type=self._QUOTE_DECISION_CLAIM, value=decision,
+            evidence_class="DECISION", producer=self._QUOTE_DECISION_PRODUCER,
+            producer_version=self._QUOTE_DECISION_VERSION, status="CONFIRMED",
+            # `outcome` is the admission vocabulary of this table: the decision was recorded.
+            outcome="ACCEPT", reason=motivo,
+            source_message_ids=([inbound] if inbound else []),
+            claim_id=claim_id, created_at=datetime.now(timezone.utc))
+        self.db.add(row)
+        self.db.flush()
+        self._turn_quote_decision = (decision, motivo)
+        logger.info("WILD1-C QUOTE_DECISION thread_id=%s decision=%s motivo=%s source=ENGINE",
+                    ctx.thread.id, decision, motivo)
+        return row
+
+    def _engine_written_decline(self, ctx):
+        """The engine's own DECLINED row that the lead's CURRENT PERDIDO came from, or None.
+
+        Current means: the lead is PERDIDO, the newest quote-decision row of the thread is an
+        ENGINE `DECLINED`, and `motivo_perdida` still equals that row's motivo. Anything
+        else — no row, a newer RECONSIDERED, a motivo an operator changed — is not the
+        engine's to reverse."""
+        lead = getattr(ctx, "lead", None)
+        if lead is None or getattr(lead, "flag", None) != "PERDIDO":
+            return None
+        # WILD1-C-R3 (WC-02): every operator/API action that can touch the flag or the loss
+        # reason appends an OPERATOR row to this same history in its own transaction
+        # (`quote_decision_history.record_operator_flag_action`). So "the newest row is the
+        # engine's DECLINED" now also means "no operator intervened after it": a clear, a
+        # flag change, a re-mark or a re-confirmation of PERDIDO — even with the same motivo
+        # — makes an OPERATOR row the newest, and the engine's authority to reactivate is
+        # revoked for good (there is no implicit return of control).
+        from .thread_evidence import for_thread
+        rows = for_thread(self.db, thread_id=ctx.thread.id,
+                          claim_type=self._QUOTE_DECISION_CLAIM)
+        last = rows[-1] if rows else None
+        if last is None or last.value != "DECLINED" or last.producer != self._QUOTE_DECISION_PRODUCER:
+            return None
+        if any(r.producer != self._QUOTE_DECISION_PRODUCER and r.id > last.id for r in rows):
+            return None                                     # defensive: ordering is by id
+        if (getattr(lead, "motivo_perdida", None) or None) == (last.reason or None):
+            return last
+        return None
+
+    def _apply_lost_lead_rule(self, ctx, state, decision):
+        """Commercial progression on a PERDIDO lead. Called with an authorizer decision.
+
+        * engine-written PERDIDO + ALLOW → the customer explicitly reconsidered: append
+          RECONSIDERED (the DECLINED row stays), restore the active quote flag and clear the
+          motivo; the normal path then advances to ACEPTADO / the Booking Flow as usual;
+        * operator-written PERDIDO → HOLD: the engine never overwrites or reactivates it."""
+        lead = getattr(ctx, "lead", None)
+        if (decision is None or not getattr(decision, "allows", False) or lead is None
+                or getattr(lead, "flag", None) != "PERDIDO"):
+            return decision
+        declined = self._engine_written_decline(ctx)
+        if declined is not None:
+            self._record_quote_decision(ctx, state, "RECONSIDERED", declined.reason)
+            self._turn_perdido_left_by = "RECONSIDERED"        # the one authorized exit
+            lead.flag = "PRESUPUESTO_ENVIADO"
+            lead.motivo_perdida = None
+            return decision
+        import dataclasses as _dc
+        logger.info("WILD1-C progression HOLD thread_id=%s — lead PERDIDO by an operator",
+                    ctx.thread.id)
+        blockers = tuple(getattr(decision, "blockers", None) or ()) + ("operator_lost",)
+        if _dc.is_dataclass(decision) and not isinstance(decision, type):
+            try:
+                return _dc.replace(decision, result="HOLD",
+                                   reason="lead marked PERDIDO by an operator",
+                                   blockers=blockers)
+            except Exception:
+                pass                     # malformed decision: HOLD below, never an error
+        # WILD1-C-R4 (review §3.5): a legacy / non-dataclass decision (`_LEGACY_ALLOW` is a
+        # SimpleNamespace) used to raise TypeError here, ending the turn `action=error` with
+        # no reply. The safe outcome is HOLD — never an error, never a reactivation.
+        return SimpleNamespace(allows=False, result="HOLD",
+                               reason="lead marked PERDIDO by an operator", blockers=blockers)
+
+    def _arm_perdido_guard(self, ctx) -> None:
+        """WILD1-C-R3 (WC-02): one chokepoint for every engine write path.
+
+        The reviewed lost-lead rule guards the acceptance and scheduling branches, but other
+        engine paths can also move a flag — the reply model's flag proposal, the deterministic
+        quote force, the vehicle/zone re-quote resets. For a lead that is PERDIDO when the
+        turn starts, this `before_flush` guard restores flag and loss reason unless the turn
+        left PERDIDO through the lost-lead rule's reconsideration of the engine's own decline
+        (`_turn_perdido_left_by="RECONSIDERED"`) or the operator-triggered cycle reset. A
+        protected write is logged; nothing else in the turn is touched."""
+        self._disarm_perdido_guard()                    # never two guards on one session
+        lead = getattr(ctx, "lead", None)
+        if lead is None or getattr(lead, "flag", None) != "PERDIDO":
+            return
+        try:
+            from sqlalchemy import event as _sa_event
+            from sqlalchemy import inspect as _sa_inspect
+            from sqlalchemy import select as _sa_select
+            from sqlalchemy.orm.attributes import set_committed_value as _set_committed
+            session = self.db
+            thread_id = getattr(getattr(ctx, "thread", None), "id", None)
+            lead_cls = type(lead)
+
+            def _guard(sess, _flush_context, _instances):
+                if getattr(self, "_turn_perdido_left_by", None) is not None:
+                    return
+                # WILD1-C-R4: act only on THIS session's own pending write to the two fields,
+                # and restore what the database holds NOW — never a value captured at turn
+                # start. A mid-turn commit expires the lead, so a captured pair could be
+                # stale and would overwrite an operator's concurrent commit (R3 did). The
+                # restore uses `set_committed_value`, so no UPDATE is emitted at all.
+                insp = _sa_inspect(lead)
+                if insp.session is not sess or not any(
+                        insp.attrs[a].history.has_changes() for a in ("flag", "motivo_perdida")):
+                    return
+                row = sess.connection().execute(
+                    _sa_select(lead_cls.flag, lead_cls.motivo_perdida)
+                    .where(lead_cls.id == lead.id)).first()
+                if row is None or row[0] != "PERDIDO":
+                    return       # no longer PERDIDO in the database: not this guard's business
+                logger.warning(
+                    "WILD1-C-R3 PERDIDO_PROTECTED thread_id=%s attempted=%s/%s — a PERDIDO "
+                    "lead leaves PERDIDO only by reconsideration of the engine's own "
+                    "decline; kept %s/%s", thread_id, lead.flag, lead.motivo_perdida,
+                    row[0], row[1])
+                _set_committed(lead, "flag", row[0])
+                _set_committed(lead, "motivo_perdida", row[1])
+
+            _sa_event.listen(session, "before_flush", _guard)
+            self._turn_perdido_guard = (session, _guard)
+        except Exception as exc:
+            logger.warning("WILD1-C-R3 PERDIDO guard unavailable thread_id=%s: %s",
+                           getattr(getattr(ctx, "thread", None), "id", None),
+                           type(exc).__name__)
+
+    def _disarm_perdido_guard(self) -> None:
+        armed = getattr(self, "_turn_perdido_guard", None)
+        self._turn_perdido_guard = None
+        if armed is None:
+            return
+        try:
+            from sqlalchemy import event as _sa_event
+            session, guard = armed
+            if _sa_event.contains(session, "before_flush", guard):
+                _sa_event.remove(session, "before_flush", guard)
+        except Exception:
+            pass
+
+    def _operator_lost_lead(self, ctx) -> bool:
+        """Legacy (authority-off) paths: True when an operator-written PERDIDO must hold."""
+        lead = getattr(ctx, "lead", None)
+        return (lead is not None and getattr(lead, "flag", None) == "PERDIDO"
+                and self._engine_written_decline(ctx) is None)
+
+    def _handle_perdido_hold(self, ctx, state) -> "ConversationHandleOut":
+        """WILD1-C-R4 (WC-08): the customer accepts (or proposes a day) on a lead an operator
+        holds PERDIDO. The lead stays PERDIDO with its motivo; no flag, stage, Flow, offer,
+        token or booking changes, and no operator notification is created or claimed. The
+        reply is the owner-approved copy; the plan may add answers the burst is owed."""
+        self._answer_source = "DETERMINISTIC_RULE"
+        self._decision_log(ctx, "perdido_acceptance_held",
+                           motivo=getattr(ctx.lead, "motivo_perdida", None))
+        logger.info("WILD1-C-R4 PERDIDO acceptance HELD thread_id=%s", ctx.thread.id)
+        self._turn_perdido_hold = True
+        sent_id = self._send_text_to_wa(ctx, composed_text(_PERDIDO_HOLD_REPLY))
+        return _out("replied", wa_message_id=sent_id)
+
+    def _handle_quote_decline(self, ctx, state, motivo: str) -> "ConversationHandleOut":
+        """The customer explicitly declined the delivered quote.
+
+        CRM: `flag=PERDIDO`, `motivo_perdida` from the existing vocabulary, an append-only
+        DECLINED row (source ENGINE). Not a complaint: `needs_human` is untouched and no
+        operator notification is created. No Booking Flow, no offer, no booking; the stage
+        stays QUOTED, so the same quote can still be accepted later. The reply is a
+        deterministic, pressure-free acknowledgement; the plan adds any answer the burst
+        is owed (the price breakdown when the viáticos were asked, an FAQ answer)."""
+        self._answer_source = "DETERMINISTIC_RULE"
+        lead = ctx.lead
+        lead.flag = "PERDIDO"
+        lead.motivo_perdida = motivo
+        self._record_quote_decision(ctx, state, "DECLINED", motivo)
+        sent_id = self._send_text_to_wa(ctx, composed_text(_QUOTE_DECLINE_ACK))
+        return _out("replied", wa_message_id=sent_id)
+
     # ── Deterministic QUOTED acceptance ───────────────────────────────────
 
     def _handle_quoted_acceptance(
@@ -13273,6 +14132,11 @@ class ConversationEngine:
         self._answer_source = "DETERMINISTIC_RULE"
         lead = ctx.lead
         assert lead is not None
+
+        # WILD1-C-R4-R3 (RV-F-01), defence in depth: a motorcycle is never accepted
+        # automatically; the turn goes to the existing plain-text handoff instead.
+        if self._thread_motorcycle_recorded(ctx, state):
+            return self._motorcycle_human_handoff(ctx, state, recorded=True)
 
         lead.flag = "ACEPTADO"
         state.last_stage = STAGE_SCHEDULING
@@ -13364,6 +14228,11 @@ class ConversationEngine:
         self._answer_source = "DETERMINISTIC_RULE"
         lead = ctx.lead
         assert lead is not None
+
+        # WILD1-C-R4-R3 (RV-F-01), defence in depth: a website form on a thread that already
+        # identified a motorcycle is not quoted or advanced; a person owns it.
+        if self._thread_motorcycle_recorded(ctx, state):
+            return self._motorcycle_human_handoff(ctx, state, recorded=True)
 
         # ── Update lead contact details from form ─────────────────────────
         if form_data.get("customer_name"):
@@ -13461,17 +14330,24 @@ class ConversationEngine:
         vehicle_desc = " ".join(filter(None, [marca, modelo])) or vehicle_text or "el vehículo"
         zone_desc = state.home_zone_detail or form_data.get("zone_detail") or "la zona"
 
+        intro = f"{greeting} Recibí tu solicitud para revisar el {vehicle_desc} en {zone_desc}."
         if real_price_quote:
+            # WILD1-C-R3 (WC-03): the ONE canonical price block — revisión / viáticos / total
+            # from the same PricingQuote, reconciled by `render_price_breakdown` and DECLARED
+            # as the 3-tuple PRICE claim the validator checks (`validate_envelope`) exactly as
+            # on every other quote path. R2 still wrote "El precio de la revisión es $TOTAL."
+            # here, which labelled the total as the revisión beside a block saying otherwise,
+            # and the plan then appended the quote copy with a second CTA. Now: one block,
+            # one CTA (the day question); the plan's CANONICAL_PRICE item is ALREADY_STATED.
             self._answer_source = "PRICING_SERVICE"
-            total_str = f"${real_price_quote.precio_total:,.0f}".replace(",", ".")
-            price_block = f" El precio de la revisión es {total_str}."
+            base, viaticos, total = _quote_breakdown(real_price_quote)
+            block = _rv_render_price_breakdown(base, viaticos, total)
+            reply = composed_text(
+                f"{intro} Te paso la cotización:\n\n{block}\n\n"
+                "¿Qué día y horario te viene mejor?",
+                claims=[StructuredClaim(DomainClaim.PRICE, (base, viaticos, total))])
         else:
-            price_block = ""
-
-        reply = (
-            f"{greeting} Recibí tu solicitud para revisar el {vehicle_desc} en {zone_desc}.{price_block} "
-            f"¿Qué día y horario te viene mejor?"
-        )
+            reply = f"{intro} ¿Qué día y horario te viene mejor?"
 
         sent_id = self._send_text_to_wa(ctx, reply)
         return _out("replied", wa_message_id=sent_id)
@@ -13545,7 +14421,8 @@ class ConversationEngine:
             if not is_website and booking_flow_id:
                 self._booking_flow_send_failed = False
                 result = self._send_booking_flow(
-                    ctx, state, booking_flow_id, body_prefix=body_prefix
+                    ctx, state, booking_flow_id, body_prefix=body_prefix,
+                    time_verified=bool(preferred_time_str),
                 )
                 if result is not None:
                     return result
@@ -13567,8 +14444,8 @@ class ConversationEngine:
                     # Don't send the generic Flow (it would re-ask data already collected).
                     # Ask for the two remaining missing pieces via chat.
                     fallback = (
-                        "Ese horario está disponible 🎉 "
-                        "Para confirmar el turno necesito dos datos más: "
+                        ("Ese horario está disponible 🎉 " if preferred_time_str else "")
+                        + "Para solicitar el turno necesito dos datos más: "
                         "¿Me podés dar tu email y la dirección exacta donde está el vehículo?"
                     )
                     sent_id = self._send_text_to_wa(ctx, fallback)
@@ -13582,8 +14459,8 @@ class ConversationEngine:
                     return _out("replied", wa_message_id=sent_id)
 
             body = (
-                "Ese horario está disponible 🎉 "
-                "Para confirmar el turno, completá el formulario con tus datos."
+                ("Ese horario está disponible 🎉 " if preferred_time_str else "")
+                + "Completá el formulario con tus datos para solicitar el turno."
             )
             if body_prefix:
                 body = f"{body_prefix} {body}"
@@ -13603,6 +14480,9 @@ class ConversationEngine:
             if not _dispatch_ok(getattr(self, "settings", None)):
                 return self._booking_dispatch_refusal(
                     ctx, state, source="ConversationEngine._legacy_data_collection_flow")
+            # WILD1-C-R4-R3 (RV-F-01), defence in depth: no offer for a motorcycle.
+            if self._thread_motorcycle_recorded(ctx, state):
+                return self._motorcycle_human_handoff(ctx, state, recorded=True)
             _legacy_offers = _OfferLifecycle(self.db)
             flow_token = _mk_token(ctx.thread.id)
             _lz_group, _lz_detail = self._get_active_inspection_location(ctx, state)
@@ -13738,8 +14618,15 @@ class ConversationEngine:
         state: WhatsAppThreadState,
         booking_flow_id: str,
         body_prefix: str = "",
+        *,
+        time_verified: bool = False,
     ) -> ConversationHandleOut | None:
         """Dispatch the published RideCheck Booking Flow for an established slot.
+
+        WILD1-C: `time_verified` is True only when the customer named a specific time and
+        ScheduleService confirmed THAT time available (`_try_schedule_and_flow`). Only then
+        may the body say "Ese horario está disponible"; before a selection (the Flow-first
+        day request) it never refers to "that time".
 
         Returns None when the Flow could not be armed, so the caller can fall back to
         the legacy data-collection Flow.  Booking itself is NEVER completed in chat:
@@ -13756,6 +14643,10 @@ class ConversationEngine:
         if not booking_dispatch_allowed(getattr(self, "settings", None)):
             return self._booking_dispatch_refusal(
                 ctx, state, source="ConversationEngine._send_booking_flow")
+        # WILD1-C-R4-R3 (RV-F-01), defence in depth: no offer, no token and no Booking Flow
+        # for a motorcycle — the turn is the existing plain-text handoff.
+        if self._thread_motorcycle_recorded(ctx, state):
+            return self._motorcycle_human_handoff(ctx, state, recorded=True)
 
         # Prerequisites the published Flow needs before it can render a booking:
         # accepted quote (caller reached the valid-slot branch), an active candidate
@@ -13809,12 +14700,10 @@ class ConversationEngine:
             self.db.commit()
             return None
 
-        body = (
-            "Ese horario está disponible 🎉 "
-            "Para confirmar el turno, elegí el horario y completá tus datos."
-        )
+        body = _booking_flow_body(time_verified=time_verified)
         if body_prefix:
             body = f"{body_prefix} {body}"
+        body = self._with_coverage_preamble(ctx, body)
 
         try:
             sent_id = self._send_flow_button(
@@ -14087,8 +14976,7 @@ class ConversationEngine:
         self.db.commit()
         window = f" por la {period_label}" if period_label else ""
         prefix = (f"Para {date_human}{window} tengo {len(slots)} "
-                  f"{'horario disponible' if len(slots) == 1 else 'horarios disponibles'}. "
-                  "Elegí el que te sirva y confirmá el turno acá:")
+                  f"{'horario disponible' if len(slots) == 1 else 'horarios disponibles'}.")
         try:
             out = self._send_booking_flow(ctx, state, booking_flow_id, body_prefix=prefix)
         except OutboundBlockedError:
@@ -15343,6 +16231,9 @@ Respondé SOLO con JSON válido:
         Clears all ACTIVE_REVISION fields and sets watermarks so subsequent
         context queries return only new-cycle data.
         """
+        # WILD1-C-R3: the reset is the OPERATOR's action (CONSULTA_NUEVA), an existing
+        # reviewed return of control — it may clear a PERDIDO.
+        self._turn_perdido_left_by = "CYCLE_RESET"
         lead = ctx.lead
         assert lead is not None
 
@@ -16893,6 +17784,13 @@ Respondé SOLO con JSON válido:
         focus = self._focus_candidate(ctx)
         if not focus or not focus.tipo_vehiculo:
             return None
+        # WILD1-C-R4-R3 (RV-F-01), defence in depth: a motorcycle/quad/UTV is never priced
+        # automatically — not as the focus, and not on a thread that recorded one.
+        if (focus.tipo_vehiculo.upper() in _MOTO_TIPO_VALUES
+                or self._thread_motorcycle_recorded(ctx, state)):
+            logger.warning("WILD1-C-R4-R3 MOTORCYCLE_PRICE_REFUSED thread_id=%s",
+                           getattr(getattr(ctx, "thread", None), "id", None))
+            return None
         # M21.1.3 LR-1: candidate zone is authoritative; thread state is fallback only.
         zone_group = (focus.zone_group or "") or (state.home_zone_group or "")
         zone_detail = (focus.zone_detail or "") or (state.home_zone_detail or "")
@@ -16981,6 +17879,11 @@ Respondé SOLO con JSON válido:
             # no clarification, missing-data, price, FAQ or vehicle proposition joins it.
             return
         for name, method, required in self._RESPONSE_PRODUCERS:
+            if getattr(self, "_turn_perdido_hold", False):
+                # WILD1-C-R4-R1: a held PERDIDO turn is EXCLUSIVE — no price, FAQ, vehicle,
+                # clarification, correction proposition and no pending acknowledgement joins
+                # the hold copy (R4 still let the FAQ producer run).
+                continue
             try:
                 getattr(self, method)(ctx, text)
             except Exception as exc:
@@ -17039,9 +17942,17 @@ Respondé SOLO con JSON válido:
         if plan is None:
             return
         quote = getattr(self, "_turn_price_quote", None)
+        # WILD1-C: the coverage ledger may REQUIRE the price this turn — the customer asked
+        # what it costs, or how much the viáticos are, on a turn whose handler is not the
+        # pricing path (an FAQ answer, a decline acknowledgement). The authorization is still
+        # typed: a PricingService quote computed from canonical vehicle type and zone.
+        coverage_requires = _cov.RequiredClaim.PRICE_BREAKDOWN in self._turn_required_claims(ctx)
+        if quote is None and coverage_requires:
+            quote = self._compute_price_quote(ctx, getattr(ctx, "state", None))
         if quote is None:
             return                                  # the pricing path authorized nothing
-        if getattr(self, "_answer_source", None) != "PRICING_SERVICE":
+        delivering = getattr(self, "_answer_source", None) == "PRICING_SERVICE"
+        if not delivering and not coverage_requires:
             return                                  # this turn is not delivering the quote
         total = getattr(quote, "precio_total", None)
         if not total:
@@ -17049,12 +17960,16 @@ Respondé SOLO con JSON válido:
         state = getattr(ctx, "state", None)
         focus = self._focus_candidate(ctx)
         _, detail = self._get_active_inspection_location(ctx, state)
-        rendered = self._build_quote_reply(
-            (focus.marca or "").strip() or None if focus else None,
-            (focus.modelo or "").strip() or None if focus else None,
-            detail,
-            int(total),
-            focus.anio if focus else None)
+        block = _rv_render_price_breakdown(*_quote_breakdown(quote))
+        if delivering:
+            rendered = self._build_quote_reply(
+                (focus.marca or "").strip() or None if focus else None,
+                (focus.modelo or "").strip() or None if focus else None,
+                detail,
+                quote,
+                focus.anio if focus else None)
+        else:
+            rendered = f"{_COVERAGE_PRICE_LEAD}\n\n{block}"
         plan.register(Proposition(
             proposition_id=PropositionId.CANONICAL_PRICE,
             kind=ResponseItemKind.CANONICAL_FACT, claim_family="pricing",
@@ -17069,7 +17984,9 @@ Respondé SOLO con JSON válido:
             # the amount and the item is withheld ALREADY_STATED; on a turn whose primary
             # is empty, is a clarification, or was rejected for conflict, the amount is not
             # going out and the item is INCLUDED. The customer cannot lose the only copy.
-            delivers_value=_format_price_ars(int(total)),
+            # WILD1-C: the canonical block is the value — a primary that carries the block
+            # makes this redundant; a total alone no longer does.
+            delivers_value=block,
             locked_values=(("pricing.precio_total", str(int(total))),)))
         self._note_fact_source(FactSource.PRICING_SERVICE)
 
@@ -17091,14 +18008,39 @@ Respondé SOLO con JSON válido:
         model-authored.
         """
         burst = getattr(self, "_turn_faq_burst", None)
-        if not burst:
-            return
         self._turn_faq_burst = None                  # consume — once per turn
         plan = self._live_plan
         if plan.human_owns_turn:                      # P2 owns the turn; nothing is added
             return
-        topics = self._faq_topics_for_burst(burst, ctx=ctx)
-        normalized = _norm_lower(text or "")
+        # WILD1-C: the turn's REQUIRED claims join the burst's topics — a re-asked question
+        # (suppressed above as "already answered this cycle") and a question an earlier
+        # burst asked and never got answered are both owed, whichever handler runs.
+        required = self._turn_required_claims(ctx)
+        owed = {_cov.CLAIM_TOPICS[c] for c in required if c in _cov.CLAIM_TOPICS}
+        # WILD1-C-R3: a question still PENDING semantic resolution (this burst's, or an
+        # earlier one's whose re-reading did not arrive) is acknowledged — truthfully: it was
+        # received and will be answered, never "answered".
+        # WILD1-C-R4 (R3RV-01): decided at this boundary for EVERY burst, whichever route
+        # produced the primary — not only when a coverage consumer read the reading.
+        if self._turn_owes_pending_ack(ctx):
+            self._register_pending_ack()
+        if not burst and not owed:
+            return
+        # WILD1-C-R3: a greeting-only burst asks nothing — reading its topics would make the
+        # turn wait on the model for nothing (base and R2 waited ~the full reading on
+        # "hola, buenas tardes" here). Owed claims are still answered.
+        greeting_only = (self._question_potential(
+            list(getattr(self, "_turn_burst_texts", None) or ()))
+            is _cov.QuestionPotential.GREETING_ONLY)
+        topics = ((self._faq_topics_for_burst(burst, ctx=ctx)
+                   if burst and not greeting_only else set()) | owed)
+        # Redundancy is judged against the CANONICAL segment only. A claim-free AI bridge
+        # in front of it ("te cuento lo del informe") is not an answer and must never make
+        # the canonical one look already stated.
+        canonical_text = (text.canonical if type(text) is _vg.ComposedBridgedMessage
+                          else text) or ""
+        normalized = _norm_lower(canonical_text)
+        coverage_canonical = self._coverage_canonical(ctx)
         state = getattr(ctx, "state", None)
         protected = _protected_slot_minutes(state)
 
@@ -17106,6 +18048,21 @@ Respondé SOLO con JSON válido:
             if topic not in topics:
                 continue
             renderer = _FAQ_TOPIC_ANSWERS[topic]
+            claim = _cov.TOPIC_CLAIMS.get(topic)
+            if claim is not None:
+                # Coverage-tracked: present by canonical identity, or included. The
+                # scope answer carries the report sentence, so a report question beside a
+                # scope question is answered once.
+                carried = (topic == "report" and "service_scope" in topics)
+                if self._contradicts_canonical(topic, normalized):
+                    self._mark_primary_conflict(ctx, topic, (), protected)
+                    self._register_faq_topic(topic, renderer, redundant=carried)
+                    continue
+                self._register_faq_topic(
+                    topic, renderer,
+                    redundant=carried or _cov.is_covered(claim, canonical_text,
+                                                         coverage_canonical))
+                continue
             if topic == "business_hours":
                 conflicts, rescued = _hours_conflict_in(text or "", protected)
                 satisfied = _hours_prose_satisfies(normalized)
@@ -17125,6 +18082,784 @@ Respondé SOLO con JSON válido:
             self._register_faq_topic(
                 topic, renderer,
                 redundant=self._satisfies_canonical(topic, normalized))
+
+    # ── WILD1-C: required-claim coverage ─────────────────────────────────────────
+
+    def _coverage_canonical(self, ctx) -> dict:
+        """The canonical answer whose presence covers each required claim. Engine-owned
+        text only: the FAQ constants and the PricingService block — never model words."""
+        canonical = {
+            _cov.RequiredClaim.SERVICE_SCOPE: _FAQ_SCOPE_LEAD,
+            _cov.RequiredClaim.REPORT: _FAQ_REPORT_ANSWER,
+            _cov.RequiredClaim.PAYMENT: _FAQ_PAYMENT_ANSWER,
+        }
+        quote = getattr(self, "_turn_price_quote", None) or self._peek_price_quote(ctx)
+        if quote is not None:
+            try:
+                canonical[_cov.RequiredClaim.PRICE_BREAKDOWN] = _rv_render_price_breakdown(
+                    *_quote_breakdown(quote))
+            except Exception:
+                pass                       # an unreconciled quote covers nothing
+        return canonical
+
+    def _peek_price_quote(self, ctx):
+        """PricingService's quote for the focus candidate and zone, read WITHOUT the side
+        effects of `_compute_price_quote` (it stores the turn quote and may fill the state
+        zone). The same inputs, the same service; None when it cannot price."""
+        # Total: a coverage helper never raises into a producer (a raising producer degrades
+        # the whole turn).
+        try:
+            state = getattr(ctx, "state", None)
+            focus = self._focus_candidate(ctx) if state is not None else None
+            if focus is None or not focus.tipo_vehiculo:
+                return None
+            zone_group = (focus.zone_group or "") or (state.home_zone_group or "")
+            zone_detail = (focus.zone_detail or "") or (state.home_zone_detail or "")
+            if not (zone_group or zone_detail):
+                return None
+            return self._pricing.quote(db=self.db, tipo_vehiculo=focus.tipo_vehiculo,
+                                       zone_group=zone_group, zone_detail=zone_detail)
+        except Exception:
+            return None
+
+    def _coverage_evidence(self):
+        """This burst's semantic evidence, read ONCE per turn for the coverage layer.
+
+        `_semantic_turn_evidence()` is a bounded wait that is repeated on every call after
+        a timeout; the coverage layer asks from several producers, so it caches its own
+        single read (None included) for the turn."""
+        memo = getattr(self, "_turn_cov_evidence", _COV_UNSET)
+        if memo is not _COV_UNSET:
+            return memo
+        if (not getattr(self, "_turn_coverage_may_wait", False)
+                or self._question_potential(list(getattr(self, "_turn_burst_texts", None)
+                                                 or ()))
+                is _cov.QuestionPotential.GREETING_ONLY):
+            # A terminal pre-gate (motorcycle, phone, service boundary, Layer F greeting)
+            # never waits on the model — the W1F-R1/R2 contract. Coverage reads only a
+            # reading that is ALREADY finished, and does not memoise the absence.
+            # WILD1-C-R3: nor does a greeting-only burst on the commercial path.
+            provider = getattr(self, "_turn_semantic", None)
+            if (provider is None or not self._same_turn_semantic_on()
+                    or not getattr(provider, "ready", False)):
+                return None
+            try:
+                result = provider.get(timeout=0)
+            except Exception:
+                return None
+            return getattr(result, "evidence", None) if getattr(result, "ok", False) else None
+        try:
+            evidence = self._semantic_turn_evidence()
+        except Exception:
+            evidence = None
+        self._turn_cov_evidence = evidence
+        if evidence is None:
+            # WILD1-C-R3: the commercial path waited and got nothing — a burst that may ask
+            # something is retained as pending, exactly as on the general-information route.
+            self._note_semantic_unavailable(list(getattr(self, "_turn_burst_texts", None)
+                                                 or ()))
+        return evidence
+
+    # ── WILD1-C-R3 (WC-01): pending questions under the asynchronous interpreter ────────
+
+    def _question_potential(self, texts) -> "_cov.QuestionPotential":
+        """The burst's typed control class for the semantic wait. Memoised per turn."""
+        memo = getattr(self, "_turn_question_potential", None)
+        if memo is not None:
+            return memo
+        potential = _cov.question_potential(
+            [t for t in (texts or ()) if isinstance(t, str)],
+            is_informational=lambda s: self._detect_general_information(self._norm_text(s)),
+            is_greeting=lambda s: bool(_GREETING_ONLY_RE.match(self._norm_text(s))))
+        self._turn_question_potential = potential
+        return potential
+
+    def _semantic_reading_dispatched(self) -> bool:
+        """True when this turn has a semantic reading that could have answered."""
+        return (self._same_turn_semantic_on()
+                and getattr(self, "_turn_semantic", None) is not None)
+
+    def _bounded_question_reading(self):
+        """This burst's reading for a MAY_ASK general-information burst, or None.
+
+        Waits at most `_LAYER_D_SEMANTIC_WAIT_SECONDS` (bounded by the configured same-turn
+        timeout), and never twice: a reading an earlier consumer of THIS turn already waited
+        for and timed out is not waited for again. The result — None included — is the
+        turn's single coverage read (`_turn_cov_evidence`), so every producer sees the same
+        answer. None with a dispatched reading marks the burst PENDING."""
+        memo = getattr(self, "_turn_cov_evidence", _COV_UNSET)
+        if memo is not _COV_UNSET:
+            return memo
+        evidence = None
+        provider = getattr(self, "_turn_semantic", None)
+        if self._semantic_reading_dispatched():
+            # WILD1-C-R4: bounded by the REMAINING turn deadline, not a budget of its own.
+            result = self._await_reading(provider)
+            evidence = (getattr(result, "evidence", None)
+                        if getattr(result, "ok", False) else None)
+        self._turn_cov_evidence = evidence
+        if evidence is None:
+            self._note_semantic_unavailable(list(getattr(self, "_turn_burst_texts", None)
+                                                 or ()))
+        return evidence
+
+    def _note_semantic_unavailable(self, texts) -> None:
+        """Retain this burst as PENDING: its dispatched reading did not resolve, the turn
+        continues the conversation, and the burst is not greeting-only.
+
+        WILD1-C-R4 (R3RV-01): ROUTE-INDEPENDENT. R3 retained only bursts Layer D's route
+        classifier called MAY_ASK, so a supported question it did not tag ("¿Cuándo me
+        mandan el informe?") vanished. The control boundary is now the typed semantic state
+        (`claim_coverage.SemanticTurnState`) — no phrase list decides whether a burst may ask
+        something; the re-reading decides what it asked. No reading dispatched (semantics
+        off) → nothing to resolve it with later, so nothing is marked (the deterministic
+        floors still answer). The row is written NOW, before composition, so the
+        acknowledgement is only ever sent for a burst that really was retained."""
+        if getattr(self, "_turn_pending_reason", None) is not None:
+            return
+        if not self._semantic_reading_dispatched():
+            return
+        if not getattr(self, "_turn_continues", False):
+            return                                   # terminal / pre-gated: nothing owed
+        if self._question_potential(texts) is _cov.QuestionPotential.GREETING_ONLY:
+            return
+        provider = getattr(self, "_turn_semantic", None)
+        self._turn_pending_reason = ("SEMANTIC_TIMEOUT" if getattr(provider, "timed_out", False)
+                                     else "SEMANTIC_UNAVAILABLE")
+        logger.warning("WILD1-C-R3 PENDING_QUESTION thread_id=%s reason=%s — the burst's "
+                       "reading did not resolve on a continuing turn; retained",
+                       getattr(getattr(getattr(self, "_turn_ctx", None), "thread", None),
+                               "id", None), self._turn_pending_reason)
+        ctx = getattr(self, "_turn_ctx", None)
+        if ctx is not None:
+            self._persist_pending_question(ctx)
+
+    def _turn_semantic_state(self, ctx) -> "_cov.SemanticTurnState":
+        """WILD1-C-R4 (R3RV-01): this burst's typed semantic state at the turn boundary.
+
+        Decided for EVERY burst, whichever route answers it — not only when a coverage
+        consumer happened to read the reading. Waits only for what is left of the turn's
+        deadline. An unresolved non-terminal burst is retained (`_note_semantic_unavailable`).
+        Memoised once decided; a TERMINAL verdict is not memoised (the turn may continue)."""
+        S = _cov.SemanticTurnState
+        memo = getattr(self, "_turn_semantic_state_memo", None)
+        if memo is not None:
+            return memo
+        texts = list(getattr(self, "_turn_burst_texts", None) or ())
+        if not self._semantic_reading_dispatched():
+            state = S.NOT_DISPATCHED
+        elif self._question_potential(texts) is _cov.QuestionPotential.GREETING_ONLY:
+            state = S.GREETING_ONLY
+        elif (not getattr(self, "_turn_continues", False)
+              or getattr(getattr(ctx, "state", None), "needs_human", False)
+              or getattr(getattr(self, "_live_plan", None), "human_owns_turn", False)):
+            return S.TERMINAL_OR_PRE_GATED
+        else:
+            result = self._await_reading(getattr(self, "_turn_semantic", None))
+            if result is not None and getattr(result, "ok", False):
+                state = S.SEMANTICALLY_RESOLVED
+                if getattr(self, "_turn_cov_evidence", _COV_UNSET) in (_COV_UNSET, None):
+                    self._turn_cov_evidence = getattr(result, "evidence", None)
+            else:
+                state = S.SEMANTICALLY_UNRESOLVED_NONTERMINAL
+                self._note_semantic_unavailable(texts)
+        self._turn_semantic_state_memo = state
+        return state
+
+    def _current_burst_ids(self) -> list:
+        burst = getattr(self, "_canonical_turn_burst", None)
+        return [str(m) for m in (getattr(burst, "ordered_message_ids", None) or ()) if m]
+
+    def _pending_rows(self, ctx) -> list:
+        state = getattr(ctx, "state", None)
+        thread = getattr(ctx, "thread", None)
+        if state is None or thread is None:
+            return []
+        from .thread_evidence import for_thread
+        cycle = getattr(state, "current_cycle_start_message_db_id", None)
+        rows = for_thread(self.db, thread_id=thread.id,
+                          cycle_key=(cycle if isinstance(cycle, int) else 0),
+                          claim_type=_cov.PENDING_QUESTION)
+        return _cov.unresolved_pending(rows)
+
+    def _dispatch_pending_resolution(self, ctx) -> None:
+        """Start the re-reading of every question an earlier burst left PENDING. Never raises.
+
+        The pending row carries the exact texts the interpreter was given, so the re-reading
+        is the same interpretation of the same burst — one model call, on its own thread so
+        the turn can bound its wait. Nothing is dispatched when semantics are off or there
+        is nothing pending (the common case costs one indexed read)."""
+        self._turn_pending_rows = ()
+        self._turn_pending_provider = None
+        try:
+            if (getattr(self.settings, "shadow_understand_enabled", False) is not True
+                    or not self._same_turn_semantic_on()):
+                return
+            rows = self._pending_rows(ctx)
+            if not rows:
+                return
+            # WILD1-C-R4 (R3RV-03): ONE re-reading is bounded by a row count AND a total
+            # character count, oldest first. Rows outside the batch are not touched: they
+            # stay PENDING and are re-read, oldest first, on a later eligible turn.
+            batch, deferred, texts, ids, chars = [], [], [], [], 0
+            for row in rows:
+                payload = getattr(row, "validated_as", None) or {}
+                row_texts = [t for t in (payload.get("texts") or ()) if isinstance(t, str)]
+                row_chars = sum(len(t) for t in row_texts)
+                if batch and (len(batch) >= _PENDING_REREAD_MAX_ROWS
+                              or chars + row_chars > _PENDING_REREAD_MAX_CHARS):
+                    deferred.append(row)
+                    continue
+                batch.append(row)
+                chars += row_chars
+                texts.extend(row_texts)
+                ids.extend(str(i) for i in (getattr(row, "source_message_ids", None) or ()))
+            self._turn_pending_deferred = tuple(deferred)
+            if not texts:
+                return
+            rows = batch
+            from .semantic_interpreter import SemanticTurnInterpreter
+            from .semantic_turn_evidence import TurnSemanticEvidence
+            from ..schemas.turn_evidence import BurstReconstruction
+            interpreter = SemanticTurnInterpreter(self.settings)
+            thread_id = getattr(ctx.thread, "id", None)
+            burst_id = f"{getattr(self, '_correlation_id', '') or ''}:pending"[:64]
+            try:
+                context = self._build_shadow_context(ctx, texts)
+            except Exception:
+                context = None
+
+            def _interpret():
+                return interpreter.interpret(
+                    texts, thread_id=thread_id, burst_id=burst_id,
+                    message_ids=tuple(ids),
+                    reconstruction=BurstReconstruction.REPLAY_CAUSAL_MARKER,
+                    context=context)
+
+            provider = TurnSemanticEvidence(_interpret, thread_id=thread_id,
+                                            burst_id=burst_id)
+
+            def _own_thread(run) -> bool:
+                threading.Thread(target=run, name="pending-question-resolution",
+                                 daemon=True).start()
+                return True
+
+            # A thread that cannot start leaves the provider undispatched; `_await_reading`
+            # then treats the re-reading as unavailable (the rows stay PENDING) instead of
+            # running it inline on the request thread (WILD1-C-R4, R3RV-03).
+            provider.start(submit=_own_thread)
+            self._turn_pending_rows = tuple(rows)
+            self._turn_pending_provider = provider
+            logger.info("WILD1-C-R3 PENDING_QUESTION resolution dispatched thread_id=%s "
+                        "pending=%d batch=%d deferred=%d chars=%d dispatched=%s", thread_id,
+                        len(rows) + len(deferred), len(rows), len(deferred), chars,
+                        getattr(provider, "dispatched", None))
+        except Exception as exc:
+            logger.warning("WILD1-C-R3 pending resolution dispatch failed thread_id=%s: %s",
+                           getattr(getattr(ctx, "thread", None), "id", None),
+                           type(exc).__name__)
+
+    def _pending_resolution(self, ctx) -> "tuple[frozenset, tuple]":
+        """(claims resolved this turn, bursts still pending). Memoised; never raises.
+
+        Resolution happens once, on an ELIGIBLE turn (one that continues the conversation):
+        a terminal pre-gate reads only a re-reading that has already finished. A resolved
+        question becomes ordinary owed claims — durable `required_claim` rows keyed to the
+        ORIGINAL burst, plus an append-only RESOLVED row — so the existing ledger answers it
+        and never answers it twice. A re-reading that again does not arrive leaves the
+        question pending."""
+        memo = getattr(self, "_turn_pending_resolution", _COV_UNSET)
+        if memo is not _COV_UNSET:
+            return memo
+        rows = tuple(getattr(self, "_turn_pending_rows", ()) or ())
+        provider = getattr(self, "_turn_pending_provider", None)
+        # WILD1-C-R4: rows outside this turn's bounded batch stay pending, untouched.
+        deferred = tuple(tuple(getattr(r, "source_message_ids", None) or ())
+                         for r in (getattr(self, "_turn_pending_deferred", ()) or ()))
+        if not rows or provider is None:
+            return frozenset(), deferred
+        still = tuple(tuple(getattr(r, "source_message_ids", None) or ()) for r in rows) + deferred
+        if not getattr(self, "_turn_continues", False) and not getattr(provider, "ready", False):
+            return frozenset(), still              # not yet: a terminal gate never waits
+        # WILD1-C-R4 (R3RV-03): the re-reading has run concurrently with the current one
+        # since turn start; it is waited for only within what is left of the ONE deadline.
+        result = self._await_reading(provider)
+        evidence = (getattr(result, "evidence", None)
+                    if result is not None and getattr(result, "ok", False) else None)
+        if evidence is None:
+            self._turn_pending_resolution = (frozenset(), still)
+            logger.warning("WILD1-C-R3 PENDING_QUESTION still unresolved thread_id=%s",
+                           getattr(getattr(ctx, "thread", None), "id", None))
+            return self._turn_pending_resolution
+        topics = set()
+        for intent in getattr(evidence, "faq_intents", ()) or ():
+            topic = getattr(intent, "topic", None) or getattr(intent, "value", None)
+            topic = getattr(topic, "value", topic)
+            if isinstance(topic, str):
+                topics.add(topic)
+        claims = set(_cov.claims_for_topics(topics))
+        for intent in getattr(evidence, "service_intents", ()) or ():
+            kind = getattr(getattr(intent, "kind", None), "value", getattr(intent, "kind", None))
+            if (kind == "QUOTE_REQUEST"
+                    and str(getattr(intent, "value", None)).strip().lower() == "true"):
+                claims.add(_cov.RequiredClaim.PRICE_BREAKDOWN)
+        resolved = frozenset(claims)
+        try:
+            with self.db.begin_nested():
+                for row in rows:
+                    ids = [str(i) for i in (getattr(row, "source_message_ids", None) or ())]
+                    self._add_owed_rows(ctx, resolved, ids, reason="RESOLVED_FROM_PENDING")
+                    self._add_pending_row(
+                        ctx, status=_cov.RESOLVED_STATUS, ids=ids,
+                        claim_id=self._evidence_claim_id(
+                            "pending-question-resolved:v1", ctx, str(row.claim_id)),
+                        reason="RESOLVED",
+                        payload={"resolves": str(row.claim_id),
+                                 "claims": sorted(c.value for c in resolved)})
+                self.db.flush()
+        except Exception as exc:
+            # The savepoint is rolled back and the session stays usable; the question stays
+            # pending and is re-read next turn — this turn still answers what it resolved.
+            logger.warning("WILD1-C-R3 pending resolution persistence failed thread_id=%s: %s",
+                           getattr(getattr(ctx, "thread", None), "id", None),
+                           type(exc).__name__)
+            self._turn_pending_resolution = (resolved, still)
+            return self._turn_pending_resolution
+        # Owed NOW = resolved minus what a DELIVERED outbound after the pending burst already
+        # carries canonically (e.g. the payment floor answered beside the acknowledgement) —
+        # so a resolved question is answered once, never twice.
+        owed = frozenset(c for c in resolved
+                         if not any(self._answered_after(ctx, r, c) for r in rows))
+        logger.info("WILD1-C-R3 PENDING_QUESTION resolved thread_id=%s claims=%s owed=%s",
+                    getattr(getattr(ctx, "thread", None), "id", None),
+                    sorted(c.value for c in resolved), sorted(c.value for c in owed))
+        self._turn_pending_resolution = (owed, deferred)
+        return self._turn_pending_resolution
+
+    def _answered_after(self, ctx, row, claim) -> bool:
+        """True when a DELIVERED outbound sent after `row`'s burst carries `claim`'s canonical
+        answer. Read from the database (no message-window horizon)."""
+        try:
+            from sqlalchemy import func as _func
+            from ..models import WhatsAppMessage as _WM
+            ids = [str(i) for i in (getattr(row, "source_message_ids", None) or ())]
+            if not ids:
+                return False
+            newest = self.db.execute(select(_func.max(_WM.id)).where(
+                _WM.thread_id == ctx.thread.id, _WM.wa_message_id.in_(ids))).scalar()
+            if newest is None:
+                return False
+            canonical = self._coverage_canonical(ctx)
+            for text, status in self.db.execute(select(_WM.text, _WM.status).where(
+                    _WM.thread_id == ctx.thread.id, _WM.direction == "out",
+                    _WM.id > newest)).all():
+                if _cov.delivered(status) and _cov.is_covered(claim, text or "", canonical):
+                    return True
+        except Exception:
+            return False
+        return False
+
+    def _cycle_key(self, ctx) -> int:
+        cycle = getattr(getattr(ctx, "state", None), "current_cycle_start_message_db_id", None)
+        return cycle if isinstance(cycle, int) else 0
+
+    def _evidence_claim_id(self, kind: str, ctx, *parts) -> str:
+        import hashlib as _hashlib
+        return _hashlib.sha256("|".join((kind, str(ctx.thread.id), str(self._cycle_key(ctx)),
+                                         *(str(p) for p in parts))).encode("utf-8")
+                               ).hexdigest()[:64]
+
+    def _add_pending_row(self, ctx, *, status, ids, claim_id, reason, payload) -> bool:
+        """Append one `pending_question` row unless that exact row exists. Caller flushes."""
+        from ..models import WhatsAppThreadEvidence as _TE
+        if self.db.execute(select(_TE.id).where(
+                _TE.thread_id == ctx.thread.id, _TE.claim_id == claim_id)).first() is not None:
+            return False
+        self.db.add(_TE(
+            thread_id=ctx.thread.id, cycle_key=self._cycle_key(ctx),
+            turn_id=(str(getattr(self, "_correlation_id", "") or "")[:64] or None),
+            claim_type=_cov.PENDING_QUESTION, value=_cov.PENDING_QUESTION,
+            evidence_class="COVERAGE", producer="ENGINE", producer_version="wild1-c-r3/1",
+            status=status, outcome="HOLD", reason=reason,
+            source_message_ids=list(ids), validated_as=dict(payload), claim_id=claim_id,
+            created_at=datetime.now(timezone.utc)))
+        return True
+
+    def _persist_pending_question(self, ctx) -> None:
+        """Durably retain THIS burst's pending question, keyed to its inbound WAMIDs, with
+        the texts the interpreter was given (so the re-reading reads the same burst).
+        Idempotent per burst; a failure rolls back its own savepoint and never raises."""
+        reason = getattr(self, "_turn_pending_reason", None)
+        ids = self._current_burst_ids()
+        if reason is None or not ids or getattr(self, "_turn_pending_persisted", False):
+            return
+        texts = [t for t in (getattr(self, "_turn_semantic_texts", None)
+                             or getattr(self, "_turn_burst_texts", None) or ())
+                 if isinstance(t, str)]
+        bounded, total = [], 0
+        for text in texts:                     # bounded: the interpreter's own burst, capped
+            if total + len(text) > 4000:
+                break
+            bounded.append(text)
+            total += len(text)
+        try:
+            with self.db.begin_nested():
+                self._add_pending_row(
+                    ctx, status=_cov.PENDING_STATUS, ids=ids,
+                    claim_id=self._evidence_claim_id("pending-question:v1", ctx,
+                                                     ",".join(sorted(ids))),
+                    reason=reason, payload={"texts": bounded})
+                self.db.flush()
+            self._turn_pending_persisted = True
+        except Exception as exc:
+            # WILD1-C-R4 (documented policy, R3-23b): the savepoint is rolled back whole and
+            # the turn's transaction stays usable. The turn CONTINUES TRUTHFULLY: with no
+            # retained row there is nothing to resume, so the acknowledgement (which promises
+            # to resume it) is NOT sent and the burst is not reported as pending; this ERROR
+            # log is the only record of it (for operations).
+            logger.error("WILD1-C-R4 PENDING_QUESTION_PERSIST_FAILED thread_id=%s: %s — no "
+                         "acknowledgement will be sent for this burst",
+                         getattr(getattr(ctx, "thread", None), "id", None),
+                         type(exc).__name__)
+
+    def _turn_pending_bursts(self, ctx) -> tuple:
+        """Every burst whose question is pending after this turn: this one, and earlier ones
+        the re-reading did not resolve."""
+        pending = list(self._pending_resolution(ctx)[1])
+        if (getattr(self, "_turn_pending_reason", None) is not None
+                and getattr(self, "_turn_pending_persisted", False)):
+            ids = tuple(self._current_burst_ids())
+            if ids and ids not in pending:
+                pending.append(ids)
+        return tuple(pending)
+
+    def _turn_owes_pending_ack(self, ctx) -> bool:
+        """WILD1-C-R4: the boundary decision, made once per send: decide the burst's typed
+        semantic state, then say whether any burst is pending after this turn."""
+        try:
+            if (self._turn_semantic_state(ctx)
+                    is _cov.SemanticTurnState.TERMINAL_OR_PRE_GATED):
+                # WILD1-C-R4-R1: a terminal / human-owned turn (motorcycle, phone, service
+                # boundary, PERDIDO hold) never carries "si me escribís nuevamente, la retomo";
+                # earlier pending rows simply stay PENDING for a later continuing turn.
+                return False
+            return bool(self._turn_pending_bursts(ctx))
+        except Exception:
+            return False
+
+    def _with_pending_ack(self, ctx, body: str) -> str:
+        """WILD1-C-R4: a clarification Flow body sent on a continuing TEXT turn carries the
+        acknowledgement when a burst is pending (that Flow never passes through the plan).
+        Never on a Flow-response turn, never on the motorcycle contact Flow (a terminal
+        pre-gate, which never reaches this). Bounded by Meta's body limit."""
+        try:
+            if (getattr(self, "_turn_continues", False) and body
+                    and _PENDING_QUESTION_ACK not in str(body)
+                    and self._turn_owes_pending_ack(ctx)):
+                joined = f"{body}\n\n{_PENDING_QUESTION_ACK}"
+                if len(joined) <= _FLOW_BODY_MAX:
+                    return joined
+        except Exception:
+            pass
+        return body
+
+    def _finalize_question_retention(self, out) -> None:
+        """WILD1-C-R4 (R3RV-01): the turn boundary's last word. A continuing, non-greeting
+        burst whose reading never resolved is retained even when no send path recorded it
+        (e.g. a turn that ended without a text message). Never on an error, a contended or
+        a dedup turn (those are redelivered or were already processed). Never raises."""
+        try:
+            action = getattr(out, "action", None)
+            ctx = getattr(self, "_turn_ctx", None)
+            if (ctx is None or action in ("error", "skipped_dedup", ACTION_THREAD_CONTENDED)
+                    or not getattr(self, "_turn_continues", False)
+                    or getattr(self, "_turn_pending_persisted", False)):
+                return
+            if (self._turn_semantic_state(ctx)
+                    is not _cov.SemanticTurnState.SEMANTICALLY_UNRESOLVED_NONTERMINAL):
+                return
+            if getattr(self, "_turn_pending_persisted", False):
+                self.db.commit()
+                logger.warning("WILD1-C-R4 PENDING_QUESTION retained at the turn boundary "
+                               "thread_id=%s (no send path recorded it)",
+                               getattr(getattr(ctx, "thread", None), "id", None))
+        except Exception as exc:
+            try:
+                self.db.rollback()
+            except Exception:
+                pass
+            logger.error("WILD1-C-R4 turn-boundary retention failed: %s", type(exc).__name__)
+
+    def _coverage_semantic_topics(self) -> set:
+        topics = set()
+        for intent in getattr(self._coverage_evidence(), "faq_intents", ()) or ():
+            topic = getattr(intent, "topic", None) or getattr(intent, "value", None)
+            topic = getattr(topic, "value", topic)
+            if isinstance(topic, str):
+                topics.add(topic)
+        return topics
+
+    def _semantic_quote_requested(self) -> bool:
+        """The interpreter's typed money question for THIS burst (QUOTE_REQUEST)."""
+        evidence = self._coverage_evidence()
+        for intent in getattr(evidence, "service_intents", ()) or ():
+            kind = getattr(getattr(intent, "kind", None), "value", getattr(intent, "kind", None))
+            if (kind == "QUOTE_REQUEST"
+                    and str(getattr(intent, "value", None)).strip().lower() == "true"):
+                return True
+        return False
+
+    def _turn_asks_price(self) -> bool:
+        burst = " ".join(t for t in (getattr(self, "_turn_burst_texts", None) or ())
+                         if isinstance(t, str))
+        if burst and self._detect_price_question(self._norm_text(burst)):
+            return True
+        return self._semantic_quote_requested()
+
+    def _outstanding_required_claims(self, ctx, canonical) -> frozenset:
+        """Claims an EARLIER burst of this cycle asked that no later outbound answered.
+
+        Read from the persisted per-burst evidence (`whatsapp_thread_evidence` faq_topic /
+        quote_request rows) and the cycle's outbound ledger — no new storage. Inbound after
+        the last outbound is the current burst, which is read directly instead."""
+        state = getattr(ctx, "state", None)
+        thread = getattr(ctx, "thread", None)
+        if state is None or thread is None:
+            return frozenset()
+        from .thread_evidence import for_thread
+        cycle = getattr(state, "current_cycle_start_message_db_id", None)
+        rows = for_thread(self.db, thread_id=thread.id,
+                          cycle_key=(cycle if isinstance(cycle, int) else 0))
+        if not rows:
+            return frozenset()
+        messages = list(getattr(ctx, "db_messages", None) or [])
+        inbound = {getattr(m, "wa_message_id", None): getattr(m, "id", None)
+                   for m in messages if getattr(m, "direction", None) == "in"}
+        # WILD1-C-R3 (WC-07): each outbound carries its status, so a failed or blocked row —
+        # which never reached the customer — cannot answer an ask.
+        outbound = [(getattr(m, "id", None), getattr(m, "text", None) or "",
+                     getattr(m, "status", None))
+                    for m in messages if getattr(m, "direction", None) == "out"]
+        last_out = max((e[0] for e in outbound if isinstance(e[0], int)), default=None)
+        if last_out is None:
+            return frozenset()
+        asks = [a for a in _cov.asks_from_evidence_rows(rows, inbound.get)
+                if a.inbound_id < last_out]
+        return _cov.Ledger(asks=asks, outbound=outbound).outstanding(canonical)
+
+    def _turn_required_claims(self, ctx) -> frozenset:
+        """What this turn's reply OWES the customer, as typed claims. Total; never raises.
+
+        * this burst's FAQ topics — explicit (deterministic floor) or semantic (the
+          interpreter labels one topic per question of the burst);
+        * a money question — the deterministic floor or the interpreter's QUOTE_REQUEST —
+          when PricingService can answer it (vehicle type and zone known);
+        * claims an earlier burst asked that were never answered (`_outstanding_…`);
+        * nothing at all while a person owns the thread."""
+        state = getattr(ctx, "state", None)
+        if state is None or getattr(state, "needs_human", False):
+            return frozenset()
+        required: set = set()
+        try:
+            burst = " ".join(t for t in (getattr(self, "_turn_burst_texts", None) or ())
+                             if isinstance(t, str))
+            topics = set(self._explicit_faq_topics(burst)) if burst else set()
+            topics |= self._coverage_semantic_topics()
+            required |= _cov.claims_for_topics(topics)
+            canonical = self._coverage_canonical(ctx)
+            if self._turn_asks_price():
+                required.add(_cov.RequiredClaim.PRICE_BREAKDOWN)
+            # WILD1-C-R3: a question an earlier burst left PENDING, resolved now, is owed by
+            # THIS reply (it is also durably keyed to its own burst, so the ledger below sees
+            # the same debt and never adds a second one).
+            required |= self._pending_resolution(ctx)[0]
+            required |= self._outstanding_required_claims(ctx, canonical)
+            if self._turn_has_scheduling_evidence(
+                    list(getattr(self, "_turn_burst_texts", None) or ()),
+                    self._coverage_evidence()):
+                required.add(_cov.RequiredClaim.AVAILABILITY)
+            if _cov.RequiredClaim.PRICE_BREAKDOWN not in canonical:
+                required.discard(_cov.RequiredClaim.PRICE_BREAKDOWN)   # not answerable yet
+        except Exception as exc:
+            logger.warning("WILD1-C coverage requirements unavailable thread_id=%s: %s",
+                           getattr(getattr(ctx, "thread", None), "id", None),
+                           type(exc).__name__)
+        return frozenset(required)
+
+    def _coverage_preamble(self, ctx) -> str:
+        """The canonical answers a NON-text message (the Booking Flow body) must carry.
+
+        The Flow body does not pass through the plan, so the answers the turn owes are
+        rendered here from the same constants, in the plan's order: price block, then FAQ."""
+        return "\n\n".join(self._coverage_preamble_parts(ctx))
+
+    def _coverage_preamble_parts(self, ctx) -> list:
+        """The preamble's segments, in the plan's order (price block, FAQ answers, then the
+        pending-question acknowledgement). WILD1-C-R3: separate segments so the Flow body
+        limit can keep what fits and leave the rest durably owed."""
+        required = self._turn_required_claims(ctx)
+        parts = []
+        if required:
+            canonical = self._coverage_canonical(ctx)
+            if _cov.RequiredClaim.PRICE_BREAKDOWN in required:
+                parts.append(f"{_COVERAGE_PRICE_LEAD}\n\n"
+                             f"{canonical[_cov.RequiredClaim.PRICE_BREAKDOWN]}")
+            topics = {_cov.CLAIM_TOPICS[c] for c in required if c in _cov.CLAIM_TOPICS}
+            for topic in _FAQ_TOPIC_ANSWERS:           # stable plan order
+                if topic not in topics:
+                    continue
+                if topic == "report" and "service_scope" in topics:
+                    continue                           # the scope answer carries it
+                parts.append(_FAQ_TOPIC_ANSWERS[topic]())
+        if self._turn_owes_pending_ack(ctx):
+            parts.append(_PENDING_QUESTION_ACK)
+        return parts
+
+    def _with_coverage_preamble(self, ctx, body: str) -> str:
+        """The Booking Flow body with the answers this turn owes in front of it.
+
+        "Answer every supported question before advancing solely to a CTA": the Flow IS the
+        CTA, so the canonical price block and FAQ answers the burst asked for precede it in
+        the same message. The Flow itself answers the availability request. Bounded by
+        Meta's body limit: if the owed answers would not fit, the Flow goes without them,
+        the gap is logged, and the ledger keeps them owed for the next reply."""
+        try:
+            routed = set(getattr(self, "_turn_coverage_routed", None) or ())
+            routed.add(_cov.RequiredClaim.AVAILABILITY)
+            self._turn_coverage_routed = routed
+            # WILD1-C-R3: Meta's limit is enforced segment by segment, in plan order — the
+            # answers that fit travel with the Flow, the ones that do not are left out WHOLE
+            # (a canonical answer is never cut) and `_record_coverage` below finds them
+            # missing on the final body and keeps them durably owed for the next reply.
+            kept: list = []
+            omitted = 0
+            for part in self._coverage_preamble_parts(ctx):
+                trial = "\n\n".join(kept + [part, body])
+                if len(trial) <= _FLOW_BODY_MAX:
+                    kept.append(part)
+                else:
+                    omitted += 1
+            full = "\n\n".join(kept + [body]) if kept else body
+            if omitted:
+                logger.warning("WILD1-C flow preamble trimmed thread_id=%s omitted=%d len=%d "
+                               "max=%d — omitted answers stay owed",
+                               getattr(getattr(ctx, "thread", None), "id", None),
+                               omitted, len(full), _FLOW_BODY_MAX)
+            self._record_coverage(ctx, full, channel="FLOW")
+            return full
+        except Exception as exc:
+            logger.warning("WILD1-C flow preamble failed thread_id=%s: %s",
+                           getattr(getattr(ctx, "thread", None), "id", None),
+                           type(exc).__name__)
+            return body
+
+    def _add_owed_rows(self, ctx, claims, burst_ids, *, reason: str) -> int:
+        """Append one `required_claim` row per claim, keyed to `burst_ids`, unless that exact
+        row exists (same claim_id scheme as WILD1-C: claim + sorted burst). Caller flushes,
+        inside its own savepoint. Returns the number of rows added."""
+        from ..models import WhatsAppThreadEvidence as _TE
+        added = 0
+        ids = [str(i) for i in (burst_ids or ()) if i]
+        if not ids:
+            return 0
+        for claim in sorted((c for c in (claims or ()) if c in _cov.TEXT_CHECKED),
+                            key=lambda c: c.value):
+            claim_id = self._evidence_claim_id("required-claim:v1", ctx, claim.value,
+                                               ",".join(sorted(ids)))
+            if self.db.execute(select(_TE.id).where(
+                    _TE.thread_id == ctx.thread.id,
+                    _TE.claim_id == claim_id)).first() is not None:
+                continue
+            self.db.add(_TE(
+                thread_id=ctx.thread.id, cycle_key=self._cycle_key(ctx),
+                turn_id=(str(getattr(self, "_correlation_id", "") or "")[:64] or None),
+                claim_type=_cov.REQUIRED_CLAIM_ROW, value=claim.value,
+                evidence_class="COVERAGE", producer="ENGINE",
+                producer_version="wild1-c/1", status="OUTSTANDING",
+                outcome="HOLD", reason=reason,
+                source_message_ids=list(ids), claim_id=claim_id,
+                created_at=datetime.now(timezone.utc)))
+            added += 1
+        return added
+
+    def _persist_owed_claims(self, ctx, missing) -> None:
+        """Record each claim this turn still owes, keyed to the current burst's inbound rows,
+        so the NEXT reply owes it too. Idempotent per (claim, burst); never raises.
+
+        WILD1-C-R3: a claim already durably owed by an EARLIER burst (still outstanding in
+        the ledger, or resolved from a pending question this turn) is not written again —
+        one debt, one row. The write runs in a SAVEPOINT: a concurrent same-burst duplicate
+        (the DB-unique `(thread_id, claim_id)`) rolls back only the savepoint and the turn's
+        transaction stays usable (WC-07; R2 swallowed the IntegrityError without a rollback)."""
+        missing = [c for c in (missing or ()) if c in _cov.TEXT_CHECKED]
+        if not missing:
+            return
+        try:
+            already = set(self._outstanding_required_claims(ctx, self._coverage_canonical(ctx)))
+            already |= set(self._pending_resolution(ctx)[0])
+        except Exception:
+            already = set()
+        missing = [c for c in missing if c not in already]
+        if not missing:
+            return
+        try:
+            messages = list(getattr(ctx, "db_messages", None) or [])
+            last_out = max((m.id for m in messages if getattr(m, "direction", None) == "out"
+                            and isinstance(getattr(m, "id", None), int)), default=-1)
+            burst = [m.wa_message_id for m in messages
+                     if getattr(m, "direction", None) == "in"
+                     and isinstance(getattr(m, "id", None), int) and m.id > last_out
+                     and getattr(m, "wa_message_id", None)]
+            inbound = str(getattr(ctx, "inbound_wa_message_id", None) or "")
+            if inbound and inbound not in burst:
+                burst.append(inbound)
+            if not burst:
+                return
+            with self.db.begin_nested():
+                self._add_owed_rows(ctx, missing, burst, reason="NOT_COVERED_THIS_TURN")
+                self.db.flush()
+        except Exception as exc:
+            logger.warning("WILD1-C owed-claim persistence failed thread_id=%s: %s",
+                           getattr(getattr(ctx, "thread", None), "id", None),
+                           type(exc).__name__)
+
+    def _record_coverage(self, ctx, text: str, *, channel: str) -> None:
+        """Verify, on the FINAL message, that every required claim's canonical answer is in
+        it. Observational at this point — nothing may be appended after composition — and
+        a missing claim stays outstanding in the ledger, so the next reply owes it."""
+        try:
+            required = self._turn_required_claims(ctx)
+            routed = set(getattr(self, "_turn_coverage_routed", None) or ())
+            if (getattr(self, "_availability_checked", False)
+                    or getattr(getattr(ctx, "state", None), "flow_booking_token", None)):
+                # ScheduleService was consulted this turn (its verdict — slots, a rejection
+                # with alternatives — is the availability answer, whatever its wording), or a
+                # Booking Flow is outstanding: the Flow holds the slots to choose from.
+                routed.add(_cov.RequiredClaim.AVAILABILITY)
+            # WILD1-C-R3: a burst whose question is still awaiting its reading is reported
+            # PENDING — not covered, not missing, and the turn is not complete — and this
+            # turn's own pending burst is durably retained before transport.
+            pending = self._turn_pending_bursts(ctx)
+            report = _cov.coverage(required, text or "", self._coverage_canonical(ctx),
+                                   routed=routed, pending=pending)
+            self._turn_coverage = report
+            self._persist_pending_question(ctx)
+            self._persist_owed_claims(ctx, report.missing)
+            if required or pending:
+                log = logger.warning if not report.complete else logger.info
+                log("WILD1-C COVERAGE thread_id=%s channel=%s %s",
+                    getattr(getattr(ctx, "thread", None), "id", None), channel,
+                    json.dumps(report.summary(), sort_keys=True))
+        except Exception as exc:
+            logger.warning("WILD1-C coverage check failed thread_id=%s: %s",
+                           getattr(getattr(ctx, "thread", None), "id", None),
+                           type(exc).__name__)
+
+    def _register_pending_ack(self) -> None:
+        """WILD1-C-R3: the pending-question acknowledgement, a canonical engine line in the
+        FAQ family (it accompanies, and never replaces, the primary)."""
+        self._register_faq_topic(_cov.PENDING_QUESTION, lambda: _PENDING_QUESTION_ACK,
+                                 redundant=False)
 
     def _register_faq_topic(self, topic: str, renderer, *, redundant: bool) -> None:
         self._live_plan.register(Proposition(
@@ -17427,6 +19162,15 @@ Respondé SOLO con JSON válido:
         # declared intents; `None` (no envelope) declares nothing.
         envelope = getattr(self, "_last_outbound_envelope", None)
         self._turn_outbound_envelope = envelope
+        # WILD1-C-R4 (owner copy, C): on a pending-question path the generic no-question
+        # closing is not sent beside the acknowledgement — a primary that is ONLY that
+        # closing carries no useful content, so the acknowledgement is sent alone. Any real
+        # answer or progression is kept and the acknowledgement accompanies it.
+        if (plan is not None and str(text or "").strip() == _GENERIC_NO_QUESTION_TEXT
+                and self._turn_owes_pending_ack(ctx)):
+            logger.info("WILD1-C-R4 generic closing dropped beside the pending "
+                        "acknowledgement thread_id=%s", ctx.thread.id)
+            text = ""
 
         # ── G3-6: producers register, THEN the plan composes ─────────────────────────
         #
@@ -17485,6 +19229,10 @@ Respondé SOLO con JSON válido:
             self._turn_dispatch_path = DispatchPath.TEXT
             self._turn_dispatch_result = DispatchResult.NOT_ATTEMPTED
             return None
+
+        # WILD1-C: the final composed message is checked for every required claim's
+        # canonical answer before transport (recorded on the turn and in the log).
+        self._record_coverage(ctx, text, channel="TEXT")
 
         from zoneinfo import ZoneInfo
         now_utc = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
@@ -17578,7 +19326,13 @@ Respondé SOLO con JSON válido:
             self._turn_renderer_source = RendererSource.META_FLOW
 
         # L4.7D: the Flow button body is customer-facing text and is validated too.
+        _composed_body = body_text
         body_text = self._validate_outbound_text(body_text, ctx, ctx.state)
+        if (getattr(self, "_turn_coverage", None) is not None
+                and str(body_text) != str(_composed_body)):
+            # WILD1-C-R3: coverage is judged on what the customer will READ. The preamble
+            # was checked before validation; if validation changed the body, check again.
+            self._record_coverage(ctx, body_text, channel="FLOW")
 
         from zoneinfo import ZoneInfo
         now_utc = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))

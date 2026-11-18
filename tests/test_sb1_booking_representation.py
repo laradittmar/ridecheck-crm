@@ -331,15 +331,24 @@ _FROZEN_AT_PARENT = {
     # milestone authorized to wire CE-W1/CE-W2 to the booking authority. Every new path is
     # behind SMART_BOOKING_CE_ENABLED (default off); tests/test_sb2b_option_b.py pins the
     # flag-off legacy behaviour and tests/test_sb2a_booking_authority.py pins the gating.
-    "backend/app/services/semantic_interpreter.py": "0de2635795da8e408da12f1264c12f840a87d82c",
-    "backend/app/services/semantic_turn_evidence.py": "50118bf6cbf21108bc1356057ba95c9a12e816c7",
+    # WILD1-C (owner prompt PRELAUNCH-MINIMUM-LAUNCH-WILD1-CONVERSATION-COVERAGE-PRICE-BREAKDOWN-AND-
+    # QUOTE-DECLINE): re-recorded — that milestone is authorized to change it; the previous blob was 0de2635795da8e408da12f1264c12f840a87d82c.
+    "backend/app/services/semantic_interpreter.py": "120ed02d8e0fe866ff50fb4a39c78c1979de5fdb",
+    # WILD1-C-R4 (owner prompt PRELAUNCH-MINIMUM-LAUNCH-WILD1-C-R4-ROUTE-COMPLETE-QUESTION-RETENTION-
+    # AND-PERDIDO-GUARD, R3RV-03): re-recorded — that milestone added the read-only
+    # `TurnSemanticEvidence.dispatched` property (no behaviour change to `get()`); recorded by
+    # WILD1-C-R4-R2, whose booking test set first ran this tripwire. The previous blob was
+    # 50118bf6cbf21108bc1356057ba95c9a12e816c7.
+    "backend/app/services/semantic_turn_evidence.py": "28968584adc4375e65e8538c83bbaedfba8577c9",
     "backend/app/services/scheduling_reconciler.py": "cb102122e1dab93ff1d182b32d35f031dc7d0040",
     "backend/app/services/field_reconciler.py": "5af92de42901e130c8f9e9b59d63082a14eda594",
     "backend/app/services/shadow_reconciler.py": "2024d335a0383054f3a0d3796ac1109101de3289",
     # R6-C1 (R6IRV-H01, owner ruling 7): re-recorded — W1F-W-01 R2 outstanding question contract
     # (e0e83c3, 2026-10-28) is the milestone authorized to change it; reviewed and merged before f16b1f3.
     "backend/app/services/claim_projection.py": "a420ef32fc3d0f401e671ca8392401bfe000e507",
-    "backend/app/services/response_composition.py": "aa60cbc06578efcbc69aa8d046374690674c0789",
+    # WILD1-C (owner prompt PRELAUNCH-MINIMUM-LAUNCH-WILD1-CONVERSATION-COVERAGE-PRICE-BREAKDOWN-AND-
+    # QUOTE-DECLINE): re-recorded — that milestone is authorized to change it; the previous blob was aa60cbc06578efcbc69aa8d046374690674c0789.
+    "backend/app/services/response_composition.py": "7e9349e75cbe09a22db01fe9be9122d7b4df3552",
     # R6-C1 (R6IRV-H01, owner ruling 7): re-recorded — FINAL-CANDIDATE-CONVERGENCE-R6 (the structured
     # response contract, R5F1RV-01..04) and its correction R6-C1 (R6IRV-S01 / S02 / P01 / T01) are the
     # milestones authorized to change it; the base f16b1f3 blob was 7085211b96771b802c177789e8c4460e4525dfad.
@@ -359,7 +368,9 @@ _FROZEN_AT_PARENT = {
     # and the verification-fallback value type (R6-C4A blob 24843e33…).
     # R6-C4B-R1 (claim-free bridge): re-recorded again — VERIFIED_GENERATED now labels an
     # approved bridge, and the verification-fallback value type is removed (C4B blob d4421ab2…).
-    "backend/app/services/response_validator.py": "a1e40945b0c2c3633cf90054af32b2fe5cc2911d",
+    # WILD1-C (owner prompt PRELAUNCH-MINIMUM-LAUNCH-WILD1-CONVERSATION-COVERAGE-PRICE-BREAKDOWN-AND-
+    # QUOTE-DECLINE): re-recorded — that milestone is authorized to change it; the previous blob was a1e40945b0c2c3633cf90054af32b2fe5cc2911d.
+    "backend/app/services/response_validator.py": "be05839e4833ac3e4843998f39eca4bf0809dde5",
     "backend/app/services/pricing.py": "9aed0358cfba7b08a4082bd7b1ecebcc778e5b5a",
     "backend/app/services/schedule.py": "00487c9a46ee168ae12dc76667863f0fbb5f71ad",
     "backend/app/services/travel.py": "fc95b0550e486b55ddf2cbb2af19e6c6d104d11d",

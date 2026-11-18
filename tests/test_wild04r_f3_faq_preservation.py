@@ -119,7 +119,11 @@ from app.services.pricing import PricingService
 # so this suite cannot drift from ScheduleService's weekday table.
 from app.services.conversation_engine import _faq_hours_answer as _canonical_hours
 _HOURS_ANSWER    = _canonical_hours()
-_REPORT_ANSWER   = "Al finalizar la revisión te enviamos un informe detallado."
+# WILD1-C-R1 (owner ruling): findings explained at the end; detailed report sent the same day.
+_REPORT_ANSWER   = ("Al terminar la revisión, el inspector te comenta los principales hallazgos. "
+                    "El informe detallado se envía durante el mismo día, con los datos del vehículo, "
+                    "los hallazgos por sistema, fotos, una conclusión sobre el estado general y "
+                    "recomendaciones técnicas.")
 _PRESENCE_ANSWER = "No es necesario que estés presente durante la inspección."
 _PAYMENT_ANSWER  = "Aceptamos efectivo, transferencia bancaria y Mercado Pago."
 

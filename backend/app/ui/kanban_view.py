@@ -1640,6 +1640,7 @@ def render_page(
     turno_fecha_to: str = "",
     zones_map: dict[str, list[str]] | None = None,
     booking_details: dict | None = None,
+    quote_history: dict | None = None,
 ) -> str:
     css = _base_css()
 
@@ -1788,7 +1789,8 @@ def render_page(
         )
         for l in col:
             html.append(render_lead_card(l, zones_map, profesionales=profesionales or [], agencias=agencias or [],
-                                         booking_details=(booking_details or {}).get(l.id)))
+                                         booking_details=(booking_details or {}).get(l.id),
+                                         quote_history=(quote_history or {}).get(l.id)))
         html.append("</div></div>")
 
     html.append("</div>")  # board
@@ -4498,6 +4500,7 @@ def render_lead_card(
     profesionales: list[Profesional] | None = None,
     agencias: list[Agencia] | None = None,
     booking_details=None,
+    quote_history=None,
 ) -> str:
     # PRELAUNCH-MINIMUM-LAUNCH-R1 (review F-04, stored HTML injection): every value below that
     # a customer, the Booking Flow, the Conversation Engine or an operator form can supply is
@@ -4537,6 +4540,10 @@ def render_lead_card(
         vehicle_badge = booking_details.vehicle
     vehicle_badge = html_lib.escape(vehicle_badge, quote=True)
     booking_details_html = render_booking_details_block(booking_details)
+    # WILD1-C: the engine's quote decisions (DECLINED / RECONSIDERED), escaped once here.
+    from ..services.quote_decision_history import history_lines as _qd_lines
+    quote_history_html = "".join(
+        f'<div class="quoteDecision">{_t(line)}</div>' for line in _qd_lines(quote_history))
 
     base_cls = "card leadCard"
     if bool(_get(l, "necesita_humano")):
@@ -4865,6 +4872,7 @@ def render_lead_card(
                 if _get(l, "motivo_perdida")
                 else ""
               )}
+              {quote_history_html}
               {''.join(f"<div>{x}</div>" for x in rev_lines)}
               <div>Estado operativo: {_t(last_rev.estado_revision) if last_rev else "-"}</div>
               {(_render_revision_approval_ui(last_rev, lead_id=l.id) if last_rev else "")}

@@ -197,8 +197,17 @@ class TestWritePath(unittest.TestCase):
 
     def test_cut_06_legacy_helper_cannot_progress_alone(self):
         """`_is_acceptance` matching is necessary but no longer sufficient."""
+        # WILD1-C: the legacy (authority-off) branch still reaches the legacy helper, now
+        # only past the operator-PERDIDO guard (an operator's PERDIDO is never overwritten).
+        # WILD1-C-R4: and only when the lost-lead rule's verdict allows it (a HOLD never
+        # accepts); an operator-held PERDIDO gets the hold copy instead (WC-08).
         self.assertIn("if not self._acceptance_authority_on():\n"
-                      "                return self._handle_quoted_acceptance(ctx, state)",
+                      "                # WILD1-C: legacy path — an operator's PERDIDO is never overwritten.\n"
+                      "                if not self._operator_lost_lead(ctx):\n"
+                      "                    # WILD1-C-R4: the rule's verdict is honoured (a HOLD never accepts).\n"
+                      "                    if getattr(self._apply_lost_lead_rule(ctx, state, _LEGACY_ALLOW),\n"
+                      "                               \"allows\", False):\n"
+                      "                        return self._handle_quoted_acceptance(ctx, state)",
                       CE_SOURCE)
         self.assertIn("_auth = self._authorize_acceptance(ctx, state, ai_input_messages)",
                       CE_SOURCE)

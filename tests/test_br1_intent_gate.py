@@ -538,10 +538,21 @@ class TestBR1Section6Provenance(unittest.TestCase):
         self.assertEqual(eng._call_openai.call_count, 1)
 
     def test_s6_moto_candidate_not_provenance(self):
-        """Motorcycle candidate is NOT valid provenance for car inspection."""
+        """Motorcycle candidate is NOT valid provenance for car inspection.
+
+        WILD1-C-R4-R3 (RV-F-01) re-record: a thread that already recorded a MOTO candidate
+        no longer reaches BR-1 at all — the owner contract hands every later turn to a person
+        through the existing plain-text motorcycle handoff (it used to get the BR-1
+        uncertain-service question, i.e. automation continued). Still never provenance: no
+        AI call and no clarification."""
+        from app.services import conversation_engine as _ce_mod
         _candidate = types.SimpleNamespace(tipo_vehiculo="MOTO")
         eng, result, state = _run("Bueno, dale.", candidate=_candidate)
-        _assert_uncertain(self, eng, result)
+        self.assertEqual(result.action, "replied")
+        self.assertEqual(eng._call_openai.call_count, 0)
+        self.assertEqual(str(eng._send_text_to_wa.call_args[0][1]),
+                         str(_ce_mod._MOTORCYCLE_HANDOFF_REPLY))
+        self.assertTrue(state.needs_human)
 
     def test_s6_location_clarification_sent_is_provenance(self):
         """§6 pt 3: location_clarification_sent=True → Flow was sent for accepted message → provenance."""

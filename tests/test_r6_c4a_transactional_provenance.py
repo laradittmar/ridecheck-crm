@@ -228,7 +228,8 @@ class _Base(unittest.TestCase):
 
 # ── A/B/C/D: each transactional route, hostile and canonical bodies, 4 postures ─────────
 
-_QUOTE = "Genial! La cotización para la revisión del Toyota Corolla 2018 en Palermo es de "
+# WILD1-C: the quote copy now introduces the Revisión / Viáticos / Total block.
+_QUOTE = "Genial! Te paso la cotización para la revisión del Toyota Corolla 2018 en Palermo:\n\n"
 
 
 class T01_Quotation(_Base):
@@ -309,7 +310,7 @@ class T03_FlowPending(_Base):
                             token=f"r6c4a-tok-{next(C._SEQ)}")
             r = _turn(self.eng, tid, wa, _THINK, body, sb, direct)
             self.discarded(body, r, route="FLOW_PENDING",
-                           expect="Te envié el formulario para confirmar el turno. "
+                           expect="Te envié el formulario para solicitar el turno. "  # WILD1-C-R2
                                   "Completalo con tus datos y terminamos la reserva.")
         self.each(HOSTILE, run)
 

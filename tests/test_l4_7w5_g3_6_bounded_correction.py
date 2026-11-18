@@ -77,7 +77,9 @@ def bench(primary, *, topics=(), quote=PRICE_TOTAL, answer_source="PRICING_SERVI
     e._turn_clarification_burst = None
     e._turn_text = "t"
     e._live_plan = LiveResponsePlan(turn_id="t")
-    e._turn_price_quote = (SimpleNamespace(precio_total=quote) if quote else None)
+    # WILD1-C: PricingService's structured quote — a total alone is no longer a quote.
+    e._turn_price_quote = (SimpleNamespace(precio_base=quote - 15000, viaticos=15000,
+                                           precio_total=quote) if quote else None)
     e._answer_source_value = answer_source
     e._turn_decision_authority = None
     e._faq_topics_for_burst = lambda t, ctx=None, st=None: set(topics)
@@ -97,6 +99,13 @@ def bench(primary, *, topics=(), quote=PRICE_TOTAL, answer_source="PRICING_SERVI
 
 def money(total=PRICE_TOTAL):
     return f"${total:,.0f}".replace(",", ".")
+
+
+def canonical_quote(total=PRICE_TOTAL):
+    """WILD1-C: an ordinary quote turn's primary IS the canonical breakdown copy, built by the
+    production composer from the structured quote (the `bench` fixture's own values)."""
+    return ConversationEngine._build_quote_reply("Ford", "Focus", "Palermo", SimpleNamespace(
+        precio_base=total - 15000, viaticos=15000, precio_total=total), 2019)
 
 
 # ══ A — the opaque primary, named rather than implied ══════════════════════
@@ -271,14 +280,13 @@ class C_PriceProposition(unittest.TestCase):
                          "the producer reads the prose")
 
     def test_bc36_14_an_ordinary_quote_turn_does_not_say_the_price_twice(self):
-        primary = ("Genial! La cotización para la revisión del Ford Focus 2019 en Palermo "
-                   f"es de {money()}. Si te parece bien, podemos avanzar.")
+        primary = canonical_quote()                       # WILD1-C: the breakdown copy
         r = bench(primary)
         self.assertEqual(r.text.count(money()), 1, "the customer was told the price twice")
         self.assertIn(primary, r.text)
 
     def test_bc36_15_the_redundant_price_stays_traceable(self):
-        r = bench("Genial! " + self.QUOTE_REPLY_FRAGMENT + f" es de {money()}.")
+        r = bench(canonical_quote())                      # WILD1-C: the breakdown copy
         item = next(i for i in r.plan.items
                     if i.proposition_id == PropositionId.CANONICAL_PRICE)
         self.assertFalse(item.included)
@@ -334,7 +342,7 @@ class D_PriceSurvivesTheRejection(unittest.TestCase):
 
     def test_bc36_21_the_surviving_price_came_from_the_canonical_renderer(self):
         r = self.result()
-        self.assertIn("La cotización para la revisión", r.text)
+        self.assertIn("la cotización para la revisión", r.text)   # WILD1-C copy
         self.assertIn("Ford Focus 2019", r.text)
         self.assertIn("Palermo", r.text)
         self.assertNotIn("La revisión sale", r.text,
@@ -472,8 +480,13 @@ class E_NothingElseMoved(unittest.TestCase):
         try:
             self.assertEqual(len(t.sent), 1)
             payload = t.engine._turn_response_plan.to_payload()
+            # WILD1-C-R4 (R3RV-01): `evidence=None` makes the provider return ok=False — a
+            # FAILED reading. The burst is therefore retained as a pending question, and
+            # its acknowledgement is a second canonical FAQ item in the SAME one message.
             self.assertEqual(payload["item_kinds"],
-                             [ResponseItemKind.TEXT, ResponseItemKind.FAQ_ANSWER])
+                             [ResponseItemKind.TEXT, ResponseItemKind.FAQ_ANSWER,
+                              ResponseItemKind.FAQ_ANSWER])
+            self.assertIn(ce._PENDING_QUESTION_ACK, t.sent[0])
             self.assertNotIn(PropositionId.CANONICAL_PRICE,
                              [i["proposition_id"] for i in payload["items"]],
                              "a price was registered with no canonical quote")
@@ -489,7 +502,7 @@ class E_NothingElseMoved(unittest.TestCase):
         interp = (ROOT / "backend/app/services/semantic_interpreter.py").read_text(
             encoding="utf-8")
         self.assertIn('REPLY_PROMPT_VERSION = "reply/1.0"', engine_src)
-        self.assertIn('PROMPT_VERSION = "understand/1.20"', interp)
+        self.assertIn('PROMPT_VERSION = "understand/1.22"', interp)
         self.assertEqual(TRACE_VERSION, "hybrid-decision-trace/1.10")
 
 

@@ -652,7 +652,10 @@ class P05_BridgesAreClaimFreeEvenWhenTheFactIsCanonical(_Engine):
 
 class P06_CanonicalFactsExactlyOnce(_Engine):
     def test_no_duplicate_price_availability_or_cta(self):
-        for label, needles in (("QUOTATION", ("140.000",)),
+        # WILD1-C: the quote is the canonical breakdown block; with viáticos $0 the amount is
+        # on both its Revisión and Total lines, so "stated once" is the BLOCK stated once.
+        for label, needles in (("QUOTATION", (CE_MOD._rv_render_price_breakdown(140000, 0, 140000),
+                                              "Total: $140.000")),
                                ("EVALUATED", ("10:00", FLOW_CTA, "disponibilidad")),
                                ("SCHEDULING", (CE_MOD._TX_SCHEDULING_ASK_TEXT,)),
                                ("QUALIFYING", ("¿En qué localidad o barrio está el auto?",))):

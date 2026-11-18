@@ -2031,6 +2031,45 @@ def _check_price(sentence: str, facts: CanonicalFacts,
                         "amount does not match the canonical quote")
 
 
+#: WILD1-C. The labels of the canonical monetary block, in order. The block is the ONE
+#: customer-facing rendering of a quote: three lines, every amount from PricingService.
+PRICE_BREAKDOWN_LABELS = ("Revisión", "Viáticos", "Total")
+
+
+class PriceBreakdownError(ValueError):
+    """The components do not reconcile, or are not exact non-negative integers."""
+
+
+def _ars(amount: int) -> str:
+    return f"${amount:,.0f}".replace(",", ".")
+
+
+def price_breakdown_values(base, viaticos, total) -> tuple:
+    """`(base, viaticos, total)` as exact ints, refusing anything that does not reconcile.
+
+    WILD1-C. `base + viaticos == total` is checked here, as integers, before any text exists.
+    `bool` is refused (it is an `int` subclass); so is a negative amount. Never computes a
+    missing component: a caller that has no total does not get one invented for it."""
+    values = (base, viaticos, total)
+    if not all(type(v) is int and v >= 0 for v in values):
+        raise PriceBreakdownError(f"non-integer or negative component: {values!r}")
+    if base + viaticos != total:
+        raise PriceBreakdownError(f"{base} + {viaticos} != {total}")
+    return values
+
+
+def render_price_breakdown(base, viaticos, total) -> str:
+    """The canonical monetary block. Raises `PriceBreakdownError` unless it reconciles.
+
+        Revisión: $140.000
+        Viáticos: $0
+        Total: $140.000
+
+    Viáticos is always shown, including $0."""
+    values = price_breakdown_values(base, viaticos, total)
+    return "\n".join(f"{label}: {_ars(v)}" for label, v in zip(PRICE_BREAKDOWN_LABELS, values))
+
+
 def _rewrite_price(sentence: str, facts: CanonicalFacts) -> str:
     """Replace every non-canonical amount with the canonical total."""
     canonical = f"${facts.quote_total:,.0f}".replace(",", ".")
@@ -2296,6 +2335,13 @@ def validate_response(
         # Nothing survived — never send an unsupported message; send a safe deterministic one.
         return ValidationResult(text=_plain(fallback), findings=findings, fell_back=True)
 
+    if len(kept) == len(sentences) and all(a is b for a, b in zip(kept, sentences)):
+        # WILD1-C: every sentence survived UNEDITED, so the text is exactly what was
+        # validated — returned as written. Re-joining with single spaces would flatten the
+        # canonical multi-line price block (`Revisión: …\nViáticos: …\nTotal: …`) into one
+        # line. Any drop or rewrite still takes the re-joined path below, unchanged.
+        return ValidationResult(text=_plain(text), findings=findings)
+
     return ValidationResult(text=_plain(" ".join(_plain(s).strip() for s in kept)),
                             findings=findings)
 
@@ -2387,12 +2433,22 @@ def _validate_structured_claim(claim, facts: CanonicalFacts) -> Optional[str]:
                 return "location claim without a canonical inspection location"
             return None if _norm(str(value[0])) in canonical else "location differs from canonical"
         if kind is DomainClaim.PRICE:
-            allowed = {v for v in (facts.quote_total, facts.quote_base, facts.quote_viaticos)
-                       if v is not None} | set(facts.previously_quoted)
+            # WILD1-C. A declared quote is ALWAYS the full breakdown — (revisión, viáticos,
+            # total) — and each component must be EXACTLY the PricingService value in its
+            # own position, reconciling as integers. A total-only declaration is refused:
+            # every customer-facing quote shows all three values.
             if not value or not facts.quote_known:
                 return "price claim without a PricingService quote"
-            return None if all(type(v) is int and v in allowed for v in value) \
-                else "amount differs from the canonical quote"
+            if len(value) != 3:
+                return "price claim must declare the breakdown (revisión, viáticos, total)"
+            try:
+                base, viaticos, total = price_breakdown_values(*value)
+            except PriceBreakdownError as exc:
+                return f"price breakdown does not reconcile ({exc})"
+            if (base, viaticos, total) != (facts.quote_base, facts.quote_viaticos,
+                                           facts.quote_total):
+                return "price breakdown differs from the canonical quote"
+            return None
         if kind is DomainClaim.AVAILABILITY:
             if not value or not facts.availability_checked:
                 return "availability claim without a ScheduleService evaluation"
@@ -2542,6 +2598,12 @@ def validate_envelope(value, facts: CanonicalFacts, *, vehicle_resolver=None,
 
         for claim in declaration.claims:
             why = _validate_structured_claim(claim, facts)
+            if why is None and claim.kind is DomainClaim.PRICE:
+                # WILD1-C: the declared breakdown must be what the customer READS — the
+                # canonical block, verbatim. A composer that declares three values and
+                # renders only a total (or other words) is refused whole.
+                if render_price_breakdown(*claim.value) not in str.__str__(value):
+                    why = "declared price breakdown is not rendered as the canonical block"
             if why is not None:
                 findings.append(ClaimFinding(
                     getattr(getattr(claim, "kind", None), "value", "UNKNOWN"), False,

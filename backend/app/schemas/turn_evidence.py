@@ -313,6 +313,8 @@ class AcceptanceEvidence(EvidenceItem):
     field: str = "acceptance"
     _MEANINGFUL_FIELDS = ()          # UNKNOWN + no value carries nothing
     signal: AcceptanceSignal = AcceptanceSignal.UNKNOWN
+    #: WILD1-C: PRICE | AVAILABILITY | OTHER, only when `signal` is REJECT; else None.
+    decline_reason: Optional[str] = None
 
     def is_semantically_empty(self) -> bool:
         # Compared by value, not identity: a signal that survived a round-trip (or a

@@ -372,6 +372,13 @@ def kanban(
     except Exception:
         db.rollback()
         booking_details = {}
+    # WILD1-C: the engine's quote-decision history per card (read only, never breaks it).
+    try:
+        from ..services.quote_decision_history import lead_quote_decisions
+        quote_history = lead_quote_decisions(db, [l.id for l in leads])
+    except Exception:
+        db.rollback()
+        quote_history = {}
     return HTMLResponse(
         render_page(
             leads,
@@ -379,6 +386,7 @@ def kanban(
             agencias=agencias,
             user_email=getattr(request.state, "user_email", ""),
             booking_details=booking_details,
+            quote_history=quote_history,
             **filters,
         ),
         media_type="text/html; charset=utf-8",

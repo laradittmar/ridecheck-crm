@@ -30,6 +30,7 @@ import os
 import sys
 import types
 import unittest
+from types import SimpleNamespace  # WILD1-C
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -367,7 +368,9 @@ class TestL301VehicleYearContamination(unittest.TestCase):
     def test_l3_01c_quote_reply_mentions_2015_not_2020(self):
         """L3-01c FINAL OUTCOME: _build_quote_reply uses new year 2015, no mention of 2020."""
         reply = ConversationEngine._build_quote_reply(
-            marca="Peugeot", modelo="2008", location="Palermo", precio_total=150000, anio=2015
+            # WILD1-C: the composer takes the structured PricingQuote, never a bare total.
+            marca="Peugeot", modelo="2008", location="Palermo",
+            quote=SimpleNamespace(precio_base=150000, viaticos=0, precio_total=150000), anio=2015
         )
         self.assertIn("2015", reply)
         self.assertNotIn("2020", reply)
@@ -997,7 +1000,7 @@ class TestL312QuoteRecomputedFromNewZone(unittest.TestCase):
         # Final customer reply uses new zone
         reply = ConversationEngine._build_quote_reply(
             marca="Toyota", modelo="Corolla",
-            location="Berazategui", precio_total=quote.precio_total, anio=2019,
+            location="Berazategui", quote=quote, anio=2019,   # WILD1-C: structured quote
         )
         self.assertIn("Berazategui", reply)
         self.assertNotIn("Palermo", reply)
@@ -1596,7 +1599,7 @@ class TestL323VoiceBurstCorrectData(unittest.TestCase):
 
         reply = ConversationEngine._build_quote_reply(
             marca="Peugeot", modelo="2008",
-            location="Berazategui", precio_total=quote.precio_total, anio=2015,
+            location="Berazategui", quote=quote, anio=2015,   # WILD1-C: structured quote
         )
         self.assertIn("2015", reply)
         self.assertIn("Berazategui", reply)

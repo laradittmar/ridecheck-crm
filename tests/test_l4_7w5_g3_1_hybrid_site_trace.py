@@ -909,14 +909,21 @@ class DomainVerdictGuard(unittest.TestCase):
         # no provider call. Measured on the complete turn: `_turn_semantic_calls` is 0 on an
         # admitting turn, so admission before the gate chain costs nothing the turn was not
         # already paying. An unauthorised tenth reader still fails here.
-        self.assertEqual(calls, 9,
+        # WILD1-C added TWO authorised readers: `_coverage_evidence` (the coverage layer's ONE
+        # memoised read per turn, non-blocking before the commercial path) and
+        # `_explicit_quote_decline` (the QUOTED-stage decline probe, memoised). Both read the
+        # interpretation the turn already dispatched; neither calls the provider. An
+        # unauthorised twelfth reader still fails here.
+        self.assertEqual(calls, 11,
                          "five pre-existing consumers, the R2 reader, the G3-7 deriver, "
-                         "the G3-7F clarification decision and the W1F-R1 admission "
-                         "boundary — none of which calls the provider")
+                         "the G3-7F clarification decision, the W1F-R1 admission "
+                         "boundary and the two WILD1-C readers — none of which calls the "
+                         "provider")
         readers = {n.name for n in ast.walk(tree)
                    if isinstance(n, ast.FunctionDef)
                    and "_semantic_turn_evidence()" in ast.unparse(n)}
         self.assertIn("_semantic_reading", readers)
+        self.assertTrue({"_coverage_evidence", "_explicit_quote_decline"} <= readers, readers)
 
 
 class ObserverFailureDiagnostics(unittest.TestCase):

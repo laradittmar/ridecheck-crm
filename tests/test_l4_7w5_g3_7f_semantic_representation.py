@@ -373,7 +373,7 @@ class F_Boundary(unittest.TestCase):
 class G_Versions(unittest.TestCase):
 
     def test_g37f_62_the_versions_moved_together(self):
-        self.assertEqual(PROMPT_VERSION, "understand/1.20")
+        self.assertEqual(PROMPT_VERSION, "understand/1.22")
         self.assertEqual(SCHEMA_VERSION, "turn-evidence/1.4")
 
     def test_g37f_63_the_model_did_not_move(self):

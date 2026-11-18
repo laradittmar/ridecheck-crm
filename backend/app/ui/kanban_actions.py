@@ -19,6 +19,8 @@ from ..models import Agencia, Lead, Revision, Profesional, Vendedor
 from ..services.lead_lifecycle import set_lead_estado
 from ..services.booking_authority import BookingAuthority, BookingSource, command_for_edit
 from ..services.vehicle_identity import normalize_dominio, parse_kilometraje
+from ..services.quote_decision_history import (PRODUCER_OPERATOR_UI, flag_fields,
+                                               record_operator_flag_action)
 from .kanban_view import (
     ESTADOS_VALIDOS,
     MOTIVOS_PERDIDA_VALIDOS,
@@ -55,6 +57,19 @@ def _to_int(v: str | None) -> int | None:
     if s is None:
         return None
     return int(s)
+
+def _operator_provenance(db: Session, lead: Lead, before: tuple, *, action: str, route: str,
+                         always: bool) -> None:
+    """WILD1-C-R3 (WC-02): append the operator-provenance row for a flag / loss-reason action
+    in THIS transaction, before the caller commits. `always` — the action is itself a flag
+    decision (set, clear, PERDIDO, re-confirmation), recorded even when the values did not
+    change; otherwise (an estado move) only when it actually changed flag or motivo. An
+    error propagates: the commit is never reached and the mutation rolls back with it."""
+    if always or flag_fields(lead) != tuple(before):
+        record_operator_flag_action(db, lead, action=action, route=route,
+                                    producer=PRODUCER_OPERATOR_UI,
+                                    flag_before=before[0], motivo_before=before[1])
+
 
 def _to_bool(v: str | None) -> bool | None:
     s = _clean_str(v)
@@ -310,10 +325,13 @@ def ui_move(lead_id: int = Form(...), estado: str = Form(...), db: Session = Dep
         raise HTTPException(status_code=404, detail="Lead not found")
     if estado not in ESTADOS_VALIDOS:
         raise HTTPException(status_code=400, detail="Estado inválido")
+    _before = flag_fields(lead)
     set_lead_estado(db, lead, estado)
     if _has(lead, "motivo_perdida") and _has(lead, "flag"):
         if lead.flag != "PERDIDO":
             lead.motivo_perdida = None
+    _operator_provenance(db, lead, _before, action="estado_move", route="/ui/move",
+                         always=False)
     db.commit()
     return RedirectResponse(url="/kanban", status_code=303)
 
@@ -357,10 +375,13 @@ def ui_move_lead(
         raise HTTPException(status_code=404, detail="Lead not found")
     if target_estado not in ESTADOS_VALIDOS:
         raise HTTPException(status_code=400, detail="Estado inválido")
+    _before = flag_fields(lead)
     set_lead_estado(db, lead, target_estado)
     if _has(lead, "motivo_perdida") and _has(lead, "flag"):
         if lead.flag != "PERDIDO":
             lead.motivo_perdida = None
+    _operator_provenance(db, lead, _before, action="estado_move", route="/ui/move_lead",
+                         always=False)
     db.commit()
     return JSONResponse({"ok": True, "estado": target_estado})
 
@@ -371,10 +392,13 @@ def ui_lead_move(lead_id: int, estado: str = Form(...), db: Session = Depends(ge
         raise HTTPException(status_code=404, detail="Lead not found")
     if estado not in ESTADOS_VALIDOS:
         raise HTTPException(status_code=400, detail="Estado inválido")
+    _before = flag_fields(lead)
     set_lead_estado(db, lead, estado)
     if _has(lead, "motivo_perdida") and _has(lead, "flag"):
         if lead.flag != "PERDIDO":
             lead.motivo_perdida = None
+    _operator_provenance(db, lead, _before, action="estado_move",
+                         route="/ui/lead/{lead_id}/move", always=False)
     db.commit()
     return JSONResponse({"ok": True})
 
@@ -396,10 +420,14 @@ def ui_perdido(lead_id: int = Form(...), motivo_perdida: str | None = Form(None)
     lead = db.get(Lead, lead_id)
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
+    _before = flag_fields(lead)
     if _has(lead, "flag"):
         lead.flag = "PERDIDO"
     if _has(lead, "motivo_perdida"):
         lead.motivo_perdida = _clean_str(motivo_perdida)
+    # WILD1-C-R3: marking — or RE-CONFIRMING — PERDIDO is an operator decision, always.
+    _operator_provenance(db, lead, _before, action="perdido", route="/ui/perdido",
+                         always=True)
     db.commit()
     return RedirectResponse(url="/kanban", status_code=303)
 
@@ -416,12 +444,15 @@ def ui_lead_flag_set(
         raise HTTPException(status_code=404, detail="Lead not found")
     if flag not in FLAG_VALUES:
         raise HTTPException(status_code=400, detail="Flag invÃ¡lido")
+    _before = flag_fields(lead)
     if _has(lead, "flag"):
         lead.flag = flag
     if _has(lead, "motivo_perdida") and flag != "PERDIDO":
         lead.motivo_perdida = None
     if _has(lead, "buscando_auto_set_at"):
         lead.buscando_auto_set_at = datetime.now(timezone.utc) if flag == "BUSCANDO_AUTO" else None
+    _operator_provenance(db, lead, _before, action="flag_set", route="/ui/lead_flag_set",
+                         always=True)
     db.commit()
     return RedirectResponse(url="/kanban", status_code=303)
 
@@ -433,10 +464,13 @@ def ui_lead_flag_clear(
     lead = db.get(Lead, lead_id)
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
+    _before = flag_fields(lead)
     if _has(lead, "flag"):
         lead.flag = None
     if _has(lead, "motivo_perdida"):
         lead.motivo_perdida = None
+    _operator_provenance(db, lead, _before, action="flag_clear", route="/ui/lead_flag_clear",
+                         always=True)
     db.commit()
     return RedirectResponse(url="/kanban", status_code=303)
 

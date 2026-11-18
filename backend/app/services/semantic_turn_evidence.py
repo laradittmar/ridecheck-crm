@@ -141,5 +141,12 @@ class TurnSemanticEvidence:
         return self._done.is_set()
 
     @property
+    def dispatched(self) -> bool:
+        """False when `start()` handed the work to a submitter that declined it or raised
+        (queue full, thread could not start): nothing is running it. WILD1-C-R4: a caller
+        bound by a turn deadline reads this instead of letting `get()` run it inline."""
+        return bool(self._started and self._dispatched)
+
+    @property
     def timed_out(self) -> bool:
         return self._timeouts > 0

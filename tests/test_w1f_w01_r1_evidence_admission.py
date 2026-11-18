@@ -491,10 +491,16 @@ class TestR1B_WholeTurn(unittest.TestCase):
 
     def test_b07_evidence_cannot_leak_to_another_candidate(self):
         """Candidate-location isolation (M21.2.14): a `mentioned` MOTO from an earlier
-        handoff is not this conversation's subject."""
+        handoff is not this conversation's subject.
+
+        WILD1-C-R4-R3 (RV-F-01) re-record: a thread that recorded a motorcycle is human-owned
+        on every later turn (owner contract), so the turn is the motorcycle handoff and
+        admission never writes a zone — to the car (it used to: `("CABA", "Flores")`) or to
+        the MOTO candidate. The isolation property is unchanged: nothing leaks to the MOTO
+        candidate. Isolation with no motorcycle on the thread stays pinned by b01–b06."""
         on = _turn("en flores", admission=True, vehicle=True, mentioned=True,
                    evidence=_evidence(_loc("Flores")))
-        self.assertEqual(on.turn.cand_zone, ("CABA", "Flores"))
+        self.assertEqual(on.turn.cand_zone, (None, None))
         self.assertEqual(on.other_candidate, (None, None))
 
     def test_b08_the_r3_ambiguity_protection_holds_through_admission(self):
@@ -1155,10 +1161,12 @@ class TestR1G_Placement(unittest.TestCase):
                     self.assertEqual((), tuple(on.admission.records))
                 else:
                     self.assertEqual(on.record_for().reason, reason)
-        # candidate isolation, at the new placement
+        # candidate isolation, at the new placement. WILD1-C-R4-R3 (RV-F-01) re-record: a
+        # thread with a recorded motorcycle is human-owned (see b07), so neither candidate
+        # receives the zone; nothing leaks to the MOTO candidate.
         on = _turn("en flores", admission=True, vehicle=True, mentioned=True,
                    evidence=_evidence(_loc("Flores")))
-        self.assertEqual(on.turn.cand_zone, ("CABA", "Flores"))
+        self.assertEqual(on.turn.cand_zone, (None, None))
         self.assertEqual(on.other_candidate, (None, None))
 
 

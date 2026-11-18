@@ -13,6 +13,8 @@ from ..schemas.whatsapp_api import WhatsAppThreadOut
 from ..services.db_errors import commit_or_400
 from ..services.lead_lifecycle import set_lead_estado
 from ..services.phone_utils import normalize_phone_or_422
+from ..services.quote_decision_history import (PRODUCER_OPERATOR_API, flag_fields,
+                                               record_operator_flag_action)
 from ..services.whatsapp_threads import load_thread_payload
 
 router = APIRouter(prefix="/leads", tags=["leads"])
@@ -81,6 +83,7 @@ def update_lead(lead_id: int, payload: LeadUpdate, db: Session = Depends(get_db)
     lead = db.get(Lead, lead_id)
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
+    _flag_before = flag_fields(lead)
 
     if payload.estado is not None:
         if payload.estado not in ESTADOS_VALIDOS:
@@ -128,6 +131,16 @@ def update_lead(lead_id: int, payload: LeadUpdate, db: Session = Depends(get_db)
         lead.apellido = payload.apellido
     if hasattr(payload, "telefono") and payload.telefono is not None:
         lead.telefono = normalize_phone_or_422(payload.telefono)
+
+    # WILD1-C-R3 (WC-02): an API write that sets the flag or the loss reason is an operator
+    # (non-engine) intervention, recorded in THIS transaction — always when the payload
+    # carries flag/motivo (re-confirming PERDIDO included), otherwise only if the estado
+    # change actually altered them. An error propagates and nothing is committed.
+    if (getattr(payload, "flag", None) is not None or payload.motivo_perdida is not None
+            or flag_fields(lead) != _flag_before):
+        record_operator_flag_action(db, lead, action="api_patch", route="PATCH /leads/{id}",
+                                    producer=PRODUCER_OPERATOR_API,
+                                    flag_before=_flag_before[0], motivo_before=_flag_before[1])
 
     commit_or_400(db, detail="No se pudo actualizar el lead: revisá longitudes y valores permitidos")
     db.refresh(lead)

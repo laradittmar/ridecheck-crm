@@ -66,7 +66,8 @@ MIX = [c for cid, c in CORPUS.items() if cid.startswith("SYN-MIX")]
 # at understand/1.19 by test_fixture_11 — Commit 1 changes no prompt. Commit 2 then
 # moved both deliberately: target_scope and patch[] are new semantic obligations, so
 # the prompt became understand/1.20 and the schema turn-evidence/1.4.
-INTERPRETER_SHA256 = "7daadd675590c6182264ffa909a84ebff353a639cafe4600ab460e94aa734d4a"
+# WILD1-C re-pinned (acceptance.decline_reason; prompt understand/1.22). Previous: 7daadd67…34d4a.
+INTERPRETER_SHA256 = "b2e9feb5572bbfe300903bf6af397c629b1d689da768b676d80d60c88d0deb2e"
 INTERPRETER_PATH = ROOT / "backend" / "app" / "services" / "semantic_interpreter.py"
 
 
@@ -239,7 +240,7 @@ class TestImmutability(unittest.TestCase):
 
     def test_fixture_11_prompt_version_unchanged(self):
         from app.services.semantic_interpreter import PROMPT_VERSION
-        self.assertEqual(PROMPT_VERSION, "understand/1.20",
+        self.assertEqual(PROMPT_VERSION, "understand/1.22",
                          "moved by L4.7W5-GATE3-G3-7F Commit 2 for target_scope and the "
                          "typed correction patch; the MODEL did not")
         source = INTERPRETER_PATH.read_text(encoding="utf-8")

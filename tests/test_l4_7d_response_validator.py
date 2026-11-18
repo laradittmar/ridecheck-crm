@@ -254,8 +254,8 @@ class TestBookingClaim(unittest.TestCase):
     def test_flow_body_is_not_a_booking_claim(self):
         """The Booking Flow invitation must survive validation."""
         facts = _facts(availability_checked=True, offered_slots=("13:00",))
-        text = ("Ese horario está disponible 🎉 "
-                "Para confirmar el turno, elegí el horario y completá tus datos.")
+        # WILD1-C-R2: the verified-time body requests the booking; it never confirms it.
+        text = "Ese horario está disponible 🎉 Completá tus datos para solicitar el turno."
         out = validate_response(text, facts, vehicle_resolver=_resolver)
         self.assertEqual(out.text, text)
 

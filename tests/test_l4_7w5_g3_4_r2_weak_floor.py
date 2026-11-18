@@ -339,7 +339,7 @@ class E_NoRegressionInScope(unittest.TestCase):
     def test_r2_30_the_model_is_unchanged(self):
         interp = (BACKEND / "app/services/semantic_interpreter.py").read_text(encoding="utf-8")
         self.assertIn('or "gpt-4o-mini"', interp)
-        self.assertIn('PROMPT_VERSION = "understand/1.20"', interp)
+        self.assertIn('PROMPT_VERSION = "understand/1.22"', interp)
 
     def test_r2_31_no_provider_call_was_added(self):
         import re

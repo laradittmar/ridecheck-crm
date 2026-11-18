@@ -45,6 +45,7 @@ from app.services.response_validator import (  # noqa: E402
     QuestionIntent, ResponseDeclaration, ResponseProvenance, StateUpdate, StructuredClaim,
     ValidationFallbackId, composed_text, safe_failure_text, select_validation_fallback,
     validate_envelope, validate_response)
+from app.services.response_validator import render_price_breakdown  # noqa: E402  WILD1-C
 
 _APP = _ROOT / "backend" / "app"
 _ZONES = tuple(
@@ -164,16 +165,19 @@ class B_StructuredClaims(unittest.TestCase):
     def test_b01_each_claim_kind_proven_by_canonical_state_is_kept(self):
         ok = [(DomainClaim.VEHICLE, ("Toyota", "Corolla"), QUOTED),
               (DomainClaim.LOCATION, ("Palermo",), QUOTED),
-              (DomainClaim.PRICE, (85000,), QUOTED),
+              # WILD1-C: a declared quote is the full breakdown, rendered as the canonical block
+              (DomainClaim.PRICE, (70000, 15000, 85000), QUOTED),
               # R6-C3: a deterministic availability claim carries its exact ISO date
               (DomainClaim.AVAILABILITY, ("2026-11-16", "10:00"), SLOTS_DATED),
               (DomainClaim.BOOKING, (), CanonicalFacts(booking_confirmed=True)),
               (DomainClaim.ACCEPTANCE, (), CanonicalFacts(acceptance_confirmed=True))]
         for kind, value, facts in ok:
             with self.subTest(kind=kind.name):
-                e = self._claim(kind, value, facts)
+                text = ("Perfecto.\n\n" + render_price_breakdown(*value)
+                        if kind is DomainClaim.PRICE else "Perfecto.")
+                e = self._claim(kind, value, facts, text=text)
                 self.assertIs(e.provenance, ResponseProvenance.DETERMINISTIC_COMPOSED)
-                self.assertEqual(e.text, "Perfecto.")
+                self.assertEqual(e.text, text)
 
     def test_b02_each_conflicting_claim_refuses_the_whole_value(self):
         bad = [(DomainClaim.VEHICLE, ("Fiat", "Uno"), QUOTED),
@@ -182,6 +186,11 @@ class B_StructuredClaims(unittest.TestCase):
                (DomainClaim.LOCATION, ("Palermo",), NEW),
                (DomainClaim.PRICE, (10000,), QUOTED),
                (DomainClaim.PRICE, (85000,), NEW),
+               # WILD1-C: a breakdown that reconciles but is not the canonical one, a total-only
+               # declaration of the right amount, and swapped components are all refused.
+               (DomainClaim.PRICE, (75000, 10000, 85000), QUOTED),
+               (DomainClaim.PRICE, (85000,), QUOTED),
+               (DomainClaim.PRICE, (15000, 70000, 85000), QUOTED),
                (DomainClaim.AVAILABILITY, ("15:00",), SLOTS),
                (DomainClaim.AVAILABILITY, ("10:00",), NEW),
                (DomainClaim.BOOKING, (), NEW),
@@ -193,7 +202,8 @@ class B_StructuredClaims(unittest.TestCase):
                 self.assertEqual(e.text, select_validation_fallback(facts).text)
 
     def test_b03_the_composed_quote_declares_and_passes(self):
-        q = ConversationEngine._composed_quote_reply(_ENG, "Toyota", "Corolla", "Palermo", 85000, 2018)
+        _q = SimpleNamespace(precio_base=70000, viaticos=15000, precio_total=85000)  # WILD1-C
+        q = ConversationEngine._composed_quote_reply(_ENG, "Toyota", "Corolla", "Palermo", _q, 2018)
         self.assertIs(type(q), ComposedText)
         kinds = {c.kind for c in q.declaration.claims}
         self.assertEqual(kinds, {DomainClaim.PRICE, DomainClaim.VEHICLE, DomainClaim.LOCATION})
@@ -201,7 +211,7 @@ class B_StructuredClaims(unittest.TestCase):
         self.assertEqual(e.text, str(q))
         self.assertIs(e.provenance, ResponseProvenance.DETERMINISTIC_COMPOSED)
         # the same composer for another car is refused before its words are read
-        wrong = ConversationEngine._composed_quote_reply(_ENG, "Fiat", "Uno", "Palermo", 85000)
+        wrong = ConversationEngine._composed_quote_reply(_ENG, "Fiat", "Uno", "Palermo", _q)
         self.assertTrue(_env(wrong, QUOTED).fell_back)
 
 
